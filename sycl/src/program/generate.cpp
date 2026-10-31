@@ -7642,7 +7642,18 @@ int main(int argc, char **argv) try {
 #if defined(STRATA_HAVE_DFLASH2)
         if (use_df2 && native_head.loaded()) mtp_bind += (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) + (48 << 20);   // DFlash2's own draft head and logits, bound after this
 #endif
-        const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
+        // STRATA_CKPT_ASYNC (a B70 default): the turn checkpoints' VRAM stage, one buffer the size of the DeltaNet state
+        // (118 MB on Flash-Next) allocated at the first save, after the cache: priced like the draft head, so the card
+        // still ends with the reserve it was asked to keep
+        int64_t ckpt_stage = 0;
+        if (o.serve && o.prompt_cache > 0) {
+            const char* ca = std::getenv("STRATA_CKPT_ASYNC");
+            strata::core::ConversationStateSizes cz;
+            std::string cerr;
+            if (ca != nullptr && ca[0] == '1' && strata::core::conversation_session_sizes(g, ss, cz, cerr))
+                ckpt_stage = (int64_t) cz.gdn;
+        }
+        const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first + ckpt_stage;
         const int64_t blob = (int64_t) nibble_max_slot_bytes();   // max_blob (STRATA_EXPERT_NIBBLE: or a larger 4-bit slot)
         // #496: the least a working cache needs (the verify window cannot start without one, #174): a cache too small to lend the prompt path a
         // 256-token chunk's buffers (plus the 128 slots a loan leaves; one slot without --prefill) makes it allocate its own on top
@@ -7671,8 +7682,9 @@ int main(int argc, char **argv) try {
 #endif
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
-                             "draft head%s) -> %d slots\n",
+                             "draft head%s%s) -> %d slots\n",
                      (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20),
+                     ckpt_stage > 0 ? (", +" + std::to_string(ckpt_stage >> 20) + " MiB for the checkpoint stage").c_str() : "",
                      auto_slots.late_priced ? ", +256 MiB for what is allocated after the cache" : "", o.expert_cache);
 #if defined(STRATA_USE_HIP) && !defined(_WIN32)
         // An APU's "VRAM" is system RAM: the device-free figure above counts the whole GPU-addressable pool and does not

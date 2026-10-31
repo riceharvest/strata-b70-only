@@ -43,7 +43,9 @@ Qwen3.8-Flash-Next IQ2_XS on one Arc Pro B70, Ryzen 9 5950X, 64 GB RAM, measured
 | 250K | 2,750 / 2,832 | 64.6 / 62.4 |
 
 The 250K row is the same test with a 249,618-token prompt (more of the same docs, the fact in the middle, found) and
-`--max-context 262144`: one run before and one after the fix for the prompt selection past ~201K tokens.
+`--max-context 262144`: one run before and one after the fix for the prompt selection past ~201K tokens. The second
+run's automatic expert cache came out 305 slots smaller (it follows what the desktop holds in VRAM), the likely reason
+for its slower answer.
 
 The same test on this branch before the latest prompt work read 1,786 / 1,817 tok/s, so the prompt is read 59% faster.
 The answer speed did not change. These numbers include the fix for the second-turn hang below, which costs about 2%.
