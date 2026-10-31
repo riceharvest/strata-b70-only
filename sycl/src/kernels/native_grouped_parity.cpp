@@ -669,7 +669,7 @@ void bench(dpct::queue_ptr s, std::mt19937 &rng) {
 // window of 2 tokens (16 groups, 20 entries) and of 4 (28 groups, 40 entries; native_grouped_parity's --bench).
 // STRATA_GU_LANES / STRATA_DOWN_LANES pick the lane split as in the engine.
 void kq_bench(dpct::queue_ptr s, std::mt19937& rng, int nl, bool host) {
-    const int pairs[][2] = {{21, 20}, {23, 20}, {18, 42}, {12, 7}, {12, 8}, {13, 8},
+    const int pairs[][2] = {{22, 42}, {16, 42}, {21, 20}, {23, 20}, {18, 42}, {12, 7}, {12, 8}, {13, 8},
 #ifdef STRATA_Q6K_EXPERTS
                             {14, 8},
 #endif
@@ -682,7 +682,11 @@ void kq_bench(dpct::queue_ptr s, std::mt19937& rng, int nl, bool host) {
     dpct::event_ptr e0 = new sycl::event(), e1 = new sycl::event();
     std::printf("\n--kqbench: %d layers per graph, each its own experts (%s); us per call (median of 40), expert MB per call, GB/s\n",
                 nl, host ? "pinned host memory" : "device memory");
-    for (const auto& pr : pairs) {
+    // STRATA_KQBENCH_PAIRS=n: the first n pairs only (2: Flash-Next's own, IQ2_S and IQ2_XXS gate/up with Q2_0 down)
+    const int all = (int) (sizeof pairs / sizeof pairs[0]);
+    const int npairs = std::getenv("STRATA_KQBENCH_PAIRS") ? std::max(1, std::min(all, std::atoi(std::getenv("STRATA_KQBENCH_PAIRS")))) : all;
+    for (int pi = 0; pi < npairs; ++pi) {
+        const auto& pr = pairs[pi];
         for (const auto& sh : shapes) {
             Setup S(pr[0], pr[1], 2560, 640, sh.T, 10, 28, rng, s);
             const int ng = S.plan_sizes(*sh.sizes, 0, rng);
