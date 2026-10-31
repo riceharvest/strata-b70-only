@@ -2161,7 +2161,7 @@ public:
     }
 private:
     static void clear_marks(ConvCheckpoint& c) {
-        c.ids.clear(); c.imgs.clear(); c.used = 0; c.pinned = false; c.dev_tag = 0;
+        c.ids.clear(); c.imgs.clear(); c.used = 0; c.pinned = false; c.root = false; c.dev_tag = 0;
         for (ConvCheckpoint& part : c.stage_parts) clear_marks(part);
     }
     bool on_;
@@ -12366,12 +12366,15 @@ int main(int argc, char **argv) try {
                 // the tail checkpoint serves only a branch of the last request: it leaves before a periodic one
                 std::unique_ptr<bool[]> tail_flags(new bool[is_tail.size()]);
                 for (size_t i = 0; i < is_tail.size(); ++i) tail_flags[i] = is_tail[i] != 0;
-                // the pin=N prefix is never the victim (flags only when one is pinned: nothing changes without)
+                // the pin=N prefix and the system prompt's end (root) are never the victim (flags only when one is
+                // marked: nothing changes without).  The policy's own root is the chain's SHORTEST item: with a system
+                // prompt longer than --prompt-cache-every that is a periodic checkpoint inside it, and the real end
+                // rotated out after a few turns - an agent's compaction or next session then read ~all of it again
                 std::unique_ptr<bool[]> pin_flags;
                 for (const ConvCheckpoint& k : checks)
-                    if (k.pinned) {
+                    if (k.pinned || k.root) {
                         pin_flags.reset(new bool[checks.size()]);
-                        for (size_t i = 0; i < checks.size(); ++i) pin_flags[i] = checks[i].pinned;
+                        for (size_t i = 0; i < checks.size(); ++i) pin_flags[i] = checks[i].pinned || checks[i].root;
                         break;
                     }
                 std::vector<int64_t> lens;
@@ -17517,6 +17520,8 @@ int main(int argc, char **argv) try {
                     std::fprintf(stderr, "strata serve: checkpoint at %lld skipped: its state could not be copied out (see "
                                          "above); the request goes on without it\n", (long long) to);
                 }
+                if (to == root_at)   // the system prompt's end: kept through the rotation (ConversationCheckpoint::root)
+                    for (ConvCheckpoint& c : checks) c.root = (int64_t) c.ids.size() == root_at;
                 if (to == pin_at && !pin_checkpoint(pin_at))
                     std::fprintf(stderr, "strata serve: pin=%lld: its checkpoint was not kept\n", (long long) pin_at);
                 if (trace && to == message_at)

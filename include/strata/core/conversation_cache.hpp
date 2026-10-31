@@ -33,6 +33,11 @@ struct ConversationCheckpoint {
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
     bool pinned = false;
+    // The end of the system prompt (the first turn boundary of a prompt read from token 0, --prompt-cache-root): the
+    // point every new conversation of the same client mounts through.  Retention never evicts it (conv_cache.hpp keeps
+    // the chain's shortest item too, which with --prompt-cache-every is a periodic checkpoint INSIDE a long system
+    // prompt, not its end).  Unlike `pinned` it does not keep a parked conversation parked.  Run-time only.
+    bool root = false;
     // --prefill-pipe on a layer split: the plan a prompt segment [from, to) is read in - its chunk (0: none), the loan
     // its buffers were laid out for (which experts the prompt reads in place and which it streams: that sets bits
     // too), the pipe value it was planned with, whether it is one chunk and whether the plan changed the buffers'
@@ -125,7 +130,7 @@ inline ConversationCheckpointSplit conversation_checkpoints_split(std::vector<Co
         if (c.stage_parts.size() != stages) continue;
         for (size_t k = 0; k < stages; ++k) {
             ConversationCheckpoint part;
-            part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned;
+            part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned; part.root = c.root;
             out.parts[k].push_back(std::move(part));
         }
     }
