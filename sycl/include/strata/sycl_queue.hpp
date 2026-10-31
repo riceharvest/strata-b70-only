@@ -196,6 +196,14 @@ inline void apply_b70_defaults() {
         {"STRATA_IQ_DECODE_FAST", "1"},
         {"STRATA_MMVQ_KREG", "1"},
         {"STRATA_HC_Q8", "1"},
+        // a turn checkpoint (118 MB of DeltaNet state) moved to the host off the critical path: card-to-card into one VRAM
+        // stage, then a background copy, into a pooled vector (two kept ready: a fresh one faulted in 59 ms of pages),
+        // the 37 small pieces as one copy.  An agent's small turn at 203K: 195-236 -> 104-149 ms (the save 77.5 -> 5 ms),
+        // 2026-10-31.  Not STRATA_CKPT_VRAM_SLOTS / STRATA_PARK_ASYNC: they hold VRAM down to 1.5 GB free.
+        {"STRATA_CKPT_ASYNC", "1"},
+        {"STRATA_CKPT_POOL", "1"},
+        {"STRATA_CKPT_POOL_READY", "2"},
+        {"STRATA_CKPT_GATHER", "1"},
     };
     std::string applied;
     for (const auto& [k, v] : defaults) {

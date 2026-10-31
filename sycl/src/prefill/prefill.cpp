@@ -5323,8 +5323,18 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         sel_x.max_q = m.sel_batch;
                         const uint64_t have = (uint64_t) m.attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s) * 4;
                         try {
-                            sel_xmx = strata::kernels::qsa_select_xmx_bytes(sel_x.key_blocks, sel_x.max_q) <= have &&
-                                      strata::kernels::qsa_select_xmx_keys(sel_x, st.idx_pooled, s, m.cs);
+                            const uint64_t need = strata::kernels::qsa_select_xmx_bytes(sel_x.key_blocks, sel_x.max_q);
+                            if (need > have) {   // said once: the rest of this prompt's chunks take the GEMM tiles
+                                static bool said_fit = false;
+                                if (!said_fit) {
+                                    said_fit = true;
+                                    std::fprintf(stderr, "prefill: the XMX block scores need %llu bytes of scratch for %lld key "
+                                                         "blocks, %llu are free: the GEMM tiles from here\n",
+                                                 (unsigned long long) need, (long long) sel_x.key_blocks,
+                                                 (unsigned long long) have);
+                                }
+                            }
+                            sel_xmx = need <= have && strata::kernels::qsa_select_xmx_keys(sel_x, st.idx_pooled, s, m.cs);
                         } catch (const std::exception& ex) {
                             static bool said = false;
                             if (!said) std::fprintf(stderr, "prefill: the XMX block scores failed (%s); the GEMM tiles instead\n", ex.what());
