@@ -13,7 +13,7 @@ Not affiliated with Intel or with upstream Strata.
 
 | Model | Status on one B70 |
 | --- | --- |
-| [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), [ISTA-DASLab GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | Usable at 118K context, chats and coding agents included (256K not measured yet). Numbers below |
+| [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), [ISTA-DASLab GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | Usable at 128K-256K context, chats and coding agents included (measured at 118K and 250K). Numbers below |
 | DeepSeek V4.1-Flash, [ISTA-DASLab sets](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF), **pruned** (`--prune-experts`) | Runs, not recommended, no further work planned: the 2-bit set plus pruning loses too much of what the model knows (in our tests it got simple facts wrong) |
 | DeepSeek V4.1-Flash, unpruned | Not recommended. On one card with 64 GB of RAM most experts come off the disk on every token: about 1 tok/s from a SATA SSD, about 5 tok/s from NVMe |
 
@@ -40,18 +40,24 @@ Qwen3.8-Flash-Next IQ2_XS on one Arc Pro B70, Ryzen 9 5950X, 64 GB RAM, measured
 | Context | Prompt (tok/s) | Answer (tok/s) |
 | --- | ---: | ---: |
 | 118K | 2,861 / 2,857 | 65.4 / 66.0 |
-| 256K | not measured yet | not measured yet |
+| 250K | 2,750 (one run) | 64.6 (one run) |
+
+The 250K row is the same test with a 249,618-token prompt (more of the same docs, the fact in the middle, found) and
+`--max-context 262144`, one run.
 
 The same test on this branch before the latest prompt work read 1,786 / 1,817 tok/s, so the prompt is read 59% faster.
 The answer speed did not change. These numbers include the fix for the second-turn hang below, which costs about 2%.
 [docs/B70.md](docs/B70.md) has what changed, every change against upstream and who wrote it, and the earlier
 comparisons with upstream Strata on this card (+12% to +17% prompt speed at 4K and 16K on 2026-10-24, before this work).
 
-**A coding agent on one B70.** The [pi](https://github.com/earendil-works/pi) agent with thinking `xhigh`, a 64K-token system
-prompt, `--max-context 262144` and 3 GB of VRAM kept for the desktop ran seven coding tasks in one session: 52 requests,
-the context growing from 64K to 118K tokens. Every turn reused the history it had already read and read only the new
-tokens (most turns under 1.5 s); answers ran at 74-111 tok/s. Turns that continue a conversation used to hang on this
-card; the engine now works around it (2% prompt speed), see [docs/B70.md](docs/B70.md#agent-use-and-the-second-turn-hang-2026-10-31).
+**A coding agent on one B70, up to 256K.** The [pi](https://github.com/earendil-works/pi) agent with thinking `xhigh`,
+`--max-context 262144` and 3 GB of VRAM kept for the desktop. A session with a 170K-token system prompt (a 156K-token
+`AGENTS.md`) ran eleven coding tasks: 82 requests, the context growing from 170K to 245K tokens, where pi compacted
+the conversation, then on from 195K to 225K. Every task finished. Each turn reused the history it had already read and
+read only the new tokens (64 of 79 turns under 1.5 s); answers ran at 73-103 tok/s. After the compaction the next
+prompt reused the 170K-token system prompt and read only the summary and recent turns (26K tokens, 11 s). An earlier
+session from 64K to 118K ran the same way. Turns that continue a conversation used to hang on this card; the engine
+now works around it (2% prompt speed), see [docs/B70.md](docs/B70.md#agent-use-and-the-second-turn-hang-2026-10-31).
 
 ## What you need
 
