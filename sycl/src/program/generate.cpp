@@ -902,6 +902,11 @@ struct Options {
     /// (drop_superseded) after writing the same bytes once more, so on a long single conversation every turn pays a
     /// whole-snapshot copy for nothing.  0 = park every turn, as before.
     int64_t conversation_cache_park_gain = 0;
+    /// --serve: a rewind on the live conversation itself (the prompt goes on from one of its own checkpoints) that leaves
+    /// at most N tokens and 1/16 of it behind is not parked: what it leaves is the last reply the client sent back
+    /// rewritten (a coding agent's new task: the template drops that reply's thinking) or a regenerated one, a few
+    /// hundred tokens nothing returns to, while parking copies the whole conversation.  0 = park every rewind, as before.
+    int64_t conversation_cache_park_tail = 4096;
     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
     int64_t memory_limit_mib = -1;
@@ -1065,6 +1070,9 @@ void usage() {
                  "  --conversation-cache-park-gain N  --serve: park only after the conversation advanced N tokens past\n"
                  "                       the copy it would supersede, so a turn that grew by a few hundred tokens does not\n"
                  "                       write a whole snapshot that the next turn drops (default 0 = park every turn)\n"
+                 "  --conversation-cache-park-tail N  --serve: do not park a rewind on the live conversation that leaves\n"
+                 "                       at most N tokens and 1/16 of it behind (the last reply, rewritten by the client;\n"
+                 "                       default 4096; 0 = park every rewind)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
@@ -3459,13 +3467,13 @@ int main(int argc, char **argv) try {
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
-                 a == "--conversation-cache-park-gain" ||
+                 a == "--conversation-cache-park-gain" || a == "--conversation-cache-park-tail" ||
                  a == "--session-min-free-mib" || a == "--memory-limit-mib") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
             const int64_t limit = (a == "--conversation-cache-slots" || a == "--conversation-cache-min-tokens" ||
-                                   a == "--conversation-cache-park-gain")
+                                   a == "--conversation-cache-park-gain" || a == "--conversation-cache-park-tail")
                                       ? INT32_MAX : INT64_MAX / (1024 * 1024);
             if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > limit) {
                 std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
@@ -3475,6 +3483,7 @@ int main(int argc, char **argv) try {
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
             else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = number;
             else if (a == "--conversation-cache-park-gain") o.conversation_cache_park_gain = number;
+            else if (a == "--conversation-cache-park-tail") o.conversation_cache_park_tail = number;
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
             else o.conversation_cache_slots = (int) number;
@@ -16017,6 +16026,29 @@ int main(int argc, char **argv) try {
                                          : 0;
             const bool park_worth = o.conversation_cache_park_gain <= 0 || park_held == 0 ||
                                     (int64_t) live.size() >= (int64_t) park_held + o.conversation_cache_park_gain;
+            // --conversation-cache-park-tail N: this prompt goes on from one of the live conversation's own checkpoints
+            // (nothing comes in over the session) and leaves at most N tokens and 1/16 of it behind.  What it leaves is
+            // the reply the client sent back rewritten: a coding agent's new task (the template drops the last reply's
+            // thinking once a user message follows) or a regenerated reply.  Parking it copied the whole conversation's K/V to the host
+            // for those few hundred tokens: 2.2-2.5 s and 3.6-4.5 GB at each task of a pi session at 183K-237K
+            // (measured, tails of 93-1,014 tokens), each copy superseded by the next.  The prefix stays in the session
+            // and its checkpoints; a client that returns to the old reply reads it again.  N caps that read: two
+            // branches a client alternates between past a long shared prefix are told apart from a rewind only by the
+            // size of what is left (re-reading 1K tokens took 1.0-1.4 s at 183K-219K, a park 2.2-2.5 s plus a restore).
+            bool short_tail = false;
+            if (o.conversation_cache_park_tail > 0 && !from_live && !incoming && !borrow && slot_source < 0 && live_ok &&
+                resume > 0 && resume < (int64_t) live.size() &&
+                std::equal(live.begin(), live.begin() + resume, ids.begin()) &&
+                imgs_below(live_imgs, resume) == imgs_below(req_imgs, resume))
+            {
+                const int64_t tail = (int64_t) live.size() - resume;
+                short_tail = tail <= o.conversation_cache_park_tail && tail * 16 <= (int64_t) live.size();
+            }
+            if (short_tail && park_worth && !pin_sibling)
+                std::fprintf(stderr, "strata serve: conversation cache: skip parking (this prompt leaves %lld of the "
+                                     "conversation's %zu tokens behind, at most %lld: --conversation-cache-park-tail)\n",
+                             (long long) ((int64_t) live.size() - resume), live.size(),
+                             (long long) o.conversation_cache_park_tail);
             // STRATA_PARK_ASYNC: the checkpoints this request drops after its park - all of them when another state
             // comes in (a parked conversation, a borrow, a batch slot) or the cvec changes, else the ones off this
             // prompt's path (off_path below) - move into the parked image
@@ -16052,7 +16084,7 @@ int main(int argc, char **argv) try {
                         return 1;
                     }
                 }
-            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth &&
+            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth && !short_tail &&
                        !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;

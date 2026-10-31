@@ -700,6 +700,7 @@ system prompt with a billing header that changes on every request; the server pi
 | `--conversation-cache-mib N`, `--conversation-cache-slots N` | Park conversations in a bounded host-RAM cache so alternating requests (controller and worker histories, sub-agents) reuse their prompts. Without `--conversation-cache-mib` the budget is 40% of the RAM left above `--conversation-cache-min-free-mib` once the model is loaded, at most 8192 MiB in steps of 256, off when under 1024; the engine log says which. `0` turns it off. It preserves histories; it does not run requests at once. |
 | `--conversation-cache-min-tokens N` | Park only conversations of at least N tokens, so short side requests do not evict a long conversation. Default `0` (park all). |
 | `--conversation-cache-park-gain N` (opt-in) | Park a conversation again only after it advanced N tokens past the copy it would replace. |
+| `--conversation-cache-park-tail N` | A prompt that goes on from the live conversation's own checkpoint and leaves at most N tokens (and at most 1/16 of it) behind does not park it. That is a coding agent's next task, whose prompt carries the last reply without its thinking, or a regenerated reply; the park copied the whole conversation to RAM for a tail nothing returns to (1.6 s at 118K, 2.2-2.5 s at 183K-237K). A longer branch still parks. Default 4096; `0` parks every rewind. |
 | `--conversation-cache-min-free-mib N` | RAM floor, default 2560. Parking and session files are skipped when less than the snapshot plus the floor is available. |
 | `--memory-limit-mib N` (or `STRATA_MEMORY_LIMIT_MIB`) | Total RAM this engine's container may use, for when a container cannot see its own limit. Config `args`: `"--memory-limit-mib", "102400"`. `0` = none. |
 
@@ -743,7 +744,7 @@ curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: ap
   dot or trailing dot or space. A save checks that the disk has room for the whole file plus `--session-min-free-mib` (engine
   argument, default 4096, `0` = no check).
 - `--session-save-reclaim` (engine argument, off by default) lets a save that fails its RAM check first release reconstructible
-  host caches (retained K/V, oldest unpinned parked conversations, unpinned checkpoints), and the server waits up to 30 s for
+  host caches (retained K/V, oldest unpinned parked conversations, unpinned checkpoints, the system prompt's end last), and the server waits up to 30 s for
   RAM accounting to catch up. It trades later prefix-cache hits for room to save and cannot guarantee a save.
 - Clients still send their messages and images; the file holds engine state and token identity, not a chat export. A follow-up
   that continues the restored conversation reuses its state; a short tail may be read again. Only the deepest checkpoint is saved.

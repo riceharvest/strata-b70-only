@@ -13,7 +13,8 @@ struct SessionSaveReclaimed {
 // Called BEFORE session_save_checkpoints selects a pointer into chain. Probe after each
 // eviction: freed capacity is not necessarily physical RAM returned by the allocator.
 // No allocation is needed here. Unknown telemetry / sizes cannot justify cache eviction.
-// Preserve every explicit pin and exactly the checkpoint the file would have selected.
+// Preserve every explicit pin and exactly the checkpoint the file would have selected; the system prompt's end
+// (ConversationCheckpoint::root) only goes when no other checkpoint is left to free.
 template<class Probe>
 SessionSaveReclaimed session_save_reclaim(std::vector<ConversationCheckpoint>& chain,
                                         ConversationCache& cache, const SessionSaveLive& live,
@@ -39,16 +40,18 @@ SessionSaveReclaimed session_save_reclaim(std::vector<ConversationCheckpoint>& c
         if (done()) return out;
     }
     size_t keep = selected ? size_t(selected - chain.data()) : chain.size();
-    // Erase from the back to preserve order, ties and the selected checkpoint's storage.
-    for (size_t i = chain.size(); i-- > 0;) {
-        if (i == keep || chain[i].pinned) continue;
-        out.bytes += chain[i].bytes();
-        chain.erase(chain.begin() + static_cast<std::ptrdiff_t>(i));
-        if (i < keep) --keep;
-        ++out.checkpoints;
-        room = available();
-        if (done()) break;
-    }
+    // Erase from the back to preserve order, ties and the selected checkpoint's storage.  The system prompt's end
+    // (`root`, the point every new conversation of the client mounts through) goes last: only when nothing else is left.
+    for (const bool roots : {false, true})
+        for (size_t i = chain.size(); i-- > 0;) {
+            if (i == keep || chain[i].pinned || chain[i].root != roots) continue;
+            out.bytes += chain[i].bytes();
+            chain.erase(chain.begin() + static_cast<std::ptrdiff_t>(i));
+            if (i < keep) --keep;
+            ++out.checkpoints;
+            room = available();
+            if (done()) return out;
+        }
     return out;
 }
 
