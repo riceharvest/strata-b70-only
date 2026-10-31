@@ -1852,6 +1852,16 @@ uint64_t gdn_set_bytes(size_t T) {
     a.take<uint16_t>(T * (ZV + (pf_pad() ? ZV_PAD : 0)), ok);
     return a.used;
 }
+// The attention scratch also takes the XMX block scores' split keys (qsa_select_xmx_keys) up to the context's last key
+// block: at --max-context 262144 those are ~34.5 MB against the attention's own ~26.2 MB, so a chunk past ~201K tokens
+// fell back to the GEMM tiles (the select ~4.5x slower at 118K).  The two never live at once (same queue, the keys are
+// dead before the layer's attention).
+size_t attn_scratch_floats(int64_t attn_batch, int64_t cap, int64_t max_blocks, int64_t sel_batch,
+                           const strata::kernels::QsaShapes& s) {
+    const uint64_t attn = (uint64_t) attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(cap, s);
+    const uint64_t sel = max_blocks > 0 ? (strata::kernels::qsa_select_xmx_bytes(max_blocks, sel_batch) + 3) / 4 : 0;
+    return (size_t) std::max(attn, sel);
+}
 uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_batch, int64_t attn_batch,
                        const strata::kernels::QsaShapes& s) {
     Alloc a; a.count_only = true; bool ok = true;
@@ -1860,7 +1870,7 @@ uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_ba
     a.take<uint16_t>(T * (ZV + (pf_pad() ? ZV_PAD : 0)), ok);
     a.take<int32_t>(T * (size_t) cap, ok);
     a.take<float>((size_t) sel_batch * (size_t) max_blocks, ok);
-    a.take<float>((size_t) attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(cap, s), ok);
+    a.take<float>(attn_scratch_floats(attn_batch, cap, max_blocks, sel_batch, s), ok);
     return a.used;
 }
 // Step 2b: which layers' experts go through MMQ (both weight types covered; the Strata Q2_0 pack always - its blob
@@ -2519,7 +2529,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.attn = b.take<float>(T * ZV, ok); m.attn_h = b.take<uint16_t>(T * (ZV + (pf_pad() ? ZV_PAD : 0)), ok);
         m.sel_ids = b.take<int32_t>(T * (size_t) m.cap, ok);
         m.sel_scores = b.take<float>((size_t) m.sel_batch * (size_t) m.max_blocks, ok);
-        m.attn_scratch = b.take<float>((size_t) m.attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s), ok);
+        m.attn_scratch = b.take<float>(attn_scratch_floats(m.attn_batch, m.cap, m.max_blocks, m.sel_batch, s), ok);
         Alloc c;
         c.base = base; c.cap = region; c.owned = &m.owned;
         m.logits = c.take<float>(T * m.g->n_expert, ok); m.w = c.take<float>(T * K, ok); m.ids = c.take<int32_t>(T * K, ok);
@@ -5307,8 +5317,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     pt.mark(kPfQsaSel, cs);
                     // SYCL port (Battlemage): the block scores on XMX with the relu-sum fused (qsa_select_xmx.hpp: FP16
                     // hi + lo splits, FP32-level, not bitwise), the chunk's keys split once here into the attention
-                    // scratch (free until this layer's attention, same queue). A chunk whose split keys do not fit
-                    // there (--max-context past ~200K, a small STRATA_ATTN_BATCH) keeps the GEMM tiles below.
+                    // scratch (free until this layer's attention, same queue; sized for the context's last key block,
+                    // attn_scratch_floats). A chunk whose split keys still do not fit keeps the GEMM tiles below.
                     // STRATA_SELECT_XMX=0, or STRATA_SELECT_GEMM / STRATA_SELECT_OLD set: off.
                     static const bool sel_xmx_off = [] {
                         const char* v = std::getenv("STRATA_SELECT_XMX");
@@ -5321,7 +5331,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         sel_x.key_blocks = (int64_t) m.steps_host[(size_t) ((T - 1) * strata::kernels::kStepCount +
                                                                             strata::kernels::kStepNBid)] + 1;
                         sel_x.max_q = m.sel_batch;
-                        const uint64_t have = (uint64_t) m.attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s) * 4;
+                        const uint64_t have = (uint64_t) attn_scratch_floats(m.attn_batch, m.cap, m.max_blocks, m.sel_batch, s) * 4;
                         try {
                             const uint64_t need = strata::kernels::qsa_select_xmx_bytes(sel_x.key_blocks, sel_x.max_q);
                             if (need > have) {   // said once: the rest of this prompt's chunks take the GEMM tiles

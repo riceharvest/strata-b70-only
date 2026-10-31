@@ -1518,6 +1518,13 @@ The times below were measured by the author of the change (linxuhao, PR #3779) o
 | `STRATA_PARK_VRAM_MIB=N` (with `STRATA_PARK_ASYNC=1`) | A park also keeps the K/V in VRAM slots (64 MiB granules, up to N MiB, only while 1.5 GB stay free). Switching back restores it card-to-card. | second and later restores of a run 33-51 -> 7-13 ms; the first is not faster |
 | `STRATA_PARK_TRACE=1` | Diagnostic: the park's joins and timers on stderr. | - |
 
+On the Arc Pro B70 (this branch) `STRATA_CKPT_ASYNC=1`, `STRATA_CKPT_POOL=1`, `STRATA_CKPT_POOL_READY=2` and
+`STRATA_CKPT_GATHER=1` are B70 defaults (`apply_b70_defaults`; set one to `0` to turn it off). Flash-Next IQ2_XS, an agent's
+small turn (17-23 new tokens after a 200-token reply): 195-236 -> 104-149 ms at 203K, 190-212 -> 109-135 ms at 118K. The
+checkpoint save went from 77.5 ms (59 ms of it faulting in a fresh vector) to 5 ms. The text was byte-identical with the
+switches off and on. `STRATA_CKPT_VRAM_SLOTS` and `STRATA_PARK_ASYNC` stay off there: they keep VRAM down to 1.5 GB free,
+and a restore costs about 12 ms on the B70 anyway.
+
 An independent user (bitaccesscomau, one RTX 3090 on PCIe 3.0 x16) tried the `STRATA_CKPT_ASYNC=1` commit on its own on 0.2.6: the checkpoint save went from 73.2 to 62.4 ms, the first token of a short prompt came about 13 ms of 350 ms sooner (median of 4 pairs), and the answers were byte-identical. On a fast link the gain is small.
 
 The serve loop's `strata trace:` lines (`STRATA_TRACE`) now end with `@<ms>`, a steady-clock timestamp.
