@@ -204,6 +204,14 @@ inline void apply_b70_defaults() {
         {"STRATA_CKPT_POOL", "1"},
         {"STRATA_CKPT_POOL_READY", "2"},
         {"STRATA_CKPT_GATHER", "1"},
+        // sampled requests: the MTP drafter samples its own distribution q and the verifier accepts a draft with
+        // probability min(1, p/q), redrawing a rejection from (p - q)+ (the `top` gate: exact rejection sampling; the
+        // default pick gate needs --pcie-frac 0 and no STRATA_SPEC_COST, else it keeps an older, inexact rule).  Six
+        // agent-shaped turns (thinking on, temperature 1.0, 1,000 tokens each, expert cache held at 16,000 slots):
+        // 82.1 / 82.9 / 83.5 tok/s off, 88.1 / 88.2 on (+5.5%), 2026-11-01.  Greedy requests are unchanged.
+        {"STRATA_SPEC_PROB", "1"},
+        {"STRATA_SPEC_COUPLED", "1"},
+        {"STRATA_SPEC_PROB_GATE", "top"},
     };
     std::string applied;
     for (const auto& [k, v] : defaults) {

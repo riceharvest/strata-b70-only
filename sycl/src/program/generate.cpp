@@ -3235,6 +3235,11 @@ int main(int argc, char **argv) try {
 #if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
     prime_hw_queues();
 #endif
+#if !defined(STRATA_USE_HIP)
+    // before any engine code reads its switches (they are read at first use) - and before Options, whose defaults read
+    // some (STRATA_SPEC_PROB / STRATA_SPEC_COUPLED latch in coupled_draft_env(), STRATA_PREFILL_AUTO_MAX in --prefill auto)
+    strata::apply_b70_defaults();
+#endif
     Options o;
     bool borrow_explicit = false;   // SYCL port: --prefill-borrow / --no-prefill-borrow given (else chosen by context)
     bool have_tokens = false;
@@ -3735,9 +3740,6 @@ int main(int argc, char **argv) try {
             }
         } else (void) cudaGetLastError();
     }
-#endif
-#if !defined(STRATA_USE_HIP)
-    strata::apply_b70_defaults();   // before any engine code reads its switches (they are read at first use)
 #endif
     strata::core::set_coupled_draft(o.coupled_draft);
     {   // --host-core / STRATA_HOST_CORE, before the pool and the session pin any thread
