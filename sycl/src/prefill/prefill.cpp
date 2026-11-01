@@ -3715,6 +3715,19 @@ inline bool pf_copy_one() {
     static const bool on = [] { const char* v = std::getenv("STRATA_PF_COPY1"); return !(v && v[0] == '0'); }();
     return on;
 }
+// STRATA_PF_F16X_GROUP=<experts> (16..64, a multiple of 16; default 32; 16 = off): the routed-only walk holds that many experts
+// before it launches, and when each 16-expert group among them takes the FP16 products (at or above the int8 crossover, as a
+// 16K chunk's ~320 rows per expert do) the held experts run as ONE gate/up and ONE down launch (i8::gate_up_f16_n / down_f16_n)
+// instead of one per 16: the same tiles, so the same bits, with half the launches, marks and grid tails.  A held group in which
+// any 16-expert group would take the int8 chain runs group by group as before.
+inline int pf_f16x_group() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_PF_F16X_GROUP");
+        const int n = e ? std::atoi(e) : 32;
+        return std::max(16, std::min(n, strata::prefill::i8::kMaxGroupH)) / 16 * 16;
+    }();
+    return v;
+}
 // STRATA_KV_STAGE_SEL=<tokens> (default 1024; 0 = off): with KV streaming, a chunk of at most this many tokens stages
 // only the K/V blocks its queries selected (kv_stage_selected, after the selection) instead of the layer's whole host
 // prefix [0, p0) before it: a 70-token chunk at 200K selects a few thousand of the ~50K blocks the stage copies. The
@@ -7259,13 +7272,23 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                              lay.native ? lay.fmt[(size_t) l].d_type : -1);
                             }
                         }
-                        const uint8_t* xg_g[strata::kernels::kXmxGroupMax];
-                        const uint8_t* xg_u[strata::kernels::kXmxGroupMax];
-                        const uint8_t* xg_d[strata::kernels::kXmxGroupMax];
-                        int32_t xg_c[strata::kernels::kXmxGroupMax];
-                        int xg_slots[strata::kernels::kXmxGroupMax];
+                        // STRATA_PF_F16X_GROUP (pf_f16x_group): the routed-only walk holds up to that many experts, and when
+                        // every 16-expert group among them takes the FP16 products, they run as one launch per product
+                        constexpr int kXgHold = strata::prefill::i8::kMaxGroupH;
+                        static_assert(strata::kernels::kXmxGroupMax <= kXgHold, "the held group covers the 16-expert groups");
+                        const uint8_t* xg_g[kXgHold];
+                        const uint8_t* xg_u[kXgHold];
+                        const uint8_t* xg_d[kXgHold];
+                        int32_t xg_c[kXgHold];
+                        int xg_slots[kXgHold];
                         int xg_n = 0, xg_ns = 0;
                         int64_t xg_r0 = 0;
+                        const int xg_cap = !stream_all && i8on && pf_f16x_group() > strata::kernels::kXmxGroupMax &&
+                                                   (int) (stage_slots() - walk_base()) >= pf_f16x_group() + STAGE + 8 &&
+                                                   f16x_on(m.cs, lay.fmt[(size_t) l].gu_type, lay.fmt[(size_t) l].d_type,
+                                                           lay.fmt[(size_t) l].n_ff, lay.fmt[(size_t) l].n_embd)
+                                               ? pf_f16x_group()
+                                               : strata::kernels::kXmxGroupMax;
                         auto xflush = [&]() {
                             if (xg_n == 0) return;
                             const auto tfl = Clock::now();
@@ -7281,16 +7304,30 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             int64_t nr = 0;
                             for (int i = 0; i < xg_n; ++i) nr += xg_c[i];
                             if (i8on) {
+                                const uint8_t* const* xg_g_all = xg_g;
+                                const uint8_t* const* xg_u_all = xg_u;
+                                const uint8_t* const* xg_d_all = xg_d;
+                                const int32_t* xg_c_all = xg_c;
+                                // the int8 / FP16 crossover measured on this GPU for the layer's formats (i8_calibrate, once)
+                                auto i8_rows = [&]() -> double {
+                                    static std::map<std::tuple<const void*, int, int>, I8Cross> xover;   // per queue (a layer split has a card per queue)
+                                    auto it = xover.find({(const void*) m.cs, f.gu_type, f.d_type});
+                                    if (it == xover.end()) it = xover.emplace(std::make_tuple((const void*) m.cs, f.gu_type, f.d_type), i8_calibrate(m, f)).first;
+                                    return it->second.rows;
+                                };
+                                // one 16-expert group (as the walk flushed them before STRATA_PF_F16X_GROUP): xg_* from i0, xg_n of them
+                                auto sub = [&](int i0, int xg_n, int64_t xg_r0, int64_t nr) {
+                                const uint8_t* const* xg_g = xg_g_all + i0;
+                                const uint8_t* const* xg_u = xg_u_all + i0;
+                                const uint8_t* const* xg_d = xg_d_all + i0;
+                                const int32_t* xg_c = xg_c_all + i0;
                                 // STRATA_PREFILL_MMQ=1: always; =auto: while the group's mean rows per expert are under the crossover
                                 // measured on this GPU (i8_calibrate); a group above it takes the FP16 chain below
                                 bool done8 = false;
                                 try {
                                 bool use_i8 = true;
                                 if (i8m == 2) {
-                                    static std::map<std::tuple<const void*, int, int>, I8Cross> xover;   // per queue (a layer split has a card per queue)
-                                    auto it = xover.find({(const void*) m.cs, f.gu_type, f.d_type});
-                                    if (it == xover.end()) it = xover.emplace(std::make_tuple((const void*) m.cs, f.gu_type, f.d_type), i8_calibrate(m, f)).first;
-                                    use_i8 = (double) nr / xg_n < it->second.rows;
+                                    use_i8 = (double) nr / xg_n < i8_rows();
                                     static long groups_i8 = 0, groups_fp = 0;
                                     (use_i8 ? groups_i8 : groups_fp) += 1;
                                     if (static bool said_n = false; !said_n && groups_i8 + groups_fp >= 500) {
@@ -7367,6 +7404,51 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                         pt.mark(kPfGemmD, cs);
                                         m.gemm.f16(m.Hh + o * 640, m.dq_d[qd], m.Dm + o * N, xg_c[i], N, 640);
                                         o += xg_c[i];
+                                    }
+                                }
+                                };
+                                constexpr int G16 = strata::kernels::kXmxGroupMax;
+                                if (xg_n <= G16) {
+                                    sub(0, xg_n, xg_r0, nr);
+                                } else {
+                                    // STRATA_PF_F16X_GROUP: the held 16-expert groups take the FP16 products together when each of them
+                                    // would on its own (auto, every group at or above the crossover); else each group as before
+                                    bool big = i8m == 2 && f16x_on(m.cs, f.gu_type, f.d_type, f.n_ff, f.n_embd);
+                                    for (int i0 = 0; big && i0 < xg_n; i0 += G16) {
+                                        const int ns_ = std::min(G16, xg_n - i0);
+                                        int64_t nr_ = 0;
+                                        for (int i = i0; i < i0 + ns_; ++i) nr_ += xg_c[i];
+                                        if ((double) nr_ / ns_ < i8_rows()) big = false;
+                                    }
+                                    bool doneb = false;
+                                    if (big) {
+                                        namespace i8 = strata::prefill::i8;
+                                        try {
+                                            pt.mark(kPfGemmGU, cs);
+                                            if (i8::gate_up_f16_n(f.gu_type, xg_g, f.up_off, f.n_ff, xg_c, xg_n, (int) N, m.Xs + xg_r0 * N,
+                                                                  m.Hh + xg_r0 * 640, m.cs)) {
+                                                had_h(xg_r0, nr);
+                                                pt.mark(kPfGemmD, cs);
+                                                doneb = i8::down_f16_n(f.d_type, xg_g, f.down_off, (int) N, xg_c, xg_n, f.n_ff,
+                                                                       m.Hh + xg_r0 * 640, m.Dm + xg_r0 * N, m.cs);
+                                            }
+                                        } catch (const std::exception& ex) {
+                                            doneb = false;
+                                            if (static bool said_b = false; !said_b) {
+                                                said_b = true;
+                                                std::fprintf(stderr, "strata: the held FP16 expert products failed to launch (%s): 16-expert groups from here\n", ex.what());
+                                            }
+                                        }
+                                    }
+                                    if (!doneb) {   // the groups one by one (their products rewrite every row they own)
+                                        int64_t r = xg_r0;
+                                        for (int i0 = 0; i0 < xg_n; i0 += G16) {
+                                            const int ns_ = std::min(G16, xg_n - i0);
+                                            int64_t nr_ = 0;
+                                            for (int i = i0; i < i0 + ns_; ++i) nr_ += xg_c[i];
+                                            sub(i0, ns_, r, nr_);
+                                            r += nr_;
+                                        }
                                     }
                                 }
                                 if (xg_ns > 0) {
@@ -7595,7 +7677,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 xg_c[xg_n] = m.cnt[(size_t) e];
                                 ++xg_n;
                                 if (slot >= 0) xg_slots[xg_ns++] = slot;
-                                if (xg_n == strata::kernels::kXmxGroupMax || j + 1 == order.size()) xflush();
+                                if (xg_n == xg_cap || j + 1 == order.size()) xflush();
                                 return true;
                             }
                             const bool xmx_on = strata::prefill::xmx::mode() == 1;

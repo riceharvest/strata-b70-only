@@ -60,6 +60,8 @@ bool down(int, const uint8_t* const*, size_t, int, const Layout&, int, const int
 bool f16_handles(int, int, int, int, void*) { return false; }
 bool gate_up_f16(int, const uint8_t* const*, size_t, int, const Layout&, int, const uint16_t*, uint16_t*, void*) { return false; }
 bool down_f16(int, const uint8_t* const*, size_t, int, const Layout&, int, const uint16_t*, float*, void*) { return false; }
+bool gate_up_f16_n(int, const uint8_t* const*, size_t, int, const int32_t*, int, int, const uint16_t*, uint16_t*, void*) { return false; }
+bool down_f16_n(int, const uint8_t* const*, size_t, int, const int32_t*, int, int, const uint16_t*, float*, void*) { return false; }
 }  // namespace strata::prefill::i8
 #else
 namespace strata::prefill::i8 {
@@ -1291,12 +1293,12 @@ uint32_t* htables(sycl::queue& q) {
     return t;
 }
 
-struct HArgs {
-    const uint8_t* blob[kMaxGroup];
+template <int G> struct HArgsT {
+    const uint8_t* blob[G];
     uint32_t sec_off;                 // gate/up: byte offset of the up rows; down: byte offset of the down rows
     int n;
-    int row0[kMaxGroup + 1];
-    int rb0[kMaxGroup + 1];           // first row block of expert i
+    int row0[G + 1];
+    int rb0[G + 1];                   // first row block of expert i
     const half* X;                    // A rows [row][K]
     void* Y;                          // gate/up: H (FP16) [row][n_out]; down: Dm (FP32) [row][n_out]
     const uint32_t* tab;
@@ -1306,13 +1308,30 @@ struct HArgs {
     uint32_t lim;                     // down: byte offset of the last dword of the matrix (ld32c)
     int dbg;                          // STRATA_F16X_DBG: 4 skip the stores, 8 no L1 prefetch of the weight rows
 };
+using HArgs = HArgsT<kMaxGroup>;
 struct HPick { int row0, cnt, rb0; const uint8_t* blob; };
-SYCL_ESIMD_FUNCTION inline HPick pick_h(const HArgs& a, int rbg) {
+template <int G>
+SYCL_ESIMD_FUNCTION inline HPick pick_h(const HArgsT<G>& a, int rbg) {
     HPick p{a.row0[0], a.row0[1] - a.row0[0], a.rb0[0], a.blob[0]};
 #pragma unroll
-    for (int i = 1; i < kMaxGroup; ++i)
+    for (int i = 1; i < G; ++i)
         if (i < a.n && rbg >= a.rb0[i]) p = HPick{a.row0[i], a.row0[i + 1] - a.row0[i], a.rb0[i], a.blob[i]};
     return p;
+}
+// the held group's (STRATA_PF_F16X_GROUP): expert i's rows from the running sum of cnt, as make_layout and fill_hargs give them
+template <int G>
+int fill_hargs_n(HArgsT<G>& a, const int32_t* cnt, int n, int BM) {
+    int rb = 0, r = 0;
+    for (int i = 0; i < n; ++i) {
+        a.row0[i] = r;
+        a.rb0[i] = rb;
+        r += cnt[i];
+        rb += (cnt[i] + BM - 1) / BM;
+    }
+    a.row0[n] = r;
+    a.rb0[n] = rb;
+    a.n = n;
+    return rb;
 }
 int fill_hargs(HArgs& a, const Layout& lo, int BM) {
     int rb = 0;
@@ -1372,19 +1391,19 @@ SYCL_ESIMD_FUNCTION inline simd<half, 16> half16(simd<uint32_t, 16> h16) {
     return lo.template bit_cast_view<half>();
 }
 
-template <int F, int MT, int NG> struct TagGuH;
-template <int F, int MT, int NT> struct TagDnH;
+template <int F, int MT, int NG, int G> struct TagGuH;
+template <int F, int MT, int NT, int G> struct TagDnH;
 
 // gate/up: rows (rbg's MT x 8) x (NG gate tiles of 16 rows from 16 NG cb, the same up rows), H out
-template <int F, int MT, int NG>
-void launch_gu_h(sycl::queue& q, const HArgs a, int nrb, int ncb, int wgn) {
+template <int F, int MT, int NG, int G = kMaxGroup>
+void launch_gu_h(sycl::queue& q, const HArgsT<G> a, int nrb, int ncb, int wgn) {
     constexpr int NT = 2 * NG;
     constexpr int BB = blk_bytes<F>();
     constexpr int OG = F == T_IQ2S ? O_HG2S : O_HG2XXS;
     static_assert(MT == 4 || MT == 8, "row tiles: one or two 32-row block loads");
     auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
     q.submit([&](sycl::handler& h) {
-        h.parallel_for<TagGuH<F, MT, NG>>(sycl::nd_range<2>(sycl::range<2>((size_t) nrb, (size_t) ncb), sycl::range<2>(1, (size_t) wgn)), props,
+        h.parallel_for<TagGuH<F, MT, NG, G>>(sycl::nd_range<2>(sycl::range<2>((size_t) nrb, (size_t) ncb), sycl::range<2>(1, (size_t) wgn)), props,
                                           [=](sycl::nd_item<2> it) SYCL_ESIMD_KERNEL {
             const int rbg = (int) it.get_group(0), cb = (int) it.get_global_id(1);
             const HPick pk = pick_h(a, rbg);
@@ -1513,13 +1532,13 @@ void launch_gu_h(sycl::queue& q, const HArgs a, int nrb, int ncb, int wgn) {
 }
 
 // down (Q2_0): rows (rbg's MT x 8) x NT tiles of 16 output columns from 16 NT cb, FP32 out
-template <int F, int MT, int NT>
-void launch_dn_h(sycl::queue& q, const HArgs a, int nrb, int ncb, int wgn) {
+template <int F, int MT, int NT, int G = kMaxGroup>
+void launch_dn_h(sycl::queue& q, const HArgsT<G> a, int nrb, int ncb, int wgn) {
     static_assert(F == T_Q2_0, "down: Q2_0");
     static_assert(MT == 4 || MT == 8, "row tiles: one or two 32-row block loads");
     auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
     q.submit([&](sycl::handler& h) {
-        h.parallel_for<TagDnH<F, MT, NT>>(sycl::nd_range<2>(sycl::range<2>((size_t) nrb, (size_t) ncb), sycl::range<2>(1, (size_t) wgn)), props,
+        h.parallel_for<TagDnH<F, MT, NT, G>>(sycl::nd_range<2>(sycl::range<2>((size_t) nrb, (size_t) ncb), sycl::range<2>(1, (size_t) wgn)), props,
                                           [=](sycl::nd_item<2> it) SYCL_ESIMD_KERNEL {
             const int rbg = (int) it.get_group(0), cb = (int) it.get_global_id(1);
             const HPick pk = pick_h(a, rbg);
@@ -1664,6 +1683,76 @@ bool down_f16(int d_type, const uint8_t* const* blob, size_t down_off, int n_emb
     const int ncb = n_embd / 16 / 2;
     const int wgn = ncb % wg == 0 ? wg : 1;
     launch_dn_h<T_Q2_0, 8, 2>(q, a, nrb, ncb, wgn);
+    return true;
+}
+
+namespace {
+template <int G>
+void gu_h_n(int gu_type, const uint8_t* const* blob, size_t up_off, int n_ff, const int32_t* cnt, int n, int K, const uint16_t* X,
+            uint16_t* H, sycl::queue& q) {
+    HArgsT<G> a{};
+    for (int i = 0; i < n; ++i) a.blob[i] = blob[i];
+    a.sec_off = (uint32_t) up_off;
+    a.X = reinterpret_cast<const half*>(X);
+    a.Y = H;
+    a.tab = htables(q);
+    a.K = K;
+    a.n_out = n_ff;
+    a.rowb = (K / 256) * block_bytes_of(gu_type);
+    a.dbg = hdbg_flags();
+    static const int wg = henv("STRATA_F16X_WG", 8);
+    const int nrb = fill_hargs_n(a, cnt, n, 64);
+    const int ncb = n_ff / 16;
+    const int wgn = ncb % wg == 0 ? wg : 1;
+    if (gu_type == T_IQ2S) launch_gu_h<T_IQ2S, 8, 1, G>(q, a, nrb, ncb, wgn);
+    else launch_gu_h<T_IQ2XXS, 8, 1, G>(q, a, nrb, ncb, wgn);
+}
+template <int G>
+void dn_h_n(const uint8_t* const* blob, size_t down_off, int n_embd, const int32_t* cnt, int n, int n_ff, const uint16_t* H, float* Dm,
+            sycl::queue& q) {
+    HArgsT<G> a{};
+    for (int i = 0; i < n; ++i) a.blob[i] = blob[i];
+    a.sec_off = (uint32_t) down_off;
+    a.X = reinterpret_cast<const half*>(H);
+    a.Y = Dm;
+    a.tab = htables(q);
+    a.K = n_ff;
+    a.n_out = n_embd;
+    a.rowb = (n_ff / 64) * 18;
+    a.lim = (uint32_t) (down_off + (size_t) n_embd * (size_t) a.rowb) - 4u;
+    a.dbg = hdbg_flags();
+    static const int wg = henv("STRATA_F16X_WG", 8);
+    const int nrb = fill_hargs_n(a, cnt, n, 64);
+    const int ncb = n_embd / 16 / 2;
+    const int wgn = ncb % wg == 0 ? wg : 1;
+    launch_dn_h<T_Q2_0, 8, 2, G>(q, a, nrb, ncb, wgn);
+}
+}  // namespace
+
+bool gate_up_f16_n(int gu_type, const uint8_t* const* blob, size_t up_off, int n_ff, const int32_t* cnt, int n, int K,
+                   const uint16_t* X, uint16_t* H, void* stream) {
+    int64_t rows = 0;
+    for (int i = 0; i < n; ++i) rows += cnt[i];
+    if (n <= 0 || rows == 0) return true;
+    if ((gu_type != T_IQ2S && gu_type != T_IQ2XXS) || K % 256 != 0 || n_ff % 32 != 0 || (up_off & 3) != 0 || n > kMaxGroupH ||
+        !al64(X) || !al64(H))
+        return false;
+    sycl::queue& q = *strata::q_of(stream);
+    if (n <= 32) gu_h_n<32>(gu_type, blob, up_off, n_ff, cnt, n, K, X, H, q);
+    else gu_h_n<kMaxGroupH>(gu_type, blob, up_off, n_ff, cnt, n, K, X, H, q);
+    return true;
+}
+
+bool down_f16_n(int d_type, const uint8_t* const* blob, size_t down_off, int n_embd, const int32_t* cnt, int n, int n_ff,
+                const uint16_t* H, float* Dm, void* stream) {
+    int64_t rows = 0;
+    for (int i = 0; i < n; ++i) rows += cnt[i];
+    if (n <= 0 || rows == 0) return true;
+    if (d_type != T_Q2_0 || n_ff % 64 != 0 || n_embd % 64 != 0 || (down_off & 3) != 0 || n > kMaxGroupH || !al64(H) || !al64(Dm))
+        return false;
+    sycl::queue& q = *strata::q_of(stream);
+    if (n <= 32) dn_h_n<32>(blob, down_off, n_embd, cnt, n, n_ff, H, Dm, q);
+    else dn_h_n<kMaxGroupH>(blob, down_off, n_embd, cnt, n, n_ff, H, Dm, q);
     return true;
 }
 

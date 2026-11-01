@@ -95,4 +95,13 @@ bool gate_up_f16(int gu_type, const uint8_t* const* blob, size_t up_off, int n_f
 bool down_f16(int d_type, const uint8_t* const* blob, size_t down_off, int n_embd, const Layout& lo, int n_ff, const uint16_t* H,
               float* Dm, void* stream);
 
+/// The same FP16 products for up to kMaxGroupH experts in one launch each (expert i's cnt[i] rows back to back from X / H row 0):
+/// the routed-only walk's held group of several 16-expert groups that all take the FP16 products (STRATA_PF_F16X_GROUP).  Every
+/// output element is computed exactly as by gate_up_f16 / down_f16 (the same tiles and K order): the same bits, fewer launches.
+constexpr int kMaxGroupH = 64;
+bool gate_up_f16_n(int gu_type, const uint8_t* const* blob, size_t up_off, int n_ff, const int32_t* cnt, int n, int K,
+                   const uint16_t* X, uint16_t* H, void* stream);
+bool down_f16_n(int d_type, const uint8_t* const* blob, size_t down_off, int n_embd, const int32_t* cnt, int n, int n_ff,
+                const uint16_t* H, float* Dm, void* stream);
+
 }  // namespace strata::prefill::i8
