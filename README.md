@@ -32,21 +32,25 @@ Anything that misses one of these is labelled "works, not usable".
 Qwen3.8-Flash-Next IQ2_XS on one Arc Pro B70, Ryzen 9 5950X, 64 GB RAM, measured 2026-11-01. Settings:
 
 - MTP draft, `--spec 4`, int8 KV, 32K of the KV in VRAM, `--prefill 16384`
-- 7 GB of VRAM kept free, because the card also drives a desktop; `STRATA_MIRROR_MIB=23500` (22 GiB of experts pinned in RAM)
+- 7 GB of VRAM kept free, because the card also drives a desktop; `STRATA_MIRROR_MIB=25000` (24 GiB of experts pinned in RAM)
 - page cache dropped before every start
 - one 118,196-token prompt (this repo's docs with a fact hidden in the middle; every answer found it), a ~730-token
   answer, temperature 0, two runs each
 
 | Context | Prompt (tok/s) | Answer (tok/s) |
 | --- | ---: | ---: |
-| 118K | 3,261 / 3,289 | 64.6 / 67.8 |
-| 250K | 3,248 / 3,246 / 3,246 | 65.9 / 65.9 / 65.9 |
+| 118K | 3,228 / 3,213 | 71.7 / 71.5 |
+| 250K | 3,171 / 3,169 / 3,174 | 70.5 / 70.4 / 69.5 |
 
 The 250K row is the same test with a 249,618-token prompt (more of the same docs, the fact in the middle, found every
 time) and `--max-context 262144`, three runs. Before the 2026-11-01 work the same tests read 2,861 / 2,857 tok/s at 118K
-and 2,750 / 2,832 at 250K: the prompt is now read 14-18% faster, mostly from mirroring the experts a prompt chunk
+and 2,750 / 2,832 at 250K: the prompt is now read 12-15% faster in these runs (14-18% in the night runs), mostly from mirroring the experts a prompt chunk
 borrows (the default now; it needs the `STRATA_MIRROR_MIB` above) and, past ~201K tokens, from keeping the prompt's
-selection on XMX. The answer speed changes little here (+3.8% in a fixed-cache decode test). These numbers include the
+selection on XMX. The answers are 6-8% faster than that day's first runs (64.6-67.8 tok/s): the experts that are not in
+VRAM are copied in by one wide-load kernel and kept in a VRAM ring that the next windows read again (from the cache's own
+budget, so it needs the larger `STRATA_MIRROR_MIB` above). These runs had the desktop in use; the night runs of the same
+day read the prompt at 3,261 / 3,289 (118K) and 3,246-3,248 tok/s (250K), and the run-to-run spread by day was ~1.5%.
+Sampled answers (an agent's) also gain ~6% from exact sampled-draft acceptance, on by default. These numbers include the
 fix for the second-turn hang below, which costs about 2%.
 [docs/B70.md](docs/B70.md) has what changed, every change against upstream and who wrote it, and the earlier
 comparisons with upstream Strata on this card (+12% to +17% prompt speed at 4K and 16K on 2026-10-24, before this work).
@@ -56,7 +60,7 @@ comparisons with upstream Strata on this card (+12% to +17% prompt speed at 4K a
 `AGENTS.md`) ran eleven coding tasks: 82 requests, the context growing from 170K to 245K tokens, where pi compacted
 the conversation, then on from 195K to 225K. Every task finished. (Rerun on 2026-11-01 with that day's work: the cold
 170K-token first prompt 60.0 -> 50.6 s, small turns 418 -> 319 ms, turns of 100-2,000 new tokens 709 ms, answers at
-87 tok/s.) Each turn reused the history it had already read and
+87 tok/s; with the later VRAM ring and sampled-draft acceptance, small turns 288 ms and answers 92.7 tok/s.) Each turn reused the history it had already read and
 read only the new tokens (64 of 79 turns under 1.5 s); answers ran at 73-103 tok/s. After the compaction the next
 prompt reused the 170K-token system prompt and read only the summary and recent turns (26K tokens, 11 s). An earlier
 session from 64K to 118K ran the same way. Turns that continue a conversation used to hang on this card; the engine
@@ -151,8 +155,8 @@ under [Speed](#speed); sessions past 118K tokens are not measured yet.
 - **Pictures run on the CPU by default** (setup's choice for this card). See the note under
   [For a coding agent](#for-a-coding-agent) before turning them on.
 - **Keep RAM headroom on a desktop.** On a 64 GB machine leave `--ple-io` at its default (`direct`); `ram` locks a
-  28.8 GB table into memory. Size `STRATA_MIRROR_MIB` so a few GB stay free: 23500 for Flash-Next IQ2_XS at 256K left
-  16.5 GB free on 64 GB.
+  28.8 GB table into memory. Size `STRATA_MIRROR_MIB` so a few GB stay free: 25000 for Flash-Next IQ2_XS at 256K left
+  15.9 GB free on 64 GB.
 - **B70 defaults are on.** The engine sets its B70 settings (`STRATA_VERIFY_DEVICE_PLAN`, `STRATA_SELECT_LONG`,
   `STRATA_HC_Q8` and the others listed in [docs/B70.md](docs/B70.md)) unless you set them yourself; `0` turns one off,
   `STRATA_B70_DEFAULTS=0` turns all of them off. The B70 prompt kernels (attention, selection, GDN, hyper-connections,

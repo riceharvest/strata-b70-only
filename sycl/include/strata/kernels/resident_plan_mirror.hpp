@@ -24,6 +24,10 @@ bool mirror_ring_create(int slots, long long stride, std::string& err);
 /// The ring's size in blobs: STRATA_MIRROR_RING=N (0 off), default 1024; 0 without the lean device plan
 /// (STRATA_VERIFY_DEVICE_PLAN + STRATA_VERIFY_NO_HOST) or with STRATA_MIRROR_STAGE=0.  The auto-sized expert cache leaves it.
 int mirror_ring_slots();
+/// The ring the expert cache made room for (generate: the slots it gave up, after the mirror check); 0 = none, and then
+/// the verifier makes no ring, so the ring never takes VRAM the cache's budget did not leave it.
+void mirror_ring_grant(int slots);
+int mirror_ring_granted();
 /// Copy the plan's mirrored list (src[j] -> ptr2[j], counts[2] blobs of blob_bytes) into VRAM.
 void mirror_stage(const int32_t* plan, long long capx, long long blob_bytes, const unsigned long long* src, void* stream);
 }

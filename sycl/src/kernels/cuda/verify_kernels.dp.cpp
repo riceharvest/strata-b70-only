@@ -3260,6 +3260,9 @@ int mirror_ring_slots() {
     }();
     return n;
 }
+static int g_ring_grant = 0;
+void mirror_ring_grant(int slots) { g_ring_grant = std::max(0, slots); }
+int mirror_ring_granted() { return g_ring_grant; }
 bool mirror_ring_create(int slots, long long stride, std::string& err) {
     if (g_ring_base != nullptr) return true;
     if (g_mirror_entries <= 0 || slots < kResidentPlanMax) { err = "no mirror table, or fewer slots than a plan's entries"; return false; }

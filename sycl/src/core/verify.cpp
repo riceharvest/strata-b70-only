@@ -1355,7 +1355,7 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     }
     if (mstage_ != nullptr && !device_plan_) mstage_ = nullptr;   // (only the device plan stages)
     if (mstage_ != nullptr && !split_) {   // STRATA_MIRROR_RING=R (blobs): keep the fetched mirrored experts in VRAM
-        const int rn = strata::kernels::mirror_ring_slots();
+        const int rn = strata::kernels::mirror_ring_granted();   // (what the expert cache left it: generate.cpp)
         if (rn > 0) {
             std::string rerr;
             mring_ = strata::kernels::mirror_ring_create(rn, mstage_stride_, rerr);

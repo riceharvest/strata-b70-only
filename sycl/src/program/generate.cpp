@@ -7776,13 +7776,41 @@ int main(int argc, char **argv) try {
     }
     // STRATA_MIRROR_RING: the lean window's VRAM ring of the mirrored experts it fetched (one largest blob a slot,
     // strata/kernels/resident_plan_mirror.hpp) is part of the cache's budget - auto-sized or --expert-cache N - when the
-    // cache cannot hold every expert anyway, so the VRAM in use stays what it was
+    // cache cannot hold every expert anyway, so the VRAM in use stays what it was.  The experts the ring's slots held then
+    // have to fit the pinned mirror too (with the device plan an expert in neither refuses the start, below): when the
+    // mirror's cap (STRATA_MIRROR_MIB, or the free RAM less 4 GiB) cannot take them, the cache keeps its slots, no ring.
     if (const int64_t ring = strata::kernels::mirror_ring_slots();
         ring > 0 && o.stream_experts && native_pack && !multi_gpu && !profile.empty() && o.expert_cache > 0 &&
         o.expert_cache < (int64_t) profile.size() && o.expert_cache - ring >= 256) {
-        o.expert_cache -= (int) ring;
-        std::fprintf(stderr, "strata generate: expert cache: %lld of its largest-blob slots go to the mirrored experts' VRAM ring "
-                             "-> %d (STRATA_MIRROR_RING=N sets the ring, 0 turns it off)\n", (long long) ring, o.expert_cache);
+        const auto& xl = strata::kernels::cpu::expert_layout();
+        auto miss_bytes = [&](int64_t slots) {   // the profile-order fill of `slots` largest-blob slots, and what stays out
+            const uint64_t budget = (uint64_t) slots * nibble_max_slot_bytes();
+            uint64_t used = 0, miss = 0;
+            for (const auto& pr : profile) {
+                const uint64_t b = xl.blob_bytes(pr.first);
+                if (used + b <= budget) used += b; else miss += b;
+            }
+            return miss;
+        };
+        uint64_t avail = 0;
+        if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+            char key[64]; unsigned long long kb = 0;
+            while (std::fscanf(f, "%63s %llu kB", key, &kb) == 2)
+                if (std::strcmp(key, "MemAvailable:") == 0) { avail = kb << 10; break; }
+            std::fclose(f);
+        }
+        const char* mv = std::getenv("STRATA_MIRROR_MIB");
+        const uint64_t cap = mv ? (uint64_t) std::atoll(mv) << 20 : (avail > (4ull << 30) ? avail - (4ull << 30) : 0);
+        const uint64_t need = miss_bytes(o.expert_cache - ring);
+        if (need <= cap) {
+            o.expert_cache -= (int) ring;
+            strata::kernels::mirror_ring_grant((int) ring);
+            std::fprintf(stderr, "strata generate: expert cache: %lld of its largest-blob slots go to the mirrored experts' VRAM ring "
+                                 "-> %d (STRATA_MIRROR_RING=N sets the ring, 0 turns it off)\n", (long long) ring, o.expert_cache);
+        } else
+            std::fprintf(stderr, "strata generate: no VRAM ring for the mirrored experts: the experts it would move out of VRAM "
+                                 "need %.1f GiB of mirror, the cap is %.1f GiB (STRATA_MIRROR_MIB)\n", (double) need / 1073741824.0,
+                         (double) cap / 1073741824.0);
     }
     // plan v0.3 P6: a native pack's blobs differ per layer, so the same VRAM holds more experts than slots of
     // the largest blob would. The shared cache below sizes slots in profile order.
