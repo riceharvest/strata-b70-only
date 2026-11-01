@@ -685,6 +685,11 @@ void kq_bench(dpct::queue_ptr s, std::mt19937& rng, int nl, bool host) {
     // STRATA_KQBENCH_PAIRS=n: the first n pairs only (2: Flash-Next's own, IQ2_S and IQ2_XXS gate/up with Q2_0 down)
     const int all = (int) (sizeof pairs / sizeof pairs[0]);
     const int npairs = std::getenv("STRATA_KQBENCH_PAIRS") ? std::max(1, std::min(all, std::atoi(std::getenv("STRATA_KQBENCH_PAIRS")))) : all;
+    // STRATA_KQBENCH_PHASE=p: part of the call only (1 gate/up + swiglu, 2 down, 3 gate/up)
+    if (const char* ph = std::getenv("STRATA_KQBENCH_PHASE")) {
+        k::native_expert_set_mode(-1, std::atoi(ph));
+        std::printf("--kqbench: phase %d only\n", std::atoi(ph));
+    }
     for (int pi = 0; pi < npairs; ++pi) {
         const auto& pr = pairs[pi];
         for (const auto& sh : shapes) {
