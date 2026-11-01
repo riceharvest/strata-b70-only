@@ -310,6 +310,40 @@ attn_chunk_kernel(const float *__restrict__ q, QsaAttnPools p,
     float acc[G];
 #pragma unroll
     for (int h = 0; h < G; ++h) acc[h] = 0.0f;
+    if constexpr (RS == 4 && KV_MODE == 1) {
+        // RS=4: RS=2 with the value loads of 4 cells issued together (upstream's CUDA kernel does the same), the
+        // fma's in the loop's cell order; a group holding a masked cell (page -1, rare) leaves for the scalar loop
+        const auto fold = [&](int c, float v) {
+#pragma unroll
+            for (int q4 = 0; q4 < G / 4; ++q4) {
+                const sycl::float4 pv = *reinterpret_cast<const sycl::float4 *>(&sp[c * G + 4 * q4]);
+                acc[4 * q4 + 0] = sycl::fma(pv.x(), v, acc[4 * q4 + 0]);
+                acc[4 * q4 + 1] = sycl::fma(pv.y(), v, acc[4 * q4 + 1]);
+                acc[4 * q4 + 2] = sycl::fma(pv.z(), v, acc[4 * q4 + 2]);
+                acc[4 * q4 + 3] = sycl::fma(pv.w(), v, acc[4 * q4 + 3]);
+            }
+        };
+        const auto ld = [&](long long r) {
+            const float sc = sycl::vec<sycl::half, 1>(sycl::bit_cast<sycl::half, unsigned short>(
+                                 p.v_scale[r * (HD / KV_Q8_GROUP) + t / KV_Q8_GROUP]))
+                                 .convert<float, sycl::rounding_mode::automatic>()[0];
+            return (float) p.v_q[r * HD + t] * sc;
+        };
+        int c = 0;
+        for (; c + 4 <= n_here; c += 4) {
+            const long long r0 = srow[c], r1 = srow[c + 1], r2 = srow[c + 2], r3 = srow[c + 3];
+            if ((r0 | r1 | r2 | r3) < 0) break;
+            const float v0 = ld(r0), v1 = ld(r1), v2 = ld(r2), v3 = ld(r3);
+            fold(c, v0);
+            fold(c + 1, v1);
+            fold(c + 2, v2);
+            fold(c + 3, v3);
+        }
+        for (; c < n_here; ++c) {
+            if (srow[c] < 0) continue;   // masked above, weight 0
+            fold(c, ld(srow[c]));
+        }
+    } else
     for (int c = 0; c < n_here; ++c) {
         if (srow[c] < 0) continue;   // masked above, weight 0
         float v;
@@ -941,13 +975,15 @@ int attn_lane_cell_env() {
 }
 
 // STRATA_ATTN_MERGE_V2: 1 merges with attn_merge_v2_kernel, 0 with attn_merge_kernel (bitwise the same output; v2 stops
-// at the query's width instead of walking the whole capacity, which is what a long context's decode wants).  Opt-in here.
+// at the query's width instead of walking the whole capacity, which is what a long context's decode wants).  On by
+// default on the B70: its batched loads take the merge from 43.7 to 14.7 us a call at a 196K context (unitrace, one B70);
+// STRATA_ATTN_MERGE_V2=0 turns it off.
 int attn_merge_v2() {
     static const int env = [] {
         const char* v = std::getenv("STRATA_ATTN_MERGE_V2");
         return v != nullptr && *v != '\0' ? (std::atoi(v) != 0 ? 1 : 0) : -1;
     }();
-    return env >= 0 ? env : 0;
+    return env >= 0 ? env : 1;
 }
 
 // the merge of `n_q` queries' partials: v2 = 0 attn_merge_kernel, 1 attn_merge_v2_kernel (bitwise the same output)
@@ -1087,8 +1123,10 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
 #undef STRATA_ATTN_RSK_DEFINED
     // 151-b70: STRATA_ATTN_RS=2 (default): the probabilities in [cell][head] order and the value phase reading a cell's 12 as three vectors - the same
     // bits (first-token logits md5 equal at 4K and 16K), +0.8..0.9% prompt tok/s on the B70; =1 adds a 16-shuffle reduce-scatter for the scores
-    // (bit-exact too, but -1.5% here: the score phase is not shuffle bound); =0 the layout before
-    static const int rs_env = [] { const char* v = std::getenv("STRATA_ATTN_RS"); return v ? std::atoi(v) : 2; }();
+    // (bit-exact too, but -1.5% here: the score phase is not shuffle bound); =0 the layout before.  =4 (default): =2 with the
+    // value loads of 4 cells issued together for INT8 KV (the same bits; one B70, 196K decode: 102 -> 84.5 us a call, the
+    // selected blocks are scattered); other KV formats take =2
+    static const int rs_env = [] { const char* v = std::getenv("STRATA_ATTN_RS"); return v ? std::atoi(v) : 4; }();
     const int rs_on = kernel < 0 ? rs_env : 0;   // (the parity harness names its kernel: never the environment)
     if (lane_cell) {
         if (kv_mode == 3) { STRATA_ATTN_LC(3); }
@@ -1100,7 +1138,9 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
         else if (kv_mode == 2) { STRATA_ATTN_RSK(2, 1); }
         else if (kv_mode == 1) { STRATA_ATTN_RSK(1, 1); }
         else { STRATA_ATTN_RSK(0, 1); }
-    } else if (rs_on == 2) {
+    } else if (rs_on == 4 && kv_mode == 1) {   // RS=4: RS=2 with the value loads 4 cells at a time (INT8 KV only)
+        STRATA_ATTN_RSK(1, 4);
+    } else if (rs_on == 2 || rs_on == 4) {
         if (kv_mode == 3) { STRATA_ATTN_RSK(3, 2); }
         else if (kv_mode == 2) { STRATA_ATTN_RSK(2, 2); }
         else if (kv_mode == 1) { STRATA_ATTN_RSK(1, 2); }

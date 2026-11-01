@@ -5485,10 +5485,24 @@ static bool scores_dx_device(int &sms, dpct::queue_ptr st) {
 template <int NQ>
 static void scores_dx_launch(const float *pooled, const float *q_idx, const int32_t *steps, int64_t max_blocks,
                              float *scores, int sms, dpct::queue_ptr st) {
-    // work-groups per Xe core: unmeasured on Battlemage (local memory allows 3 of the 8-query size)
-    const int64_t tiles = (max_blocks + DX_NB - 1) / DX_NB, want = (int64_t) 3 * sms;
+    // work-groups per Xe core (local memory allows 3 of the 8-query size).  STRATA_SCORES_DX_GPC overrides it; one B70,
+    // 196K context, 3 queries, wall-clock per call: 3 -> ~70 us, 4 -> 59, 6 -> 74, 12 -> 62 (not yet the default)
+    static const int gpc = [] { const char* v = std::getenv("STRATA_SCORES_DX_GPC"); return v && std::atoi(v) > 0 ? std::atoi(v) : 3; }();
+    const int64_t tiles = (max_blocks + DX_NB - 1) / DX_NB, want = (int64_t) gpc * sms;
     const unsigned grid = (unsigned) (want < tiles ? want : tiles);
     if (grid == 0) return;
+    // STRATA_SCORES_DX_SG (default 16; 32 the old build): the kernel in sub-groups of 16.  It has no sub-group
+    // operations (a lane only names its block and head), so the arithmetic and the score bits are the same; in
+    // sub-groups of 32 the AOT build spills 14-82 registers (NQ 1-8).  One B70, 196K context, 4 queries: 160 -> 99 us.
+    static const int sg = [] { const char* v = std::getenv("STRATA_SCORES_DX_SG"); return v && std::atoi(v) == 32 ? 32 : 16; }();
+    if (sg == 16) {
+        st->parallel_for<dpct_kernel_name<class block_scores_dx16_kernel_b70d11, dpct_kernel_scalar<NQ>>>(
+            sycl::nd_range<3>(sycl::range(1, 1, grid) * sycl::range(1, 1, DX_T), sycl::range(1, 1, DX_T)),
+            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
+                block_scores_dx_kernel<NQ>(pooled, q_idx, steps, max_blocks, scores);
+            });
+        return;
+    }
     st->parallel_for<dpct_kernel_name<class block_scores_dx_kernel_b70d01, dpct_kernel_scalar<NQ>>>(
         sycl::nd_range<3>(sycl::range(1, 1, grid) * sycl::range(1, 1, DX_T), sycl::range(1, 1, DX_T)),
         [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {

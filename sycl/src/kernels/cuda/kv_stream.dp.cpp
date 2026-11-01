@@ -275,6 +275,37 @@ __dpct_inline__ void copy_kernel(KvStreamMap m, Runs r) {
     }
 }
 
+// copy_kernel with every load of a block issued before its stores (STRATA_KV_COPY_BATCH, default on; 0 off): the loads
+// cross PCIe, and the loop above waits for one run's load before the next run's (four round trips a block for INT8 KV).
+// One B70, 196K context: 34.9 -> 30.1 us a call (the rest is the misses' PCIe bytes).  Up to
+// two 16-byte pieces per thread per run in registers, the rest (a run longer than 2 x 16 x threads bytes) by the plain loop.
+__dpct_inline__ void copy_batch_kernel(KvStreamMap m, Runs r) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int need = m.ctl[2];
+    const int t = (int) item_ct1.get_local_id(2), nt = (int) item_ct1.get_local_range(2);
+    for (int k = item_ct1.get_group(2); k < need; k += item_ct1.get_group_range(2)) {
+        const long long b = m.miss_block[k], sl = m.miss_slot[k];
+        sycl::uint4 x0[4], x1[4];
+#pragma unroll
+        for (int a = 0; a < 4; ++a) {
+            const int n16 = a < r.n ? r.len[a] / 16 : 0;
+            const sycl::uint4 *src = reinterpret_cast<const sycl::uint4 *>(r.src[a] + b * (a < r.n ? r.len[a] : 0));
+            x0[a] = t < n16 ? src[t] : sycl::uint4(0u, 0u, 0u, 0u);
+            x1[a] = t + nt < n16 ? src[t + nt] : sycl::uint4(0u, 0u, 0u, 0u);
+        }
+#pragma unroll
+        for (int a = 0; a < 4; ++a) {
+            const int n16 = a < r.n ? r.len[a] / 16 : 0;
+            if (n16 == 0) continue;
+            const sycl::uint4 *src = reinterpret_cast<const sycl::uint4 *>(r.src[a] + b * r.len[a]);
+            sycl::uint4 *dst = reinterpret_cast<sycl::uint4 *>(r.dst[a] + sl * r.len[a]);
+            if (t < n16) dst[t] = x0[a];
+            if (t + nt < n16) dst[t + nt] = x1[a];
+            for (int i = t + 2 * nt; i < n16; i += nt) dst[i] = src[i];
+        }
+    }
+}
+
 __dpct_inline__ void reset_kernel(KvStreamMap m) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const long long i0 = (long long)item_ct1.get_group(2) *
@@ -376,6 +407,14 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
                 auto runs_of_slots_host_fmt_s_ct1 =
                     runs_of(slots, host, fmt, s);
 
+                static const bool batch = [] { const char* v = std::getenv("STRATA_KV_COPY_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+                if (batch)
+                    cgh.parallel_for<dpct_kernel_name<class copy_batch_kernel_b70f01>>(
+                        sycl::nd_range<3>(sycl::range(1, 1, 256) * sycl::range(1, 1, 128), sycl::range(1, 1, 128)),
+                        exp_props, [=](sycl::nd_item<3> item_ct1) {
+                            copy_batch_kernel(m, runs_of_slots_host_fmt_s_ct1);
+                        });
+                else
                 cgh.parallel_for<dpct_kernel_name<class copy_kernel_4bb253>>(
                     sycl::nd_range<3>(sycl::range(1, 1, 96) *
                                           sycl::range(1, 1, 128),

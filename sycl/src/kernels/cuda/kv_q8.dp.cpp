@@ -29,6 +29,13 @@ void validate(const QsaShapes& s, const char* what) {
     }
 }
 
+// STRATA_KV_APPEND_PACK (default on, 0 off): a streamed KV cache's host copy written eight codes to a store (the same
+// bytes; 196K decode on one B70: the append took 20.8 us a call with one-byte stores over PCIe)
+inline bool kv_append_pack_host() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_KV_APPEND_PACK"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+}
+
 // One block = one 64-value group of one KV head of K (blockIdx.z = 0) or V (1); 64 threads, one value each.
 // MULTI (S26 STRATA_LFUSE): blockIdx.z = 2 * token + (K / V); token j reads step + j * step_stride and its rows at
 // kcur / vcur + j * cur_stride - every token's code is the single launch's
@@ -39,7 +46,7 @@ __dpct_inline__ void kv_append_q8_kernel(
     const int32_t *__restrict__ table, const int32_t *__restrict__ step,
     const float *__restrict__ kcur, const float *__restrict__ vcur,
     int kv_heads, int head_dim, int page_size, KvHostPools host,
-    int step_stride = 0, int cur_stride = 0) {
+    int step_stride = 0, int cur_stride = 0, bool pack_host = false) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     if constexpr (MULTI) {
         const int j = item_ct1.get_group(0) >> 1;
@@ -86,6 +93,15 @@ __dpct_inline__ void kv_append_q8_kernel(
     }
     if (host.k_q != nullptr) {
         const long long row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
+        if (pack_host) {
+            // the same bytes, eight codes to a store: lane 8i gathers lanes 8i..8i+7 (one PCIe write instead of eight)
+            uint64_t w = (uint64_t) (uint8_t) q;
+#pragma unroll
+            for (int j = 1; j < 8; ++j)
+                w |= (uint64_t) (uint8_t) sycl::select_from_group(sg, q, (int) ((t & 31) | j)) << (8 * j);
+            if ((t & 7) == 0)
+                *reinterpret_cast<uint64_t *>((is_v ? host.v_q : host.k_q) + row * head_dim + g * KV_Q8_GROUP + t) = w;
+        } else
         (is_v ? host.v_q : host.k_q)[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t) q;
         if (t == 0) (is_v ? host.v_scale : host.k_scale)[row * groups + g] = sbits;
     }
@@ -225,6 +241,7 @@ void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_
             ->submit([&](sycl::handler &cgh) {
                 KvHostPools host_host_KvHostPools_ct11 =
                     host ? *host : KvHostPools{};
+                const bool pack = kv_append_pack_host();
 
                 /*
                 DPCT1050: The template argument of the dpct_kernel_name
@@ -242,7 +259,7 @@ void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_
                                 k_q, v_q, k_scale, v_scale, page_table, step,
                                 kcur, vcur, (int)s.n_head_kv, (int)s.head_dim,
                                 (int)s.page_size, host_host_KvHostPools_ct11, 0,
-                                0);
+                                0, pack);
                         });
             });
     }
@@ -264,6 +281,7 @@ void kv_append_q8_steps(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v
             ->submit([&](sycl::handler &cgh) {
                 KvHostPools host_host_KvHostPools_ct11 =
                     host ? *host : KvHostPools{};
+                const bool pack = kv_append_pack_host();
 
                 cgh.parallel_for<
                     dpct_kernel_name<class kv_append_q8_kernel_b60fdc,
@@ -277,7 +295,7 @@ void kv_append_q8_steps(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v
                                 k_q, v_q, k_scale, v_scale, page_table, step,
                                 kcur, vcur, (int)s.n_head_kv, (int)s.head_dim,
                                 (int)s.page_size, host_host_KvHostPools_ct11,
-                                step_stride, cur_stride);
+                                step_stride, cur_stride, pack);
                         });
             });
     }

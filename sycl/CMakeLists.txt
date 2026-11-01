@@ -444,6 +444,8 @@ if(STRATA_SYCL_PARITY)
   add_test(NAME gr_prompt_parity COMMAND gr_prompt_bench 3508 2 16)   # a 118K prompt's last chunk: partial tiles
   add_executable(qsa_select_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/qsa_select_bench.cpp)   # QSA selection stages + selections vs FP64
   target_link_libraries(qsa_select_bench PRIVATE strata_kernels strata_prefill)   # -qmkl for the GEMM block scores
+  add_executable(qsa_decode_select_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/qsa_decode_select_bench.cpp)   # the long decode select vs the plain kernels, bitwise + timing
+  target_link_libraries(qsa_decode_select_bench PRIVATE strata_kernels)
   add_executable(sycl_router_fast ${CMAKE_CURRENT_SOURCE_DIR}/probe/router_fast.cpp)
   target_link_libraries(sycl_router_fast PRIVATE strata_kernels)
   add_test(NAME sycl_router_fast COMMAND sycl_router_fast)
