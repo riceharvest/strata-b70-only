@@ -2110,6 +2110,25 @@ __dpct_inline__ void gr_q8_up_kernel(Args m, float* lo /*[T][LR]*/, float* pr /*
     for (int j = 0; j < NQ; ++j) qv[j] = q4[j];
 #pragma unroll
     for (int b = 0; b < NB; ++b) dv[b] = (float) dbase[(size_t) i * (LR / 32) + q * NB + b];
+    // the epilogue's element(s) of this thread: R' (and the pending write) and R' * w_norm * rs, independent of the
+    // dot, loaded now so their latency hides behind the lo staging and the dot (the same operations: bitwise)
+    constexpr int NE = (T * 64 + UTH - 1) / UTH;
+    float xxp[NE];
+#pragma unroll
+    for (int e = 0; e < NE; ++e) {
+        const int x = t + e * UTH;
+        xxp[e] = 0.0f;
+        if (x < T * 64) {
+            const int k = x / 64, s = x - k * 64, cgs = s / SG, l = s - cgs * SG;
+            const int cs = l / 4, ds = d0 + cgs * 4 + (l & 3), is = cs * N + ds;
+            float rv = m.R[(size_t) k * D + is];
+            if (m.apply) {
+                rv = sycl::fma(m.bo[(size_t) k * N + ds], 2.0f * sigmoidf_(m.ip[k * HC + cs] / (float) HC), rv);
+                m.R_out[(size_t) k * D + is] = rv;
+            }
+            xxp[e] = rv * m.wn[is] * m.rs[k * HC + cs];
+        }
+    }
     for (int x = t; x < T * LR; x += UTH) lo[x] = m.lo[x];
     item.barrier(sycl::access::fence_space::local_space);
     float acc[T];
@@ -2137,19 +2156,16 @@ __dpct_inline__ void gr_q8_up_kernel(Args m, float* lo /*[T][LR]*/, float* pr /*
     for (int k = 0; k < T; ++k) pr[(q * T + k) * 64 + rw] = acc[k];
     item.barrier(sycl::access::fence_space::local_space);
     // the fifths in a fixed order, then the default read's epilogue per element
-    for (int x = t; x < T * 64; x += UTH) {
+#pragma unroll
+    for (int e = 0; e < NE; ++e) {
+        const int x = t + e * UTH;
+        if (x >= T * 64) break;
         const int k = x / 64, s = x - k * 64, cgs = s / SG, l = s - cgs * SG;
-        const int cs = l / 4, ds = d0 + cgs * 4 + (l & 3), is = cs * N + ds;
+        const int cs = l / 4, ds = d0 + cgs * 4 + (l & 3);
         float u = 0.0f;
 #pragma unroll
         for (int qq = 0; qq < UQ; ++qq) u += pr[(qq * T + k) * 64 + s];
-        float rv = m.R[(size_t) k * D + is];
-        if (m.apply) {
-            rv = sycl::fma(m.bo[(size_t) k * N + ds], 2.0f * sigmoidf_(m.ip[k * HC + cs] / (float) HC), rv);
-            m.R_out[(size_t) k * D + is] = rv;
-        }
-        const float xx = rv * m.wn[is] * m.rs[k * HC + cs];
-        gs[(k * HC + cs) * UP_COLS_Q8 + (ds - d0)] = xx * sigmoidf_(u);
+        gs[(k * HC + cs) * UP_COLS_Q8 + (ds - d0)] = xxp[e] * sigmoidf_(u);
     }
     item.barrier(sycl::access::fence_space::local_space);
     for (int x = t; x < T * UP_COLS_Q8; x += UTH) {
@@ -2173,8 +2189,10 @@ void launch_down(sycl::queue* st, const Args& m, Scratch sc) {
         sycl::local_accessor<float, 1> xs(sycl::range<1>(XS), cgh);
         sycl::local_accessor<float, 1> red(sycl::range<1>((size_t) DSG * TM), cgh);
         sycl::local_accessor<int, 1> flag(sycl::range<1>(1), cgh);
+        // without inject rows the row groups past LR hold nothing the read writes: not launched
+        const int nrg = m.wi != nullptr ? NRG : (LR + RPG - 1) / RPG;
         cgh.parallel_for<dpct_kernel_name<class gr_q8_down_sycl, dpct_kernel_scalar<T>>>(
-            sycl::nd_range<3>(sycl::range(1, 1, NRG * NSLAB * DTH), sycl::range(1, 1, DTH)),
+            sycl::nd_range<3>(sycl::range(1, 1, nrg * NSLAB * DTH), sycl::range(1, 1, DTH)),
             [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
                 gr_q8_down_kernel<T, RPL, KS>(m, sc, xs.get_multi_ptr<sycl::access::decorated::no>().get(),
                                               red.get_multi_ptr<sycl::access::decorated::no>().get(),

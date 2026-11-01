@@ -27,7 +27,8 @@ const char* name_of(int t) {
 // random blocks with a finite, small fp16 scale (at the format's offset) so the outputs are finite
 void fill(int t, std::vector<uint8_t>& w, std::mt19937& rng) {
     std::uniform_int_distribution<int> b(0, 255);
-    for (auto& v : w) v = (uint8_t) b(rng);
+    for (size_t i = 0; i + 4 <= w.size(); i += 4) { const uint32_t r = rng(); std::memcpy(&w[i], &r, 4); }   // fast fill
+    for (size_t i = w.size() & ~(size_t) 3; i < w.size(); ++i) w[i] = (uint8_t) b(rng);
     const size_t bs = t == 14 ? 210 : t == 13 ? 176 : t == 12 ? 144 : t == 23 ? 136 : 34;
     const size_t off = t == 14 ? 208 : 0;
     for (size_t o = 0; o + bs <= w.size(); o += bs) {
@@ -51,7 +52,8 @@ int main(int argc, char** argv) {
     dpct::queue_ptr s = dpct::get_current_device().create_queue(true);
     std::mt19937 rng(7);
     const struct { int n_in, n_out; const char* what; } shapes[] = {
-        {2560, 10240, "GDN qkv"}, {2560, 6144, "GDN z"}, {6144, 2560, "out-proj"}, {2560, 12288, "QSA q"}, {2560, 512, "k/v"}};
+        {2560, 10240, "GDN qkv"}, {2560, 6144, "GDN z"}, {6144, 2560, "out-proj"}, {2560, 12288, "QSA q"}, {2560, 512, "k/v"},
+        {2560, 640, "sh_gu"}, {2560, 1003, "partial"}};
     constexpr int NMAT = 24;
     std::printf("dense_bench: %d matrices per shape in one graph; us per call (median of 30), GB/s of weights, hash\n", NMAT);
     for (const int t : types) {

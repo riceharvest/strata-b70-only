@@ -166,9 +166,18 @@ bool same(const std::vector<float>& x, const std::vector<float>& y) {
 }
 }  // namespace
 
+uint64_t fnv_add(uint64_t h, const std::vector<float>& v) {
+    const uint32_t* u = (const uint32_t*) v.data();
+    for (size_t i = 0; i < v.size(); ++i) { h ^= u[i]; h *= 1099511628211ull; }
+    return h;
+}
+
 int main(int argc, char** argv) {
-    for (int i = 1; i < argc; ++i)
-        if (std::string(argv[i]) != "--selftest") { std::fprintf(stderr, "usage: gr_q8_parity [--selftest]\n"); return 2; }
+    bool bench = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--bench") bench = true;
+        else if (std::string(argv[i]) != "--selftest") { std::fprintf(stderr, "usage: gr_q8_parity [--selftest] | --bench\n"); return 2; }
+    }
     const float eps = 1e-6f;
     std::mt19937 rng(20261016u);
     std::normal_distribution<float> gauss(0.0f, 1.0f);
@@ -233,6 +242,59 @@ int main(int argc, char** argv) {
         stream->memset(d_io, 0, (size_t) TM * HC * sizeof(float));
         stream->memset(d_mixed, 0, (size_t) TM * N * sizeof(float));
     };
+
+    if (bench) {
+        // --bench: NB distinct Q8_0 weight copies (the window reads another layer's projections every call; 3.3 MB
+        // each fits in L2), one graph of NB reads per T (pending write on, no inject: a layer read), us per read
+        // (median of 30); then an FNV hash of every output of direct reads (T 1..8 x pending write x inject) to
+        // compare two builds or two settings bit for bit.
+        constexpr int NB = 24;
+        std::vector<uint8_t*> qd(NB), qu(NB);
+        for (int b = 0; b < NB; ++b) { qd[b] = up(s_down); qu[b] = up(s_up); }
+        const double wbytes = (double) (s_down.size() + s_up.size());
+        for (int T : {1, 2, 3, 4, 6, 8}) {
+            reset();
+            auto aq = args_for(T, true, false, true);
+            dpct::experimental::command_graph_ptr g = nullptr;
+            dpct::experimental::begin_recording(stream);
+            for (int b = 0; b < NB; ++b) {
+                for (auto& x : aq) { x.q8_down = qd[b]; x.q8_up = qu[b]; }
+                k::fused_gr_read_multi(aq.data(), T, d_xn, stream);
+            }
+            dpct::experimental::end_recording(stream, &g);
+            auto* gx = new sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>(g->finalize());
+            std::vector<double> us;
+            for (int i = 0; i < 40; ++i) {
+                if (i % 8 == 0) { reset(); stream->wait(); }
+                sycl::event e0 = stream->ext_oneapi_submit_barrier();
+                stream->ext_oneapi_graph(*gx);
+                sycl::event e1 = stream->ext_oneapi_submit_barrier();
+                e1.wait();
+                const double ns = (double) (e1.get_profiling_info<sycl::info::event_profiling::command_end>() -
+                                            e0.get_profiling_info<sycl::info::event_profiling::command_start>());
+                if (i >= 10) us.push_back(ns / 1e3 / NB);
+            }
+            std::sort(us.begin(), us.end());
+            std::printf("gr_q8 read T=%d: %8.2f us per read (min %8.2f)  %6.1f GB/s of Q8_0 weights\n", T, us[us.size() / 2],
+                        us[0], wbytes / us[us.size() / 2] / 1e3);
+            delete gx;
+            delete g;
+        }
+        uint64_t h = 1469598103934665603ull;
+        for (int T = 1; T <= TM; ++T)
+            for (int apply = 0; apply < 2; ++apply)
+                for (int inject = 0; inject < 2; ++inject) {
+                    clear(); reset();
+                    auto aq = args_for(T, apply, inject, true);
+                    k::fused_gr_read_multi(aq.data(), T, d_xn, stream);
+                    const Out o = snapshot(T, inject);
+                    h = fnv_add(fnv_add(fnv_add(fnv_add(fnv_add(h, o.r_out), o.lo), o.rs), o.inject), o.mixed);
+                }
+        std::printf("gr_q8 outputs hash %016llx\n", (unsigned long long) h);
+        for (int b = 0; b < NB; ++b) { sycl::free(qd[b], dpct::get_in_order_queue()); sycl::free(qu[b], dpct::get_in_order_queue()); }
+        dpct::get_current_device().destroy_queue(stream);
+        return 0;
+    }
 
     int bad = 0, cases = 0;
     const double tol = 1e-4;   // FP32 summation order against FP64: a structural error is orders of magnitude larger

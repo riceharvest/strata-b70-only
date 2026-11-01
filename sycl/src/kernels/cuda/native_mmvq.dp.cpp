@@ -2458,6 +2458,189 @@ void kreg_dispatch(const void* w, const void* x, float* y, int n_in, int n_out, 
         } else launch_kreg<F, NCOLS, 8, 256>(w, x, y, n_in, n_out, s);
     }
 }
+// KREG2 (IQ4_XS at 1-4 columns under STRATA_MMVQ_KREG=1; STRATA_KREG2=0: off): the KREG IQ4_XS per-output arithmetic
+// (a column's sum is bitwise the KREG one: the 16-lane butterfly and the sub-group-ordered SLM sum do not depend on
+// the work-group, the tile or R) on another schedule:
+//   - a persistent grid of 60 threads per Xe core walks the tiles; at 2-4 columns the next tile's raw block words
+//     (header + 16 qs bytes per lane per row) are in flight while this tile decodes, reduces and waits (PF);
+//   - the first tile's loads go out before the activation loads and the codebook fill; the codebook is computed from
+//     four constant words (no loads), with a second table holding the entries << 8;
+//   - no lo/hi recombination: a lookup pair gives [c(lo b0), c(lo b1), c(hi b0), c(hi b1)] and the activations are
+//     permuted to match once per work-group, so the integer dot is the same sum.
+// Taken where it measured faster than KREG on the Arc Pro B70 (2026-11-01): 2-4 columns when the matrix has more
+// tiles (R = 4 rows) than the grid (2560 x 6144..248320 and 6144 x 2560: 1.05-1.26x), and 1 column at R = 2 (one
+// work-group per tile) when the tiles fit in the grid (2560 x 512 / x 640: 1.2-1.36x; KREG's R = 8 leaves cores
+// idle). Elsewhere KREG. STRATA_KREG2_R="a,b,c,d": R (2 or 4) per column count (2,4,2,2 measured faster at 3-4
+// columns on all but the head; bitwise either way).
+struct K2Raw { sycl::int2 hdr, qa, qb; };
+__dpct_inline__ uint32_t k2_code(int n) {   // kIq4nlTable[n] as a byte, from registers
+    const uint32_t w0 = 0xBFAD9881u, w1 = 0xF6EADDCFu, w2 = 0x26190D01u, w3 = 0x71594535u;
+    const uint32_t wd = n < 8 ? (n < 4 ? w0 : w1) : (n < 12 ? w2 : w3);
+    return (wd >> (8 * (n & 3))) & 0xFFu;
+}
+__dpct_inline__ K2Raw k2_raw(const IQ4XSBlock* b, int g) {
+    K2Raw r;
+    r.hdr = *reinterpret_cast<const sycl::int2*>(b);
+    const sycl::int2* q2 = reinterpret_cast<const sycl::int2*>(b->qs + 16 * g);
+    r.qa = q2[0]; r.qb = q2[1];
+    return r;
+}
+// lo / hi: the P / Q words of each qs word (tl: the table, tl + 256: the table << 8); d as KregIQ4XS::load
+__dpct_inline__ KregIQ4XS::W k2_decode(const K2Raw& raw, int g, const uint32_t* tl) {
+    KregIQ4XS::W r;
+    const uint32_t v[4] = {(uint32_t) raw.qa.x(), (uint32_t) raw.qa.y(), (uint32_t) raw.qb.x(), (uint32_t) raw.qb.y()};
+    const uint32_t* tb = tl + 256;
+    int lo[4], hi[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        lo[i] = (int) (tl[v[i] & 0xFF] | tb[(v[i] >> 8) & 0xFF]);
+        hi[i] = (int) (tl[(v[i] >> 16) & 0xFF] | tb[v[i] >> 24]);
+    }
+    r.lo = sycl::int4(lo[0], lo[1], lo[2], lo[3]); r.hi = sycl::int4(hi[0], hi[1], hi[2], hi[3]);
+    const uint32_t h0 = (uint32_t) raw.hdr.x(), sl = (uint32_t) raw.hdr.y();
+    const int ls = (int) (((sl >> (8 * (g >> 1) + 4 * (g & 1))) & 0x0f) | (((h0 >> (16 + 2 * g)) & 0x03) << 4));
+    r.d = (float) sycl::bit_cast<sycl::half>((uint16_t) (h0 & 0xFFFF)) * (float) (ls - 32);
+    return r;
+}
+template <int R>
+__dpct_inline__ void k2_load_tile(K2Raw (&raw)[R], const IQ4XSBlock* __restrict__ w, int t, int bpr, int kb, int g,
+                                  int n_out) {
+    const int row0 = t * R;
+    const IQ4XSBlock* wt = w + std::size_t(row0) * bpr + kb;
+    const int rlast = n_out - 1 - row0;
+#pragma unroll
+    for (int r = 0; r < R; ++r) raw[r] = k2_raw(wt + (r < rlast ? r : rlast) * bpr, g);
+}
+template <int NCOLS, int R, bool PF>
+void kreg2_iq4xs_kernel(const IQ4XSBlock* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
+                        int n_in, int n_out, float* __restrict__ slm) {
+    using F = KregIQ4XS;
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<1>();
+    const sycl::sub_group sg = it.get_sub_group();
+    constexpr int P0 = R * NCOLS, P = kreg_p<R, NCOLS>(), PL = P / KREG_SG;
+    const int lid = int(it.get_local_id(0)), lane = int(sg.get_local_linear_id()), sgi = lid / KREG_SG;
+    const int L = int(it.get_local_range(0)), nsg = L / KREG_SG;
+    const int bpr = n_in / QK, x_stride = n_in / Q8K;
+    const bool live = (lid >> 3) < bpr;
+    const int kb = live ? (lid >> 3) : 0, g = lid & 7;
+    const int ntiles = (n_out + R - 1) / R, G = int(it.get_group_range(0));
+    int t = int(it.get_group(0));   // < ntiles: the grid never exceeds the tiles
+    K2Raw cur[R];
+    k2_load_tile<R>(cur, w, t, bpr, kb, g, n_out);
+    typename F::A a[NCOLS];
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {   // word i: [x 4i, x 4i+1, x 16+4i, x 16+4i+1] and [x 4i+2, x 4i+3, x 16+4i+2, x 16+4i+3]
+        a[j] = F::act(x + std::size_t(j) * x_stride + kb * (QK / Q8K), g);
+        if (!live) a[j] = typename F::A{};
+        const sycl::int4 u0 = a[j].u0, u1 = a[j].u1;
+        auto pl = [](int l, int h) { return (int) (((uint32_t) l & 0xFFFFu) | ((uint32_t) h << 16)); };
+        auto ph = [](int l, int h) { return (int) (((uint32_t) l >> 16) | ((uint32_t) h & 0xFFFF0000u)); };
+        a[j].u0 = sycl::int4(pl(u0.x(), u1.x()), pl(u0.y(), u1.y()), pl(u0.z(), u1.z()), pl(u0.w(), u1.w()));
+        a[j].u1 = sycl::int4(ph(u0.x(), u1.x()), ph(u0.y(), u1.y()), ph(u0.z(), u1.z()), ph(u0.w(), u1.w()));
+    }
+    uint32_t* tw = reinterpret_cast<uint32_t*>(slm + 2 * nsg * P);
+    for (int i = lid; i < 256; i += L) {
+        const uint32_t te = k2_code(i & 15) | (k2_code(i >> 4) << 16);
+        tw[i] = te;
+        tw[256 + i] = te << 8;
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+    int buf = 0;
+    for (; t < ntiles; t += G) {
+        const int tn = t + G;
+        K2Raw nxt[R];
+        if constexpr (PF) k2_load_tile<R>(nxt, w, tn < ntiles ? tn : t, bpr, kb, g, n_out);
+        const int row0 = t * R;
+        float v[P];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const typename F::W wv = k2_decode(cur[r], g, tw);
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) v[r * NCOLS + j] = F::dot(wv, a[j]);
+        }
+#pragma unroll
+        for (int k = P0; k < P; ++k) v[k] = 0.0f;
+        kreg_tsum<KREG_SG / 2, P, P>(v, sg, lane);
+        float* b = slm + buf * nsg * P;
+#pragma unroll
+        for (int i = 0; i < PL; ++i) b[sgi * P + lane * PL + i] = v[i];
+        it.barrier(sycl::access::fence_space::local_space);
+        for (int k = lid; k < P0; k += L) {
+            float s = 0.0f;
+            for (int q = 0; q < nsg; ++q) s += b[q * P + k];
+            const int r = k / NCOLS, j = k % NCOLS;
+            if (row0 + r < n_out) y[std::size_t(j) * n_out + row0 + r] = s;
+        }
+        buf ^= 1;
+        if constexpr (PF) {
+#pragma unroll
+            for (int r = 0; r < R; ++r) cur[r] = nxt[r];
+        } else if (tn < ntiles) {
+            k2_load_tile<R>(cur, w, tn, bpr, kb, g, n_out);
+        }
+    }
+}
+template <int NCOLS, int R>
+void launch_kreg2(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int G, dpct::queue_ptr s) {
+    constexpr bool PF = NCOLS > 1;
+    const auto* w = static_cast<const IQ4XSBlock*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const int L = ((n_in / QK) * 8 + KREG_SG - 1) / KREG_SG * KREG_SG;
+    const int nsg = L / KREG_SG;
+    constexpr int P = kreg_p<R, NCOLS>();
+    s->submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> slm(sycl::range<1>(2 * nsg * P + 2 * 256), h);
+        auto k = [=](sycl::nd_item<1>) [[sycl::reqd_sub_group_size(16)]] {
+            kreg2_iq4xs_kernel<NCOLS, R, PF>(w, x, y, n_in, n_out, slm.get_multi_ptr<sycl::access::decorated::no>().get());
+        };
+        h.parallel_for<dpct_kernel_name<class kreg2_iq4xs, dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<R>>>(
+            sycl::nd_range<1>(std::size_t(G) * L, L), k);
+    });
+}
+struct Kreg2Cfg {
+    bool on = true;
+    int r[5] = {0, 2, 4, 4, 4};   // R per column count
+};
+inline const Kreg2Cfg& kreg2_cfg() {   // latched before graph capture
+    static const Kreg2Cfg c = [] {
+        Kreg2Cfg k;
+        const char* e = std::getenv("STRATA_KREG2");
+        k.on = !(e && e[0] == '0');
+        if (const char* rl = std::getenv("STRATA_KREG2_R")) {   // "a,b,c,d": 2 or 4; anything else keeps the default
+            for (int i = 1; i <= 4 && *rl; ++i) {
+                const int v = std::atoi(rl);
+                if (v == 2 || v == 4) k.r[i] = v;
+                while (*rl && *rl != ',') ++rl;
+                if (*rl == ',') ++rl;
+            }
+        }
+        return k;
+    }();
+    return c;
+}
+template <int NC>
+bool k2_go(const Kreg2Cfg& c, const void* w, const void* x, float* y, int n_in, int n_out, dpct::queue_ptr s) {
+    static const int cores = std::max(1, int(s->get_device().get_info<sycl::info::device::max_compute_units>()) / 8);
+    const int nsg = ((n_in / QK) * 8 + KREG_SG - 1) / KREG_SG;
+    const int grid = std::max(1, 60 / nsg) * cores;   // 60 threads per Xe core (max_compute_units / 8 XVEs)
+    const int R = c.r[NC], tiles = (n_out + R - 1) / R;
+    if (NC == 1 ? tiles > grid : tiles <= grid) return false;
+    const int G = tiles < grid ? tiles : grid;
+    if (R == 2) launch_kreg2<NC, 2>(w, x, y, n_in, n_out, G, s);
+    else launch_kreg2<NC, 4>(w, x, y, n_in, n_out, G, s);
+    return true;
+}
+inline bool try_kreg2(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, dpct::queue_ptr s) {
+    const Kreg2Cfg& c = kreg2_cfg();
+    if (!c.on || g_kreg_override == 3) return false;   // native_mmvq_set_kreg(3) (bench): KREG without KREG2
+    switch (ncols) {
+        case 1: return k2_go<1>(c, w, x, y, n_in, n_out, s);
+        case 2: return k2_go<2>(c, w, x, y, n_in, n_out, s);
+        case 3: return k2_go<3>(c, w, x, y, n_in, n_out, s);
+        case 4: return k2_go<4>(c, w, x, y, n_in, n_out, s);
+        default: return false;
+    }
+}
 template <typename F>
 bool try_kreg(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
     if (!kreg_on()) return false;   // STRATA_MMVQ_KREG unset: nothing below runs
@@ -2468,6 +2651,8 @@ bool try_kreg(const void* weights, const void* x_q8_1, float* y, int n_in, int n
     if (std::is_same_v<F, KregIQ4XS> && (wa & 7u) != 0) return false;
     if ((wa & 1u) != 0 || (reinterpret_cast<uintptr_t>(x_q8_1) & 3u) != 0) return false;
     const auto s = strata::q_of(stream);
+    if constexpr (std::is_same_v<F, KregIQ4XS>)
+        if (try_kreg2(weights, x_q8_1, y, n_in, n_out, ncols, s)) return true;   // the default; STRATA_KREG2=0: off
     switch (ncols) {
         case 1: kreg_dispatch<F, 1>(weights, x_q8_1, y, n_in, n_out, s); return true;
         case 2: kreg_dispatch<F, 2>(weights, x_q8_1, y, n_in, n_out, s); return true;

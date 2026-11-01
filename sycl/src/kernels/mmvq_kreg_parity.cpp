@@ -173,7 +173,9 @@ constexpr double kBound = 2e-5;
 struct Shape { int n_in, n_out; };
 // n_in <= 4096 and > 4096 take different tiles; 768 and 256 leave lanes of the last sub-group idle; n_out 1000, 520,
 // 300, 77 and 3 end in a partial tile.
-const Shape SHAPES[] = {{2560, 1000}, {6144, 520}, {768, 300}, {256, 77}, {2560, 3}};
+// 2560 x 4099: more tiles than the persistent KREG2 grid (its default engages at 2-4 columns there, KREG at 1 column:
+// check 4 then compares the two kernels bit for bit), and a partial last tile.
+const Shape SHAPES[] = {{2560, 1000}, {6144, 520}, {768, 300}, {256, 77}, {2560, 3}, {2560, 4099}};
 
 struct Dev {
     sycl::queue& q;
@@ -365,13 +367,22 @@ int bench(const char* types_s, const char* ncols_s, const std::string& ssel) {
                 if (nc < 1 || nc > maxc) continue;
                 k::native_quantize_q8_1(dx, xq, sh.n_in, nc, &q);
                 q.wait();
-                double us[2];
-                for (int kreg = 0; kreg < 2; ++kreg) {
-                    k::native_mmvq_set_kreg(kreg);
-                    us[kreg] = time_graph(q, nmat, [&](int m) {
+                auto timed = [&](int mode) {
+                    k::native_mmvq_set_kreg(mode);
+                    return time_graph(q, nmat, [&](int m) {
                         k::native_mmvq(t, dpool + (size_t) (m % ndist) * slot, xq, y, sh.n_in, sh.n_out, nc, &q);
                     }, wb > (100u << 20) ? 7 : 11);
+                };
+                if (std::getenv("STRATA_BENCH_AB")) {   // KREG alone (3: no KREG2) against the default (1), A B A B
+                    const double a0 = timed(3), b0 = timed(1), a1 = timed(3), b1 = timed(1);
+                    std::printf("%-6s %-6s %5d x %6d nc %d  kreg %8.2f %8.2f us %5.1f GB/s  kreg2 %8.2f %8.2f us %5.1f GB/s  x%.3f\n",
+                                f->name, sh.name, sh.n_in, sh.n_out, nc, a0, a1, 2 * wb / (a0 + a1) / 1e3, b0, b1,
+                                2 * wb / (b0 + b1) / 1e3, (a0 + a1) / (b0 + b1));
+                    std::fflush(stdout);
+                    continue;
                 }
+                double us[2];
+                for (int kreg = 0; kreg < 2; ++kreg) us[kreg] = timed(kreg);
                 std::printf("%-6s %-6s %5d x %6d nc %d  default %8.2f us %5.1f GB/s  kreg %8.2f us %5.1f GB/s  x%.2f\n",
                             f->name, sh.name, sh.n_in, sh.n_out, nc, us[0], wb / us[0] / 1e3, us[1], wb / us[1] / 1e3,
                             us[0] / us[1]);
@@ -386,8 +397,27 @@ int bench(const char* types_s, const char* ncols_s, const std::string& ssel) {
 
 }  // namespace
 
+// --floor: us per launch of a kernel that does nothing but one store, in the same graph replay as --bench
+int floor_bench() {
+    sycl::queue q(sycl::gpu_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()});
+    float* y = sycl::malloc_device<float>(1 << 20, q);
+    const int grids[][2] = {{1, 16}, {160, 80}, {640, 80}, {2560, 80}, {384, 80}, {62080, 80}};
+    for (const auto& gl : grids) {
+        const int G = gl[0], L = gl[1];
+        const double us = time_graph(q, 64, [&](int m) {
+            q.parallel_for(sycl::nd_range<1>(std::size_t(G) * L, L), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                if (it.get_global_linear_id() == 0) y[m] = 1.0f;
+            });
+        }, 11);
+        std::printf("floor: %6d work-groups x %3d lanes: %6.2f us per launch\n", G, L, us);
+    }
+    sycl::free(y, q);
+    return 0;
+}
+
 int main(int argc, char** argv) try {
     bool selftest_flag = false;
+    if (argc > 1 && std::string(argv[1]) == "--floor") return floor_bench();
     if (argc > 1 && std::string(argv[1]) == "--bench")
         return bench(argc > 2 ? argv[2] : "12,13,14,23", argc > 3 ? argv[3] : "1,2,3,4,6", argc > 4 ? argv[4] : "all");
     for (int i = 1; i < argc; ++i) {
