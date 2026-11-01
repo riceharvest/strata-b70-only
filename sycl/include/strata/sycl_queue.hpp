@@ -226,7 +226,7 @@ inline void apply_b70_defaults() {
 // A-series included); a set value turns the control on ("1") or off ("0") whatever the device, as before.
 inline bool bm_default_on(const char* name, const sycl::device& d) {
     const char* v = std::getenv(name);
-    if (v != nullptr && v[0] != ' ') return v[0] != '0';
+    if (v != nullptr && v[0] != '\0') return v[0] != '0';
     return intel_gpu_gen(d) == IntelGpuGen::Battlemage;
 }
 }  // namespace strata
