@@ -3689,20 +3689,21 @@ const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa pr
 // time, on this branch and before it, while the same runs with STRATA_PREFILL_TIMING=1 (or STRATA_PREFILL_SYNC=1)
 // finished: a two-turn chat at 15K, and a 52-request coding-agent session from 64K to 118K tokens (2026-10-31). Which of
 // the timing's effects keeps the queues moving is not known yet (not the barrier before the routing download, not one
-// before each cross-queue wait, not a drain of either queue at the chunk's start, not polled drains); one recorded
-// mark per layer is enough (prefill_order_mask below). STRATA_PREFILL_ORDER=0: off (the old behaviour).
+// before each cross-queue wait, not a drain of either queue at the chunk's start, not polled drains; one mark per
+// layer is not enough at 250K: prefill_order_mask below). STRATA_PREFILL_ORDER=0: off (the old behaviour).
 inline bool prefill_order_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_PREFILL_ORDER"); return !(v && v[0] == '0'); }();
     return on;
 }
-// Which marks keep the queues moving (2026-11-01, the 15K two-turn repro, which stopped every time without them): any
-// one barrier per layer before its routing sync - the hc read's, or the router's, or the hc write's - while the gate/up
-// marks alone do not. So the quiet timing records only the router's mark: one barrier per layer instead of ~20, the
-// 118K prompt 2,736 -> 2,813 tok/s (A B B A). STRATA_PREFILL_ORDER_MASK=<hex> (bit = PfPhase) picks other marks.
+// STRATA_PREFILL_ORDER_MASK=<hex> (diagnosis; bit = PfPhase): only these phases' marks are recorded when the timing is
+// quiet; default every phase.  Bisected 2026-11-01: on the 15K two-turn repro any one barrier per layer before its
+// routing sync (the hc read's, the router's or the hc write's alone) kept the queues moving, but with the router's alone
+// a cold 249,618-token prompt stopped at an early layer of its third chunk in 3 of 5 runs (every mark: 0 of 2), and
+// the prompt read no faster (3,248 against 3,245-3,248 tok/s).  So every mark stays.
 inline uint32_t prefill_order_mask() {
     static const uint32_t m = [] {
         const char* v = std::getenv("STRATA_PREFILL_ORDER_MASK");
-        return v ? (uint32_t) std::strtoul(v, nullptr, 16) : (1u << kPfRouter);
+        return v ? (uint32_t) std::strtoul(v, nullptr, 16) : 0xFFFFFFFFu;
     }();
     return m;
 }
