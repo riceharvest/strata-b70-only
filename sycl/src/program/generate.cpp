@@ -8272,10 +8272,19 @@ int main(int argc, char **argv) try {
         // the prompt and put back after it; from the GGUF that was a pread at ~2.3 GB/s per expert (~1 s for a 4K prompt's
         // 930 slots, 0.26 s for a 600-token prompt's 284), from the pinned mirror it is a DMA.  Their mirror entries are never
         // read by a decode window: it only looks at a mirror address for an expert that has no slot.
-        // STRATA_LEND_MIRROR=0 turns it off; =N: the last N slots (default 10% of the cache with a loan, at most 1,200).
+        // STRATA_LEND_MIRROR=0 turns it off; =N: the last N slots.  Default: the whole loan of a --prefill chunk (its
+        // buffers in slots, + 64), so no lent expert is read from the GGUF.  It was 10% of the cache, at most 1,200: at
+        // --prefill 16384 the loan is ~4,840 slots, and the other ~3,600 lent experts were read through the stager on every
+        // chunk (31.6K of a 118K prompt's 123K streamed experts, 7.7 s of host waits) and again to put them back (1.56 s).
+        // B70, Flash-Next, 118K: 36.6 -> 35.0 s of prompt, the put-back 1.56 -> 0.30 s (+8% to the first token), for 5.5 GiB
+        // more pinned RAM; a STRATA_MIRROR_MIB too small for it drops these entries first, as before.
         if (!o.no_prefill_borrow && o.prefill_chunk > 0 && !multi_gpu) {
             const char* lm = std::getenv("STRATA_LEND_MIRROR");
-            const int64_t want_tail = lm ? std::atoll(lm) : std::min<int64_t>(xcache.slots() / 10, 1200);
+            const int64_t blob_b = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+            const int64_t loan = blob_b > 0
+                ? ((int64_t) strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk, srcp != nullptr) + blob_b - 1) / blob_b + 64
+                : std::min<int64_t>(xcache.slots() / 10, 1200);
+            const int64_t want_tail = lm ? std::atoll(lm) : loan;
             if (want_tail > 0) {
                 const int64_t first_tail = xcache.slots() - std::min<int64_t>(want_tail, xcache.slots());
                 for (int64_t l = 0; l < mirror_end; ++l)
