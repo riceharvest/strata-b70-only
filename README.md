@@ -48,8 +48,9 @@ and 2,750 / 2,832 at 250K: the prompt is now read 12-15% faster in these runs (1
 borrows (the default now; it needs the `STRATA_MIRROR_MIB` above) and, past ~201K tokens, from keeping the prompt's
 selection on XMX. The answers are 6-8% faster than that day's first runs (64.6-67.8 tok/s): the experts that are not in
 VRAM are copied in by one wide-load kernel and kept in a VRAM ring that the next windows read again (from the cache's own
-budget, so it needs the larger `STRATA_MIRROR_MIB` above). These runs had the desktop in use; the night runs of the same
-day read the prompt at 3,261 / 3,289 (118K) and 3,246-3,248 tok/s (250K), and the run-to-run spread by day was ~1.5%.
+budget, so it needs the larger `STRATA_MIRROR_MIB` above). The prompt numbers are lower than that night's runs of the
+previous build (3,261 / 3,289 and 3,246-3,248 tok/s), but that build rerun the same day read 3,190 / 3,108 (118K) and
+3,094 tok/s (250K), and no switch of the new work, turned off, read faster: the machine reads slower by day.
 Sampled answers (an agent's) also gain ~6% from exact sampled-draft acceptance, on by default. These numbers include the
 fix for the second-turn hang below, which costs about 2%.
 [docs/B70.md](docs/B70.md) has what changed, every change against upstream and who wrote it, and the earlier
