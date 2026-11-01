@@ -3670,11 +3670,22 @@ const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa pr
 // time, on this branch and before it, while the same runs with STRATA_PREFILL_TIMING=1 (or STRATA_PREFILL_SYNC=1)
 // finished: a two-turn chat at 15K, and a 52-request coding-agent session from 64K to 118K tokens (2026-10-31). Which of
 // the timing's effects keeps the queues moving is not known yet (not the barrier before the routing download, not one
-// before each cross-queue wait, not a drain of either queue at the chunk's start, not polled drains). ~5% of a
-// 118K prompt. STRATA_PREFILL_ORDER=0: off (the old behaviour).
+// before each cross-queue wait, not a drain of either queue at the chunk's start, not polled drains); one recorded
+// mark per layer is enough (prefill_order_mask below). STRATA_PREFILL_ORDER=0: off (the old behaviour).
 inline bool prefill_order_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_PREFILL_ORDER"); return !(v && v[0] == '0'); }();
     return on;
+}
+// Which marks keep the queues moving (2026-11-01, the 15K two-turn repro, which stopped every time without them): any
+// one barrier per layer before its routing sync - the hc read's, or the router's, or the hc write's - while the gate/up
+// marks alone do not. So the quiet timing records only the router's mark: one barrier per layer instead of ~20, the
+// 118K prompt 2,736 -> 2,813 tok/s (A B B A). STRATA_PREFILL_ORDER_MASK=<hex> (bit = PfPhase) picks other marks.
+inline uint32_t prefill_order_mask() {
+    static const uint32_t m = [] {
+        const char* v = std::getenv("STRATA_PREFILL_ORDER_MASK");
+        return v ? (uint32_t) std::strtoul(v, nullptr, 16) : (1u << kPfRouter);
+    }();
+    return m;
 }
 struct PfTimer {
     bool quiet = std::getenv("STRATA_PREFILL_TIMING") == nullptr;   // the timing's work without its report
@@ -3696,6 +3707,7 @@ struct PfTimer {
                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
         }
         if (!on) return;
+        if (quiet && phase < 32 && !((prefill_order_mask() >> phase) & 1u)) return;
         if (used == ev.size()) {
             dpct::event_ptr e = nullptr;
             e = new sycl::event();
