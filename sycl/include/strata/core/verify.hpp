@@ -742,6 +742,11 @@ private:
     int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr;
     int32_t* plan_ = nullptr;                                     // device copy of the plan block
     uint8_t* staging_ = nullptr;                                  // VRAM slots for the PCIe share of the misses
+    uint8_t* mstage_ = nullptr;                                   // STRATA_MIRROR_STAGE: the lean plan's host-mirrored groups, copied to VRAM
+    long long mstage_stride_ = 0;
+    unsigned long long* msrc_ = nullptr;                          // their mirror addresses, per plan group
+    bool mstage_on_ = false;
+    bool mring_ = false;                                          // STRATA_MIRROR_RING: the plans keep the fetched mirrored experts
     static constexpr int64_t kStagingBlobs = 16;
     static constexpr int64_t kPcieGroupRows = 4;                  // the PCIe call's groups side by side (of <= 16)
     uint8_t* hit_xq_ = nullptr;

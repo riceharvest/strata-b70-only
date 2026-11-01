@@ -30,6 +30,7 @@
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/resident_plan_mirror.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -1062,6 +1063,21 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         const auto& lay = strata::kernels::cpu::expert_layout();
         for (size_t l = 0; lay.native && l < lay.fmt.size(); ++l) had_gu_any = had_gu_any || lay.fmt[l].had_gu;
     }
+    // STRATA_MIRROR_STAGE (default on with the native pack; =0 off): the device plan's host-mirrored groups are copied into
+    // VRAM by a streaming kernel before the expert launch, which then reads every group from VRAM.  The expert kernels'
+    // own narrow loads read pinned host memory at ~16.8 GB/s on a B70; the copy's 16-byte loads at ~25.5 (the copy
+    // engine: 27.5).  A mirrored expert a window fetched is fetched again by the next window of its layer over half the
+    // time, so the copies go to a VRAM ring (STRATA_MIRROR_RING, 1024 blobs; the auto-sized cache leaves it) and a plan
+    // reads an expert still in the ring from there.  Flash-Next IQ2_XS, 8K prompt, --expert-cache 13000 (13,626 slots):
+    // decode 69.1 tok/s -> 75.6 staged -> 90.5 with a 512-blob ring, 101.5 with 1024, at the same VRAM (the cache
+    // --expert-cache 13000 less the ring), token ids identical.
+    {
+        const char* v = std::getenv("STRATA_MIRROR_STAGE");
+        auto set_nonzero = [](const char* k) { const char* e = std::getenv(k); return e != nullptr && e[0] != '\0' && e[0] != '0'; };
+        // (only the lean window plans on the device without a host: STRATA_VERIFY_DEVICE_PLAN + STRATA_VERIFY_NO_HOST)
+        mstage_on_ = strata::kernels::cpu::expert_layout().native && !(v != nullptr && v[0] == '0') &&
+                     set_nonzero("STRATA_VERIFY_DEVICE_PLAN") && set_nonzero("STRATA_VERIFY_NO_HOST");
+    }
     // ---- the device arena: the same sequence counted, then carved
     auto carve = [&](Bump& b) {
         tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(T * strata::kernels::kStepCount);
@@ -1090,6 +1106,11 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
         staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
+        if (mstage_on_) {   // STRATA_MIRROR_STAGE: a blob per possible group, and each plan group's copy sources
+            mstage_stride_ = (long long) ((strata::kernels::cpu::expert_layout().max_blob + 255) / 256 * 256);
+            mstage_ = b.take<uint8_t>(T * K * (uint64_t) mstage_stride_);
+            msrc_ = b.take<unsigned long long>(2 * T * K);
+        }
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
         nat_xr_ = had_gu_any ? b.take<float>(T * N) : nullptr;
@@ -1332,6 +1353,21 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         */
         if (!ok2) {; all_resident_ = false; device_plan_ = false; }
     }
+    if (mstage_ != nullptr && !device_plan_) mstage_ = nullptr;   // (only the device plan stages)
+    if (mstage_ != nullptr && !split_) {   // STRATA_MIRROR_RING=R (blobs): keep the fetched mirrored experts in VRAM
+        const int rn = strata::kernels::mirror_ring_slots();
+        if (rn > 0) {
+            std::string rerr;
+            mring_ = strata::kernels::mirror_ring_create(rn, mstage_stride_, rerr);
+            if (!mring_) std::fprintf(stderr, "strata verify: the mirrored experts' VRAM ring is off (%s)\n", rerr.c_str());
+            else std::fprintf(stderr, "strata verify: a VRAM ring of %d blobs (%.1f MiB) keeps the mirrored experts the windows fetch "
+                                      "(STRATA_MIRROR_RING=N sets it, 0 turns it off)\n", rn, (double) rn * (double) mstage_stride_ / 1048576.0);
+        }
+    }
+    if (mstage_ != nullptr)
+        std::fprintf(stderr, "strata verify: host-mirrored experts staged in VRAM (%.1f MiB) by a 16-byte-load copy before "
+                             "the expert kernels read them (STRATA_MIRROR_STAGE=0 turns it off)\n",
+                     (double) max_t_ * (double) g.n_expert_used * (double) mstage_stride_ / 1048576.0);
     if (std::getenv("STRATA_VERIFY_DEBUG") != nullptr) {   // SYCL port: the per-layer residual ladder (token 0)
         dbgR_ = (float*) sycl::malloc_device((size_t) g.n_layers * g.n_embd * 4, dpct::get_in_order_queue());
         dbgM_ = (float*) sycl::malloc_device((size_t) g.n_layers * g.n_embd * 4, dpct::get_in_order_queue());
@@ -2278,9 +2314,11 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
         if (rs_on_ && G == 1 && n <= 8 && T <= 8)
             strata::kernels::route_marginal_stats(ids_ + tb * K, n, (int) K, rs_dev_ + ((size_t) T * (size_t) g.n_layers + (size_t) l) * 8, cs);
         if (ar_on() || lean) {   // lean: grouped() writes parts_out from this plan, so a miss must empty it, not skip it
+            if (lean && mstage_ != nullptr) resident_plan_set_stage(mstage_, mstage_stride_, msrc_ + (size_t) grp * (size_t) (max_t_ * K), mring_ && G == 1);
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, nullptr, 0, cs, m_plan_err_);
+            if (lean && mstage_ != nullptr) resident_plan_set_stage(nullptr, 0, nullptr);
         } else {
             if (device_plan_)   // E-6: every routed expert resident: this group's plan without the host
                 resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
@@ -2417,6 +2455,8 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
         bool hits_in_combine = false;
         if (ar_on() || lean) {
             stamp(l, 19, grp);
+            if (lean && mstage_ != nullptr)   // STRATA_MIRROR_STAGE: the plan's mirrored list into VRAM first
+                mirror_stage(pl, capx, (long long) lay.blob_bytes(l), msrc_ + (size_t) grp * (size_t) capx, cs);
             grouped(p_ptr, p_start, p_counts, 0, parts_out, true);
             stamp(l, 20, grp);
         } else {

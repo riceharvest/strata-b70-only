@@ -7774,6 +7774,16 @@ int main(int argc, char **argv) try {
             o.expert_cache = (int) fit;
         }
     }
+    // STRATA_MIRROR_RING: the lean window's VRAM ring of the mirrored experts it fetched (one largest blob a slot,
+    // strata/kernels/resident_plan_mirror.hpp) is part of the cache's budget - auto-sized or --expert-cache N - when the
+    // cache cannot hold every expert anyway, so the VRAM in use stays what it was
+    if (const int64_t ring = strata::kernels::mirror_ring_slots();
+        ring > 0 && o.stream_experts && native_pack && !multi_gpu && !profile.empty() && o.expert_cache > 0 &&
+        o.expert_cache < (int64_t) profile.size() && o.expert_cache - ring >= 256) {
+        o.expert_cache -= (int) ring;
+        std::fprintf(stderr, "strata generate: expert cache: %lld of its largest-blob slots go to the mirrored experts' VRAM ring "
+                             "-> %d (STRATA_MIRROR_RING=N sets the ring, 0 turns it off)\n", (long long) ring, o.expert_cache);
+    }
     // plan v0.3 P6: a native pack's blobs differ per layer, so the same VRAM holds more experts than slots of
     // the largest blob would. The shared cache below sizes slots in profile order.
     // #369: that list does not match --expert-cache-per-layer. A range is layer * quota + n, so a size cut for
