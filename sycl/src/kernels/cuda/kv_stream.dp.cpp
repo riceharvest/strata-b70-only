@@ -452,6 +452,56 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+void kv_stage_selected(const QsaAttnPools& stage, const KvHostPools& host, int fmt, int64_t n_blocks, const int32_t* ids,
+                       const int32_t* steps, int64_t n_q, int64_t cap, const QsaShapes& s, int32_t* stamp, int32_t epoch,
+                       int32_t* list, int32_t* count, void* stream) try {
+    if (n_blocks <= 0 || n_q <= 0 || cap <= 0) return;
+    sycl::queue& q = *strata::q_of(stream);
+    const Runs r = runs_of(stage, host, fmt, s);
+    const int ps = (int) s.page_size;
+    const int nb = (int) n_blocks;
+    q.memset(count, 0, sizeof(int32_t));
+    // 1. the blocks: one work-item per selected cell; a block's first cell in a query's (ascending) ids claims it
+    //    for this call, and the one that changes its stamp lists it
+    constexpr int WG = 256;
+    const size_t wq = (size_t) ((cap + WG - 1) / WG) * WG;
+    q.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) n_q, wq), sycl::range<2>(1, WG)), [=](sycl::nd_item<2> it) {
+        const int64_t qi = (int64_t) it.get_global_id(0);
+        const int i = (int) it.get_global_id(1);
+        const int width = steps[qi * kStepCount + kStepWidth];
+        if (i >= width || i >= cap) return;
+        const int32_t* qids = ids + qi * cap;
+        const int b = qids[i] / ps;
+        if (b < 0 || b >= nb) return;
+        if (i > 0 && qids[i - 1] / ps == b) return;
+        if (sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                             sycl::access::address_space::global_space>(stamp[b]).exchange(epoch) == epoch)
+            return;
+        const int32_t at = sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                            sycl::access::address_space::global_space>(*count).fetch_add(1);
+        list[at] = b;
+    });
+    // 2. the copies: a work-group per listed block (grid-stride), its runs in 16-byte loads, as copy_kernel
+    constexpr int CW = 128, CG = 1024;
+    q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) CG * CW), sycl::range<1>(CW)), [=](sycl::nd_item<1> it) {
+        const int need = *count;
+        for (int k = (int) it.get_group(0); k < need; k += CG) {
+            const int64_t b = list[k];
+            for (int a = 0; a < r.n; ++a) {
+                const sycl::uint4* src = reinterpret_cast<const sycl::uint4*>(r.src[a] + b * r.len[a]);
+                sycl::uint4* dst = reinterpret_cast<sycl::uint4*>(r.dst[a] + b * r.len[a]);
+                for (int i = (int) it.get_local_id(0); i < r.len[a] / 16; i += CW) dst[i] = src[i];
+            }
+        }
+    });
+    check("stage selected");
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
 void kv_unstage_to_host(const QsaAttnPools &stage, const KvHostPools &host,
                         int fmt, int64_t b0, int64_t b1, const QsaShapes &s,
                         void *stream) try {

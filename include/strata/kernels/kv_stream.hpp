@@ -102,6 +102,15 @@ void kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, int fmt
 void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, int fmt, int64_t n_blocks,
                         const QsaShapes& s, void* stream);
 
+/// STRATA_KV_STAGE_SEL (a small chunk): of the first `n_blocks` blocks, only those the chunk's queries selected (n_q
+/// queries, `ids` / `steps` as the attention reads them) copied from the host copy into the identity-layout pool, each
+/// once - by kernels that read the host copy over PCIe. stamp[b] (one int per block, zero-initialized, never reset)
+/// holds the call's `epoch` (> 0, a new one per call) once block b is taken; list (n_blocks ints) and count (one int)
+/// are scratch. The attention then reads exactly the bytes the whole stage would have given it.
+void kv_stage_selected(const QsaAttnPools& stage, const KvHostPools& host, int fmt, int64_t n_blocks, const int32_t* ids,
+                       const int32_t* steps, int64_t n_q, int64_t cap, const QsaShapes& s, int32_t* stamp, int32_t epoch,
+                       int32_t* list, int32_t* count, void* stream);
+
 /// #579 #613 (HIP A/B, STRATA_KV_HOST_DMA=1): the reverse of kv_stage_from_host for blocks [b0, b1) - the staging
 /// pool's blocks into the host copy, by DMA, so the prompt path's append need not write host memory from a kernel.
 /// Not capturable.
