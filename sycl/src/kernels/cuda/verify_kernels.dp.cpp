@@ -2856,7 +2856,7 @@ resident_plan_kernel(const int32_t *__restrict__ ids, int n, int k,
                      const unsigned long long *slot_off, long long blob,
                      int32_t *__restrict__ pl, long long capx, uint32_t *skip,
                      uint32_t ring, const unsigned long long *__restrict__ mir,
-                     volatile uint32_t *plan_err, int32_t *usage) {
+                     volatile uint32_t *plan_err, int32_t *usage, bool mfirst) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     constexpr int NW = NT / 32;
     auto &s_ids =
@@ -2866,6 +2866,13 @@ resident_plan_kernel(const int32_t *__restrict__ ids, int n, int k,
         *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[NT]>(
             sycl::ext::oneapi::this_work_item::get_work_group<3>());
     auto &s_wsum =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[NW]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    // STRATA_PLAN_MIRROR_FIRST: the host-mirrored groups' own scan (they take the first group indices)
+    auto &s_exclm =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[NT]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_wsumm =
         *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[NW]>(
             sycl::ext::oneapi::this_work_item::get_work_group<3>());
     auto &s_bad = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(
@@ -2923,7 +2930,12 @@ resident_plan_kernel(const int32_t *__restrict__ ids, int n, int k,
     }
     const bool is_first = (tid < n && first_j == tid && (slot >= 0 || maddr != 0));
     const int my_cnt = is_first ? count_same : 0;
-    const int my_pack = (my_cnt << 16) | (is_first ? 1 : 0);
+    // mfirst: the groups read over PCIe (slot < 0: every entry of a group shares its expert's slot) are numbered
+    // first, so their work-groups are dispatched at the start of the expert launch rather than wherever their
+    // first entry falls; the group order changes no entry's arithmetic (each entry's rows are summed alone)
+    const bool in_m = mfirst && slot < 0;
+    const int my_pack = in_m ? 0 : (my_cnt << 16) | (is_first ? 1 : 0);
+    const int my_packm = in_m ? (my_cnt << 16) | (is_first ? 1 : 0) : 0;
     const int lane = tid & 31;
     const int warp = tid >> 5;
     const int pref = sycl::inclusive_scan_over_group(
@@ -2933,7 +2945,19 @@ resident_plan_kernel(const int32_t *__restrict__ ids, int n, int k,
     if (lane == 31) {
         s_wsum[warp] = pref;
     }
+    if (mfirst) {
+        const int prefm = sycl::inclusive_scan_over_group(
+            sycl::ext::oneapi::this_work_item::get_sub_group(), my_packm,
+            sycl::plus<int>());
+        s_exclm[tid] = prefm - my_packm;
+        if (lane == 31) s_wsumm[warp] = prefm;
+    }
     item_ct1.barrier(sycl::access::fence_space::local_space);
+    int mtot = 0;   // the mirrored groups' (entries << 16 | groups), ahead of every device group
+    if (mfirst) {
+#pragma unroll
+        for (int w = 0; w < NW; ++w) mtot += s_wsumm[w];
+    }
 
     int32_t* counts = pl;
     int32_t* start = pl + 4;
@@ -2944,10 +2968,10 @@ resident_plan_kernel(const int32_t *__restrict__ ids, int n, int k,
     int32_t* start2 = pl + ptr_off + 4 * capx;
 
     if (is_first) {
-        int tot = s_excl[tid];
+        int tot = in_m ? s_exclm[tid] : s_excl[tid] + mtot;
 #pragma unroll
         for (int w = 0; w < NW; ++w) {
-            if (w < warp) tot += s_wsum[w];
+            if (w < warp) tot += in_m ? s_wsumm[w] : s_wsum[w];
         }
         const int grp_idx = tot & 0xffff;
         const int ent_start = tot >> 16;
@@ -2957,10 +2981,10 @@ resident_plan_kernel(const int32_t *__restrict__ ids, int n, int k,
     }
     if (tid < n) {
         const int fj_warp = first_j >> 5;
-        int fj_tot = s_excl[first_j];
+        int fj_tot = in_m ? s_exclm[first_j] : s_excl[first_j] + mtot;
 #pragma unroll
         for (int w = 0; w < NW; ++w) {
-            if (w < fj_warp) fj_tot += s_wsum[w];
+            if (w < fj_warp) fj_tot += in_m ? s_wsumm[w] : s_wsum[w];
         }
         const int out_idx = (fj_tot >> 16) + rank_in_group;
         dst[out_idx] = tid;
@@ -2968,9 +2992,9 @@ resident_plan_kernel(const int32_t *__restrict__ ids, int n, int k,
     }
     if (tid == 0) {
         int groups;
-        if constexpr (NW == 4) groups = (s_wsum[0] + s_wsum[1] + s_wsum[2] + s_wsum[3]) & 0xffff;   // (the 128-thread kernel as it was)
+        if constexpr (NW == 4) groups = (s_wsum[0] + s_wsum[1] + s_wsum[2] + s_wsum[3] + mtot) & 0xffff;   // (the 128-thread kernel as it was)
         else {
-            groups = 0;
+            groups = mtot;
 #pragma unroll
             for (int w = 0; w < NW; ++w) groups += s_wsum[w];
             groups &= 0xffff;
@@ -3149,6 +3173,19 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
     int32_t* use = nullptr;                    // the layer's slice of the device routing counts, if on
     if (g_mirror_table != nullptr && in_mirror_table(res_layer)) mir = g_mirror_table + (res_layer - g_mirror_res);
     if (g_usage != nullptr && in_mirror_table(res_layer)) use = g_usage + (res_layer - g_mirror_res);
+    // STRATA_PLAN_MIRROR_FIRST=1 (opt-in; default off): the groups read over PCIe (host-mirrored experts) take the first
+    // group indices of the plan, so the expert launches start their PCIe reads at once and the VRAM groups run beside
+    // them; with first-occurrence order a mirrored group can come last and its PCIe read then runs alone at the end of
+    // the launch.  Bitwise the same outputs (each entry's sums are its own; only the order of the groups changes).  B70
+    // kqbench, 2560 x 640 IQ2_S / Q2_0, 4-token window, 48 layers in a 20 GB arena, one mirrored group per layer: 203.2 ->
+    // 132.7 us per call (no mirrored group: 126.9); two: 290.1 -> 216.2 us.  Engine-neutral at 15202 slots (Flash-Next
+    // IQ2_XS, 8K prompt, ~9.4K pairs mirrored): per-window cost T2/T3/T4 29.47/43.88/57.48 ms off, 29.61/44.15/58.00 on -
+    // there the layers carry many mirrored groups and the launch is PCIe-bound whatever their order.
+    static const bool mfirst_env = [] {
+        const char* v = std::getenv("STRATA_PLAN_MIRROR_FIRST");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    const bool mfirst = mfirst_env && mir != nullptr;
     if (n_entries > kResidentPlanNarrow) {   // a 9..16-row window (kResidentPlanMax == 256 only in a wide build)
         if (kResidentPlanMax > kResidentPlanNarrow && n_entries <= kResidentPlanMax)
         {
@@ -3166,7 +3203,7 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                             resident_plan_kernel<kResidentPlanMax>(
                                 ids, n_entries, k, res_layer, n_expert,
                                 cache_base, slot_off, blob, plan, capx, skip,
-                                ring, mir, plan_err, use);
+                                ring, mir, plan_err, use, mfirst);
                         });
         } else {
             std::fprintf(stderr, "resident_plan: %d entries, at most %d\n", n_entries, kResidentPlanMax);
@@ -3186,7 +3223,7 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                     [[sycl::reqd_sub_group_size(32)]] {
                         resident_plan_kernel<kResidentPlanNarrow>(
                             ids, n_entries, k, res_layer, n_expert, cache_base,
-                            slot_off, blob, plan, capx, skip, ring, mir, plan_err, use);
+                            slot_off, blob, plan, capx, skip, ring, mir, plan_err, use, mfirst);
                     });
     }
     check("resident_plan");

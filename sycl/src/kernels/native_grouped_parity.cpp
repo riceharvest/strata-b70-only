@@ -690,47 +690,109 @@ void kq_bench(dpct::queue_ptr s, std::mt19937& rng, int nl, bool host) {
         k::native_expert_set_mode(-1, std::atoi(ph));
         std::printf("--kqbench: phase %d only\n", std::atoi(ph));
     }
+    // The engine's layout (STRATA_KQBENCH_ARENA_MIB=n): the experts sit at random slots of one n MiB device arena (the
+    // engine's expert cache: one allocation, slots in profile order, so a layer's experts are scattered over all of it);
+    // STRATA_KQBENCH_MIRROR=m: m groups of every layer point into pinned host memory instead (the engine's host-mirrored
+    // experts, read over PCIe inside the same launch), at STRATA_KQBENCH_MPOS 0 the end of the group list (default),
+    // 1 the front, 2 random places; STRATA_KQBENCH_SORT=1: the device groups of a layer in address order.
+    // STRATA_KQBENCH_SHAPES=bits: which window shapes run (1: 1 token, 2: 2 tokens, 4: 4 tokens; default all).
+    auto env_i = [](const char* n, long long d) { const char* v = std::getenv(n); return v && *v ? std::atoll(v) : d; };
+    const long long arena_mib = env_i("STRATA_KQBENCH_ARENA_MIB", 0);
+    const int n_mirror = (int) env_i("STRATA_KQBENCH_MIRROR", 0);
+    const int mpos = (int) env_i("STRATA_KQBENCH_MPOS", 0);
+    const bool sort_addr = env_i("STRATA_KQBENCH_SORT", 0) != 0;
+    const int shape_bits = (int) env_i("STRATA_KQBENCH_SHAPES", 7);
+    // STRATA_KQBENCH_SETS=n (with the arena): n graphs over different random slots, launched in turn, so consecutive
+    // launches touch different pages as the engine's windows do (one set replayed keeps the TLB warm)
+    const int n_sets = arena_mib > 0 ? std::max(1, (int) env_i("STRATA_KQBENCH_SETS", 1)) : 1;
+    if (arena_mib > 0 || n_mirror > 0)
+        std::printf("--kqbench: engine layout: arena %lld MiB, %d mirrored group(s) per layer at %s%s\n", arena_mib, n_mirror,
+                    mpos == 0 ? "the end" : mpos == 1 ? "the front" : "random places", sort_addr ? ", device groups by address" : "");
+    uint8_t* big = nullptr;
+    if (arena_mib > 0) {
+        big = (uint8_t*) sycl::malloc_device((size_t) arena_mib << 20, dpct::get_in_order_queue());
+        if (big == nullptr) { std::fprintf(stderr, "--kqbench: the %lld MiB arena does not fit\n", arena_mib); std::exit(2); }
+    }
     for (int pi = 0; pi < npairs; ++pi) {
         const auto& pr = pairs[pi];
-        for (const auto& sh : shapes) {
+        for (int si = 0; si < 3; ++si) {
+            const auto& sh = shapes[si];
+            if (!((shape_bits >> (si == 2 ? 2 : si)) & 1)) continue;
             Setup S(pr[0], pr[1], 2560, 640, sh.T, 10, 28, rng, s);
             const int ng = S.plan_sizes(*sh.sizes, 0, rng);
             // host: the arena in pinned host memory, read by the kernels over PCIe (the B70's mirrored experts)
             uint8_t* arena = host ? (uint8_t*) sycl::malloc_host(S.slot * (size_t) (nl * ng) + 256, dpct::get_in_order_queue())
-                                  : dalloc<uint8_t>(S.slot * (size_t) (nl * ng));
+                                  : big != nullptr ? nullptr : dalloc<uint8_t>(S.slot * (size_t) (nl * ng));
+            uint8_t* mirror = n_mirror > 0 ? (uint8_t*) sycl::malloc_host(S.slot * (size_t) (n_sets * nl * n_mirror) + 256,
+                                                                          dpct::get_in_order_queue()) : nullptr;
+            std::vector<size_t> slot_pick;   // the engine layout: distinct random slots of the big arena
+            if (big != nullptr) {
+                const size_t n_slots = ((size_t) arena_mib << 20) / S.slot;
+                if (n_slots < (size_t) (n_sets * nl * ng)) { std::fprintf(stderr, "--kqbench: arena too small\n"); std::exit(2); }
+                std::vector<size_t> all(n_slots);
+                std::iota(all.begin(), all.end(), (size_t) 0);
+                std::shuffle(all.begin(), all.end(), rng);
+                slot_pick.assign(all.begin(), all.begin() + n_sets * nl * ng);
+            }
             std::vector<unsigned long long*> lp;
-            for (int l = 0; l < nl; ++l) {
+            for (int l = 0; l < n_sets * nl; ++l) {
                 std::vector<unsigned long long> p;
+                std::vector<int> mj;   // the group indices of this layer that read host memory
+                if (n_mirror > 0) {
+                    std::vector<int> idx(ng);
+                    std::iota(idx.begin(), idx.end(), 0);
+                    if (mpos == 2) std::shuffle(idx.begin(), idx.end(), rng);
+                    for (int i = 0; i < std::min(n_mirror, ng); ++i) mj.push_back(mpos == 0 ? ng - 1 - i : idx[(size_t) i]);
+                }
+                int mi = 0;
                 for (int j = 0; j < ng; ++j) {
-                    uint8_t* d = arena + S.slot * (size_t) (l * ng + j);
+                    const bool on_host = std::find(mj.begin(), mj.end(), j) != mj.end();
+                    uint8_t* d = on_host ? mirror + S.slot * (size_t) (l * n_mirror + mi++)
+                               : big != nullptr ? big + S.slot * slot_pick[(size_t) (l * ng + j)]
+                                                : arena + S.slot * (size_t) (l * ng + j);
                     dpct::get_in_order_queue().memcpy(d, S.blobs + S.slot * (size_t) (j % S.n_blobs), S.L.bytes).wait();
                     p.push_back((unsigned long long) d);
+                }
+                if (sort_addr) {   // the device groups by address; the plan's group sizes stay where they are
+                    std::vector<unsigned long long> dev;
+                    for (int j = 0; j < ng; ++j)
+                        if (std::find(mj.begin(), mj.end(), j) == mj.end()) dev.push_back(p[(size_t) j]);
+                    std::sort(dev.begin(), dev.end());
+                    size_t di = 0;
+                    for (int j = 0; j < ng; ++j)
+                        if (std::find(mj.begin(), mj.end(), j) == mj.end()) p[(size_t) j] = dev[di++];
                 }
                 unsigned long long* dp = dalloc<unsigned long long>(p.size());
                 dpct::get_in_order_queue().memcpy(dp, p.data(), p.size() * 8).wait();
                 lp.push_back(dp);
             }
-            dpct::experimental::command_graph_ptr g;
-            dpct::experimental::begin_recording(s);
-            for (int l = 0; l < nl; ++l)
-                k::native_expert_grouped(S.L, lp[l], S.start, S.n, S.dst, S.tok, S.cap, S.cap, S.xq, S.scr, S.out, s, 0);
-            dpct::experimental::end_recording(s, &g);
-            auto* ge = new sycl::ext::oneapi::experimental::command_graph<
-                sycl::ext::oneapi::experimental::graph_state::executable>(g->finalize());
-            delete g;
+            std::vector<sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>*> ges;
+            for (int st = 0; st < n_sets; ++st) {
+                dpct::experimental::command_graph_ptr g;
+                dpct::experimental::begin_recording(s);
+                for (int l = 0; l < nl; ++l)
+                    k::native_expert_grouped(S.L, lp[(size_t) (st * nl + l)], S.start, S.n, S.dst, S.tok, S.cap, S.cap, S.xq, S.scr,
+                                             S.out, s, 0);
+                dpct::experimental::end_recording(s, &g);
+                ges.push_back(new sycl::ext::oneapi::experimental::command_graph<
+                              sycl::ext::oneapi::experimental::graph_state::executable>(g->finalize()));
+                delete g;
+            }
             std::vector<float> t;
             for (int i = 0; i < 60; ++i) {
-                const float us = launch_us(s, ge, e0, e1) * 48.0f / (float) nl;
+                const float us = launch_us(s, ges[(size_t) (i % n_sets)], e0, e1) * 48.0f / (float) nl;
                 if (i >= 20) t.push_back(us);
             }
-            delete ge;
+            for (auto* ge : ges) delete ge;
             const double mb = (double) ng * (double) S.L.bytes / 1e6, us = median(t);
             std::printf("  %-7s/%-6s %-26s %8.2f us  %6.2f MB  %6.1f GB/s\n", name_of(pr[0]), name_of(pr[1]), sh.what, us,
                         mb, mb * 1e3 / us);
             for (auto* p : lp) sycl::free(p, dpct::get_in_order_queue());
-            sycl::free(arena, dpct::get_in_order_queue());
+            if (arena != nullptr) sycl::free(arena, dpct::get_in_order_queue());
+            if (mirror != nullptr) sycl::free(mirror, dpct::get_in_order_queue());
         }
     }
+    if (big != nullptr) sycl::free(big, dpct::get_in_order_queue());
     dpct::destroy_event(e0);
     dpct::destroy_event(e1);
 }

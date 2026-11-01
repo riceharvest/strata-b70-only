@@ -252,7 +252,16 @@ bool MtpDrafter::make_q4_head(std::string& err) {
         tt->to_float(src.data() + (size_t) r * in_row, row.data(), N);
         ggml_quantize_chunk(GGML_TYPE_Q4_0, row.data(), dst.data() + (size_t) r * out_row, 0, 1, N, nullptr);
     }
-    // the Q4_0 rows replace the subset in place (they are smaller)
+    // the Q4_0 rows replace the subset in place when they are smaller (Q5_K / Q6_K heads); an IQ4_XS head's rows
+    // (136 B per 256 values) are smaller than Q4_0's (144 B), so the in-place copy wrote past the end of the
+    // buffer (--mtp-q4 all / head: SIGSEGV at start-up on an IQ4_XS head): those get a buffer of their own
+    if (dst.size() > src.size()) {
+        uint8_t* bigger = (uint8_t*) sycl::malloc_device(dst.size(), dpct::get_in_order_queue());
+        if (bigger == nullptr) { err = "mtp: the Q4_0 draft head does not fit"; return false; }
+        sycl::free(dhead_, dpct::get_in_order_queue());
+        dhead_ = bigger;
+        vram_ += dst.size() - src.size();
+    }
     try { dpct::get_in_order_queue().memcpy(dhead_, dst.data(), dst.size()).wait(); }
     catch (sycl::exception const&) { err = "mtp: writing the draft head"; return false; }
     dhead_type_ = GGML_Q4_0;
