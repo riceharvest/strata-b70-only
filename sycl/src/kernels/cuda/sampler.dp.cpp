@@ -1086,8 +1086,9 @@ __dpct_inline__ void
 sampler_split_part_kernel(const float *__restrict__ logits, int n_vocab,
                           const int *__restrict__ history, int history_len,
                           const SamplerParams p, int k, int n_blocks,
-                          sycl::int2 *__restrict__ cand) {
+                          sycl::int2 *__restrict__ cand, int stride = -1) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    if (stride < 0) stride = k;   // the lists' spacing in `cand` (the draft sampler: kpart, with k = the request's top_k)
     const int t = item_ct1.get_group(1);
     const float* l = logits + (size_t) t * n_vocab;
     const int warp = (int)(item_ct1.get_local_id(2) >> 5),
@@ -1183,7 +1184,7 @@ sampler_split_part_kernel(const float *__restrict__ logits, int n_vocab,
     item_ct1.barrier(sycl::access::fence_space::local_space);
     if (warp == 0) {
         sycl::int2 *dst =
-            cand + ((size_t)t * n_blocks + item_ct1.get_group(2)) * k;
+            cand + ((size_t)t * n_blocks + item_ct1.get_group(2)) * stride;
         warp_merge_lists(&wl[0][0], kSplitWarps, kSelMax, k, n_vocab, [&](int r, float v, int id) {
             if (lane == 0) dst[r] = sycl::int2(id, sycl::bit_cast<int>(v));
         });
@@ -2308,6 +2309,12 @@ void spec_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const in
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
+        // STRATA_SPEC_DRAFT_TOPK (default 1): each block's list holds only the request's top_k (read on the device): the
+        // merge takes the first top_k of the union, which lie in the first top_k of each list - the same q, bit for bit,
+        // with top_k instead of 64 selection rounds per block (the draft sampler's lists 0.25 -> 0.11 ms a draft step
+        // at top_k 20).  0: 64 rounds (the lists' capacity), as before.
+        static const bool topk_lists = [] { const char* v = std::getenv("STRATA_SPEC_DRAFT_TOPK"); return !(v && v[0] == '0'); }();
+        const SamplerParams* dpp = topk_lists ? params : nullptr;
         s->parallel_for<
             dpct_kernel_name<class sampler_split_part_kernel_b56ef5>>(
             sycl::nd_range<3>(sycl::range(1, 1u, (unsigned)n_blocks) *
@@ -2315,9 +2322,10 @@ void spec_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const in
                               sycl::range(1, 1, kSplitWarps * 32)),
             exp_props,
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                const int kk = dpp != nullptr ? sampled_k(dpp->top_k, nv) : kpart;
                 sampler_split_part_kernel(logits, nv, nullptr, 0,
-                                          SamplerParams{}, kpart, n_blocks,
-                                          (sycl::int2 *)scratch);
+                                          SamplerParams{}, kk < kpart ? kk : kpart, n_blocks,
+                                          (sycl::int2 *)scratch, kpart);
             });
     }
     coupled_check("spec_draft split part");
