@@ -29,7 +29,7 @@ Anything that misses one of these is labelled "works, not usable".
 
 ## Speed
 
-Qwen3.8-Flash-Next IQ2_XS on one Arc Pro B70, Ryzen 9 5950X, 64 GB RAM, measured 2026-11-01. Settings:
+Qwen3.8-Flash-Next IQ2_XS on one Arc Pro B70, Ryzen 9 5950X, 64 GB RAM, measured 2026-11-02 (by day). Settings:
 
 - MTP draft, `--spec 4`, int8 KV, 32K of the KV in VRAM, `--prefill 16384`
 - 7 GB of VRAM kept free, because the card also drives a desktop; `STRATA_MIRROR_MIB=25000` (24 GiB of experts pinned in RAM)
@@ -39,11 +39,24 @@ Qwen3.8-Flash-Next IQ2_XS on one Arc Pro B70, Ryzen 9 5950X, 64 GB RAM, measured
 
 | Context | Prompt (tok/s) | Answer (tok/s) |
 | --- | ---: | ---: |
-| 118K | 3,228 / 3,213 | 71.7 / 71.5 |
-| 250K | 3,171 / 3,169 / 3,174 | 70.5 / 70.4 / 69.5 |
+| 118K | 3,343 / 3,402 | 76.8 / 76.6 |
+| 250K | 3,333 / 3,339 / 3,335 | 75.4 / 76.4 / 75.6 |
+
+Short cold prompts (one user message, nothing cached, same settings but 3 GB kept free), prompt read time and time to the
+first token:
+
+| Prompt | Read (tok/s) | First token |
+| --- | ---: | ---: |
+| 135 tokens | 340 ms (397) | 377 ms |
+| 393 tokens | 416 ms (944) | 454 ms |
+| 1,178 tokens | 678 ms (1,738) | 728 ms |
+| 5,382 tokens | 2,008 ms (2,680) | 2,121 ms |
+
+A short prompt cannot reach the long prompts' speed: about 40% of the experts live in RAM, and a few hundred tokens
+already route to most of them, so every read has to bring most of those across PCIe whatever its length.
 
 The 250K row is the same test with a 249,618-token prompt (more of the same docs, the fact in the middle, found every
-time) and `--max-context 262144`, three runs. Before the 2026-11-01 work the same tests read 2,861 / 2,857 tok/s at 118K
+time) and `--max-context 262144`, three runs. On 2026-11-01 the same tests read 3,228 / 3,213 and 3,171-3,174 tok/s with answers at 71.7 / 71.5 and 69.5-70.5 tok/s; the 2026-11-02 work (decode graphs without the shared-expert fork, cheaper drafts, the prompt's expert copies started a layer ahead, smaller tiles for experts of few rows) made the prompts 4-6% and the answers 7% faster here, and short prompts 20-30% faster to their first token ([docs/B70.md](docs/B70.md#short-prompts-2026-11-02)). Before the 2026-11-01 work the same tests read 2,861 / 2,857 tok/s at 118K
 and 2,750 / 2,832 at 250K: the prompt is now read 12-15% faster in these runs (14-18% in the night runs), mostly from mirroring the experts a prompt chunk
 borrows (the default now; it needs the `STRATA_MIRROR_MIB` above) and, past ~201K tokens, from keeping the prompt's
 selection on XMX. The answers are 6-8% faster than that day's first runs (64.6-67.8 tok/s): the experts that are not in
