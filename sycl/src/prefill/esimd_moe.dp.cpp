@@ -1702,7 +1702,7 @@ int f16_mt_env() {
     return v;
 }
 int f16_small_rows() {
-    static const int v = [] { const char* e = std::getenv("STRATA_F16X_SMALL"); return e ? std::max(0, std::atoi(e)) : 0; }();
+    static const int v = [] { const char* e = std::getenv("STRATA_F16X_SMALL"); return e ? std::max(0, std::atoi(e)) : 64; }();   // default 64 (prefill.cpp pf_f16_small)
     return v;
 }
 int f16_mt_for(const int32_t* cnt, int n, int mt, uint64_t skip = 0) {

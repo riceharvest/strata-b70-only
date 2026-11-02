@@ -472,7 +472,7 @@ inline bool f16x_on(void* cs, int gu_type, int d_type, int64_t n_ff, int64_t n_e
 inline int pf_nat_rows() {
     static const int v = [] {
         const char* e = std::getenv("STRATA_PF_NAT");
-        return e != nullptr ? std::max(0, std::min(std::atoi(e), 16)) : 0;
+        return e != nullptr ? std::max(0, std::min(std::atoi(e), 16)) : 4;   // default 4 (B70 short reads: see below); 0 = off
     }();
     return v;
 }
@@ -507,17 +507,21 @@ inline bool pf_nat_fmt(int gu_type) {
     }();
     return v.empty() || std::find(v.begin(), v.end(), gu_type) != v.end();
 }
+// Defaults since the short-prompt round (2026-11-02): STRATA_F16X_SMALL=64, STRATA_F16X_OVER_I8=1 and STRATA_PF_NAT=4 are on (=0 off each).
+// Stacked on the copy overlap (STRATA_PF_PREDICT etc.), pfshort A B B A on the B70: SMALL alone -10..-25 ms TTFT on 130-400-token
+// cold prompts (bitwise), all three -25..-50 ms (the IQ2_XXS and IQ1_M layers' small experts change numerics: 5 of 14 greedy texts,
+// first logits max |d| 0.28 at 300 tokens, 0.89 at 4,800, top-1/top-5 unchanged), 1.2K-4.8K tokens neutral.
 // STRATA_F16X_SMALL=<rows> (bitwise; 64 measured): the FP16 products of a held group whose experts average at most <rows> rows take
 // 8-, 16- or 64-row tiles by a cost model of the group's row counts (esimd_moe.dp.cpp f16_mt_for); the groups of 16 or fewer experts
 // take the held-group launch for it (gate_up_f16_n: the same bits as gate_up_f16).  STRATA_F16X_OVER_I8=1 (changes the IQ2_XXS layers' numerics, to the FP16
 // chain's): a group at or under <rows> takes the FP16 products instead of the int8 chain (native_grouped_parity --pfbench, IQ2_XXS at
 // 6 rows an expert: int8 9.4 us an expert, FP16 with 8-row tiles 7.2).
 inline int pf_f16_small() {
-    static const int v = [] { const char* e = std::getenv("STRATA_F16X_SMALL"); return e ? std::max(0, std::atoi(e)) : 0; }();
+    static const int v = [] { const char* e = std::getenv("STRATA_F16X_SMALL"); return e ? std::max(0, std::atoi(e)) : 64; }();
     return v;
 }
 inline bool pf_f16_over_i8() {
-    static const bool v = [] { const char* e = std::getenv("STRATA_F16X_OVER_I8"); return e != nullptr && e[0] == '1'; }();
+    static const bool v = [] { const char* e = std::getenv("STRATA_F16X_OVER_I8"); return !(e != nullptr && e[0] == '0'); }();
     return v && pf_f16_small() > 0;
 }
 // the entries one call may hold: a held group (up to i8::kMaxGroupH experts) at the larger limit
