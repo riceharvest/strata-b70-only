@@ -2858,7 +2858,8 @@ resident_plan_kernel(const int32_t *__restrict__ ids, int n, int k,
                      uint32_t ring, const unsigned long long *__restrict__ mir,
                      volatile uint32_t *plan_err, int32_t *usage, bool mfirst,
                      uint8_t *stage, long long sstride, unsigned long long *msrc, uint8_t *rbase, int32_t *rof,
-                     int32_t *rof_g, int32_t *rtag, uint8_t *rref, int32_t *rhand, int R, int key_base) {
+                     int32_t *rof_g, int32_t *rtag, uint8_t *rref, int32_t *rhand, int R, int key_base,
+                     uint32_t *mstat) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     constexpr int NW = NT / 32;
     auto &s_ids =
@@ -2982,6 +2983,17 @@ resident_plan_kernel(const int32_t *__restrict__ ids, int n, int k,
                 rslot = cs;
                 rnew = true;
             }
+        }
+    }
+    // STRATA_MIRROR_STATS (measurement): this layer's calls, entries, groups, VRAM groups, ring hits, ring inserts and
+    // groups copied to (or read from) a per-call staging blob / the mirror
+    if (mstat != nullptr) {
+        using aref = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                      sycl::access::address_space::global_space>;
+        if (tid == 0) { aref(mstat[0]).fetch_add(1u); aref(mstat[1]).fetch_add((uint32_t) n); }
+        if (is_first) {
+            aref(mstat[2]).fetch_add(1u);
+            aref(mstat[slot >= 0 ? 3 : rnew ? 5 : rslot >= 0 ? 4 : 6]).fetch_add(1u);
         }
     }
     // mfirst: the groups read over PCIe (slot < 0: every entry of a group shares its expert's slot) are numbered
@@ -3237,6 +3249,7 @@ int32_t* g_rtag = nullptr;                 // per ring slot: its (layer, expert)
 uint8_t* g_rref = nullptr;                 // per ring slot: the clock's count (0..2)
 int32_t* g_rhand = nullptr;                // the clock hand
 int g_ring_n = 0;
+uint32_t* g_mstat = nullptr;               // STRATA_MIRROR_STATS: [n_layers][8] device counters (mirror_stats_*)
 long long g_mirror_entries = 0;   // 0: unchecked
 // #1980: the layer slice `res_layer` belongs to the table the mirror was set for (a later stage passes its own)
 bool in_mirror_table(const int32_t* res_layer) {
@@ -3259,6 +3272,22 @@ int mirror_ring_slots() {
         return v != nullptr && *v ? std::max(0, std::atoi(v)) : 1024;
     }();
     return n;
+}
+bool mirror_stats_enable(int n_layers) {
+    if (g_mstat != nullptr) return true;
+    if (n_layers <= 0) return false;
+    sycl::queue& q = dpct::get_in_order_queue();
+    try { g_mstat = sycl::malloc_device<uint32_t>((size_t) n_layers * 8, q); } catch (const sycl::exception&) { g_mstat = nullptr; }
+    if (g_mstat == nullptr) return false;
+    q.memset(g_mstat, 0, (size_t) n_layers * 8 * 4).wait();
+    return true;
+}
+bool mirror_stats_read(uint32_t* out, int n_layers, bool reset) {
+    if (g_mstat == nullptr) return false;
+    sycl::queue& q = dpct::get_in_order_queue();
+    q.memcpy(out, g_mstat, (size_t) n_layers * 8 * 4).wait();
+    if (reset) q.memset(g_mstat, 0, (size_t) n_layers * 8 * 4).wait();
+    return true;
 }
 static int g_ring_grant = 0;
 void mirror_ring_grant(int slots) { g_ring_grant = std::max(0, slots); }
@@ -3354,6 +3383,7 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
     uint8_t* rrf = g_rref;
     int32_t* rhd = g_rhand;
     const int rn = g_ring_n;
+    uint32_t* mst = g_mstat != nullptr && mir != nullptr ? g_mstat + (size_t) (kb / n_expert) * 8 : nullptr;
     if (n_entries > kResidentPlanNarrow) {   // a 9..16-row window (kResidentPlanMax == 256 only in a wide build)
         if (kResidentPlanMax > kResidentPlanNarrow && n_entries <= kResidentPlanMax)
         {
@@ -3371,7 +3401,7 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                             resident_plan_kernel<kResidentPlanMax>(
                                 ids, n_entries, k, res_layer, n_expert,
                                 cache_base, slot_off, blob, plan, capx, skip,
-                                ring, mir, plan_err, use, mfirst, stg, sstr, ssrc, rng, rof, rofg, rtg, rrf, rhd, rn, kb);
+                                ring, mir, plan_err, use, mfirst, stg, sstr, ssrc, rng, rof, rofg, rtg, rrf, rhd, rn, kb, mst);
                         });
         } else {
             std::fprintf(stderr, "resident_plan: %d entries, at most %d\n", n_entries, kResidentPlanMax);
@@ -3391,7 +3421,7 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                     [[sycl::reqd_sub_group_size(32)]] {
                         resident_plan_kernel<kResidentPlanNarrow>(
                             ids, n_entries, k, res_layer, n_expert, cache_base,
-                            slot_off, blob, plan, capx, skip, ring, mir, plan_err, use, mfirst, stg, sstr, ssrc, rng, rof, rofg, rtg, rrf, rhd, rn, kb);
+                            slot_off, blob, plan, capx, skip, ring, mir, plan_err, use, mfirst, stg, sstr, ssrc, rng, rof, rofg, rtg, rrf, rhd, rn, kb, mst);
                     });
     }
     check("resident_plan");

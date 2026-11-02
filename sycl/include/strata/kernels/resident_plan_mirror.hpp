@@ -28,6 +28,12 @@ int mirror_ring_slots();
 /// the verifier makes no ring, so the ring never takes VRAM the cache's budget did not leave it.
 void mirror_ring_grant(int slots);
 int mirror_ring_granted();
+/// STRATA_MIRROR_STATS (measurement): device counters per layer, 8 each: plan calls, routed entries, groups (distinct
+/// experts), VRAM-cache groups, ring hits, ring inserts (copied into the ring), other mirrored groups (a per-call staging
+/// blob, or read over PCIe without a stage), 0.  Enable once before the graphs are captured; read (and reset) between
+/// requests.
+bool mirror_stats_enable(int n_layers);
+bool mirror_stats_read(uint32_t* out, int n_layers, bool reset);
 /// Copy the plan's mirrored list (src[j] -> ptr2[j], counts[2] blobs of blob_bytes) into VRAM.
 void mirror_stage(const int32_t* plan, long long capx, long long blob_bytes, const unsigned long long* src, void* stream);
 }

@@ -11275,7 +11275,10 @@ int main(int argc, char **argv) try {
         vh.d_res = thits.d_res;
         // 0.1.44 --expert-profile-save under STRATA_VERIFY_NO_HOST (no adaptive tier, so no host-side counts): the device
         // plan counts every routed expert of the verify windows and the saved profile is ranked from those counts.
-        if (mirror_table_d && !o.expert_profile_save.empty()) {
+        // STRATA_USAGE_DUMP=PATH (measurement) in serve mode: after each request the counts so far (raw table) go to PATH
+        const char* usage_dump_srv = std::getenv("STRATA_USAGE_DUMP");
+        if (usage_dump_srv != nullptr && *usage_dump_srv == '\0') usage_dump_srv = nullptr;
+        if (mirror_table_d && (!o.expert_profile_save.empty() || usage_dump_srv != nullptr)) {
             usage_dev_srv = sycl::malloc_device<int32_t>((size_t) (g.n_layers * g.n_expert), dpct::get_in_order_queue());
             dpct::get_in_order_queue().memset(usage_dev_srv, 0, (size_t) (g.n_layers * g.n_expert) * 4).wait();
         }
@@ -11316,6 +11319,9 @@ int main(int argc, char **argv) try {
             }
         }
         if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d, usage_dev_srv, (long long) (g.n_layers * g.n_expert));
+        // STRATA_MIRROR_STATS=1 (measurement): the device plan counts per layer what each window's groups read from where
+        const bool mstats_on = mirror_table_d != nullptr && std::getenv("STRATA_MIRROR_STATS") != nullptr &&
+                               std::getenv("STRATA_MIRROR_STATS")[0] == '1' && strata::kernels::mirror_stats_enable((int) g.n_layers);
         // STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, with STRATA_ROUTE_RESIDENT=<margin>; changes the output): the MTP
         // draft's router gets the same residency bias, with the last layer's residency row as its table (single GPU)
         if (use_mtp && stages.empty() && thits.d_res != nullptr && std::getenv("STRATA_ROUTE_RESIDENT") != nullptr &&
@@ -19035,6 +19041,40 @@ int main(int argc, char **argv) try {
             if (lex.on() && !lex.drain(err)) {   // no exchange in flight while the next prompt is read
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
+            }
+            if (mstats_on && dec_windows > 0) {   // STRATA_MIRROR_STATS: this request's windows (the counters restart)
+                std::vector<uint32_t> ms((size_t) g.n_layers * 8);
+                if (strata::kernels::mirror_stats_read(ms.data(), (int) g.n_layers, true)) {
+                    double c[8] = {0, 0, 0, 0, 0, 0, 0, 0}, mb_ring = 0, mb_other = 0;
+                    const auto& lay = strata::kernels::cpu::expert_layout();
+                    for (int64_t l = 0; l < g.n_layers; ++l) {
+                        for (int j = 0; j < 8; ++j) c[j] += ms[(size_t) l * 8 + j];
+                        const double bb = lay.native ? (double) lay.blob_bytes(l) : 0.0;
+                        mb_ring += ms[(size_t) l * 8 + 5] * bb / 1e6;
+                        mb_other += ms[(size_t) l * 8 + 6] * bb / 1e6;
+                    }
+                    const double w = (double) dec_windows;
+                    std::fprintf(stderr, "strata decode mirror stats: %lld windows, per window: %.1f plan calls, %.1f entries, %.1f groups = "
+                                         "VRAM %.1f (%.1f%%) + ring hits %.1f (%.1f%%) + ring inserts %.1f (%.1f%%) + staged/direct %.1f; "
+                                         "copied %.1f MB/window (ring %.1f + other %.1f) = %.2f ms at 25.5 GB/s; lean swaps %lld\n",
+                                 (long long) dec_windows, c[0] / w, c[1] / w, c[2] / w, c[3] / w, 100.0 * c[3] / std::max(1.0, c[2]),
+                                 c[4] / w, 100.0 * c[4] / std::max(1.0, c[2]), c[5] / w, 100.0 * c[5] / std::max(1.0, c[2]), c[6] / w,
+                                 (mb_ring + mb_other) / w, mb_ring / w, mb_other / w, (mb_ring + mb_other) / w / 25.5,
+                                 (long long) (lex.on() ? lex.done() : 0));
+                }
+            }
+            if (usage_dump_srv != nullptr && usage_dev_srv != nullptr) {   // STRATA_USAGE_DUMP (serve): "STRU", L, E, counts
+                std::vector<int32_t> uh((size_t) (g.n_layers * g.n_expert));
+                dpct::get_in_order_queue().memcpy(uh.data(), usage_dev_srv, uh.size() * 4).wait();
+                const std::string tmp = std::string(usage_dump_srv) + ".tmp";
+                if (FILE* uf = std::fopen(tmp.c_str(), "wb")) {
+                    const int32_t hdr[3] = {0x55525453, (int32_t) g.n_layers, (int32_t) g.n_expert};
+                    std::fwrite(hdr, 4, 3, uf);
+                    std::fwrite(uh.data(), 4, uh.size(), uf);
+                    std::fclose(uf);
+                    std::rename(tmp.c_str(), usage_dump_srv);
+                } else
+                    std::fprintf(stderr, "strata serve: STRATA_USAGE_DUMP: cannot write %s\n", tmp.c_str());
             }
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();
