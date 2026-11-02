@@ -16933,10 +16933,16 @@ int main(int argc, char **argv) try {
             // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
             // participant's own cache, and marking only that participant's own layers
             int64_t seg_lend = 0;   // the loan the last lend left (the largest participant's chunk; 0: none)
+            int64_t lend_to = 0;    // STRATA_PF_STAGE_FIT: the end of the part the next lend is for (its K/V stage's cells)
             auto lend = [&](int64_t tokens, std::string &e,
                             int64_t exact) -> bool {
                 try {
             seg_lend = 0;
+                // STRATA_PF_STAGE_FIT (read by the prompt path): the K/V stage priced and laid out for this part's end only
+                struct StageCells {
+                    explicit StageCells(int64_t c) { strata::prefill::Prefill::set_stage_cells(c); }
+                    ~StageCells() { strata::prefill::Prefill::set_stage_cells(0); }
+                } stage_cells_scope(lend_to);
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
@@ -16956,7 +16962,8 @@ int main(int argc, char **argv) try {
                 for (PfPart& p : pf_parts) {
                     if (p.first < 0) continue;
                     if (!p.lent.empty()) {
-                        if (want <= p.lent_chunk) continue;            // its current loan already covers this
+                        // its current loan already covers this (and its K/V stage this part's end)
+                        if (want <= p.lent_chunk && p.sp->stage_cells() >= lend_to) continue;
                         // ONLY this participant's loan goes back: `refill` would return the other participants'
                         // loans too, and their buffers are still laid out in their caches - marking those slots
                         // resident again would hand the next window a prompt buffer in place of an expert
@@ -16991,7 +16998,7 @@ int main(int argc, char **argv) try {
                                          (long long) need_p, (long long) (p.cache->slots() - p.first));
                         first = (int32_t) (p.cache->slots() - need_p);
                     }
-                    if (want_p != p.sp->chunk() || first != p.first_now) {
+                    if (want_p != p.sp->chunk() || first != p.first_now || p.sp->stage_cells() < lend_to) {
                         if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
                         p.first_now = first;
                     }
@@ -17710,6 +17717,8 @@ int main(int argc, char **argv) try {
                 // another, and the loan decides which experts are read in place: bits)
                 const int64_t plan_lend = resume_plan.chunk > 0 && at == resume_plan_at && to == resume_plan_end
                                               ? resume_plan.lend : 0;
+                // the request's end: its later parts read in the same stage (no relayout between them); one participant only
+                lend_to = pf_parts.size() == 1 ? n : 0;
                 if (!win && !lend(to - at, err, plan_lend)) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
                     return 1;

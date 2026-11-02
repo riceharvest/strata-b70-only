@@ -129,6 +129,11 @@ public:
     /// #583: the auto chunk scan's byte-budget ring, for chunks above `small_max` (0.1.39's auto chunk: a prompt that
     /// fits it keeps 0.1.39's ring).  0 slots = none.  A layer split's set_ring_override and STRATA_PREFILL_RING win.
     static void set_ring_budget(int slots, int64_t small_max);
+    /// STRATA_PF_STAGE_FIT (default on): the cells the next loan's KV stage must hold (the end of the part it is lent for), set by the
+    /// lend around its bytes_needed and relayout; 0 (the default) = the whole context.  stage_cells(): what the current
+    /// layout's stage holds (INT64_MAX: the whole context, or no KV streaming).
+    static void set_stage_cells(int64_t cells);
+    int64_t stage_cells() const;
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).  `src`: init gets an
     /// ExpertSource (carve picks the fused MoE layout only then).
