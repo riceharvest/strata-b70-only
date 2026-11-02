@@ -45,6 +45,7 @@
 namespace strata::prefill { void set_nonresident_share(double share); }   // SYCL port: prefill.cpp
 #include "strata/kernels/resident_plan_mirror.hpp"
 #include "strata/core/lean_exchange.hpp"
+#include "strata/copy_queue.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/pin_budget.hpp"
@@ -16844,6 +16845,75 @@ int main(int argc, char **argv) try {
               std::exit(1);
             }
             };
+            // STRATA_REFILL_DEFER (default on, =0 off): the loan of the prompt's LAST batched part is given back on the
+            // copy engine while the first decode window runs, instead of before it (49 / 75 / 144 ms for 546 / 932 / 2052
+            // slots at 193K, all of it before the first token).  Its experts stay out of the residency table until the
+            // copies have landed: that window reads them from their pinned mirror (every lent expert must have one),
+            // the lean exchange skips that window, and the table takes them back at the start of the second window
+            // (or after the request).  Same bytes in the same slots; nothing else reads the loan's slots meanwhile.
+            static const bool refill_defer_env = [] { const char* v = std::getenv("STRATA_REFILL_DEFER"); return v == nullptr || std::atoi(v) != 0; }();
+            struct RefillDefer {
+                bool on = false;
+                sycl::event ev;
+                int64_t n = 0;
+                Clock::time_point t0;
+                double issue_ms = 0.0;
+            } rfd;
+            auto refill_defer = [&](std::string& e) -> bool {   // false: not deferred (refill as before)
+                (void) e;
+                if (!refill_defer_env || rfd.on || pipe || n_pipe != 1 || o.batch != 0 || batch_on() || admit_slot >= 0 ||
+                    refill_parts || refill_blocking() || srcp != &gguf_src || pf_parts.size() != 1)
+                    return false;
+                PfPart& p = pf_parts[0];
+                if (p.lent.empty()) return false;
+                for (const auto& [i, slot] : p.lent)
+                    if (!gguf_src.pinned((int64_t) i / g.n_expert, (int64_t) i % g.n_expert)) return false;
+                static sycl::queue* rq = strata::make_copy_engine_queue("the deferred refill's expert");
+                if (rq == nullptr) return false;
+                const strata::core::OnDevice on(p.dev);
+                const auto t0 = Clock::now();
+                const auto& lay = strata::kernels::cpu::expert_layout();
+                sycl::event last;
+                for (const auto& [i, slot] : p.lent) {
+                    const int64_t l = (int64_t) i / g.n_expert;
+                    const uint8_t* b = gguf_src.blob(l, (int64_t) i % g.n_expert);   // the pinned mirror (checked above)
+                    uint8_t* dst = p.cache->device_slot(slot);
+                    if (b == nullptr || dst == nullptr) {   // nothing queued yet that matters: the copies are the same
+                        rq->wait();
+                        return false;
+                    }
+                    last = rq->memcpy(dst, b, (size_t) lay.blob_bytes(l));
+                }
+                rfd.on = true;
+                rfd.ev = last;
+                rfd.n = (int64_t) p.lent.size();
+                rfd.t0 = t0;
+                rfd.issue_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                return true;
+            };
+            // the deferred loan back in the table, once its copies have landed (waits for them)
+            auto refill_defer_finish = [&](const char* where) -> bool {
+                if (!rfd.on) return true;
+                const auto tw = Clock::now();
+                try {
+                    rfd.ev.wait_and_throw();
+                } catch (sycl::exception const& exc) {
+                    std::fprintf(stderr, "strata serve: the deferred refill failed: %s\n", exc.what());
+                    return false;
+                }
+                const double wait_ms = std::chrono::duration<double, std::milli>(Clock::now() - tw).count();
+                PfPart& p = pf_parts[0];
+                for (const auto& [i, slot] : p.lent) host_res[(size_t) i] = slot;
+                p.lent.clear();
+                p.lent_chunk = 0;
+                const bool up = res_upload() == 0;
+                rfd.on = false;
+                if (trace)
+                    std::fprintf(stderr, "strata trace: deferred refill of %lld slots: queued in %.1f ms, landed %.1f ms after, "
+                                         "waited %.1f ms %s\n", (long long) rfd.n, rfd.issue_ms,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - rfd.t0).count(), wait_ms, where);
+                return up;
+            };
             // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
             // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
             // participant's own cache, and marking only that participant's own layers
@@ -17617,7 +17687,7 @@ int main(int argc, char **argv) try {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
-                if (win && !refill(err)) {
+                if (win && !(to == n - 1 && refill_defer(err)) && !refill(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
@@ -17695,7 +17765,7 @@ int main(int argc, char **argv) try {
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
             }
-            if (!refill(err)) {
+            if (!rfd.on && !(!cancelled && refill_defer(err)) && !refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;
             }
@@ -18581,6 +18651,10 @@ int main(int argc, char **argv) try {
                 }
             }
             while (!pl_ran && !cancelled && produced_n < max_new) {
+                if (rfd.on && !first_window && !refill_defer_finish("before the second window")) {
+                    std::printf("ERR the deferred refill of the lent slots failed\n");
+                    return 1;
+                }
                 int T = 1;
                 policy.set_context(p);
                 const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
@@ -18821,7 +18895,7 @@ int main(int argc, char **argv) try {
                     return 1;
                 }
                 tr("window", p, T);
-                if (lex.on() && !lex.step(err)) {   // STRATA_LEAN_EXCHANGE: between two windows
+                if (lex.on() && !rfd.on && !lex.step(err)) {   // STRATA_LEAN_EXCHANGE: between two windows (not while a loan is out)
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
@@ -18877,7 +18951,7 @@ int main(int argc, char **argv) try {
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
                 // (--adapt-async 1: the asynchronous tier above instead, ticked before the window)
-                if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_iv(rounds)) == 0)
+                if (!drive.d.usage.empty() && !ajob && !rfd.on && ((rounds + 1) % o.adapt_iv(rounds)) == 0)
                     adapt_thr = std::thread([&] { strata::platform::name_this_thread("strata-adapt"); strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
@@ -19031,6 +19105,10 @@ int main(int argc, char **argv) try {
                 if (stop_req.load()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
                 p += a + 1;
+            }
+            if (!refill_defer_finish("after the request")) {   // a request of one window (or none) still has its loan out
+                std::printf("ERR the deferred refill of the lent slots failed\n");
+                return 1;
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
