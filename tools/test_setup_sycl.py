@@ -197,6 +197,24 @@ class ToSycl(unittest.TestCase):
         c = m.to_sycl(self.cfg(m, ["--expert-profile", shipped]), m.ROOT / "build-sycl" / "strata", 64.0, {}, 8.0, "i915")
         self.assertTrue(c["args"][c["args"].index("--expert-profile") + 1].endswith("expert-profile.bin"))   # the CPU computes the misses there
 
+    def test_a_long_context_drafts_over_the_last_8192_cells_and_asks_for_the_code_subset(self):
+        m = self.mod()
+        mtp = ["--mtp", str(m.MOUNT / "d" / "mtp" / "rt")]
+        long = self.cfg(m, mtp)
+        long["args"][long["args"].index("--max-context") + 1] = "262144"
+        c = m.to_sycl(long, m.ROOT / "build-sycl-aot" / "strata", 64.0, {}, 32.0, "xe", fit=False)
+        self.assertEqual(c["args"][c["args"].index("--mtp-window") + 1], "8192")
+        c = m.to_sycl(self.cfg(m, mtp), m.ROOT / "build-sycl-aot" / "strata", 64.0, {}, 32.0, "xe", fit=False)
+        self.assertNotIn("--mtp-window", c["args"])                      # 32K: the engine's own window
+        mine = self.cfg(m, [*mtp, "--mtp-window", "4096"])
+        mine["args"][mine["args"].index("--max-context") + 1] = "262144"
+        c = m.to_sycl(mine, m.ROOT / "build-sycl-aot" / "strata", 64.0, {}, 32.0, "xe", fit=False)
+        self.assertEqual(c["args"].count("--mtp-window"), 1)
+        self.assertEqual(c["args"][c["args"].index("--mtp-window") + 1], "4096")
+        self.assertEqual(m.asked_context(["--model", "IQ2_XS", "--context", "262144"]), 262144)
+        self.assertEqual(m.asked_context(["--context=131072"]), 131072)
+        self.assertEqual(m.asked_context(["--model", "IQ2_XS"]), 0)
+
     def test_an_explicit_reserve_is_kept_on_both_drivers(self):
         m = self.mod()
         for vram, drv in ((32.0, "xe"), (8.0, "i915")):

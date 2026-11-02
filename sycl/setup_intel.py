@@ -348,6 +348,11 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
             new_prefill = fr.prefill
             if fit_notes is not None:
                 fit_notes.append(fr.line)
+    if ctx > 32768 and "--mtp" in args and "--mtp-window" not in args:
+        # the draft layer attends to the last 8192 cells instead of 32768: with the code draft subset below, a coding
+        # agent at 190-205K on the B70 drafts in 2.25 instead of 3.5 ms a window, the same tokens per window (decode 84.9 ->
+        # 90.0 tok/s sampled, docs/B70.md); the draft layer's KV is ~35 MiB smaller
+        args += ["--mtp-window", "8192"]
     kv_ram = ctx * (13 * (576 if kv == "q4_0" else 1056)) / 1e9
     if kv != "k8v4" and ctx >= 65536 and ram >= kv_ram + 6:
         args += ["--kv-resident", "32768"]
@@ -396,6 +401,18 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
         out["env"] = env
     out.update(keep)
     return out
+
+
+def asked_context(argv) -> int:
+    """The --context the command line asks for (0: none, or not a number)."""
+    for i, a in enumerate(argv):
+        v = argv[i + 1] if a == "--context" and i + 1 < len(argv) else a[len("--context="):] if a.startswith("--context=") else None
+        if v is not None:
+            try:
+                return int(v)
+            except ValueError:
+                return 0
+    return 0
 
 
 def install(argv) -> None:
@@ -565,6 +582,11 @@ def install(argv) -> None:
             argv += ["--draft-vocab", "en"]             # ~110 MiB less VRAM than the default CJK subset
         if "--vram-reserve-mib" not in argv:
             argv += ["--vram-reserve-mib", str(SMALL_RESERVE_MIB)]
+    elif "--draft-vocab" not in argv and asked_context(argv) > 65536:
+        # a long-context setup is an agent's: the draft head over English + the tokens of 99.9% of a code corpus (54K
+        # ids, 70.5 MiB on Flash-Next IQ2_XS instead of 137.9) - the default subset misses ~4% of code tokens, this one
+        # 0.05-0.1%; any language still decodes exactly, only the drafts are English and code (docs/B70.md)
+        argv += ["--draft-vocab", "code"]
     sys.argv = [str(ROOT / "setup.py"), *argv]
     if "--backend" not in argv:
         sys.argv += ["--backend", "hip"]
