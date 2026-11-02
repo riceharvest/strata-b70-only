@@ -11356,6 +11356,19 @@ int main(int argc, char **argv) try {
         // K+1 while stage 1 still reads window K's hand-off.  With more stages every stage but the last is a "front"
         // stage: window K+1 follows window K through them one card behind, and only the last stage waits for K's verdict
         const bool pipe = o.pipeline_windows > 0 && n_stages >= 2 && !split_same && (int) stages.size() == n_stages - 1;
+        // STRATA_PROMPT_ROWS=N (one GPU, no --batch): the verify windows that read a short part of the prompt hold up to
+        // N rows (default kVerifyNarrowT = 8, at most kVerifyMaxT) instead of the S rows of a decode window; the verifier
+        // is made that wide, and the graph of each window size is captured at its first use.  0: S rows, as before.
+        // B70, Flash-Next IQ2_XS, parts of 25-55 tokens read through the windows: 8 rows -4 ms (short context) and -17 ms
+        // (193K) against 6.  A window costs ~13 ms + ~3.3 ms a row at short context; 12- and 16-row windows (a
+        // STRATA_VERIFY_MAX_T=16 build) cost 6.2-6.5 ms a token against 4.7 at 8 rows.  The rows come out bit-identical
+        // to 6-row windows (first logits, greedy texts).
+        const int prompt_rows = [&]() -> int {
+            const char* v = std::getenv("STRATA_PROMPT_ROWS");
+            const int r = v != nullptr ? std::atoi(v) : (int) strata::kernels::kVerifyNarrowT;
+            if (r <= 0 || n_stages != 1 || o.batch > 0 || batch_mtp) return 0;
+            return std::min(r, (int) strata::kernels::kVerifyMaxT);
+        }();
         strata::core::Verifier ver_b;
         SplitDrive split_drive_b;
         std::vector<dpct::queue_ptr> pl_stream(pipe ? (size_t)n_stages : 0,
@@ -11603,7 +11616,7 @@ int main(int argc, char **argv) try {
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
-                      batch_max_t(), err) ||
+                      std::max(batch_max_t(), prompt_rows), err) ||
             (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
@@ -16712,12 +16725,14 @@ int main(int argc, char **argv) try {
                     explicit NoHeadSampling(strata::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
                     ~NoHeadSampling() { v.set_head_sampling(true); }
                 } no_head_sampling(ver);
-                std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
+                // STRATA_PROMPT_ROWS: up to that many rows a window (the verifier was made that wide), else S
+                const int W = prompt_rows > 0 ? std::min(prompt_rows, ver.max_t()) : S;
+                std::vector<int32_t> win((size_t) W), outw((size_t) W), nxt((size_t) W);
                 pp_exact = true;   // between windows the session is exactly at `a`
                 for (int64_t q = a; q < b;) {
                     if (stop_req.load()) { e = "cancelled"; return false; }
                     pp_exact = false;   // until this window and the drafter's rows are in
-                    const int T = (int) std::min<int64_t>(S, b - q);
+                    const int T = (int) std::min<int64_t>(W, b - q);
                     for (int t = 0; t < T; ++t) {
                         win[(size_t) t] = (int32_t) cur[(size_t) (q + t)];
                         nxt[(size_t) t] = (int32_t) cur[(size_t) (q + t + 1)];
