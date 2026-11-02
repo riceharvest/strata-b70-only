@@ -61,7 +61,7 @@ comparisons with upstream Strata on this card (+12% to +17% prompt speed at 4K a
 `AGENTS.md`) ran eleven coding tasks: 82 requests, the context growing from 170K to 245K tokens, where pi compacted
 the conversation, then on from 195K to 225K. Every task finished. (Rerun on 2026-11-01 with that day's work: the cold
 170K-token first prompt 60.0 -> 50.6 s, small turns 418 -> 319 ms, turns of 100-2,000 new tokens 709 ms, answers at
-87 tok/s; with the later VRAM ring and sampled-draft acceptance, small turns 288 ms and answers 92.7 tok/s.) Each turn reused the history it had already read and
+87 tok/s; with the later VRAM ring and sampled-draft acceptance, small turns 288 ms and answers 92.7 tok/s. On 2026-11-02, after a night on pi's turns: answers 102.7 tok/s, small turns 246 ms, turns of 100-1,000 new tokens 573 ms, the cold prompt 50.4 s, every task finished; [docs/B70.md](docs/B70.md#pi-round-2026-11-02-night).) Each turn reused the history it had already read and
 read only the new tokens (64 of 79 turns under 1.5 s); answers ran at 73-103 tok/s. After the compaction the next
 prompt reused the 170K-token system prompt and read only the summary and recent turns (26K tokens, 11 s). An earlier
 session from 64K to 118K ran the same way. Turns that continue a conversation used to hang on this card; the engine
@@ -131,6 +131,10 @@ For one long agent session (a system prompt of 40K-60K tokens, the context up to
 
 - **3 GB of VRAM for the desktop** was enough on the test box (KDE and a browser). Everything else goes to the expert
   cache: about 16,000 experts in VRAM instead of 13,000 with 7 GB kept free, so less is read over PCIe.
+- **Drafts for code.** With a context above 64K setup drafts from an English + code token subset (`--draft-vocab code`)
+  over the last 8,192 cells (`--mtp-window 8192`): ~6% faster answers for a coding agent, the same tokens. For an agent
+  that writes code, `--expert-profile data/expert-profile-pi.bin` in the config's args keeps the experts pi sessions use
+  in VRAM (made from pi sessions on this repo; ~2.6% on those, the same elsewhere).
 - **Thinking** is on at the model's highest level (`xhigh`) unless the client asks for another (`reasoning_effort`:
   `low`, `medium`, `high` or `xhigh`, `none` turns it off).
 - **Earlier turns' thinking stays in the prompt** when the client sends it back (`reasoning_content`, as pi does). The
