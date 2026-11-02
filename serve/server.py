@@ -856,6 +856,7 @@ def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict) 
 
 
 _BTRACE = bool(os.environ.get("STRATA_BATCH_TRACE"))
+FAST_PROMPT = os.environ.get("STRATA_SERVER_FAST_PROMPT", "1") != "0"   # see StrataEngine._ids_text and serve/frontend.py
 
 
 def btrace(*a):
@@ -2230,6 +2231,28 @@ class StrataEngine:
                          "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
         return view
 
+    IDS_BLOCK = 4096
+
+    def _ids_text(self, ids) -> str:
+        """The prompt's ids as the GEN line's comma list.  A conversation's next request repeats the last one's ids up to
+        its new turn, so the text of each block of IDS_BLOCK ids is kept and reused while the block is unchanged: ~1 ms
+        instead of ~20 ms for a 190K-token prompt.  STRATA_SERVER_FAST_PROMPT=0: the whole list joined every time."""
+        if not FAST_PROMPT:
+            return ','.join(str(int(t)) for t in ids)
+        B, old, new, parts = self.IDS_BLOCK, getattr(self, "_ids_blocks", []), [], []
+        same = True
+        for k, a in enumerate(range(0, len(ids), B)):
+            blk = ids[a:a + B]
+            if same and k < len(old) and old[k][0] == blk:
+                txt = old[k][1]
+            else:
+                same = False
+                txt = ','.join(str(int(t)) for t in blk)
+            new.append((blk, txt))
+            parts.append(txt)
+        self._ids_blocks = new
+        return ','.join(parts)
+
     def generate(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
@@ -2256,7 +2279,7 @@ class StrataEngine:
                 raise ValueError("prefill_only is a text prompt and max_new 0")
             head = "GEN 0 prefill=1"
         try:
-            self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
+            self.proc.stdin.write(f"{head} {self._ids_text(ids)}\n")
             self.proc.stdin.flush()
         except OSError:                                  # the pipe is gone: the engine died (not the client)
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None

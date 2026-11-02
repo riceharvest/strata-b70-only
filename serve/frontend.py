@@ -307,10 +307,54 @@ def literal_tags(controls) -> dict[str, str]:
     return dict(sorted(tags.items(), key=lambda t: -len(t[0])))
 
 
-def _mark(text: str, tags: dict[str, str] = LITERAL_TAGS) -> str:
+# A long message text (an agent's system prompt with a repository's docs, ~650K characters) comes back unchanged in
+# every request of its conversation: its marked form and whether it holds a tag are kept for the next request (both are
+# pure functions of the text and the tags), so a continuation turn does not scan it ~70 times again (~13 ms each turn).
+# STRATA_SERVER_FAST_PROMPT=0: no memo, and the marks are found with the regex as before.
+FAST_PROMPT = os.environ.get("STRATA_SERVER_FAST_PROMPT", "1") != "0"
+_MEMO_MIN_CHARS = 8192
+_MEMO_MAX_CHARS = 1 << 24          # the texts kept, all together (a request walks its messages in order: a cap below a
+                                   # whole conversation would miss every one of them)
+_MARK_MEMO: "OrderedDict[tuple, str]" = OrderedDict()
+_HAS_MEMO: "OrderedDict[tuple, bool]" = OrderedDict()
+_MEMO_CHARS = {id(_MARK_MEMO): 0, id(_HAS_MEMO): 0}
+_MEMO_LOCK = threading.Lock()
+
+
+def _memo_get(memo, key):
+    with _MEMO_LOCK:
+        v = memo.get(key)
+        if v is not None:
+            memo.move_to_end(key)
+        return v
+
+
+def _memo_put(memo, key, v):
+    with _MEMO_LOCK:
+        if key not in memo:
+            _MEMO_CHARS[id(memo)] += len(key[0])
+        memo[key] = v
+        memo.move_to_end(key)
+        while _MEMO_CHARS[id(memo)] > _MEMO_MAX_CHARS and len(memo) > 1:
+            old, _ = memo.popitem(last=False)
+            _MEMO_CHARS[id(memo)] -= len(old[0])
+
+
+def _mark_plain(text: str, tags: dict[str, str]) -> str:
     for tag, mark in tags.items():
         text = text.replace(tag, mark)
     return text
+
+
+def _mark(text: str, tags: dict[str, str] = LITERAL_TAGS) -> str:
+    if not FAST_PROMPT or len(text) < _MEMO_MIN_CHARS:
+        return _mark_plain(text, tags)
+    key = (text, tuple(tags.items()))
+    v = _memo_get(_MARK_MEMO, key)
+    if v is None:
+        v = _mark_plain(text, tags)
+        _memo_put(_MARK_MEMO, key, v)
+    return v
 
 
 def _mark_deep(v, tags: dict[str, str] = LITERAL_TAGS):
@@ -325,7 +369,14 @@ def _mark_deep(v, tags: dict[str, str] = LITERAL_TAGS):
 
 def _has_tag(v, tags: dict[str, str] = LITERAL_TAGS) -> bool:
     if isinstance(v, str):
-        return any(tag in v for tag in tags)
+        if not FAST_PROMPT or len(v) < _MEMO_MIN_CHARS:
+            return any(tag in v for tag in tags)
+        key = (v, tuple(tags))
+        h = _memo_get(_HAS_MEMO, key)
+        if h is None:
+            h = any(tag in v for tag in tags)
+            _memo_put(_HAS_MEMO, key, h)
+        return h
     if isinstance(v, dict):
         return any(_has_tag(x, tags) for x in v.values())
     if isinstance(v, list):
@@ -408,6 +459,27 @@ def unmark_think_literals(prompt: str, tags: dict[str, str] = LITERAL_TAGS) -> t
     """The rendered prompt with THINK_TAGS' marks turned back into the tags' text, and the (start, end) spans of those
     tags in it: the server encodes them as ordinary text (the tokenizer's encode_plain_spans)."""
     marks = THINK_MARKS if tags is LITERAL_TAGS else {v: k for k, v in tags.items()}
+    if FAST_PROMPT and all(len(m) == 1 for m in marks):
+        # every mark is one character: str.find for each (~3 ms over 650K characters) instead of the regex's scan of
+        # the alternation (~50 ms: a prompt with a mark is stored 4 bytes a character), the same result
+        hits = []
+        for c in marks:
+            i = prompt.find(c)
+            while i >= 0:
+                hits.append(i)
+                i = prompt.find(c, i + 1)
+        hits.sort()
+        out, spans, pos, n = [], [], 0, 0
+        for i in hits:
+            out.append(prompt[pos:i])
+            n += i - pos
+            tag = marks[prompt[i]]
+            out.append(tag)
+            spans.append((n, n + len(tag)))
+            n += len(tag)
+            pos = i + 1
+        out.append(prompt[pos:])
+        return "".join(out), spans
     mark_re = _THINK_MARK_RE if tags is LITERAL_TAGS else re.compile("|".join(map(re.escape, marks)))
     out, spans, pos, n = [], [], 0, 0
     for m in mark_re.finditer(prompt):

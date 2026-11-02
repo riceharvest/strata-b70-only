@@ -1269,8 +1269,36 @@ void extra_sources_append(const int32_t* t, size_t n) {
     for (auto& src : strata::spec::extra_draft_sources()) src->append(t, n);
 }
 
+/// STRATA_TURN_FAST=0: the request's id list parsed through a string stream and its line searched from the start of
+/// the buffer at every read, as before (a 190K-token prompt: ~20 ms more before its read starts)
+static bool turn_fast() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_TURN_FAST"); return e == nullptr || std::atoi(e) != 0; }();
+    return on;
+}
+
 bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) {
     out.clear();
+    if (turn_fast()) {   // the same rule as below: ids separated by commas or white space, each a whole id in [0, 2^31)
+        auto sep = [](char c) { return c == ',' || c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r'; };
+        const char* q = s;
+        for (;;) {
+            while (*q != '\0' && sep(*q)) ++q;
+            if (*q == '\0') break;
+            const char* e = q;
+            while (*e != '\0' && !sep(*e)) ++e;
+            int32_t id = 0;
+            const auto parsed = std::from_chars(q, e, id);
+            if (parsed.ec != std::errc{} || parsed.ptr != e || id < 0) {
+                err = "invalid token id: expected an integer in [0, 2147483647]";
+                out.clear();
+                return false;
+            }
+            out.push_back(id);
+            q = e;
+        }
+        if (out.empty()) { err = "token list was empty"; return false; }
+        return true;
+    }
     std::string text(s);
     for (char& c : text) if (c == ',') c = ' ';
     std::istringstream input(text);
@@ -13658,25 +13686,30 @@ int main(int argc, char **argv) try {
             // stdin's lock, which getline holds while it waits for input - an engine ending on an error (every
             // std::exit) would hang in exit() on Linux, and the server would wait for it forever
             std::string l, buf;
-            char chunk[4096];
+            static char chunk[1 << 16];   // (this thread's only: one reader)
+            const size_t chunk_n = turn_fast() ? sizeof chunk : 4096;
+            size_t scanned = 0;   // STRATA_TURN_FAST: buf[0, scanned) holds no newline (a long GEN line comes in many reads)
             auto getline_fd = [&](std::string& out) -> bool {
                 for (;;) {
-                    const size_t nlpos = buf.find('\n');
+                    const size_t nlpos = buf.find('\n', turn_fast() ? scanned : 0);
                     if (nlpos != std::string::npos) {
                         out.assign(buf, 0, nlpos);
                         buf.erase(0, nlpos + 1);
+                        scanned = 0;
                         return true;
                     }
+                    scanned = buf.size();
 #if defined(_WIN32)
-                    const int n = _read(0, chunk, (unsigned) sizeof chunk);
+                    const int n = _read(0, chunk, (unsigned) chunk_n);
 #else
-                    const ssize_t n = ::read(0, chunk, sizeof chunk);
+                    const ssize_t n = ::read(0, chunk, chunk_n);
                     if (n < 0 && errno == EINTR) continue;
 #endif
                     if (n <= 0) {
                         if (buf.empty()) return false;
                         out.swap(buf);
                         buf.clear();
+                        scanned = 0;
                         return true;
                     }
                     buf.append(chunk, (size_t) n);
@@ -15790,6 +15823,26 @@ int main(int argc, char **argv) try {
             cur = ids;
             const Clock::time_point r0 = Clock::now();
             tr("r0");
+            // STRATA_SFX_ASYNC (default on): the suffix drafter's index of this prompt is built beside its read (a 190K-token
+            // prompt: ~20 ms of one CPU, a 32 MiB table cleared and every token's trigram put in it) instead of between the
+            // read and the first window; it is joined where it was built before, so the drafter is the same.  =0: as before.
+            struct SfxBuild {
+                std::thread th;
+                bool join() {
+                    if (!th.joinable()) return false;
+                    th.join();
+                    return true;
+                }
+                ~SfxBuild() { join(); }
+            } sfx_build;
+            static const bool sfx_async = [] { const char* e = std::getenv("STRATA_SFX_ASYNC"); return e == nullptr || std::atoi(e) != 0; }();
+            if (sfx_async && (o.suffix_draft > 0 || o.lookup_chain > 0))
+                sfx_build.th = std::thread([&sfx, &ids] {
+                    strata::platform::name_this_thread("strata-sfx");
+                    strata::aux_cpus::pin_current_thread();
+                    sfx.reset();
+                    for (int64_t t : ids) sfx.append((int32_t) t);
+                });
             strata::core::conversation_checkpoint_join(nullptr);   // STRATA_CKPT_ASYNC: the last save's copy has landed
             const int64_t streamed0 = sp.chain_experts_streamed();   // the DONE line's experts_streamed= is the difference
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
@@ -17523,7 +17576,22 @@ int main(int argc, char **argv) try {
             // admission's first token, every expert of every stage in VRAM (the zero-doorbell graphs, no loan, no swap)
             // and the serial loop with nothing else reading its windows
             int64_t merge_at = -1;
+            // STRATA_TURN_MERGE (default on, =0 off): the same for a request of the serial loop (no --batch, one stage):
+            // the last part's windows (a continuation's assistant header) leave their tokens to the first decode window,
+            // which then makes the first token - one window (~19 ms at 193K) less before it.  Its rows run as one
+            // T-row window instead of a prompt window and a 1-row window, with any expert out of VRAM: on the B70 the
+            // first-window logits and the greedy text came out bit-identical.
+            static const bool turn_merge = [] { const char* v = std::getenv("STRATA_TURN_MERGE"); return v == nullptr || std::atoi(v) != 0; }();
             auto merge_from = [&](int64_t a0, int64_t to) -> int64_t {
+                if (turn_merge && admit_slot < 0 && o.batch == 0 && !batch_on() && !pipe && n_pipe == 1 && !batch_mtp &&
+                    max_new >= 1 && !req_prefill_only) {   // (a prefill-only request has no decode window to take them)
+                    if (to != n - 1 || to == turn_at || to == root_at || to == message_at || to == pin_at) return -1;
+                    if (!req_imgs.empty() || kvg.on || peer.valid() || remote_caches || remote_opt || fs_swap) return -1;
+                    if (std::getenv("STRATA_LOGPOS") != nullptr || !pending.empty()) return -1;
+                    const int mt = std::min(S, stage_verifier(0).max_t());
+                    if (mt < 2) return -1;
+                    return std::max(a0, n - mt);
+                }
                 if (!admit_merge_first_env() || admit_slot < 0 || max_new != 1 || batch_mtp || pipe) return -1;
                 if (to != n - 1 || to == turn_at || to == root_at || to == message_at || to == pin_at) return -1;
                 if (!req_imgs.empty() || kvg.on || peer.valid() || remote_caches || remote_opt || fs_swap) return -1;
@@ -17662,7 +17730,7 @@ int main(int argc, char **argv) try {
             std::array<float, 8> dwin_s{};   // the probabilities the current window was chosen from (STRATA_SPEC_COST)
             std::vector<int32_t> sbuf((size_t) S, 0);
             const bool sfx_on = o.suffix_draft > 0 || o.lookup_chain > 0;
-            if (sfx_on) {
+            if (sfx_on && !sfx_build.join()) {
                 sfx.reset();
                 for (int64_t t : ids) sfx.append((int32_t) t);
             }
