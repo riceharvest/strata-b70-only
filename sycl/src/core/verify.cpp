@@ -395,10 +395,14 @@ bool batch_self_commits(const int* rows, int S) { return g_batch_self_commit && 
 // at 8K, ids identical), so the gfx1151 arch table sets STRATA_SH_STREAM=1 on Linux.  On Windows gfx1151 the fork is slower (0.2.7,
 // Qwen IQ3_S: decode -6.4% with it, ids identical), so there the table leaves it out and this default (off on HIP) applies.
 // Read on first use, after that table ran.
+// SYCL port: off by default too.  The fork makes the window graph a non-linear SYCL graph, and every node of such a graph
+// is synchronized through events instead of running as an in-order list: on the Arc Pro B70 (Flash-Next IQ2_XS, 6K
+// prompt, every window 3 tokens) the window costs 23.25 ms with the fork and 22.43 ms without it (decode 90.2 -> 93.5
+// tok/s), greedy ids identical - the same kernels on the same data, only the order changes.  STRATA_SH_STREAM=1 forks.
 bool sh_stream_on() {
     static const bool on = [] {
         if (const char* v = std::getenv("STRATA_SH_STREAM")) return v[0] != '0';
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(SYCL_LANGUAGE_VERSION)
         return false;
 #else
         return true;
@@ -2729,7 +2733,7 @@ std::string Verifier::profile_by_t_report() {
                                           "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve",
                                           "attention", "gate", "", "out-proj", "router+plan", "shared+quant",
                                           "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
-                                          "(gap)", "head", "hc0 norm", "hc0 down", "hc0 up", "hc1 norm", "hc1 down", "hc1 up"};
+                                          "(gap)", "head", "hc0 norm", "hc0 down", "hc0 up", "hc1 norm", "hc1 down", "hc1 up|read"};
     std::string out;
     char b[96];
     for (int T = 1; T <= 8; ++T) {
@@ -2792,7 +2796,7 @@ std::string Verifier::profile_report() {
                                           "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve",
                                           "attention", "gate", "", "out-proj", "router+plan+bell", "shared+quant",
                                           "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
-                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "  hc1 norm", "  hc1 down", "  hc1 up"};
+                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "  hc1 norm", "  hc1 down", "  hc1 up|read"};
     std::string out;
     char b[80];
     double total = 0;
@@ -3209,6 +3213,10 @@ void Verifier::accumulate_profile_inner(const unsigned long long* stamps) {
                 prof_sum_[kind][31] += d1;
                 prof_sum_[kind][32] += u1;
                 prof_sum_[kind][17] -= gap(at(l, 32), at(l, 16));
+            } else if (const double r1 = gap(at(l, 32), at(l, 16)); r1 > 0) {
+                // the Q8_0 read (STRATA_HC_Q8, the B70 default) stamps neither 30 nor 31: the whole FFN-side read in 32
+                prof_sum_[kind][32] += r1;
+                prof_sum_[kind][17] -= r1;
             }
         }
         if (l + 1 < le_) prof_sum_[kind][25] += gap(at(l + 1, 0), at(l, 24));
