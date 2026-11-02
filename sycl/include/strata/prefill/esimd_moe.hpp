@@ -99,9 +99,11 @@ bool down_f16(int d_type, const uint8_t* const* blob, size_t down_off, int n_emb
 /// the routed-only walk's held group of several 16-expert groups that all take the FP16 products (STRATA_PF_F16X_GROUP).  Every
 /// output element is computed exactly as by gate_up_f16 / down_f16 (the same tiles and K order): the same bits, fewer launches.
 constexpr int kMaxGroupH = 64;
+/// `mt`: the row tile (1, 2 or 8 tiles of 8 rows; 0 = STRATA_F16X_MT / the auto choice, see esimd_moe.dp.cpp f16_mt_for): the same
+/// bits whatever it is.  `skip`: bit i set = expert i's rows keep their place but are not computed (another kernel writes them).
 bool gate_up_f16_n(int gu_type, const uint8_t* const* blob, size_t up_off, int n_ff, const int32_t* cnt, int n, int K,
-                   const uint16_t* X, uint16_t* H, void* stream);
+                   const uint16_t* X, uint16_t* H, void* stream, int mt = 0, uint64_t skip = 0);
 bool down_f16_n(int d_type, const uint8_t* const* blob, size_t down_off, int n_embd, const int32_t* cnt, int n, int n_ff,
-                const uint16_t* H, float* Dm, void* stream);
+                const uint16_t* H, float* Dm, void* stream, int mt = 0, uint64_t skip = 0);
 
 }  // namespace strata::prefill::i8

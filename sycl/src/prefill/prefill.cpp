@@ -462,6 +462,71 @@ inline bool f16x_on(void* cs, int gu_type, int d_type, int64_t n_ff, int64_t n_e
     return !off && !g_f16x_failed.load(std::memory_order_relaxed) &&
            strata::prefill::i8::f16_handles(gu_type, d_type, (int) n_ff, (int) n_embd, cs);
 }
+// STRATA_PF_NAT=<rows> (gemm lever): in a held group of experts, each expert of at most <rows> rows takes the decode path's grouped
+// expert kernels (native_expert_grouped: q8_1 activations from `mixed`, integer dots; one call for those experts of the group) and the
+// rest the FP16 products (gate_up_f16_n / down_f16_n with those experts skipped).  The products tile 64 rows per expert (8 or 16 with
+// STRATA_F16X_SMALL) and so mostly compute padding for an expert of a few rows; the decode kernels take up to 4 rows in one pass over
+// the weights (native_grouped_parity --pfbench on branch dk5-gemm: IQ2_S 3.9 / 4.6 / 6.3 us an expert at 1 / 2 / 4 rows against 12.4 for the products).
+// The same kernels and numerics the verify window applies to the same tokens.  In a layer the FP16 products do not take (IQ1_M) the
+// limit is STRATA_PF_NAT_CHAIN (default 8) and the rest takes the per-expert dequantize + oneMKL chain as before.  0 = off.
+inline int pf_nat_rows() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_PF_NAT");
+        return e != nullptr ? std::max(0, std::min(std::atoi(e), 16)) : 0;
+    }();
+    return v;
+}
+inline int pf_nat_rows_chain() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_PF_NAT_CHAIN");
+        return e != nullptr ? std::max(0, std::min(std::atoi(e), 16)) : 8;
+    }();
+    return pf_nat_rows() > 0 ? v : 0;
+}
+// STRATA_PF_NAT_MIN (default 16): in a layer the FP16 products take, the decode kernels only for a held group with at least this many
+// experts under the limit - each call is four launches more for the host to submit, and a 4,799-token prompt (few small experts a
+// group) read 2,145 -> 2,483 ms with every small expert on them (pfbench/run.sh, STRATA_PF_NAT=4)
+inline int pf_nat_min() {
+    static const int v = [] { const char* e = std::getenv("STRATA_PF_NAT_MIN"); return e ? std::max(1, std::atoi(e)) : 16; }();
+    return v;
+}
+// STRATA_PF_NAT_FMT=<gate/up types> (comma separated ggml type ids, e.g. 29,16): only the layers of these gate/up formats.  Unset: only
+// the layers the FP16 products do not take (IQ1_M: the per-expert dequantize + oneMKL chain otherwise) - on the IQ2_S / IQ2_XXS layers
+// the decode kernels lost (above) and STRATA_PF_NAT_MIN is not measured.
+inline bool pf_nat_fmt_set() { return std::getenv("STRATA_PF_NAT_FMT") != nullptr; }
+inline bool pf_nat_fmt(int gu_type) {
+    static const std::vector<int> v = [] {
+        std::vector<int> r;
+        if (const char* e = std::getenv("STRATA_PF_NAT_FMT"))
+            for (const char* c = e; *c;) {
+                r.push_back(std::atoi(c));
+                while (*c && *c != ',') ++c;
+                if (*c) ++c;
+            }
+        return r;
+    }();
+    return v.empty() || std::find(v.begin(), v.end(), gu_type) != v.end();
+}
+// STRATA_F16X_SMALL=<rows> (bitwise; 64 measured): the FP16 products of a held group whose experts average at most <rows> rows take
+// 8-, 16- or 64-row tiles by a cost model of the group's row counts (esimd_moe.dp.cpp f16_mt_for); the groups of 16 or fewer experts
+// take the held-group launch for it (gate_up_f16_n: the same bits as gate_up_f16).  STRATA_F16X_OVER_I8=1 (changes the IQ2_XXS layers' numerics, to the FP16
+// chain's): a group at or under <rows> takes the FP16 products instead of the int8 chain (native_grouped_parity --pfbench, IQ2_XXS at
+// 6 rows an expert: int8 9.4 us an expert, FP16 with 8-row tiles 7.2).
+inline int pf_f16_small() {
+    static const int v = [] { const char* e = std::getenv("STRATA_F16X_SMALL"); return e ? std::max(0, std::atoi(e)) : 0; }();
+    return v;
+}
+inline bool pf_f16_over_i8() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_F16X_OVER_I8"); return e != nullptr && e[0] == '1'; }();
+    return v && pf_f16_small() > 0;
+}
+// the entries one call may hold: a held group (up to i8::kMaxGroupH experts) at the larger limit
+inline int64_t pf_nat_cap() { return (int64_t) strata::prefill::i8::kMaxGroupH * std::max({1, pf_nat_rows(), pf_nat_rows_chain()}); }
+constexpr size_t kNatTabBytes = 2048;   // the call table: 64 blob pointers, 65 entry starts, 64 first rows, the group count
+// q8_1 rows of `mixed` (T tokens of N), the decode kernels' scratch, the table + the entries' rows and tokens
+inline size_t pf_nat_xq_bytes(size_t T) { return T * (N / 32) * 36; }
+inline size_t pf_nat_scr_bytes() { return strata::kernels::native_expert_scratch_bytes(pf_nat_cap(), 640); }
+inline size_t pf_nat_tab_bytes() { return kNatTabBytes + 2 * (size_t) pf_nat_cap() * 4; }
 // ring sizing happens before any queue is at hand: room for the int8 groups whenever the choice could be on
 // B70: the routed-only walk's held groups get STRATA_PREFILL_STAGE_AHEAD (64) more slots, so the copy engine moves
 // the next groups' experts while one computes. With STAGE + a group (24 slots) a copy waited for the slot of the copy 24
@@ -1439,6 +1504,8 @@ struct Prefill::Impl {
     int32_t *ids = nullptr, *slot_dev = nullptr, *src_dev = nullptr;
     uint16_t *Xs = nullptr, *Hh = nullptr, *sh_h = nullptr;
     float* Xr = nullptr;   // APR: Hadamard-rotated copy of `mixed` for the MMQ path
+    // STRATA_PF_NAT: the layer's activations as q8_1 rows (by token), the decode kernels' scratch and their call table
+    uint8_t *nat_xq = nullptr, *nat_scr = nullptr, *nat_tab = nullptr;
     // step 2b (MMQ): the activations quantized per layer, H in FP32 and its group's quantized rows, the identity
     // row map, the group bounds, the group buffers of gathered experts
     void *Xq = nullptr, *Hq = nullptr;
@@ -2139,6 +2206,7 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
     if (fp16_bufs(mp)) a.take<uint16_t>(T * K * 640, ok);
     a.take<float>(T * K * N, ok); a.take<float>(T * 640, ok);
     a.take<float>(T * 640, ok); a.take<uint16_t>(T * 640, ok); a.take<float>(T * N, ok); a.take<float>(T, ok);
+    if (pf_nat_rows() > 0) { a.take<uint8_t>(pf_nat_xq_bytes(T), ok); a.take<uint8_t>(pf_nat_scr_bytes(), ok); a.take<uint8_t>(pf_nat_tab_bytes(), ok); }
     if (mp.any) {
         a.take<uint8_t>(mb.xq, ok);
         a.take<float>(mb.h, ok);
@@ -2648,6 +2716,11 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.Dm = c.take<float>(T * K * N, ok);
         m.sgate = c.take<float>(T * 640, ok); m.sup = c.take<float>(T * 640, ok); m.sh_h = c.take<uint16_t>(T * 640, ok);
         m.shared = c.take<float>(T * N, ok); m.sg = c.take<float>(T, ok);
+        if (pf_nat_rows() > 0) {   // STRATA_PF_NAT (moe_set_bytes counts the same)
+            m.nat_xq = c.take<uint8_t>(pf_nat_xq_bytes(T), ok);
+            m.nat_scr = c.take<uint8_t>(pf_nat_scr_bytes(), ok);
+            m.nat_tab = c.take<uint8_t>(pf_nat_tab_bytes(), ok);
+        }
         if (mp.any) {
             m.Xq = c.take<uint8_t>(mb.xq, ok);
             m.H = c.take<float>(mb.h, ok);
@@ -7451,7 +7524,23 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                            lay.fmt[(size_t) l].d_type == 8) &&
                                           lay.fmt[(size_t) l].n_ff == 640 && lay.fmt[(size_t) l].n_embd == 2560 &&
                                           strata::prefill::i8::available(m.cs);
-                        const bool xmx2 = xmx2_only || i8on;
+                        // STRATA_PF_NAT (pf_nat_rows): the held groups of few rows per expert on the decode kernels; a layer whose
+                        // formats only they and the per-expert FP16 chain take (IQ1_M) is held too
+                        strata::kernels::NativeExpertLayout nat_L{};
+                        bool nat_l = false;
+                        if (pf_nat_rows() > 0 && m.nat_xq != nullptr && !stream_all && lay.native && !had_gu && !had_d && !use_mmq &&
+                            !xmx2_only) {
+                            const auto& ff = lay.fmt[(size_t) l];
+                            const bool fmt_ok = pf_nat_fmt_set() ? pf_nat_fmt(ff.gu_type) : !f16x_on(m.cs, ff.gu_type, ff.d_type, ff.n_ff, ff.n_embd);
+                            if (fmt_ok && strata::kernels::native_expert_supported(ff.gu_type, ff.d_type, ff.n_embd, ff.n_ff) && ff.n_embd == N &&
+                                ff.n_ff == 640 && !ff.tail_off) {
+                                nat_L = strata::kernels::native_expert_layout(ff.gu_type, ff.d_type, ff.n_embd, ff.n_ff);
+                                nat_l = nat_L.up_off == ff.up_off && nat_L.down_off == ff.down_off && nat_L.bytes <= ff.bytes;
+                            }
+                        }
+                        const bool nat_only = nat_l && !i8on;   // held for the decode kernels, else the per-expert FP16 chain
+                        bool nat_xq_ready = false;              // this layer's q8_1 rows of `mixed` (quantized at the first call)
+                        const bool xmx2 = xmx2_only || i8on || nat_only;
                         if (i8_env() != nullptr && i8m != 0 && lay.native) {
                             static std::set<std::tuple<int, int, int, int, int>> said_fmt;
                             const auto& ff = lay.fmt[(size_t) l];
@@ -7480,12 +7569,65 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         int xg_slots[kXgHold];
                         int xg_n = 0, xg_ns = 0;
                         int64_t xg_r0 = 0;
-                        const int xg_cap = !stream_all && i8on && pf_f16x_group() > strata::kernels::kXmxGroupMax &&
+                        const int xg_cap = !stream_all && pf_f16x_group() > strata::kernels::kXmxGroupMax &&
                                                    (int) (stage_slots() - walk_base()) >= pf_f16x_group() + STAGE + 8 &&
-                                                   f16x_on(m.cs, lay.fmt[(size_t) l].gu_type, lay.fmt[(size_t) l].d_type,
-                                                           lay.fmt[(size_t) l].n_ff, lay.fmt[(size_t) l].n_embd)
+                                                   ((i8on && f16x_on(m.cs, lay.fmt[(size_t) l].gu_type, lay.fmt[(size_t) l].d_type,
+                                                                     lay.fmt[(size_t) l].n_ff, lay.fmt[(size_t) l].n_embd)) ||
+                                                    nat_only)
                                                ? pf_f16x_group()
                                                : strata::kernels::kXmxGroupMax;
+                        // the held group's experts in `sel` (bit i: expert i) on the decode kernels: one table write (their blob
+                        // pointers, entry starts and first rows; each entry's row and token) and native_expert_grouped over them
+                        auto nat_run = [&](uint64_t sel, int64_t ne) {
+                            if (static bool said = false; !said) {
+                                said = true;
+                                std::fprintf(stderr, "strata: prompt experts of up to %d rows (%d without the FP16 products) on the decode kernels "
+                                                     "(STRATA_PF_NAT)\n", pf_nat_rows(), pf_nat_rows_chain());
+                            }
+                            if (!nat_xq_ready) {
+                                strata::kernels::quantize_q8_1_rows(m.mixed, T, N, m.nat_xq, m.cs);
+                                nat_xq_ready = true;
+                            }
+                            constexpr int G = strata::prefill::i8::kMaxGroupH;
+                            struct NatTab { unsigned long long p[G]; int32_t st[G + 1]; int32_t r0[G]; int32_t n; };
+                            static_assert(sizeof(NatTab) <= kNatTabBytes, "the call table fits its buffer");
+                            NatTab tb{};
+                            int ng = 0;
+                            int32_t acc = 0, row = (int32_t) xg_r0;
+                            for (int i = 0; i < xg_n; ++i) {
+                                if ((sel >> i) & 1) {
+                                    tb.p[ng] = (unsigned long long) (uintptr_t) xg_g[i];
+                                    tb.st[ng] = acc;
+                                    tb.r0[ng] = row;
+                                    acc += xg_c[i];
+                                    ++ng;
+                                }
+                                row += xg_c[i];
+                            }
+                            tb.st[ng] = acc;
+                            tb.n = ng;
+                            unsigned long long* dp = reinterpret_cast<unsigned long long*>(m.nat_tab);
+                            int32_t* dst = reinterpret_cast<int32_t*>(m.nat_tab + offsetof(NatTab, st));
+                            int32_t* dn = reinterpret_cast<int32_t*>(m.nat_tab + offsetof(NatTab, n));
+                            int32_t* drow = reinterpret_cast<int32_t*>(m.nat_tab + kNatTabBytes);
+                            int32_t* dtok = drow + pf_nat_cap();
+                            const int32_t* src = m.src_dev;
+                            m.cs->parallel_for(sycl::range<1>((size_t) std::max<int64_t>(ne, ng + 1)), [=](sycl::id<1> id) {
+                                const int i = (int) id[0];
+                                if (i < ng) dp[i] = tb.p[i];
+                                if (i <= ng) dst[i] = tb.st[i];
+                                if (i == 0) *dn = tb.n;
+                                if (i < ne) {
+                                    int j = 0;
+                                    while (j + 1 < ng && tb.st[j + 1] <= i) ++j;
+                                    const int32_t r = tb.r0[j] + (i - tb.st[j]);
+                                    drow[i] = r;
+                                    dtok[i] = src[r];
+                                }
+                            });
+                            pt.mark(kPfGemmGU, cs);
+                            strata::kernels::native_expert_grouped(nat_L, dp, dst, dn, drow, dtok, ng, ne, m.nat_xq, m.nat_scr, m.Dm, m.cs, 0);
+                        };
                         auto xflush = [&]() {
                             if (xg_n == 0) return;
                             const auto tfl = Clock::now();
@@ -7504,6 +7646,73 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             const auto& f = lay.fmt[(size_t) l];
                             int64_t nr = 0;
                             for (int i = 0; i < xg_n; ++i) nr += xg_c[i];
+                            // STRATA_PF_NAT: the experts of few rows on the decode kernels, the rest on the FP16 products with those
+                            // skipped (or, in a layer without them, IQ1_M, on the per-expert FP16 chain compute() runs unheld)
+                            const bool nat_fx = nat_l && f16x_on(m.cs, f.gu_type, f.d_type, f.n_ff, f.n_embd);
+                            if (nat_l && (nat_fx || nat_only)) {
+                                const int lim = nat_fx ? pf_nat_rows() : pf_nat_rows_chain();
+                                uint64_t small = 0;
+                                int ns = 0;
+                                int64_t nr_small = 0;
+                                for (int i = 0; i < xg_n; ++i)
+                                    if (xg_c[i] > 0 && xg_c[i] <= lim) { small |= 1ull << i; ++ns; nr_small += xg_c[i]; }
+                                if (nat_fx && ns < pf_nat_min()) { small = 0; ns = 0; nr_small = 0; }   // too few to pay their launches
+                                {
+                                    static long e_nat = 0, e_other = 0;
+                                    e_nat += ns;
+                                    e_other += xg_n - ns;
+                                    if (static bool said_n = false; !said_n && e_nat + e_other >= 20000) {
+                                        said_n = true;
+                                        std::fprintf(stderr, "strata: STRATA_PF_NAT: %ld experts took the decode kernels, %ld the products / chain\n", e_nat, e_other);
+                                    }
+                                }
+                                if (ns > 0) nat_run(small, nr_small);
+                                if (ns < xg_n) {
+                                    bool done = false;
+                                    if (nat_fx) {
+                                        namespace i8 = strata::prefill::i8;
+                                        try {
+                                            pt.mark(kPfGemmGU, cs);
+                                            if (i8::gate_up_f16_n(f.gu_type, xg_g, f.up_off, f.n_ff, xg_c, xg_n, (int) N, m.Xs + xg_r0 * N,
+                                                                  m.Hh + xg_r0 * 640, m.cs, 0, small)) {
+                                                pt.mark(kPfGemmD, cs);
+                                                done = i8::down_f16_n(f.d_type, xg_g, f.down_off, (int) N, xg_c, xg_n, f.n_ff, m.Hh + xg_r0 * 640,
+                                                                      m.Dm + xg_r0 * N, m.cs, 0, small);
+                                            }
+                                        } catch (const std::exception& ex) {
+                                            done = false;
+                                            if (!g_f16x_failed.exchange(true))
+                                                std::fprintf(stderr, "strata: the FP16 expert products failed to launch (%s): the dequantize + oneMKL chain is used from here\n", ex.what());
+                                        }
+                                    }
+                                    if (!done) {
+                                        int64_t o = xg_r0;
+                                        for (int i = 0; i < xg_n; ++i) {
+                                            if (!((small >> i) & 1)) {
+                                                const int qd = i % DQ;
+                                                pt.mark(kPfDequant, cs);
+                                                strata::kernels::iq_dequant_expert_f16(f.gu_type, f.d_type, xg_g[i], xg_u[i], xg_d[i], f.n_ff,
+                                                                                       f.n_embd, m.dq_gu[qd], m.dq_d[qd], m.cs);
+                                                pt.mark(kPfGemmGU, cs);
+                                                m.gemm.f16(m.Xs + o * N, m.dq_gu[qd], m.GU + o * 1280, xg_c[i], 1280, N);
+                                                swiglu_interleaved(m.GU + o * 1280, m.Hh + o * 640, xg_c[i], m.cs);
+                                                had_h(o, xg_c[i]);
+                                                pt.mark(kPfGemmD, cs);
+                                                m.gemm.f16(m.Hh + o * 640, m.dq_d[qd], m.Dm + o * N, xg_c[i], N, 640);
+                                            }
+                                            o += xg_c[i];
+                                        }
+                                    }
+                                }
+                                if (xg_ns > 0) {
+                                    const int rel = xg_slots[xg_ns - 1];
+                                    dpct::sync_barrier(m.used[rel], m.cs);
+                                    for (int i = 0; i < xg_ns; ++i) m.used_of[xg_slots[i]] = rel;
+                                }
+                                xg_n = 0;
+                                xg_ns = 0;
+                                return;
+                            }
                             if (i8on) {
                                 const uint8_t* const* xg_g_all = xg_g;
                                 const uint8_t* const* xg_u_all = xg_u;
@@ -7529,6 +7738,9 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 bool use_i8 = true;
                                 if (i8m == 2) {
                                     use_i8 = (double) nr / xg_n < i8_rows();
+                                    if (use_i8 && pf_f16_over_i8() && nr <= (int64_t) pf_f16_small() * xg_n &&
+                                        f16x_on(m.cs, f.gu_type, f.d_type, f.n_ff, f.n_embd))
+                                        use_i8 = false;   // STRATA_F16X_OVER_I8: the FP16 products' small tiles instead
                                     static long groups_i8 = 0, groups_fp = 0;
                                     (use_i8 ? groups_i8 : groups_fp) += 1;
                                     if (static bool said_n = false; !said_n && groups_i8 + groups_fp >= 500) {
@@ -7579,7 +7791,15 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                         i8::Layout loh;
                                         i8::make_layout(loh, xg_c, xg_n);
                                         pt.mark(kPfGemmGU, cs);
-                                        if (i8::gate_up_f16(f.gu_type, xg_g, f.up_off, f.n_ff, loh, (int) N, m.Xs + xg_r0 * N, m.Hh + xg_r0 * 640, m.cs)) {
+                                        if (pf_f16_small() > 0) {   // STRATA_F16X_SMALL: the held-group launch (its small tiles), the same bits
+                                            if (i8::gate_up_f16_n(f.gu_type, xg_g, f.up_off, f.n_ff, xg_c, xg_n, (int) N, m.Xs + xg_r0 * N,
+                                                                  m.Hh + xg_r0 * 640, m.cs)) {
+                                                had_h(xg_r0, nr);
+                                                pt.mark(kPfGemmD, cs);
+                                                doneh = i8::down_f16_n(f.d_type, xg_g, f.down_off, (int) N, xg_c, xg_n, f.n_ff, m.Hh + xg_r0 * 640,
+                                                                       m.Dm + xg_r0 * N, m.cs);
+                                            }
+                                        } else if (i8::gate_up_f16(f.gu_type, xg_g, f.up_off, f.n_ff, loh, (int) N, m.Xs + xg_r0 * N, m.Hh + xg_r0 * 640, m.cs)) {
                                             had_h(xg_r0, nr);
                                             pt.mark(kPfGemmD, cs);
                                             doneh = i8::down_f16(f.d_type, xg_g, f.down_off, (int) N, loh, f.n_ff, m.Hh + xg_r0 * 640,
