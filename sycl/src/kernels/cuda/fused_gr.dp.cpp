@@ -2836,7 +2836,7 @@ static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn
         return false;   // SYCL port: never writes the q8_1 images (STRATA_QFUSE is not supported here)
     }
     m.part = down_partials(st);
-    static const bool reuse_norm = strata::bm_default_on("STRATA_GR_CACHED_NORM", st->get_device());
+    static const bool reuse_norm = strata::bm_default_on("STRATA_GR_CACHED_NORM", st->get_device(), false);
     static const bool reuse_lo = strata::bm_default_on("STRATA_GR_LO_REUSE", st->get_device());
     if ((reuse_norm || reuse_lo) && gr_norm_split() && gr_down_sliced() &&
         !gr_more_groups(st) && !gr_large_grf(st) && !gr_up_ilp() && !gr_up_wide_on() && gr_up_cols() == UPM_COLS &&

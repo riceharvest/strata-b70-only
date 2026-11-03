@@ -1899,10 +1899,10 @@ void launch_q6k_wide(const void* weights, const void* x_q8_1, float* y, int n_in
     if (rpw == 1 && q6k_a2()) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
         if constexpr (NCOLS > 1) {
-            // #4185 (STRATA_Q6_SHAPE_GRF): large GRF for the bounded Q6_K projection shapes on a Battlemage card; an
-            // explicit STRATA_MMVQ_LARGE_GRF decides alone.  With STRATA_MMVQ_KREG on (the B70 default) the KREG kernels
+            // #4185 (STRATA_Q6_SHAPE_GRF=1, opt-in): large GRF for the bounded Q6_K projection shapes on a Battlemage card;
+            // an explicit STRATA_MMVQ_LARGE_GRF decides alone.  With STRATA_MMVQ_KREG on (the B70 default) the KREG kernels
             // take these calls first and this one is not reached.
-            static const bool shape_grf = strata::bm_default_on("STRATA_Q6_SHAPE_GRF", s->get_device());
+            static const bool shape_grf = strata::bm_default_on("STRATA_Q6_SHAPE_GRF", s->get_device(), false);
             const bool eligible = (n_in == 6144 && n_out == 2560) ||
                 (n_in == 2560 && (n_out == 512 || n_out == 640)) ||
                 (NCOLS >= 3 && n_in == 2560 && n_out == 6144) ||

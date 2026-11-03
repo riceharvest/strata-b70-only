@@ -2425,7 +2425,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         std::fprintf(stderr, "gdn_step_norm_multi: invalid arguments\n");
         std::exit(1);
     }
-    static const bool qk_reg = strata::bm_default_on("STRATA_GDN_QK_REG", strata::q_of(stream)->get_device());
+    static const bool qk_reg = strata::bm_default_on("STRATA_GDN_QK_REG", strata::q_of(stream)->get_device(), false);
     if (qk_reg && !xq && !n_keep && t_out_begin == 0 &&
         h_k == 16 && h_v == 48 && conv_channels == 10240 &&
         strata::intel_gpu_gen(strata::q_of(stream)->get_device()) == strata::IntelGpuGen::Battlemage) {

@@ -4596,7 +4596,7 @@ bool g_old_kernels = env_on("STRATA_OLD_IQ_MMVQ");
 // every format; STRATA_EXPERT_SPLIT=1 takes upstream's multi kernels, launched with their own grid (GU_ROWS rows).
 bool g_split_multi = env_on("STRATA_EXPERT_SPLIT");
 bool g_no_sub16_gu = env_on("STRATA_NO_SUB16_GU");
-// PR #4185 controls: on by default for a Battlemage device (strata::bm_default_on), =0 turns each off
+// PR #4185 controls: six are on by default for a Battlemage device (strata::bm_default_on), the rest are opt-in (measured neutral); =0 / =1 decides
 // STRATA_IQ_STAGE_GRID=0 disables staging 64-bit i-quant codebook tables into shared memory
 bool g_stage_grid = [] {
     const char* v = std::getenv("STRATA_IQ_STAGE_GRID");
@@ -6612,7 +6612,7 @@ void launch_gu_row_reuse(unsigned groups, dpct::queue_ptr s,
                          float* gate, float* up) {
     const unsigned gx = (unsigned) ((2 * L.n_ff + 63) / 64);
     auto props = sycl::ext::oneapi::experimental::properties{};
-    static const bool e3 = TG == 21 || strata::bm_default_on("STRATA_EXPERT_ROW_E3", s->get_device());
+    static const bool e3 = TG == 21 || strata::bm_default_on("STRATA_EXPERT_ROW_E3", s->get_device(), false);
     if (e3) {
         static const bool logged = [] {
             std::fprintf(stderr, "strata: %s exact three-entry row reuse enabled\n",
@@ -7022,7 +7022,7 @@ void launch_gu(dpct::dim3 grid, dpct::queue_ptr s,
             return;
         }
 #endif
-        static const bool iq3s_gu_slm = strata::bm_default_on("STRATA_IQ3S_GU_SLM", s->get_device());
+        static const bool iq3s_gu_slm = strata::bm_default_on("STRATA_IQ3S_GU_SLM", s->get_device(), false);
         if (!b70_fast && !g_old_kernels && iq3s_gu_slm && L.n_embd == 2560 && L.n_ff == 640) {
             auto exp_props = sycl::ext::oneapi::experimental::properties{};
             const size_t gx = (size_t) ((2 * L.n_ff + 31) / 32);
@@ -7082,7 +7082,7 @@ void launch_down(dpct::dim3 grid, dpct::queue_ptr s,
                  float *out) {
     if constexpr (TD == 20) {   // #4185's IQ4_NL down kernel where this tree's STRATA_IQ_DECODE_FAST one does not take the call
         const bool b70_fast = !g_split_multi && down_lanes() == 8 && iq_fast_on(TD, *s);
-        static const bool iq4nl_down_slm = strata::bm_default_on("STRATA_IQ4NL_DOWN_SLM", s->get_device());
+        static const bool iq4nl_down_slm = strata::bm_default_on("STRATA_IQ4NL_DOWN_SLM", s->get_device(), false);
         if (!b70_fast && !g_old_kernels && iq4nl_down_slm && L.n_embd == 2560 && L.n_ff == 640) {
             launch_down_iq4nl_slm(grid, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
             return;
