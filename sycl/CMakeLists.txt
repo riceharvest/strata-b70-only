@@ -29,6 +29,11 @@ endif()
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 
 set(STRATA_SYCL_AOT "" CACHE STRING "AOT device for the GPU code, e.g. bmg-g31 (empty: SPIR-V, JIT at run time)")
+option(STRATA_SYCL_IQ_DECODE_FAST "Opt in to the packed IQ/Q2 decode helpers" OFF)
+if(STRATA_SYCL_IQ_DECODE_FAST)
+  add_compile_definitions(STRATA_Q2_WORD_FAST=1 STRATA_IQ4NL_LUT_SWAR=1 STRATA_IQ4XS_LUT_SWAR=1
+                         STRATA_IQ4_LUT_SWAR=1 STRATA_IQ3S_SIGN_FAST=1 STRATA_IQ3S_SIGN_APPLY_FAST=1)
+endif()
 # The device spins on host flags are bounded (include/strata/sycl_doorbell.hpp). The bound is chosen per device at run
 # time (20,000 reads on a B-series card, 2,000,000 elsewhere; STRATA_SPIN_MAX overrides). STRATA_SYCL_SPIN_MAX fixes one
 # bound for every device in this build.
@@ -406,7 +411,7 @@ if(STRATA_SYCL_PARITY)
     add_test(NAME ${p}_parity COMMAND ${p}_parity)
   endforeach()
   # not built here: qsa_topk_parity / qsa_topk_active_parity (the sm_90 thread-block-cluster QSA top-k has no SYCL
-  # counterpart: the callers take the plain kernels), route_window_parity and fused_gr_bench (no migrated copy yet)
+  # counterpart: the callers take the plain kernels) and route_window_parity (no migrated copy yet)
   # (upstream PR #413's gdn_rec_parity is an SM-holding NVIDIA bench - PTX timers, __nanosleep - not built here; the
   # key-head kernel is checked through the engine: output hashes with STRATA_GDN_KEYHEAD=1 and without)
   # the conversation snapshots (#216) against the engine, as upstream's STRATA_BUILD_CONVERSATION_TESTS
@@ -446,6 +451,8 @@ if(STRATA_SYCL_PARITY)
   target_link_libraries(qsa_select_bench PRIVATE strata_kernels strata_prefill)   # -qmkl for the GEMM block scores
   add_executable(qsa_decode_select_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/qsa_decode_select_bench.cpp)   # the long decode select vs the plain kernels, bitwise + timing
   target_link_libraries(qsa_decode_select_bench PRIVATE strata_kernels)
+  add_executable(fused_gr_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/fused_gr_bench.cpp)   # #4185: the multi-token GR read, hashes across switches
+  target_link_libraries(fused_gr_bench PRIVATE strata_kernels)
   add_executable(sycl_router_fast ${CMAKE_CURRENT_SOURCE_DIR}/probe/router_fast.cpp)
   target_link_libraries(sycl_router_fast PRIVATE strata_kernels)
   add_test(NAME sycl_router_fast COMMAND sycl_router_fast)

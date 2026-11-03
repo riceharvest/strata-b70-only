@@ -144,6 +144,7 @@ int main(int argc, char** argv) {
         s->memcpy(ddst, dst.data(), (size_t) NE * 4).wait();
         s->memcpy(dtok, tok.data(), (size_t) NE * 4).wait();
         K::quantize_q8_1_rows((const float*) dx, NTOK, H, dxq, s);
+        s->wait_and_throw();
         auto run = [&](int m, int phase) {
             K::native_expert_set_mode(m, phase);
             K::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, CAP, CAPE, dxq, dscr, dout, s);

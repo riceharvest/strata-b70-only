@@ -7,6 +7,7 @@
 // order, so a verify window reproduces plain decode bit for bit.
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include "strata/core/geometry.hpp"
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
@@ -477,7 +478,7 @@ __dpct_inline__ void gdn_q8_1_store(GdnQ81 *__restrict__ xq, size_t idx,
     if (idx % 32 == 0) xq[idx / 32].ds = q8_1_ds(d, sum);   // #606: clamped (the QFUSE path bypassed the finite helper)
 }
 
-template <bool ALL_OUT, bool Q>
+template <bool ALL_OUT, bool Q, bool QK_REG = false>
 /*
 DPCT1110: The total declared local variable size in device function
 gdn_step_norm_multi_kernel exceeds 128 bytes and may cause high register
@@ -527,7 +528,7 @@ __dpct_inline__ void gdn_step_norm_multi_kernel(
     const int qk = S * h_k;             // q at [0, qk), k at [qk, 2qk), v at [2qk, ...)
     const int value_dim = S * h_v;
     const int n = ALL_OUT ? T : (n_keep ? *n_keep : T);
-    if (n > 0) {
+    if (!QK_REG && n > 0) {
         if (rg == 0) sk[0][col] = hbuf[qk + qh * S + col];
         else if (rg == 1 && (ALL_OUT || 0 >= t_out_begin)) sq[0][col] = hbuf[qh * S + col];
     }
@@ -557,7 +558,14 @@ __dpct_inline__ void gdn_step_norm_multi_kernel(
         better performance if there is no access to global memory.
         */
         item_ct1.barrier();
-        if (t + 1 < n) {
+        float k_own = 0.0f, q_own = 0.0f;
+        auto sg = item_ct1.get_sub_group();
+        if constexpr (QK_REG) {
+            const int i = rg * RPG + sg.get_local_linear_id();
+            k_own = ht[qk + qh * S + i];
+            if (need_out) q_own = ht[qh * S + i];
+        }
+        if (!QK_REG && t + 1 < n) {
             const float* ht_next = ht + C;
             const bool need_next = ALL_OUT || (t + 1 >= t_out_begin);
             if (rg == 0) sk[nxt][col] = ht_next[qk + qh * S + col];
@@ -567,7 +575,7 @@ __dpct_inline__ void gdn_step_norm_multi_kernel(
         float kv = 0.0f;
 #pragma unroll
         for (int r = 0; r < RPG; ++r)
-            kv = sycl::fma(s[r], sk[cur][rg * RPG + r], kv);
+            kv = sycl::fma(s[r], QK_REG ? sycl::select_from_group(sg, k_own, r) : sk[cur][rg * RPG + r], kv);
         red_kv[rg][col] = kv;
         /*
         DPCT1118: SYCL group functions and algorithms must be encountered in
@@ -584,14 +592,16 @@ __dpct_inline__ void gdn_step_norm_multi_kernel(
         if (!need_out) {
 #pragma unroll
             for (int r = 0; r < RPG; ++r)
-                s[r] = sycl::fma((float)g, s[r], sk[cur][rg * RPG + r] * delta);
+                s[r] = sycl::fma((float)g, s[r],
+                                (QK_REG ? sycl::select_from_group(sg, k_own, r) : sk[cur][rg * RPG + r]) * delta);
             continue;
         }
         float o = 0.0f;
 #pragma unroll
         for (int r = 0; r < RPG; ++r) {
-            s[r] = sycl::fma((float)g, s[r], sk[cur][rg * RPG + r] * delta);
-            o = sycl::fma(s[r], sq[cur][rg * RPG + r], o);
+            s[r] = sycl::fma((float)g, s[r],
+                            (QK_REG ? sycl::select_from_group(sg, k_own, r) : sk[cur][rg * RPG + r]) * delta);
+            o = sycl::fma(s[r], QK_REG ? sycl::select_from_group(sg, q_own, r) : sq[cur][rg * RPG + r], o);
         }
         red_o[rg][col] = o;
         /*
@@ -2414,6 +2424,29 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         n_tok > kVerifyMaxT) {
         std::fprintf(stderr, "gdn_step_norm_multi: invalid arguments\n");
         std::exit(1);
+    }
+    static const bool qk_reg = [] {
+        const char* v = std::getenv("STRATA_GDN_QK_REG");
+        return v && v[0] == '1';
+    }();
+    if (qk_reg && !xq && !n_keep && t_out_begin == 0 &&
+        h_k == 16 && h_v == 48 && conv_channels == 10240 &&
+        strata::intel_gpu_gen(strata::q_of(stream)->get_device()) == strata::IntelGpuGen::Battlemage) {
+        static const bool note = [] {
+            std::fprintf(stderr, "strata: GDN QK register broadcast enabled (GRF256)\n");
+            return true;
+        }();
+        (void) note;
+        auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
+        strata::q_of(stream)->parallel_for<dpct_kernel_name<class gdn_qk_register>>(
+            sycl::nd_range<3>(sycl::range(1, RG, (unsigned) h_v * S), sycl::range(1, RG, S)),
+            props, [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                gdn_step_norm_multi_kernel<true, false, true>(
+                    state, h, conv_channels, gate, beta, z, gamma, eps, y,
+                    h_k, h_v, n_tok, nullptr, 0, nullptr);
+            });
+        check("gdn QK register");
+        return;
     }
     static const bool split = [] { const char* v = std::getenv("STRATA_GDN_SPLIT"); return v && v[0] == '1'; }();
     // S26: the split runs where it is faster (gfx1151 harness, h_v 48: the commit 8-19% per call; a window of 2+ rows

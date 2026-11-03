@@ -125,6 +125,11 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     // masked (weight 0) in every kernel and in the FP64 reference
     if (const char* ho = std::getenv("QA_HOLES"))
         for (int64_t i = std::atoi(ho) / 2; std::atoi(ho) > 0 && i < pages; i += std::atoi(ho)) table[i] = -1;
+    if (const char* mask = std::getenv("QA_MASK_PAGES")) {
+        const bool all = std::strcmp(mask, "all") == 0;
+        for (size_t i = 0; i < table.size(); ++i)
+            if (all || i % 7 == 0) table[i] = -1;
+    }
     // queries at positions ctx - nq .. ctx - 1
     const int64_t cap = k::qsa_selection_width(ctx, s);
     std::vector<int32_t> ids((size_t) (nq * cap), 0), steps((size_t) (nq * k::kStepCount), 0);
@@ -280,6 +285,11 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                             .wait()),
        "down");
     if (refused) nw = o;   // SYCL port: nothing of the XMX kernel to compare
+    {
+        uint64_t hh = 1469598103934665603ull;
+        for (float x : o) { uint32_t u; std::memcpy(&u, &x, 4); hh = (hh ^ u) * 1099511628211ull; }
+        std::printf("FP32HASH %016llx\n", (unsigned long long) hh);
+    }
     {   // a hash of the new kernel's output bits (bitwise A/B of two builds / switches)
         uint64_t hh = 1469598103934665603ull;
         for (float x : nw) { uint32_t u; std::memcpy(&u, &x, 4); hh = (hh ^ u) * 1099511628211ull; }
@@ -317,7 +327,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                                       : fmt == 1 ? (double) vq[row * HD + d] * h2f(vs[row * 4 + d / 64]) : h2f(vh[row * HD + d]);
                     a += sco[c] * vv;
                 }
-                const double r = a / l;
+                const double r = l > 0 ? a / l : 0.0;
                 const size_t at = (size_t) ((i * NH + h) * HD + d);
                 ref_scale = std::max(ref_scale, std::fabs(r));
                 err_old = std::max(err_old, std::fabs(o[at] - r));
@@ -367,6 +377,30 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 ok_pc ? "PASS" : "FAIL", fmt == 2 ? "q4_0" : fmt == 1 ? "int8" : "fp16", err_pc, err_old, diff_pc / scale,
                 ms_old / reps, ms_pc / reps, ms_old / ms_pc);
     sycl::free((void *)d_pc, dpct::get_in_order_queue());
+    if (std::getenv("QA_FP32_GRAPH")) {
+        auto* queue = &dpct::get_in_order_queue();
+        constexpr int calls = 32;
+        dpct::experimental::command_graph_ptr graph;
+        dpct::experimental::begin_recording(queue);
+        for (int i = 0; i < calls; ++i) old_run();
+        dpct::experimental::end_recording(queue, &graph);
+        auto executable = graph->finalize();
+        delete graph;
+        std::vector<double> times;
+        for (int i = 0; i < 20; ++i) {
+            auto begin = queue->ext_oneapi_submit_barrier();
+            queue->ext_oneapi_graph(executable);
+            auto end = queue->ext_oneapi_submit_barrier();
+            end.wait_and_throw();
+            if (i >= 5)
+                times.push_back(double(
+                    end.get_profiling_info<sycl::info::event_profiling::command_end>() -
+                    begin.get_profiling_info<sycl::info::event_profiling::command_start>()) / 1000 / calls);
+        }
+        std::sort(times.begin(), times.end());
+        std::printf("DECODEGRAPH fmt=%d ctx=%lld nq=%lld us=%.3f\n",
+                    fmt, (long long) ctx, (long long) nq, times[times.size() / 2]);
+    }
     const bool ok1 = err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale) && ok_pc;
     const bool ok2 = diff <= 1e-4 * scale;
     uint64_t sum = 1469598103934665603ull;   // the new kernel's output bits: two builds of it compare by this
@@ -420,12 +454,19 @@ int main(int argc, char** argv) {
     const int64_t ctx = argc > 1 ? std::atoll(argv[1]) : 32768;
     const int64_t nq = argc > 2 ? std::atoll(argv[2]) : 2048;
     const int reps = argc > 3 ? std::atoi(argv[3]) : 5;
+    const bool int8_only = argc > 4 && std::strcmp(argv[4], "--int8-only") == 0;
+    if (argc > 4 && !int8_only) {
+        std::fprintf(stderr, "usage: qsa_prompt_attn_parity [context] [queries] [reps] [--int8-only]\n");
+        return 2;
+    }
     int fails = 0;
     fails += run(1, ctx, nq, reps);
 #if !defined(__HIP_PLATFORM_AMD__)
-    fails += run(0, ctx, nq, reps);   // FP16 KV: the RDNA4 kernel takes int8 KV only
-    fails += run(2, ctx, nq, reps);   // Q4_0 KV (mode 4)
-    fails += run(2, 1500, std::min<int64_t>(nq, 1500), reps);
+    if (!int8_only) {
+        fails += run(0, ctx, nq, reps);   // FP16 KV: the RDNA4 kernel takes int8 KV only
+        fails += run(2, ctx, nq, reps);   // Q4_0 KV (mode 4)
+        fails += run(2, 1500, std::min<int64_t>(nq, 1500), reps);
+    }
 #endif
     fails += run(1, 1500, std::min<int64_t>(nq, 1500), reps);   // short context: the selection is every cell
     fails += run(1, 2100, std::min<int64_t>(nq, 256), reps);    // the identity-to-sparse edge
