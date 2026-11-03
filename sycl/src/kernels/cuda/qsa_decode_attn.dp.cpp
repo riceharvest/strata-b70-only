@@ -829,14 +829,11 @@ __dpct_inline__ void attn_merge_active_kernel(
     attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
 }
 
-// #4185 (glorysdj): STRATA_ATTN_MERGE_ACTIVE=1 merges a window of up to 8 queries with attn_merge_active_kernel.  It does
+// #4185 (glorysdj): STRATA_ATTN_MERGE_ACTIVE merges a window of up to 8 queries with attn_merge_active_kernel.  It does
 // what attn_merge_v2_kernel does (stop at the width, loads batched; the same bits as attn_merge_kernel), so on this tree it
 // is the merge only where v2 is off (STRATA_ATTN_MERGE_V2=0): see attn_merge_mode.
-bool merge_active_on() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_ATTN_MERGE_ACTIVE");
-        return v && v[0] == '1';
-    }();
+bool merge_active_on(const sycl::device& d) {
+    static const bool on = strata::bm_default_on("STRATA_ATTN_MERGE_ACTIVE", d);
     return on;
 }
 
@@ -1058,9 +1055,9 @@ int attn_merge_v2() {
 
 // The merge the engine's decode calls take for `n_q` queries: 1 (attn_merge_v2_kernel, the default), else 2
 // (attn_merge_active_kernel) where #4185's STRATA_ATTN_MERGE_ACTIVE is on and the window holds at most 8 queries, else 0.
-int attn_merge_mode(int64_t n_q) {
+int attn_merge_mode(int64_t n_q, dpct::queue_ptr st) {
     if (attn_merge_v2()) return 1;
-    return merge_active_on() && n_q <= 8 ? 2 : 0;
+    return n_q <= 8 && merge_active_on(st->get_device()) ? 2 : 0;
 }
 
 // the merge of `n_q` queries' partials: v2 = 0 attn_merge_kernel, 1 attn_merge_v2_kernel, 2 attn_merge_active_kernel
@@ -1324,7 +1321,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     }
     dpct::queue_ptr st = strata::q_of(stream);
     launch_chunks_batch(q, pools, ids, steps, cap, s, scratch, n_q, st, -1);
-    launch_merge_batch(steps, cap, s, scratch, attn, n_q, attn_merge_mode(n_q), st);
+    launch_merge_batch(steps, cap, s, scratch, attn, n_q, attn_merge_mode(n_q, st), st);
     /*
     DPCT1010: SYCL uses exceptions to report errors and does not use the
     error codes. The cudaGetLastError function call was replaced with 0. You
@@ -1416,7 +1413,7 @@ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const 
         else STRATA_ATTN_SLOTS(0, false, 0)
     }
 #undef STRATA_ATTN_SLOTS
-    launch_merge(attn_merge_mode(n_q), part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head,
+    launch_merge(attn_merge_mode(n_q, st), part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head,
                  (unsigned) n_q, st);
     /*
     DPCT1010: SYCL uses exceptions to report errors and does not use the
@@ -1506,7 +1503,7 @@ void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, co
         else STRATA_ATTN_ROWS(0, 0)
     }
 #undef STRATA_ATTN_ROWS
-    launch_merge(attn_merge_mode(n_q), part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head,
+    launch_merge(attn_merge_mode(n_q, st), part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head,
                  (unsigned) n_q, st);
     /*
     DPCT1010: SYCL uses exceptions to report errors and does not use the
@@ -1603,7 +1600,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
                                      part_l, n_chunks, 0, 0);
             });
     }
-    launch_merge(attn_merge_mode(1), part_acc, part_m, part_l, n_chunks, step, attn, 0, (unsigned) s.n_head, 1u, st);
+    launch_merge(attn_merge_mode(1, st), part_acc, part_m, part_l, n_chunks, step, attn, 0, (unsigned) s.n_head, 1u, st);
     /*
     DPCT1010: SYCL uses exceptions to report errors and does not use the
     error codes. The cudaGetLastError function call was replaced with 0. You

@@ -1899,13 +1899,10 @@ void launch_q6k_wide(const void* weights, const void* x_q8_1, float* y, int n_in
     if (rpw == 1 && q6k_a2()) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
         if constexpr (NCOLS > 1) {
-            // #4185 (STRATA_Q6_SHAPE_GRF=1): large GRF for the bounded Q6_K projection shapes on a Battlemage card; an
+            // #4185 (STRATA_Q6_SHAPE_GRF): large GRF for the bounded Q6_K projection shapes on a Battlemage card; an
             // explicit STRATA_MMVQ_LARGE_GRF decides alone.  With STRATA_MMVQ_KREG on (the B70 default) the KREG kernels
             // take these calls first and this one is not reached.
-            static const bool shape_grf = [] {
-                const char* v = std::getenv("STRATA_Q6_SHAPE_GRF");
-                return v && v[0] == '1';
-            }();
+            static const bool shape_grf = strata::bm_default_on("STRATA_Q6_SHAPE_GRF", s->get_device());
             const bool eligible = (n_in == 6144 && n_out == 2560) ||
                 (n_in == 2560 && (n_out == 512 || n_out == 640)) ||
                 (NCOLS >= 3 && n_in == 2560 && n_out == 6144) ||
@@ -2161,10 +2158,7 @@ void launch_wide(const void* weights, const void* x_q8_1, float* y, int n_in, in
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     int rpw = wide_k_rpw();
-    static const bool shape_reuse = [] {
-        const char* v = std::getenv("STRATA_MMVQ_SHAPE_RPW");
-        return v && v[0] == '1';
-    }();
+    static const bool shape_reuse = strata::bm_default_on("STRATA_MMVQ_SHAPE_RPW", s->get_device());
     if (shape_reuse && std::getenv("STRATA_MMVQ_WIDE_K_RPW") == nullptr &&
         strata::intel_gpu_gen(s->get_device()) == strata::IntelGpuGen::Battlemage) {
         bool eligible = false;
