@@ -805,6 +805,7 @@ Verifier::~Verifier() try {
         slot.compare_exchange_strong(me, nullptr);
     }
     if (cs_) cs_->wait();
+    if (slot_hist_d_ != nullptr && cs_) { try { sycl::free(slot_hist_d_, *cs_); } catch (...) {} slot_hist_d_ = nullptr; }
     if (sh_cs_) sh_cs_->wait();
     for (auto& row : exec_)
         for (auto& e : row)
@@ -4352,6 +4353,7 @@ bool Verifier::init_slots(const std::vector<SessionState *> &slots,
     tail_snap_b_ = (float*) ((uint8_t*) d + a);
     slots_ = slots;
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
+    slot_tail_.assign(slots.size(), {});
     std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences (layers [%lld, %lld))%s\n", (long long) S,
                  (long long) lb_, (long long) le_, g_batch_self_commit ? ", one-row windows keep their rows" : "");
     return true;
@@ -5304,12 +5306,52 @@ catch (sycl::exception const &exc) {
 
 bool Verifier::sample_rows(int S, std::string &err) try {
     bool any = false;
+    constexpr int kSlotHistMax = 4096;   // serve's kPenaltyWindowCap
+    auto penalised = [](const strata::kernels::SamplerParams& sp) {
+        return sp.penalty_last_n > 0 && (sp.penalty_repeat != 1.0f || sp.penalty_freq != 0.0f || sp.penalty_present != 0.0f);
+    };
+    // #4590 / e8a6afd5: the penalised rows' histories - the slot's reply tail plus its tokens in this window up to the row
+    // (slot_penalty_rows), what a solo window of that slot counts.  Built once for the window at the longest window any of
+    // its rows asks for (a row with a shorter one reads the end of its row: the same tokens) and staged in one copy before
+    // any row is drawn, so no row's draw can still read a buffer that a later row replaces.
+    int hmax = 0;
+    for (int t = 0; t < S; ++t) {
+        const strata::kernels::SamplerParams& sp = slot_sp_[(size_t) last_rows_[t]];
+        if (penalised(sp)) hmax = std::max(hmax, std::min(sp.penalty_last_n, kSlotHistMax));
+    }
+    if (hmax > 0) {
+        std::vector<const int32_t*> tails(slots_.size(), nullptr);
+        std::vector<int64_t> n_tails(slots_.size(), 0);
+        for (size_t b = 0; b < slots_.size() && b < slot_tail_.size(); ++b) {
+            tails[b] = slot_tail_[b].data();
+            n_tails[b] = (int64_t) slot_tail_[b].size();
+        }
+        std::vector<int32_t> hrows((size_t) S * (size_t) hmax, -1);
+        strata::kernels::slot_penalty_rows(last_rows_, last_tokens_, S, tails.data(), n_tails.data(), hmax, hrows.data());
+        const OnDevice on_hist(device_);
+        if (slot_hist_cap_ < hrows.size()) {
+            cs_->wait();   // (nothing queued may still read the old rows)
+            if (slot_hist_d_ != nullptr) sycl::free(slot_hist_d_, *cs_);
+            slot_hist_d_ = sycl::malloc_device<int32_t>(hrows.size(), *cs_);
+            if (slot_hist_d_ == nullptr) { slot_hist_cap_ = 0; err = "verify batch: the penalty-history allocation failed"; return false; }
+            slot_hist_cap_ = hrows.size();
+        }
+        cs_->memcpy(slot_hist_d_, hrows.data(), hrows.size() * sizeof(int32_t)).wait();   // (waited: hrows is this call's)
+    }
     for (int t = 0; t < S; ++t) {
         strata::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
-        if (sp.greedy || sp.temperature <= 0.0f) continue;
+        const bool pen = penalised(sp);
+        if ((sp.greedy || sp.temperature <= 0.0f) && !pen) continue;   // a plain greedy slot keeps the window's argmax token untouched
         sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
-        sp.penalty_last_n = 0;
-        strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,
+        const int32_t* hist = nullptr;
+        int hlen = 0;
+        if (pen) {
+            hlen = std::min(sp.penalty_last_n, kSlotHistMax);
+            hist = slot_hist_d_ + (size_t) t * (size_t) hmax + (size_t) (hmax - hlen);
+        } else {
+            sp.penalty_last_n = 0;
+        }
+        strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, hist, hlen, sp,
                                        m_out_ + t, cs_);
         any = true;
     }
