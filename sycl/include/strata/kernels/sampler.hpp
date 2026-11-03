@@ -92,6 +92,18 @@ bool sample_tokens_proposal(const float* logits, int n_tokens, int n_vocab, cons
                         const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
                         void* stream);
 
+// #4590: which tokens the repeat / frequency / presence penalties count.  By default only the current reply: the
+// tokens the answer has written (the window starts at the last prompt token, the one the first decode step feeds in).
+// The prompt, including earlier assistant turns in it, is not counted, so a number or a quoted answer in the new
+// task is not penalised just for being there.  STRATA_PENALTY_PROMPT=1 restores the old window, the last
+// penalty_last_n tokens of prompt + reply.  Any other value (or none) is the default.
+inline bool penalty_counts_prompt(const char* env) { return env != nullptr && env[0] == '1'; }
+// The first index of the session's consumed tokens (prompt, then reply) the penalty window may read, given how
+// many were consumed when the request's decode began (the prompt without its last token).
+inline size_t penalty_window_from(size_t consumed_at_decode_start, bool counts_prompt) {
+    return counts_prompt ? 0 : consumed_at_decode_start;
+}
+
 // The penalty-history rows of a verify window, on the host: row t of `out` (T rows of `h` slots) is the last `h`
 // tokens of `tail[0..n_tail)` followed by `window[0..t]`, most recent LAST, -1 in the unused front slots.
 // `tail` is what the state consumed before the window, `window[0]` the fed-back token and `window[1..]` the
@@ -108,6 +120,19 @@ inline void penalty_rows(const int32_t* tail, int64_t n_tail, const int32_t* win
             row[h - take + j] = i < n_tail ? tail[i] : window[i - n_tail];
         }
     }
+}
+// #4590 on this tree: the rows of a verify window that starts at position `p` of a session whose consumed tokens
+// (`consumed`, indexed by position, `n_consumed` of them) are counted from position `from` on (penalty_window_from of
+// the prompt without its last token).  A window from `from` on: penalty_rows over (consumed[from..p), window).  A merged
+// first window (STRATA_TURN_MERGE / STRATA_ADMIT_MERGE_FIRST: the prompt's last tokens as rows, then the first token)
+// starts before `from`: its rows before the head x at `from` are prompt rows whose draws are not used and get empty
+// rows (-1); the rows from x on count x and the window's tokens after it, as a window that starts at x would.
+inline void penalty_window_rows(const int32_t* consumed, size_t n_consumed, size_t from, int64_t p, const int32_t* window,
+                                int T, int h, int32_t* out) {
+    const size_t pf = std::min(from, n_consumed);
+    const int skip = (int) std::min<int64_t>(T - 1, std::max<int64_t>(0, (int64_t) from - p));
+    std::fill(out, out + (size_t) skip * (size_t) h, -1);
+    penalty_rows(consumed + pf, (int64_t) (n_consumed - pf), window + skip, T - skip, h, out + (size_t) skip * (size_t) h);
 }
 
 // Gated proposal verification is not implemented by the SYCL backend.

@@ -17597,6 +17597,11 @@ int main(int argc, char **argv) try {
                                                ? drive.d.pcie_num : pcie_num_of(stages[(size_t) st - 1]->pcie_frac);
             if (pipe) for (int st = 0; st < split_drive.n; ++st) split_drive_b.pcie_num[st] = split_drive.pcie_num[st];
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
+            // #4590: the repeat / frequency / presence penalties count the tokens this reply has written, not the prompt's last
+            // tokens.  Earlier assistant turns inside the prompt are not counted either.
+            // STRATA_PENALTY_PROMPT=1 brings the old window back (the last penalty_last_n tokens of prompt + reply).  The history
+            // is rebuilt from the request's prompt ids every time, so a restored conversation seeds it like a cold read.
+            static const bool pen_prompt = strata::kernels::penalty_counts_prompt(std::getenv("STRATA_PENALTY_PROMPT"));
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             if (pipe) ver_b.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             bool cancelled = false;
@@ -17856,6 +17861,11 @@ int main(int argc, char **argv) try {
             std::vector<int32_t> consumed;
             consumed.reserve((size_t) (n + max_new + S));
             for (int64_t i = 0; i < p; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
+            // #4590: where the penalty window may start in `consumed` (see pen_prompt above): position n - 1, the last prompt
+            // token, which joins the window as the fed-back head `x`.  `consumed` is indexed by position, so this is the
+            // prompt without its last token - also when a merged first window (STRATA_TURN_MERGE, STRATA_ADMIT_MERGE_FIRST)
+            // starts earlier, at p < n - 1, and carries the prompt's last tokens as rows (see the penalty rows below).
+            const size_t pen_gen0 = strata::kernels::penalty_window_from((size_t) (n - 1), pen_prompt);
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
@@ -18904,8 +18914,9 @@ int main(int argc, char **argv) try {
                     // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
                     // before that row - what plain decode would have counted there.  (Until 0.1.19 only row 0
                     // was staged, and the drafted rows read unwritten slots.)
-                    strata::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), window.data(), T,
-                                                  hist_n, hist_stage.data());
+                    // #4590: counted from pen_gen0 on (a merged first window starts before it: penalty_window_rows)
+                    strata::kernels::penalty_window_rows(consumed.data(), consumed.size(), pen_gen0, p, window.data(), T,
+                                                         hist_n, hist_stage.data());
                     const strata::core::OnDevice on_h(hist_dev);
                     dpct::get_in_order_queue()
                         .memcpy(d_hist, hist_stage.data(),
@@ -19061,8 +19072,10 @@ int main(int argc, char **argv) try {
                 const Clock::time_point tw2 = Clock::now();
                 // coupled drafts with penalties: the next window's row-0 history (`consumed` holds this window's
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
-                if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
-                    mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
+                if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new) {
+                    const size_t pf = std::min(pen_gen0, consumed.size());   // #4590: the reply's tail only
+                    mtp.set_draft_history(consumed.data() + pf, (int64_t) (consumed.size() - pf), outv[(size_t) a]);
+                }
                 generation = {};   // a skipped or failed production must not expose an older q view
                 const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
                 const bool drafted = !use_mtp || eos || produced_n >= max_new ||

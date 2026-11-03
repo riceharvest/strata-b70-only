@@ -489,6 +489,10 @@ if(STRATA_SYCL_PARITY)
   add_executable(pipeline_auto_test ${CMAKE_CURRENT_SOURCE_DIR}/src/core/pipeline_auto_test.cpp)   # the default of --pipeline-windows (no GPU)
   target_include_directories(pipeline_auto_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   add_test(NAME pipeline_auto_test COMMAND pipeline_auto_test)
+  # #4590: the penalty window is the current reply by default, STRATA_PENALTY_PROMPT=1 the old prompt + reply window (header-only, CPU)
+  add_executable(penalty_window_test ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/penalty_window_test.cpp)
+  target_include_directories(penalty_window_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME penalty_window_test COMMAND penalty_window_test)
   if(_i8_esimd)   # DPAS s8 8x16x32 (Xe2): not for an Alchemist / Xe-HPC AOT build, nor with STRATA_SYCL_I8_ESIMD=OFF
     add_executable(esimd_dpas_probe ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/esimd_dpas_probe.cpp)   # ESIMD DPAS peak (registers only)
     add_executable(esimd_i8_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/esimd_i8_bench.cpp)   # ESIMD int8 DPAS GEMM on pre-decoded weights
