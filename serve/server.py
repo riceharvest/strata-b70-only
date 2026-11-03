@@ -8843,7 +8843,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
     svc.gpu_locks = gpu_locks
-    svc.request_stop = request_stop
+    # POST /v1/restart: SIGTERM to ourselves on POSIX - its handler is always installed, while a server started in the
+    # background of a script has SIGINT ignored, so _thread.interrupt_main() (request_stop off the main thread) does nothing
+    svc.request_stop = ((lambda reason: os.kill(os.getpid(), signal.SIGTERM)) if hasattr(signal, "SIGTERM") and os.name == "posix"
+                        else request_stop)
     svc.before_load = a.before_load or cfg.get("before_load") or None
     try:
         svc.before_load_timeout_s = float(cfg.get("before_load_timeout_s") or svc.before_load_timeout_s)
