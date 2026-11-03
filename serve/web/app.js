@@ -939,11 +939,15 @@ $("cfg-save").addEventListener("click", async () => {
 // again. The connection drops on the way; the page waits for /health and reloads itself.
 $("cfg-restart").addEventListener("click", async () => {
   const live = (lastMetrics && lastMetrics.live) || {};
-  if (turnBlocksUnload(live)) { toast("warn", "Model is busy", "Stop the reply, then restart."); return; }
-  if (!confirm("Restart Strata now? The model unloads, the run config is read again and the model loads (a few minutes).")) return;
+  // a running or queued request (or one the engine hangs on) is ended by a forced restart, after asking
+  const force = turnBlocksUnload(live);
+  if (!confirm(force
+    ? "A request is running (or the engine is stuck on it). Force restart? It ends that request, then Strata reads the run config again and loads the model (a few minutes)."
+    : "Restart Strata now? The model unloads, the run config is read again and the model loads (a few minutes).")) return;
+  if (force && busy) busy.controller.abort();
   $("cfg-restart").disabled = true;
   try {
-    const r = await fetch("v1/restart", {method: "POST", headers: headers(true), body: "{}"});
+    const r = await fetch(force ? "v1/restart?force=1" : "v1/restart", {method: "POST", headers: headers(true), body: "{}"});
     let b = {};
     try { b = await r.json(); } catch (e) { /* no body */ }
     if (!r.ok) throw new Error((b.error || {}).message || `HTTP ${r.status}`);

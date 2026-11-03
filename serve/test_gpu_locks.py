@@ -102,6 +102,18 @@ class GpuLocksFollowTheModel(unittest.TestCase):
         self.assertFalse(self.engine.loaded)
         self.assertFalse(any(map(held_elsewhere, self.paths)))
 
+    def test_force_restart_goes_ahead_while_a_turn_runs(self):
+        stopped = threading.Event()
+        self.svc.request_stop = lambda reason: stopped.set()
+        self.svc.load()
+        with self.svc.status_lock:
+            self.svc.status["busy"] = True                              # a turn the engine hangs on
+        self.addCleanup(lambda: self.svc.status.update(busy=False))
+        code, body = self.request("/v1/restart?force=1", {})
+        self.assertEqual((code, body["status"]), (200, "restarting"))
+        self.assertTrue(stopped.wait(5))
+        self.assertTrue(self.svc.restart_requested)
+
     def test_restart_refuses_while_a_turn_runs_and_from_another_site(self):
         self.svc.request_stop = lambda reason: self.fail("must not stop")
         self.svc.load()

@@ -7023,10 +7023,14 @@ def make_handler(svc: Service):
                     if svc.request_stop is None:
                         self._json(409, {"error": {"message": "this server cannot restart itself"}})
                         return
-                    if svc.unload() == "busy":               # the GPU back first; a running or queued turn: 409
+                    # ?force=1: also when a request is running - a hung engine (a turn that never ends) is ended by
+                    # the clean stop (STOP/QUIT, terminate, kill) and its request's connection drops at the restart
+                    force = parse_qs(urlsplit(self.path).query).get("force", [""])[0].lower() in ("1", "true", "yes")
+                    if svc.unload() == "busy" and not force:  # the GPU back first; a running or queued turn: 409
                         raise ModelBusy("a request is running or queued")
                     svc.restart_requested = True
-                    print("[strata] restarting (the Settings view asked): the run config is read again", flush=True)
+                    print("[strata] restarting (the Settings view asked" + (", forced" if force else "") +
+                          "): the run config is read again", flush=True)
                     self._json(200, {"status": "restarting"})
                     threading.Timer(0.3, svc.request_stop, args=("restart",)).start()
                     return
@@ -9021,6 +9025,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             for close in filter(None, closers):
                 try:
                     close()
+                except EngineStuck as e:                # say it and go on: the other closers (and a restart) still run
+                    print(f"[strata] {e}", flush=True)
                 except KeyboardInterrupt:               # a second Ctrl+C: don't wait for the engine to free its memory
                     if getattr(engine, "proc", None):
                         engine.proc.kill()
