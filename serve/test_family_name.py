@@ -1,6 +1,6 @@
 """serve/test_family_name.py - the API's model name per model family (NEW-MODELS-PLAN.md T0): the config's
-"model_name" wins; without one, the family's ("arch": qwen4exp -> qwen3.8-flash-next, qwen35moe -> qwen3.6-35b-a3b),
-and Flash-Next's for a config that names neither (every config setup wrote before).
+"model_name" wins; without one, the family's ("arch": qwen4exp -> qwen3.8-flash-next, qwen35moe -> qwen3.6-35b-a3b,
+qwen35 -> qwen3.8-27b), and Flash-Next's for a config that names neither (every config setup wrote before).
 
     python -m unittest serve.test_family_name
 """
@@ -20,11 +20,12 @@ class FamilyName(unittest.TestCase):
         self.assertEqual(default_model_name({"arch": "qwen35moe"}), "qwen3.6-35b-a3b")
         self.assertEqual(default_model_name({"arch": "qwen4exp"}), "qwen3.8-flash-next")
         self.assertEqual(default_model_name({"arch": "deepseek41"}), "deepseek-v4.1-flash")
+        self.assertEqual(default_model_name({"arch": "qwen35"}), "qwen3.8-27b")   # the dense Qwen3.8-27B (strata-q36)
 
     def test_old_configs(self):
         self.assertEqual(default_model_name({}), "qwen3.8-flash-next")
         self.assertEqual(default_model_name({"arch": "something-else"}), "qwen3.8-flash-next")
-        self.assertEqual(set(FAMILY_MODEL_NAMES), {"qwen4exp", "qwen35moe", "deepseek41"})
+        self.assertEqual(set(FAMILY_MODEL_NAMES), {"qwen4exp", "qwen35moe", "qwen35", "deepseek41"})
 
 
 if __name__ == "__main__":

@@ -3636,7 +3636,7 @@ class Service:
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
-        self.model_arch = None                        # the config's family ("qwen4exp", "qwen35moe"): None = no model-card defaults
+        self.model_arch = None                        # the config's family ("qwen4exp", "qwen35moe", "qwen35"): None = no model-card defaults
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
@@ -3645,6 +3645,7 @@ class Service:
         self.gpu_locks = None                         # GpuLocks: the config's "gpu_locks", held while the model is loaded
         self.request_stop = None                      # main()'s clean stop, for POST /v1/restart
         self.restart_requested = False                # main() ends, then the process starts itself again (os.execv)
+        self.restart_config = None                    # ... with this run config instead of --config's (a model switch)
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -7026,9 +7027,17 @@ def make_handler(svc: Service):
                     # ?force=1: also when a request is running - a hung engine (a turn that never ends) is ended by
                     # the clean stop (STOP/QUIT, terminate, kill) and its request's connection drops at the restart
                     force = parse_qs(urlsplit(self.path).query).get("force", [""])[0].lower() in ("1", "true", "yes")
+                    switch_to = req.get("config") if isinstance(req, dict) else None
+                    if switch_to is not None:                # another model: one of the run configs next to this one
+                        pick = [m for m in self._model_configs() if m["file"] == switch_to]
+                        if not pick:
+                            self._json(404, {"error": {"message": f"no run config {switch_to!r} next to this one"}})
+                            return
+                        switch_to = str(Path(svc.config_path).resolve().parent / pick[0]["file"])
                     if svc.unload() == "busy" and not force:  # the GPU back first; a running or queued turn: 409
                         raise ModelBusy("a request is running or queued")
                     svc.restart_requested = True
+                    svc.restart_config = switch_to
                     print("[strata] restarting (the Settings view asked" + (", forced" if force else "") +
                           "): the run config is read again", flush=True)
                     self._json(200, {"status": "restarting"})
@@ -7232,6 +7241,22 @@ def make_handler(svc: Service):
                 return False
             return True
 
+        def _model_configs(self) -> list[dict]:
+            """The run configs in the folder of this server's --config (engine "strata"): the models the Settings view can
+            switch to (POST /v1/restart {"config": <file>}).  {"file", "model", "current"} each."""
+            if not svc.config_path:
+                return []
+            here = Path(svc.config_path).resolve()
+            out = []
+            for f in sorted(here.parent.glob("*.json")):
+                try:
+                    c = json.loads(f.read_text(encoding="utf-8-sig"))
+                except (OSError, ValueError):
+                    continue
+                if isinstance(c, dict) and c.get("engine") == "strata" and isinstance(c.get("args"), list):
+                    out.append({"file": f.name, "model": default_model_name(c), "current": f.resolve() == here})
+            return out
+
         def _config_get(self):
             if not svc.config_path:
                 self._json(404, {"error": {"message": "this server was started without a run config"}})
@@ -7241,7 +7266,7 @@ def make_handler(svc: Service):
             except (OSError, ValueError) as e:
                 self._json(500, {"error": {"type": "server_error", "message": f"the run config cannot be read: {e}"}})
                 return
-            self._json(200, runconfig.view(cfg, svc.config_path))
+            self._json(200, {**runconfig.view(cfg, svc.config_path), "models": self._model_configs()})
 
         def _config_post(self):
             """#564: change a few documented keys of the run config - JSON from Strata's own page only, as
@@ -8303,8 +8328,10 @@ def check_request_sampling(req) -> None:
             raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
 
 
-# the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none
-FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b",
+# the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none.
+# "qwen35" is the dense Qwen3.8-27B, served by strata-q36 (the config's exe; on an Intel Arc sycl/serve/strata-sycl.sh with
+# STRATA_SYCL_BIN=build-sycl-aot/strata-q36 in its "env": tools/qwen35/serve-27b.json)
+FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b", "qwen35": "qwen3.8-27b",
                       "deepseek41": "deepseek-v4.1-flash"}
 
 
@@ -8318,6 +8345,9 @@ MODEL_CARD_SAMPLING = {
     # Qwen3.6-35B-A3B: the general-task sets (the card's precise-coding set is temperature 0.6, presence_penalty 0)
     "qwen35moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
+    # Qwen3.8-27B: the GGUF's general.sampling (temp 1.0, top_p 0.95, top_k 20) when thinking, Qwen's instruct set without
+    "qwen35": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+               "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
     # DeepSeek-V4.1-Flash: temperature 1.0, top_p 1.0 for local use (thinking or not), no penalties
     "deepseek41": {"thinking": {"temperature": 1.0, "top_p": 1.0}, "instruct": {"temperature": 1.0, "top_p": 1.0}},
 }
@@ -8340,7 +8370,7 @@ def arch_from_tokenizer(arch, pre) -> str | None:
 
 
 def default_model_name(cfg: dict) -> str:
-    """The config's "model_name", else its family's name ("arch": qwen4exp, qwen35moe), else Flash-Next's."""
+    """The config's "model_name", else its family's name ("arch": qwen4exp, qwen35moe, qwen35), else Flash-Next's."""
     return cfg.get("model_name") or FAMILY_MODEL_NAMES.get(cfg.get("arch") or "qwen4exp", "qwen3.8-flash-next")
 
 
@@ -9047,12 +9077,25 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                                  "drained": drained, "cancelled_requests": cancelled,
                                  "exit_code": exit_code})
     global RESTART_REQUESTED
-    RESTART_REQUESTED = svc.restart_requested
+    RESTART_REQUESTED = svc.restart_config or svc.restart_requested
     return exit_code
 
 
 RESTART_REQUESTED = False
 START_CWD = os.getcwd()
+
+
+def with_config(argv: list[str], path: str) -> list[str]:
+    """argv with its --config (or --config=...) naming `path`; appended when it had none."""
+    out, i, done = [], 0, False
+    while i < len(argv):
+        a = argv[i]
+        if a == "--config" and i + 1 < len(argv):
+            out += [a, path]; i += 2; done = True; continue
+        if a.startswith("--config="):
+            out.append("--config=" + path); i += 1; done = True; continue
+        out.append(a); i += 1
+    return out if done else out + ["--config", path]
 
 
 def exec_restart(code: int) -> int:
@@ -9064,8 +9107,9 @@ def exec_restart(code: int) -> int:
         subprocess.run(["docker", "stop", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60,
                        check=False)
     print("[strata] starting again ...", flush=True)
+    argv = with_config(sys.argv, RESTART_REQUESTED) if isinstance(RESTART_REQUESTED, str) else sys.argv
     os.chdir(START_CWD)
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    os.execv(sys.executable, [sys.executable] + argv)
     return code                                          # not reached
 
 

@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, GpuBusy, GpuLocks, Service, serve
+from serve.server import ByteTokenizer, GpuBusy, GpuLocks, Service, serve, with_config
 from serve.test_lifecycle import Lifecycle, ResidentEngine
 
 
@@ -125,6 +125,42 @@ class GpuLocksFollowTheModel(unittest.TestCase):
         self.assertEqual(self.request("/v1/restart", {}, {"Origin": "https://evil.example"})[0], 403)
         self.assertFalse(self.svc.restart_requested)
         self.assertTrue(self.engine.loaded)
+
+
+class ModelSwitch(GpuLocksFollowTheModel):
+    def setUp(self):
+        super().setUp()
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.dir = Path(d.name)
+        (self.dir / "flash-next.json").write_text('{"engine": "strata", "args": [], "model_name": "qwen38-flash-next"}')
+        (self.dir / "qwen38-27b.json").write_text('{"engine": "strata", "arch": "qwen35", "args": ["--kv", "int8"]}')
+        (self.dir / "flash-next.lifetime.json").write_text('{"tokens": 1}')          # not a run config
+        self.svc.config_path = str(self.dir / "flash-next.json")
+
+    def test_the_settings_view_lists_the_run_configs(self):
+        code, body = self.request("/config")
+        self.assertEqual(code, 200)
+        self.assertEqual(body["models"], [
+            {"file": "flash-next.json", "model": "qwen38-flash-next", "current": True},
+            {"file": "qwen38-27b.json", "model": "qwen3.8-27b", "current": False}])
+
+    def test_restart_with_another_config_switches_the_model(self):
+        stopped = threading.Event()
+        self.svc.request_stop = lambda reason: stopped.set()
+        self.assertEqual(self.request("/v1/restart", {"config": "../etc.json"})[0], 404)
+        self.assertEqual(self.request("/v1/restart", {"config": "flash-next.lifetime.json"})[0], 404)
+        self.assertFalse(stopped.is_set())
+        code, body = self.request("/v1/restart", {"config": "qwen38-27b.json"})
+        self.assertEqual((code, body["status"]), (200, "restarting"))
+        self.assertTrue(stopped.wait(5))
+        self.assertEqual(self.svc.restart_config, str((self.dir / "qwen38-27b.json").resolve()))
+
+    def test_with_config_rewrites_argv(self):
+        self.assertEqual(with_config(["s.py", "--config", "a.json", "--port", "1"], "b.json"),
+                         ["s.py", "--config", "b.json", "--port", "1"])
+        self.assertEqual(with_config(["s.py", "--config=a.json"], "b.json"), ["s.py", "--config=b.json"])
+        self.assertEqual(with_config(["s.py"], "b.json"), ["s.py", "--config", "b.json"])
 
 
 if __name__ == "__main__":

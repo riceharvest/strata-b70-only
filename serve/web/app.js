@@ -889,6 +889,10 @@ async function loadConfig() {
   if (!r.ok) { $("cfg-card").hidden = true; return; }       // no run config, an older server, or no key yet
   const c = await r.json();
   cfgKeys = c.keys || [];
+  const models = c.models || [];                     // the run configs next to this one: other models to switch to
+  $("cfg-model-row").hidden = models.length < 2;
+  $("cfg-model").innerHTML = models.map((m) =>
+    `<option value="${esc(m.file)}"${m.current ? " selected" : ""}>${esc(m.model)} (${esc(m.file)})${m.current ? " - running" : ""}</option>`).join("");
   $("cfg-file").textContent = c.file || "";
   $("cfg-form").innerHTML = cfgKeys.map((k, i) => {
     const id = `cfg-${i}`, v = k.value;
@@ -937,22 +941,25 @@ $("cfg-save").addEventListener("click", async () => {
 
 // POST /v1/restart: the server unloads, stops cleanly and starts the same command again, so the whole run config is read
 // again. The connection drops on the way; the page waits for /health and reloads itself.
-$("cfg-restart").addEventListener("click", async () => {
+// config: another run config next to this one (a model switch), else the same one read again
+async function restartServer(config) {
   const live = (lastMetrics && lastMetrics.live) || {};
+  const what = config ? `switch to ${config}` : "read the run config again";
   // a running or queued request (or one the engine hangs on) is ended by a forced restart, after asking
   const force = turnBlocksUnload(live);
   if (!confirm(force
-    ? "A request is running (or the engine is stuck on it). Force restart? It ends that request, then Strata reads the run config again and loads the model (a few minutes)."
-    : "Restart Strata now? The model unloads, the run config is read again and the model loads (a few minutes).")) return;
+    ? `A request is running (or the engine is stuck on it). Force restart? It ends that request, then Strata restarts to ${what} and loads the model (a few minutes).`
+    : `Restart Strata now to ${what}? The model unloads and the model loads again (a few minutes).`)) return;
   if (force && busy) busy.controller.abort();
-  $("cfg-restart").disabled = true;
+  $("cfg-restart").disabled = $("cfg-switch").disabled = true;
   try {
-    const r = await fetch(force ? "v1/restart?force=1" : "v1/restart", {method: "POST", headers: headers(true), body: "{}"});
+    const r = await fetch(force ? "v1/restart?force=1" : "v1/restart",
+                          {method: "POST", headers: headers(true), body: JSON.stringify(config ? {config} : {})});
     let b = {};
     try { b = await r.json(); } catch (e) { /* no body */ }
     if (!r.ok) throw new Error((b.error || {}).message || `HTTP ${r.status}`);
   } catch (e) {
-    $("cfg-restart").disabled = false;
+    $("cfg-restart").disabled = $("cfg-switch").disabled = false;
     toast("error", "Not restarted", String(e.message || e), 8000);
     return;
   }
@@ -964,8 +971,15 @@ $("cfg-restart").addEventListener("click", async () => {
     try { if ((await fetch("health", {cache: "no-store"})).ok) { location.reload(); return; } } catch (e) { /* still down */ }
     await new Promise((resolve) => setTimeout(resolve, 2000));
   }
-  $("cfg-restart").disabled = false;
+  $("cfg-restart").disabled = $("cfg-switch").disabled = false;
   $("cfg-msg").textContent = "Strata did not come back in 30 minutes: look at its window.";
+}
+$("cfg-restart").addEventListener("click", () => restartServer(null));
+$("cfg-switch").addEventListener("click", () => {
+  const sel = $("cfg-model");
+  const cur = sel.querySelector("option[selected]");
+  if (cur && sel.value === cur.value) { toast("info", "Already running", "Pick another model first."); return; }
+  restartServer(sel.value);
 });
 
 // ------------------------------------------------------------------ Markdown (escaped first, then formatted)

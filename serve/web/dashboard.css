@@ -58,6 +58,9 @@ body { background: var(--bg-page); font-size: var(--st-fs-md); overflow: hidden;
 .topbar__spacer { flex: 1; }
 #unload-btn { flex: none; height: 32px; padding: 0 12px; min-width: 7.75rem; }
 .topbar--clip #pill-text { display: none; }
+.cfg-model { display: flex; align-items: center; gap: 10px; margin: 4px 0 14px; }
+.cfg-model label { font-weight: 600; }
+.cfg-model select { flex: 1; min-width: 0; }
 @media (max-width: 457px) { #unload-btn { min-width: 0; padding: 0 8px; } }
 .stage main { background: var(--bg-page); }
 .st-pill { height: 28px; background: var(--st-surface); border-radius: 6px; }

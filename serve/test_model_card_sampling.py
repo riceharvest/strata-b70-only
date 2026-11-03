@@ -63,6 +63,9 @@ class ModelCardSampling(unittest.TestCase):
         self.assertEqual(model_card_sampling("qwen4exp", False),
                          {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5})
         self.assertEqual(model_card_sampling("qwen35moe", True)["presence_penalty"], 1.5)
+        # Qwen3.8-27B (dense): the GGUF's general.sampling when thinking - no penalty, so a temperature 0 request stays the
+        # engine's greedy path (and its MTP drafts)
+        self.assertEqual(model_card_sampling("qwen35", True), {"temperature": 1.0, "top_p": 0.95, "top_k": 20})
         self.assertEqual(model_card_sampling(None, True), {})
         self.assertEqual(model_card_sampling("unknown", False), {})
 
