@@ -22,25 +22,26 @@ class WebLoadUnloadMarkup(unittest.TestCase):
     def setUpClass(cls):
         cls.html = (WEB / "index.html").read_text(encoding="utf-8")
         cls.js = (WEB / "app.js").read_text(encoding="utf-8")
-        cls.css = (WEB / "app.css").read_text(encoding="utf-8")
+        cls.css = (WEB / "dashboard.css").read_text(encoding="utf-8")   # the dashboard's top bar (02d81812)
 
     def test_header_button_and_monitor_badge(self):
         self.assertIn('id="unload-btn"', self.html)
         self.assertIn('data-s="unloaded"', self.html)
-        self.assertLess(self.html.index('id="unload-btn"'), self.html.index('id="theme-btn"'))   # in the header row
+        bar = self.html[self.html.index('<header class="topbar">'):self.html.index("</header>")]
+        self.assertIn('id="unload-btn"', bar)                        # in the top bar, beside the pill
 
     def test_button_posts_load_and_unload(self):
         self.assertIn('$("unload-btn").onclick', self.js)
         self.assertIn('fetch(loadingNow ? "load" : "unload", {method: "POST", headers: headers(true), body: "{}"})', self.js)
 
     def test_unload_asks_first_and_never_interrupts_a_turn(self):
-        self.assertIn("confirm(tr(\"model.confirmUnload\"", self.js)
+        self.assertIn('confirm("Unload the model and free the GPU?', self.js)
         self.assertIn("turnBlocksUnload(live)", self.js)
         self.assertIn("function turnBlocksUnload(live)", self.js)
 
     def test_401_gets_the_key_copy(self):
         # The control POST answers a 401 the way poll and send do, not with a bare HTTP line.
-        self.assertIn('r.status === 401 ? tr("toast.keyAbout2"', self.js)
+        self.assertIn('r.status === 401 ? "API key needed', self.js)
 
     def test_poll_hold_until_a_poll_agrees(self):
         self.assertIn("metricsHold = {state, after: metricsEpoch};", self.js)
@@ -52,9 +53,8 @@ class WebLoadUnloadMarkup(unittest.TestCase):
 
     def test_the_header_row_keeps_the_buttons_on_a_phone(self):
         self.assertIn("#unload-btn", self.css)
-        self.assertIn(".st-header--clip #pill-text", self.css)
-        for width in ("955px", "457px", "382px"):
-            self.assertIn(f"@media (max-width: {width})", self.css)
+        self.assertIn(".topbar--clip #pill-text", self.css)
+        self.assertIn('document.querySelector(".topbar")', self.js)
 
 
 @unittest.skipUnless(shutil.which("node"), "node is not installed")

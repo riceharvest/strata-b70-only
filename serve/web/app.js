@@ -168,9 +168,18 @@ function setMetric(key, value, unit, sub) {
 let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
 let allReqs = [], allReqsAt = 0, polling = false;      // every request the server keeps, fetched at most every 5 s
 const wantsAll = () => tab === "monitor" || tab === "requests";
+// After Load or Unload returns, a poll that started earlier can still say the opposite. Hold the POST's state until a later
+// poll agrees, or until the first poll that started after the POST arrives. (PR #3550 by sakuumomo)
+let metricsEpoch = 0, metricsHold = null;
+function metricsAgree(live, state) {
+  const s = (live && live.state) || "";
+  if (state === "unloaded") return s === "unloaded";
+  return s !== "" && s !== "unloaded";
+}
 async function poll() {
   if (polling) return;
   polling = true;
+  const epoch = ++metricsEpoch;
   try {
     const full = wantsAll() && Date.now() - allReqsAt > 5000;
     const r = await fetch(full ? "metrics?requests=all" : "metrics", {headers: headers()});
@@ -178,7 +187,14 @@ async function poll() {
       setPill("error", "API key needed");
       if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under Model and settings.", 6000); }
     } else if (r.ok) {
-      lastMetrics = await r.json();
+      const m = await r.json();
+      if (metricsHold && epoch <= metricsHold.after && !metricsAgree(m.live, metricsHold.state)) {
+        polling = false;
+        setTimeout(poll, 1000);
+        return;
+      }
+      if (metricsHold && (metricsAgree(m.live, metricsHold.state) || epoch > metricsHold.after)) metricsHold = null;
+      lastMetrics = m;
       if (full) { allReqs = lastMetrics.requests || []; allReqsAt = Date.now(); }
       else if (allReqs.length) {                         // the newest 12 are always fresh; the rest comes from the last full read
         const ids = new Set((lastMetrics.requests || []).map((x) => x.id));
@@ -200,14 +216,132 @@ async function poll() {
 function setPill(state, text) {
   $("pill").dataset.state = state === "error" ? "queued" : state;
   $("pill-text").textContent = text;
+  // a poll re-sets the sentence every second; refit only when its text changed
+  if (text !== lastPillText) { lastPillText = text; fitHeader(); }
 }
+let lastPillText = null;
+// The pill's sentence is the first thing the top bar can spare when it runs out of room.
+function fitHeader() {
+  const bar = document.querySelector(".topbar");
+  if (!bar) return;
+  bar.classList.remove("topbar--clip");
+  if (bar.scrollWidth > bar.clientWidth) bar.classList.add("topbar--clip");
+}
+window.addEventListener("resize", fitHeader);
+
+// ------------------------------------------------------------------ Load / Unload (POST /load, /unload: the top bar button)
+// Metrics stay "unloaded" until the engine is READY, so a turn or an image job on this page has to paint Loading itself.
+// modelOp covers the button's own POST, which returns before the next poll can agree. (PR #3550 by sakuumomo)
+let modelOp = null;
+let imageBusy = false;
+function pageBusy() { return busy != null || imageBusy; }
+function imageLive(live) {
+  if (live && live.phase === "generating an image") return true;
+  const state = live && live.state;
+  if (state === "reading" || state === "generating") return false;
+  return imageBusy;
+}
+function paintLive() { if (lastMetrics) render(lastMetrics); }
+function turnBlocksUnload(live) {
+  const state = (live && live.state) || "";
+  return pageBusy() || state === "reading" || state === "generating" || (live && live.queued > 0);
+}
+function setModelButton(text, title, disabled) {
+  const btn = $("unload-btn");
+  btn.textContent = text; btn.title = title; btn.disabled = disabled;
+  fitHeader();
+}
+function modelButton(live) {
+  if (modelOp === "load") return setModelButton("Loading\u2026", "The model is loading", true);
+  if (modelOp === "unload") return setModelButton("Unloading\u2026", "The model is unloading", true);
+  const state = (live && live.state) || "";
+  const metricsBusy = state === "reading" || state === "generating" || (live && live.queued > 0);
+  const imageNow = imageLive(live);
+  if (state === "unloaded") {
+    if (imageNow) return setModelButton("Loading\u2026", "An image is already loading the model", true);
+    if (pageBusy()) return setModelButton("Loading\u2026", "A reply is already loading the model", true);
+    return setModelButton("Load", "Load the model now. A message also loads it.", false);
+  }
+  if (imageNow) return setModelButton("Unload", "An image is generating. It finishes on its own.", true);
+  if (!state) return setModelButton("\u2026", "Waiting for the server", true);
+  if (metricsBusy || pageBusy()) return setModelButton("Unload", "Stop the reply, then unload", true);
+  return setModelButton("Unload", "Unload the model and free the GPU", false);
+}
+const busyCopy = (sample, stillLoading) => stillLoading
+  ? (imageLive(sample) ? "An image is already loading the model." : "A reply is already loading the model.")
+  : (imageLive(sample) ? "An image is generating. It finishes on its own." : "Stop the reply, then unload.");
+$("unload-btn").onclick = async () => {
+  if (modelOp) return;
+  const live = (lastMetrics && lastMetrics.live) || {};
+  const loading = live.state === "unloaded";
+  if (loading ? pageBusy() : turnBlocksUnload(live)) { toast("warn", "Model is busy", busyCopy(live, loading)); return; }
+  if (!loading && !confirm("Unload the model and free the GPU? Load, or the next message, brings it back.")) return;
+  // confirm() blocks the poll. Yield so a sample that arrived during the dialog is applied. A confirmed Unload stays an unload.
+  if (!loading) {
+    modelOp = "unload";
+    modelButton(live);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  const now = (lastMetrics && lastMetrics.live) || {};
+  const loadingNow = loading;
+  if (loadingNow ? pageBusy() : turnBlocksUnload(now)) {
+    modelOp = null;
+    if (lastMetrics) render(lastMetrics); else modelButton(now);
+    toast("warn", "Model is busy", busyCopy(now, loadingNow));
+    return;
+  }
+  modelOp = loadingNow ? "load" : "unload";
+  modelButton(now);
+  if (loadingNow) toast("info", "Loading the model", "This can take a few minutes.");
+  const remember = (state) => {
+    if (!lastMetrics) lastMetrics = {};
+    lastMetrics.live = Object.assign({}, lastMetrics.live, {state, queued: 0});
+    metricsHold = {state, after: metricsEpoch};
+  };
+  const failTitle = loadingNow ? "Load failed" : "Unload failed";
+  try {
+    const r = await fetch(loadingNow ? "load" : "unload", {method: "POST", headers: headers(true), body: "{}"});
+    let body = {};
+    try { body = await r.json(); } catch (e) { /* the connection dropped */ }
+    const status = body.status || "";
+    const msg = (body.error && body.error.message) ||
+                (r.status === 401 ? "API key needed: add it under Model and settings." : `The server answered HTTP ${r.status}.`);
+    if (loadingNow) {
+      if (r.ok && status === "loaded") { remember("idle"); toast("success", "Model loaded", "The GPU is in use."); }
+      else toast("error", failTitle, msg, 8000);
+    } else if (status === "unloaded" || status === "not loaded") {
+      remember("unloaded");
+      toast(status === "unloaded" ? "success" : "info", status === "unloaded" ? "Model unloaded" : "Already unloaded",
+            "The GPU is free. Load, or the next message, brings it back.");
+    } else if (r.status === 409 || status === "busy") {
+      toast("warn", "Model is busy", busyCopy(live, false));
+    } else if (status === "unsupported") {
+      toast("error", "Unload is not available", "");
+    } else {
+      toast("error", failTitle, msg, 8000);
+    }
+  } catch (e) {
+    toast("error", failTitle, "The server did not answer.");
+  } finally {
+    modelOp = null;
+    if (lastMetrics) render(lastMetrics); else modelButton({});
+  }
+};
 
 function render(m) {
   const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
   const reqs = wantsAll() && allReqs.length ? allReqs : (m.requests || []);
   const last = (m.requests || [])[0];
-  // the header pill
-  if (live.state === "reading") {
+  // the header pill. modelOp and a local load win over "N queued": queued stays up through ensure_loaded(), and
+  // metrics stay "unloaded" until the engine is READY. An image POST in that window is still a load.
+  const localLoad = live.state === "unloaded" && pageBusy();
+  if (modelOp === "load" || localLoad) {
+    setPill("idle", "Loading\u2026");
+  } else if (modelOp === "unload") {
+    setPill("idle", "Unloading\u2026");
+  } else if (imageLive(live)) {
+    setPill("reading", "Generating image\u2026");
+  } else if (live.state === "reading") {
     const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
     setPill("reading", pct != null ? `Reading prompt · ${pct}%` : "Reading prompt");
   } else if (live.state === "generating") {
@@ -215,7 +349,8 @@ function render(m) {
   } else {
     setPill("idle", live.state === "unloaded" ? "Unloaded" : "Idle");
   }
-  if (live.queued > 0) setPill("queued", `${live.queued} queued`);
+  modelButton(live);
+  if (!modelOp && !localLoad && live.queued > 0) setPill("queued", `${live.queued} queued`);
   $("side-model-name").textContent = eng.model || "–";
   $("side-model-sub").textContent = [eng.max_context ? `${ctxfmt(eng.max_context)} context` : null,
                                      live.state === "unloaded" ? "not loaded" : "loaded"].filter(Boolean).join(" · ");
@@ -792,12 +927,41 @@ $("cfg-save").addEventListener("click", async () => {
     const b = await r.json();
     if (!r.ok) throw new Error((b.error || {}).message || `HTTP ${r.status}`);
     $("cfg-msg").textContent = b.changed.length
-      ? `Saved (${b.changed.join(", ")}); the earlier file is ${b.file}.bak. Start the model again to use it.` : "Nothing changed.";
+      ? `Saved (${b.changed.join(", ")}); the earlier file is ${b.file}.bak. Restart to use it.` : "Nothing changed.";
     loadConfig();
   } catch (e) {
     $("cfg-msg").textContent = "";
     toast("error", "Not saved", String(e.message || e), 6000);
   }
+});
+
+// POST /v1/restart: the server unloads, stops cleanly and starts the same command again, so the whole run config is read
+// again. The connection drops on the way; the page waits for /health and reloads itself.
+$("cfg-restart").addEventListener("click", async () => {
+  const live = (lastMetrics && lastMetrics.live) || {};
+  if (turnBlocksUnload(live)) { toast("warn", "Model is busy", "Stop the reply, then restart."); return; }
+  if (!confirm("Restart Strata now? The model unloads, the run config is read again and the model loads (a few minutes).")) return;
+  $("cfg-restart").disabled = true;
+  try {
+    const r = await fetch("v1/restart", {method: "POST", headers: headers(true), body: "{}"});
+    let b = {};
+    try { b = await r.json(); } catch (e) { /* no body */ }
+    if (!r.ok) throw new Error((b.error || {}).message || `HTTP ${r.status}`);
+  } catch (e) {
+    $("cfg-restart").disabled = false;
+    toast("error", "Not restarted", String(e.message || e), 8000);
+    return;
+  }
+  $("cfg-msg").textContent = "Restarting\u2026 this page reloads when Strata is back.";
+  toast("info", "Restarting", "The page reloads when Strata is back.", 8000);
+  const t0 = Date.now();
+  await new Promise((resolve) => setTimeout(resolve, 3000));
+  while (Date.now() - t0 < 30 * 60 * 1000) {
+    try { if ((await fetch("health", {cache: "no-store"})).ok) { location.reload(); return; } } catch (e) { /* still down */ }
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+  $("cfg-restart").disabled = false;
+  $("cfg-msg").textContent = "Strata did not come back in 30 minutes: look at its window.";
 });
 
 // ------------------------------------------------------------------ Markdown (escaped first, then formatted)
@@ -1083,6 +1247,7 @@ function assistantMessages(m) {
 }
 
 function setBusy(on) {
+  paintLive();                                       // the Load / Unload button and the pill follow a turn at once
   $("stop-btn").hidden = !on;
   $("send-btn").disabled = on;
   $("composer-hint").textContent = on ? "" : "Shift+Enter: new line";
@@ -1428,6 +1593,8 @@ $("img-form").onsubmit = async (ev) => {
   const body = {prompt, size: $("img-size").value, response_format: "b64_json"};
   if ($("img-seed").value !== "") body.seed = Number($("img-seed").value);
   $("img-go").disabled = true;
+  imageBusy = true;
+  paintLive();
   const t0 = performance.now();
   $("img-hint").textContent = "Generating\u2026 (a minute or more on a small GPU)";
   try {
@@ -1450,5 +1617,7 @@ $("img-form").onsubmit = async (ev) => {
     toast("error", "No image", String(e.message || e), 8000);
   } finally {
     $("img-go").disabled = false;
+    imageBusy = false;
+    paintLive();
   }
 };

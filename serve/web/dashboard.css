@@ -56,6 +56,9 @@ body { background: var(--bg-page); font-size: var(--st-fs-md); overflow: hidden;
 .topbar__title { margin: 0; font-size: var(--st-fs-lg); font-weight: 700; letter-spacing: -.01em; }
 .topbar__sub { font-size: var(--st-fs-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .topbar__spacer { flex: 1; }
+#unload-btn { flex: none; height: 32px; padding: 0 12px; min-width: 7.75rem; }
+.topbar--clip #pill-text { display: none; }
+@media (max-width: 457px) { #unload-btn { min-width: 0; padding: 0 8px; } }
 .stage main { background: var(--bg-page); }
 .st-pill { height: 28px; background: var(--st-surface); border-radius: 6px; }
 .st-pill__dot { border-radius: 50%; }

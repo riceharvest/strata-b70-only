@@ -461,6 +461,40 @@ class GpuBusy(RuntimeError):
         self.retry_after = retry_after
 
 
+class GpuLocks:
+    """The config's "gpu_locks": lock files (flock) that are held exactly while the model is loaded, in the listed
+    order, so jobs that share the GPU through the same files (`flock <file> <job>`) get the card when the model is
+    unloaded, and a load never starts while one of them runs.  Taken without waiting: a held file is a GpuBusy (503
+    with Retry-After), never a request that hangs.  The kernel drops them when the process ends, however it ends."""
+
+    def __init__(self, paths):
+        self.paths = [str(Path(x).expanduser()) for x in paths]
+        self.fds: list[int] = []
+
+    @property
+    def held(self) -> bool:
+        return bool(self.fds)
+
+    def take(self) -> None:
+        if self.fds:
+            return
+        import fcntl
+        for path in self.paths:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(fd)
+                self.release()
+                raise GpuBusy(f"the GPU is in use by another job ({path} is held): the model stays unloaded until "
+                              "it is free", retry_after=15) from None
+            self.fds.append(fd)
+
+    def release(self) -> None:
+        while self.fds:
+            os.close(self.fds.pop())           # closing the only descriptor releases the flock
+
+
 # The page's only CSP directive: its preview frames (srcdoc) may not load any address. Other directives are left out
 # on purpose: a frame made from srcdoc inherits the page's policy, and the opt-in "run scripts" preview needs its own inline script.
 PAGE_CSP = "frame-src 'none'"
@@ -3608,6 +3642,9 @@ class Service:
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
+        self.gpu_locks = None                         # GpuLocks: the config's "gpu_locks", held while the model is loaded
+        self.request_stop = None                      # main()'s clean stop, for POST /v1/restart
+        self.restart_requested = False                # main() ends, then the process starts itself again (os.execv)
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -4040,10 +4077,21 @@ class Service:
             return None
 
     def ensure_loaded(self):
-        """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
-        the free-VRAM check.  The caller holds self.fifo."""
+        """Start the engine if it is not running (unloaded, or it died - issue #27), after the gpu_locks, the
+        before_load hook and the free-VRAM check.  The caller holds self.fifo."""
         if self.loaded() and not self._vision_down():
             return
+        locks = self.gpu_locks
+        if locks is not None:
+            locks.take()                                 # GpuBusy when another job holds one
+        try:
+            self._ensure_loaded()
+        except BaseException:
+            if locks is not None and not self.loaded():
+                locks.release()
+            raise
+
+    def _ensure_loaded(self):
         hook_failed = None
         if self.before_load:
             cmd = self.before_load
@@ -4222,6 +4270,8 @@ class Service:
             return "busy"
         try:
             if not self.engine.alive():
+                if self.gpu_locks is not None:      # an engine that died holds no GPU: the locks go back too
+                    self.gpu_locks.release()
                 return "not loaded"
             with self.status_lock:
                 if self.status.get("busy") or self.status.get("queued"):
@@ -4232,6 +4282,8 @@ class Service:
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
             self.vision_held = False
+            if self.gpu_locks is not None:
+                self.gpu_locks.release()
             print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
                   "the next request loads it again", flush=True)
             return "unloaded"
@@ -6965,6 +7017,19 @@ def make_handler(svc: Service):
                         result = "loaded"
                     self._json(200, {"status": result, **svc.v1_status()})
                     return
+                if path == "/v1/restart":                    # the Settings view's "Restart to apply": the config is read again
+                    if not self._own_page("the server can be restarted"):
+                        return
+                    if svc.request_stop is None:
+                        self._json(409, {"error": {"message": "this server cannot restart itself"}})
+                        return
+                    if svc.unload() == "busy":               # the GPU back first; a running or queued turn: 409
+                        raise ModelBusy("a request is running or queued")
+                    svc.restart_requested = True
+                    print("[strata] restarting (the Settings view asked): the run config is read again", flush=True)
+                    self._json(200, {"status": "restarting"})
+                    threading.Timer(0.3, svc.request_stop, args=("restart",)).start()
+                    return
                 if path == "/v1/vram":                       # #533: give VRAM back to other programs, or take it
                     if not self._own_page("the VRAM reserve can be changed"):
                         return
@@ -8567,6 +8632,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if blocked:
             ap.error("--offline cannot be strict for this profile: " + "; ".join(blocked))
     lazy = False
+    gpu_locks = None
     if a.engine == "strata":
         if not cfg:
             ap.error("--engine strata needs --config")
@@ -8581,6 +8647,13 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
+        gpu_locks = GpuLocks(cfg["gpu_locks"]) if isinstance(cfg.get("gpu_locks"), list) and cfg["gpu_locks"] else None
+        if gpu_locks is not None and not lazy:
+            try:
+                gpu_locks.take()
+            except GpuBusy as e:
+                print(f"[strata] {e}; starting unloaded (Load, or the next request, loads it)", flush=True)
+                lazy = True
         for line in card_roles_lines(cfg):             # the card roles: said first; every card Off stops here, before anything touches a card
             print(line, flush=True)
         if cfg.get("vision"):
@@ -8769,6 +8842,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
+    svc.gpu_locks = gpu_locks
+    svc.request_stop = request_stop
     svc.before_load = a.before_load or cfg.get("before_load") or None
     try:
         svc.before_load_timeout_s = float(cfg.get("before_load_timeout_s") or svc.before_load_timeout_s)
@@ -8962,8 +9037,31 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     notify_lifecycle("stopped", {"instance_id": svc.instance_id, "reason": termination if interrupted else "normal",
                                  "drained": drained, "cancelled_requests": cancelled,
                                  "exit_code": exit_code})
+    global RESTART_REQUESTED
+    RESTART_REQUESTED = svc.restart_requested
     return exit_code
 
 
+RESTART_REQUESTED = False
+START_CWD = os.getcwd()
+
+
+def exec_restart(code: int) -> int:
+    """After POST /v1/restart, main() has stopped cleanly (engine, vision, MCP servers, counters): start this same
+    command again in this process (os.execv keeps the PID a launcher waits on).  The engine of a container runner
+    (STRATA_SYCL_NAME) is stopped first in case a kill left its container behind."""
+    name = os.environ.get("STRATA_SYCL_NAME")
+    if name and shutil.which("docker"):
+        subprocess.run(["docker", "stop", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60,
+                       check=False)
+    print("[strata] starting again ...", flush=True)
+    os.chdir(START_CWD)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+    return code                                          # not reached
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    _code = main()
+    if RESTART_REQUESTED:
+        exec_restart(_code)
+    sys.exit(_code)
