@@ -887,7 +887,10 @@ def _close_verdict(after: str, final: bool) -> str:
     text decide, so a call is never held longer than that."""
     m = re.match(r"(?:</function>)?\s*</tool_call>", after)
     if not m:
-        return "end"                                       # only `</function>` so far, or the call is cut: as before
+        tail = after[len(FUNC_END):].lstrip() if after.startswith(FUNC_END) else after
+        if not final and CALL_END.startswith(tail):
+            return "hold"                                  # #5040: `</tool_call>` is still arriving: a streamed view must not end the value yet
+        return "end"                                       # the call is cut, or it has no wrapper: as before
     rest = after[m.end():].lstrip()
     if not rest:
         return "end" if final else "hold"                  # the usual call: the turn ends right after it
@@ -1054,7 +1057,7 @@ def function_end(text: str) -> int:
             gt = text.find(">", pos)
             if gt < 0:
                 return -1
-            end = param_end(text[gt + 1:], name=text[pos:gt].split("=", 1)[1].strip())
+            end = param_end(text[gt + 1:], name=text[pos:gt].split("=", 1)[1].strip(), hold=False)   # a bare or unwrapped call: the old rule
             if end < 0:
                 return -1
             pos = gt + 1 + end + close_len(text[gt + 1:], end)
@@ -2056,9 +2059,10 @@ class OutputParser:
                 if self.stream_tools:
                     if i >= 0:
                         whole, self.buf = self.buf, self.buf[:i]     # scan only the body
+                        final, self._final = self._final, True       # #5040: its end is known, so no closing tag is still arriving
                         out += self._scan()
                         out += self._close_scan()
-                        self.buf = whole
+                        self.buf, self._final = whole, final
                     else:
                         out += self._scan()
                 if i < 0 or drop is None:
