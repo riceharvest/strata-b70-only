@@ -29,9 +29,7 @@ group (`strata doctor` says so). It was tested on an Arc A750 only.
 source or container setup for you. When a model needs preparation, follow the [source workflow](INTEL.md#setup). Installing the
 engine package alone does not prove the selected model is ready; check a loaded server with a real request.
 
-Docker: the ready-made image is `ghcr.io/niko1221/strata:0.2.3-sycl`, published only for a release that carries a Linux Intel
-engine package. Otherwise [build the image yourself](DOCKER.md#build-it-yourself). The image needs prepared model files
-([Docker: Intel Arc](DOCKER.md#intel-arc)).
+Docker: there is no ready-made image; build the engine in the `strata-sycl-dev` image ([B70.md](B70.md)).
 
 ## What you need
 
