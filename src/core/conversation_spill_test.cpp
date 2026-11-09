@@ -112,6 +112,22 @@ int main() {
         CHECK(!s.submit(std::move(pic), {}, why), "pictures");
     }
     {
+        // a write that finished but was never drained (the engine stopped first) is in the log and survives the restart
+        ConversationSpill s(config(dir.string()));
+        CHECK(s.open(id, err), "open");
+        CHECK(s.submit(image(555, 3000, 1000), {}, why), "submit, never drained");
+        s.wait_idle();                                   // (no drain())
+    }
+    {
+        ConversationSpill s(config(dir.string()));
+        CHECK(s.open(id, err), "reopen after an undrained write");
+        CHECK(s.files() == 1, "the undrained file is indexed");
+        CHECK(s.best(prompt_of(image(555, 3000, 0), 3000, 5), {}, true).tokens == 3000, "and matches");
+        SavedConversation back;
+        size_t bytes = 0;
+        CHECK(s.take(s.best(prompt_of(image(555, 3000, 0), 3000, 5), {}, true), SessionReadLimits{}, back, bytes, err), "and reads back");
+    }
+    {
         // a second image of the same conversation (it went on) replaces the older file; the index survives a restart
         ConversationSpill s(config(dir.string()));
         CHECK(s.open(id, err), "open");

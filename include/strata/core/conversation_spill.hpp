@@ -163,10 +163,9 @@ public:
         }
         std::vector<Done> out;
         for (auto& f : got) {
-            if (f.done.ok) {
-                f.entry.bytes = f.done.bytes;
-                append_add(f.entry);
-                index_.push_back(std::move(f.entry));
+            if (f.done.ok) {                                         // (its index record is in the log already: the writer
+                f.entry.bytes = f.done.bytes;                        //  appended it when the file was complete, so a stop before
+                index_.push_back(std::move(f.entry));                //  this call does not lose the file)
             }
             out.push_back(std::move(f.done));
         }
@@ -283,6 +282,7 @@ private:
         o << '\n';
     }
     void append(const std::string& text) {
+        std::lock_guard<std::mutex> lk(idx_mu_);                  // the writer thread appends too
         std::ofstream f(path("index.log"), std::ios::app | std::ios::binary);
         f << text;
         f.flush();
@@ -398,6 +398,10 @@ private:
             fin.done.ok = ok;
             fin.done.cancelled = cancel_.load();
             fin.done.bytes = bytes;
+            if (ok) {
+                fin.entry.bytes = bytes;
+                append_add(fin.entry);
+            }
             fin.done.why = ok ? "" : (fin.done.cancelled || err.empty() ? "cancelled" : err);
             j.image = SavedConversation{};                       // the entry's memory goes back to the kernel here
             {
@@ -416,7 +420,7 @@ private:
     uint64_t seq_ = 0;
     std::vector<Entry> index_;                // serve thread only
     std::thread writer_;
-    std::mutex mu_;
+    std::mutex mu_, idx_mu_;                  // mu_: the job and completion queues; idx_mu_: appends to index.log
     std::condition_variable cv_, idle_;
     std::optional<Job> job_;
     std::deque<Finished> done_;
