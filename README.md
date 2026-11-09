@@ -14,8 +14,6 @@ Not affiliated with Intel or with upstream Strata.
 | Model | Status on one B70 |
 | --- | --- |
 | [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), [ISTA-DASLab GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | Usable at 128K-256K context, chats and coding agents included (measured at 118K and 250K). Numbers below |
-| DeepSeek V4.1-Flash, [ISTA-DASLab sets](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF), **pruned** (`--prune-experts`) | Runs, not recommended, no further work planned: the 2-bit set plus pruning loses too much of what the model knows (in our tests it got simple facts wrong) |
-| DeepSeek V4.1-Flash, unpruned | Not recommended. On one card with 64 GB of RAM most experts come off the disk on every token: about 1 tok/s from a SATA SSD, about 5 tok/s from NVMe |
 
 ## What counts as usable here
 
@@ -26,6 +24,10 @@ A model and setting is called usable when it does all of this on one B70:
 - at least 10 tokens/s writing the answer
 
 Anything that misses one of these is labelled "works, not usable".
+
+**DeepSeek V4.1-Flash is not maintained** (since 2026-10-30). The code stays in `sycl/src/dsv41`, and its build is off by default
+(`DSV41=ON` for `sycl/tools/build.sh`). On one B70 the 2-bit pack plus expert pruning cost too much answer quality: a pruned model
+was fluent but had lost knowledge (in our tests it got simple facts wrong). Unpruned, most experts come off the disk on every token.
 
 ## Speed
 
@@ -86,18 +88,16 @@ now works around it (2% prompt speed), see [docs/B70.md](docs/B70.md#agent-use-a
   `renderD128`)
 - Docker (or Podman). The engine builds and runs in a container, so the host needs no oneAPI
 - 64 GB of RAM (what it's measured on)
-- Disk: about 80 GB for Qwen3.8-Flash-Next IQ2_XS, about 260 GB for a DeepSeek V4.1-Flash set
+- Disk: about 80 GB for Qwen3.8-Flash-Next IQ2_XS
 
 ### The rest of your PC matters too
 
 Every number in this repo comes from one older desktop: a Ryzen 9 5950X (Zen 3, AVX2, no AVX-512) with dual-channel DDR4 on a
 PCIe 4.0 x16 slot. Treat them as a floor; on a newer platform expect more, but nobody has measured that here yet.
 
-- **Qwen** keeps the experts that don't fit in VRAM in RAM and reads them over PCIe on every token; that link is the
+- Qwen3.8-Flash-Next keeps the experts that don't fit in VRAM in RAM and reads them over PCIe on every token; that link is the
   biggest cost in decode. The B70 is a PCIe 5.0 card, so a PCIe 5.0 x16 slot can carry up to twice what this box does.
   Faster RAM on its own changes little here: dual-channel DDR4 already outruns a PCIe 4.0 link.
-- **DeepSeek V4.1 pruned** runs the experts that aren't in VRAM on the CPU. That is bound by memory bandwidth and by the
-  CPU's vector units, so DDR5 and a CPU with AVX-512 (Zen 4/5, recent Xeons) should help it directly.
 - Run the card in an x16 slot wired to the CPU. An x8 or chipset slot halves the link or worse
   (`cat /sys/bus/pci/devices/*/current_link_width` and `current_link_speed` show what you got).
 
@@ -116,7 +116,7 @@ PCIe 4.0 x16 slot. Treat them as a floor; on a newer platform expect more, but n
        docker run --rm -u $(id -u):$(id -g) -v "$PWD/..:/work" -e AOT=bmg-g31 -e REPO=/work/$H \
            -e BUILD_DIR=/work/$H/build-sycl-aot strata-sycl-dev "cd /work/$H && bash sycl/tools/build.sh strata"
 
-   The build ends with `BUILD EXIT 0` and `errors: 0`. Build `strata-dsv41` the same way for DeepSeek.
+   The build ends with `BUILD EXIT 0` and `errors: 0`.
 
 3. Set up a model and serve it:
 
@@ -124,7 +124,7 @@ PCIe 4.0 x16 slot. Treat them as a floor; on a newer platform expect more, but n
 
    Setup downloads the model, builds its pack, writes a config and a `run-<model>.sh` that starts the server.
 
-Details, every engine switch and what was measured: [docs/INTEL.md](docs/INTEL.md). DeepSeek: [docs/DEEPSEEK41.md](docs/DEEPSEEK41.md).
+Details, every engine switch and what was measured: [docs/INTEL.md](docs/INTEL.md).
 
 ## Using it
 
