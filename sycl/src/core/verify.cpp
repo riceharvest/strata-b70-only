@@ -1427,7 +1427,8 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
     // Not for a batch window (batch_rec_): unless the stage is all-resident, run_slot_rows / batch_poll wait for each
     // layer's doorbell, so a lean batch graph finishes with the ring silent ("verify batch: layer 0 never rang (graph
     // finished)", then the engine dies). Batch windows keep the doorbell nodes; the solo window stays lean.
-    const bool lean = lean_env && no_host_env && device_plan_ && !batch_rec_ && !step_hook_ && !step_hook2_ && !remote_opt_ && !always_publish_ && !g_stepped;
+    // STRATA_BATCH_LEAN=1 (opt-in, capture_batch decides): a batch window is lean too, and run_slot_rows waits for the whole graph.
+    const bool lean = lean_env && no_host_env && device_plan_ && (!batch_rec_ || batch_lean_ == 1) && !step_hook_ && !step_hook2_ && !remote_opt_ && !always_publish_ && !g_stepped;
     lean_plan_ = lean;
     const WeightTable& wt = *wt_;
     SessionState& ss = *ss_;
@@ -4393,6 +4394,33 @@ bool Verifier::capture_batch(const int *rows, int S, int hbase,
     dpct::experimental::command_graph_exec_ptr &ex =
         exec_bm_[bkey(rows, S, hbase)];
     if (ex != nullptr) return true;
+    if (batch_lean_ < 0) {
+        // STRATA_BATCH_LEAN=1 (opt-in; default off = the doorbell graphs as before), decided once per verifier.  With the
+        // device plan under STRATA_VERIFY_NO_HOST every routed expert is in VRAM or in the host mirror and the device
+        // plans every layer of a batch window as well (resident_plan: skip == ring), so the doorbell graph's host side
+        // is work nobody reads: the CPU pool computes the "missed" experts' rows, which copy_or_zero_from_mapped then
+        // replaces by zeros, the PCIe share is copied into a staging buffer the plan does not point at, and the
+        // mirrored experts are read from host memory inside the expert kernels in every window (no staging, no VRAM
+        // ring).  The lean graph is the solo window's: the plan stages the mirrored experts or finds them in the ring,
+        // no doorbell, no flag waits; run_slot_rows waits for the whole graph.  The same expert kernels on the same
+        // bytes.  One GPU only: a layer split's pipelined groups (batch_launch / batch_poll) serve doorbells.
+        static const bool want = [] { const char* v = std::getenv("STRATA_BATCH_LEAN"); return v != nullptr && v[0] == '1'; }();
+        static const bool no_host = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
+        static const bool lean_off = [] { const char* v = std::getenv("STRATA_VERIFY_LEAN"); return v && v[0] == '0'; }();
+        const char* why = !device_plan_ ? "no device plan: STRATA_VERIFY_DEVICE_PLAN is off or every expert is in VRAM"
+                        : !no_host ? "STRATA_VERIFY_NO_HOST is off"
+                        : lean_off ? "STRATA_VERIFY_LEAN=0"
+                        : (next_ != nullptr || lb_ > 0 || le_ != g_->n_layers || hbase != 0) ? "a layer split"
+                        : (step_hook_ || step_hook2_ || remote_opt_ || always_publish_ || g_stepped || h_plan_err_ == nullptr)
+                              ? "the window is stepped, published or has no plan-error word" : nullptr;
+        batch_lean_ = want && why == nullptr ? 1 : 0;
+        if (want)
+            std::fprintf(stderr, "strata verify: STRATA_BATCH_LEAN=1: %s%s\n",
+                         why == nullptr ? "the batch windows are lean graphs (the device plans every layer, no CPU share; "
+                                          "the host waits for the whole window)"
+                                        : "off, the batch windows stay doorbell graphs: ",
+                         why == nullptr ? "" : why);
+    }
     if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs_)) != 0) {
         err = "verify: begin batch capture failed";
         return false;
@@ -4405,7 +4433,11 @@ bool Verifier::capture_batch(const int *rows, int S, int hbase,
     // record_window notes whether the graph it records is the lean one (lean_plan_); a batch graph never is, and
     // run() reads the flag for the solo windows' plan-error check (h_plan_err_): keep the solo graphs' value
     const bool lean_solo = lean_plan_;
-    const bool ok = record_window(S, cs_, rerr);
+    bool ok = record_window(S, cs_, rerr);
+    if (ok && lean_plan_ != (batch_lean_ == 1)) {   // run_slot_rows serves every batch graph of this verifier one way
+        rerr = "verify: a batch window graph was recorded as the other kind (lean / doorbell) than STRATA_BATCH_LEAN decided";
+        ok = false;
+    }
     lean_plan_ = lean_solo;
     batch_rec_ = false;
     row_base_ = 0;
@@ -5105,6 +5137,13 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
     const ModelGeometry& g = *g_;
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
+    // STRATA_BATCH_LEAN (capture_batch decided, at the latest in the stage_batch above): this window's graph is lean
+    const bool lean_b = batch_lean_ == 1;
+    if (lean_b) {   // the device plan's miss word, as run() clears it for a solo lean window
+        *(volatile uint32_t*) h_plan_err_ = 0;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        strata_store_fence();
+    }
     const dpct::err0 le =
         DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*exec_bm_[bkey(rows, S, 0)]));
     /*
@@ -5124,6 +5163,30 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
       return false;
     }
     (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
+    if (lean_b) {
+        // The lean batch graph (STRATA_BATCH_LEAN): no doorbell and no flag wait in it (its PLE rows were gathered by
+        // stage_batch before the launch), so the host has nothing to serve per layer: wait for the graph, as run()
+        // does for a solo lean window.  A routed expert that is neither in VRAM nor mirrored leaves an empty plan and
+        // the miss word set: the window is refused instead of committed.
+        const Clock::time_point a = Clock::now();
+        progress_at("verify batch: waiting for the GPU to finish the lean window", (int64_t) S);
+        if (DPCT_CHECK_ERROR(cs_->wait()) != 0) { err = "verify batch: the lean window failed on the GPU"; return false; }
+        copy_->wait();
+        ms_wait += ms_since(a);
+        if (*(volatile uint32_t*) h_plan_err_ != 0) {
+            *(volatile uint32_t*) h_plan_err_ = 0;
+            err = "verify batch: the device plan met an expert that is neither in VRAM nor mirrored";
+            return false;
+        }
+        if (prof_on_) collect_profile();
+        ++windows;
+        if (!sample_rows(S, err)) return false;
+        for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+        note_nonfinite(S, last_pos_b_);
+        progress_at("decode");
+        progress_beat();
+        return true;
+    }
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
     const int64_t steps = le_ - lb_;
