@@ -12,6 +12,37 @@ const kfmt = (n) => (n == null ? "–" : n >= 1000 ? `${fmt(n / 1000, n >= 10000
 const ctxfmt = (n) => (n && n % 1024 === 0 ? `${fmt(n / 1024)}K` : kfmt(n));
 const gb = (b, d = 1) => (b == null ? "–" : fmt(b / 1073741824, d));   // memory: binary GB, as Windows shows it
 
+// Cloud baseline: Alibaba Cloud Int. rates for Qwen-Flash
+const QWEN_FLASH_PRICING = {
+  provider: "Alibaba Cloud Int.",
+  model: "Qwen-Flash",
+  inputPerM: 0.15,
+  outputPerM: 0.47,
+  cacheReadPerM: 0.016,
+  cacheCreate5mPerM: 0.20,
+  cacheRead5mPerM: 0.016,
+};
+function calcCost(promptTokens = 0, reusedTokens = 0, outputTokens = 0) {
+  const p = Number(promptTokens) || 0;
+  const r = Math.min(p, Math.max(0, Number(reusedTokens) || 0));
+  const f = Math.max(0, p - r);
+  const o = Math.max(0, Number(outputTokens) || 0);
+  return (f * QWEN_FLASH_PRICING.inputPerM + r * QWEN_FLASH_PRICING.cacheReadPerM + o * QWEN_FLASH_PRICING.outputPerM) / 1e6;
+}
+function fmtCost(n, precision) {
+  if (n == null || Number.isNaN(n)) return "–";
+  const v = Number(n);
+  if (v === 0) return "$0.00";
+  if (v >= 1e6) return `$${fmt(v / 1e6, 2)}M`;
+  if (v >= 1e4) return `$${fmt(v / 1e3, 1)}k`;
+  if (v >= 100) return `$${v.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+  if (v >= 1) return `$${v.toFixed(precision != null ? precision : 2)}`;
+  if (v >= 0.01) return `$${v.toFixed(precision != null ? precision : 2)}`;
+  if (v >= 0.001) return `$${v.toFixed(precision != null ? precision : 3)}`;
+  if (v >= 0.0001) return `$${v.toFixed(precision != null ? precision : 4)}`;
+  return `$${v.toFixed(precision != null ? precision : 4)}`;
+}
+
 const store = {
   get(k, d) { try { const v = localStorage.getItem("strata." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem("strata." + k, JSON.stringify(v)); return true; } catch (e) { return false; } },
@@ -360,7 +391,7 @@ function render(m) {
     renderConvCache(m.conversation_cache);
   }
   if (tab === "requests") renderRequests(reqs, m);
-  if (tab === "about") renderAbout(eng, hw, st);
+  if (tab === "about") renderAbout(eng, hw, st, m);
 }
 
 // #596: the conversation cache - the prompt's state the engine keeps between requests (always), and the whole
@@ -598,7 +629,15 @@ function renderDash(live, hw, st, eng, h, last, reqs, m) {
   const cacheShare = L.prompt_tokens ? (100 * L.reused) / L.prompt_tokens : null;
   const day = (f) => days.map(f);
   const nowSpeed = live.state === "generating" ? live.tok_s : dNow;
+  const lifeFresh = Math.max(0, (L.prompt_tokens || 0) - (L.reused || 0));
+  const lifeCost = calcCost(L.prompt_tokens, L.reused, L.output_tokens);
+  const todayCost = calcCost(today.prompt_tokens, today.reused, today.output_tokens);
+  const ydayCost = calcCost(yday.prompt_tokens, yday.reused, yday.output_tokens);
+  const dayCost = (d) => calcCost(d.prompt_tokens, d.reused, d.output_tokens);
   const tiles = [
+    tile("Cost saved", fmtCost(lifeCost), "", [
+      row(`${chip(todayCost, ydayCost)} <span class="muted">${fmtCost(todayCost)} today</span>`),
+      row(`<span class="muted">${fmtCost(calcCost(lifeFresh, 0, 0))} in · ${fmtCost(calcCost(0, 0, L.output_tokens))} out</span>`)], day(dayCost), "cost", "Estimated API cost saved vs Alibaba Cloud Qwen-Flash ($0.15/M input, $0.47/M output, $0.016/M cache read)"),
     tile("Input tokens", big(L.prompt_tokens), "", [
       row(`${chip(today.prompt_tokens, yday.prompt_tokens)} <span class="muted">${big(today.prompt_tokens)} today</span>`),
       row(`<span class="muted">${big(L.prompt_tokens - L.reused)} read · ${big(L.reused)} reused</span>`)], day((d) => d.prompt_tokens), "", "All prompt tokens the server has processed, lifetime"),
@@ -611,6 +650,9 @@ function renderDash(live, hw, st, eng, h, last, reqs, m) {
     tile("Requests", big(L.requests), "", [
       row(`${chip(today.requests, yday.requests)} <span class="muted">${fmt(today.requests)} today</span>`),
       row(`<span class="muted">${fmt(m.totals.requests)} since this start</span>`)], day((d) => d.requests)),
+    tile("Completed", done.length ? fmt((100 * ok) / done.length, ok === done.length ? 0 : 1) : "–", done.length ? "%" : "", [
+      row(`<span class="${errs ? "bad" : "muted"}">${fmt(errs)} errors</span> <span class="muted">· ${fmt(cut)} cut short</span>`),
+      row(`<span class="muted">of ${fmt(done.length)} kept requests</span>`)], null),
     tile("Decode speed", nowSpeed == null ? "–" : fmt(nowSpeed, 1), "tok/s", [
       row(`${chip(dNow, dPrev)} <span class="muted">${live.state === "generating" ? "live" : "median of last 10"}</span>`),
       row(`<span class="muted">${lifeDecode ? `${fmt(lifeDecode, 1)} lifetime avg` : "&nbsp;"}</span>`)], decodes, "decode"),
@@ -620,9 +662,6 @@ function renderDash(live, hw, st, eng, h, last, reqs, m) {
     tile("Time to first token", tNow == null ? "–" : fmt(tNow, tNow < 10 ? 2 : 1), "s", [
       row(`${chip(tNow, tPrev, "down")} <span class="muted">median of last 10</span>`),
       row(`<span class="muted">p95 ${quant(ttfts, 0.95) == null ? "–" : `${fmt(quant(ttfts, 0.95), 1)} s`}</span>`)], ttfts, "ttft"),
-    tile("Completed", done.length ? fmt((100 * ok) / done.length, ok === done.length ? 0 : 1) : "–", done.length ? "%" : "", [
-      row(`<span class="${errs ? "bad" : "muted"}">${fmt(errs)} errors</span> <span class="muted">· ${fmt(cut)} cut short</span>`),
-      row(`<span class="muted">of ${fmt(done.length)} kept requests</span>`)], null),
   ].join("");
   if ($("tiles").dataset.sig !== tiles) { $("tiles").innerHTML = tiles; $("tiles").dataset.sig = tiles; }
 
@@ -639,6 +678,7 @@ function renderDash(live, hw, st, eng, h, last, reqs, m) {
     $("tp-legend").innerHTML = legend([["Decode (left axis)", COLORS.decode], ["Prefill (right axis)", COLORS.prefill]]);
     const dl = days.map((d) => dayLabel(d.key));
     drawChart("chart-day", {kind: "bars", labels: dl, xlabels: dl, empty: "No tokens counted yet",
+      tips: dl.map((d, i) => `${days[i].key} · ${fmtCost(dayCost(days[i]))} saved`),
       series: [{name: "Cached input", color: COLORS.cached, values: days.map((d) => d.reused), fmt: big},
                {name: "Fresh input", color: COLORS.fresh, values: days.map((d) => d.prompt_tokens - d.reused), fmt: big},
                {name: "Output", color: COLORS.out, values: days.map((d) => d.output_tokens), fmt: big}]});
@@ -737,14 +777,15 @@ function renderDash(live, hw, st, eng, h, last, reqs, m) {
 
   // the latest requests (compact)
   const body = $("dash-req-body");
-  const html = reqs.length ? reqs.slice(0, 8).map((r) => reqCells(r, false)).join("") : `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
+  const html = reqs.length ? reqs.slice(0, 8).map((r) => reqCells(r, false)).join("") : `<tr><td colspan="10" class="muted">No requests yet</td></tr>`;
   if (body.dataset.sig !== html) { body.innerHTML = html; body.dataset.sig = html; }
 }
 $("goto-requests").onclick = () => showTab("requests");
 
 function renderTotalsShort(t) {
   const read = t.prompt_tokens - t.reused;
-  return `${fmt(t.requests)} requests · ${big(read)} read · ${big(t.output_tokens)} written`;
+  const cost = calcCost(t.prompt_tokens, t.reused, t.output_tokens);
+  return `${fmt(t.requests)} requests · ${big(read)} read · ${big(t.output_tokens)} written · ${fmtCost(cost)} saved`;
 }
 function statusBadge(r) {
   const [cls, text] = FINISH[r.finish] || ["", r.finish || "–"];
@@ -755,10 +796,12 @@ function statusBadge(r) {
 function reqCells(r, full) {
   const fresh = freshOf(r), pf = prefillOf(r), tt = ttftOf(r);
   const t = clock(r.time);
+  const cost = calcCost(r.prompt_tokens, r.reused, r.output_tokens);
   if (!full) {
     return `<tr><td>${esc(t)}</td><td>${statusBadge(r)}</td><td class="num">${fmt(fresh)}</td><td class="num">${fmt(r.reused)}</td>` +
       `<td class="num">${fmt(r.output_tokens)}</td><td class="num">${tt == null ? "–" : `${fmt(tt, 2)} s`}</td><td class="num">${fmt(pf)}</td>` +
-      `<td class="num">${fmt(r.decode_tok_s, 1)}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
+      `<td class="num">${fmt(r.decode_tok_s, 1)}</td><td class="num">${fmt(r.duration_s, 1)} s</td>` +
+      `<td class="num">${fmtCost(cost)}</td></tr>`;
   }
   const total = r.prompt_tokens || 0, share = total ? (100 * (r.reused || 0)) / total : 0;
   const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%` +
@@ -768,7 +811,8 @@ function reqCells(r, full) {
     `<td><div class="pcell"><span>${fmt(total)}</span><div class="pbar" title="${fmt(r.reused || 0)} reused of ${fmt(total)}"><i style="width:${share.toFixed(1)}%"></i></div>` +
     `<em>${share >= 1 ? `${fmt(share)}% cached` : "fresh"}</em></div></td>` +
     `<td class="num">${fmt(r.output_tokens)}</td><td class="num">${tt == null ? "–" : `${fmt(tt, 2)} s`}</td><td class="num">${fmt(pf)}</td>` +
-    `<td class="num">${fmt(r.decode_tok_s, 1)}</td><td class="num">${hit}</td><td class="num">${drafts}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
+    `<td class="num">${fmt(r.decode_tok_s, 1)}</td><td class="num">${hit}</td><td class="num">${drafts}</td><td class="num">${fmt(r.duration_s, 1)} s</td>` +
+    `<td class="num">${fmtCost(cost)}</td></tr>`;
 }
 let reqFilter = "all";
 for (const b of $("req-filter").children) b.onclick = () => {
@@ -786,7 +830,7 @@ function renderRequests(reqs, m) {
   if (body.dataset.sig !== sig) {
     body.dataset.sig = sig;
     body.innerHTML = shown.length ? shown.map((r) => reqCells(r, true)).join("")
-                                  : `<tr><td colspan="10" class="muted">${reqs.length ? "No request matches this filter" : "No requests yet"}</td></tr>`;
+                                  : `<tr><td colspan="11" class="muted">${reqs.length ? "No request matches this filter" : "No requests yet"}</td></tr>`;
   }
   const kept = m.requests_kept == null ? reqs.length : m.requests_kept;
   $("req-count").textContent = `${fmt(shown.length)}${reqFilter === "all" ? "" : ` of ${fmt(reqs.length)}`} requests · the server keeps the last ${fmt(Math.max(kept, 500))}`;
@@ -798,8 +842,9 @@ function renderTotals(t) {
   const read = t.prompt_tokens - t.reused;
   const pSpeed = t.prompt_ms > 0 && read > 0 ? ` at ${fmt(read / (t.prompt_ms / 1000))} tok/s` : "";
   const oSpeed = t.decode_ms > 0 && t.output_tokens > 0 ? ` at ${fmt(t.output_tokens / (t.decode_ms / 1000), 1)} tok/s` : "";
+  const cost = calcCost(t.prompt_tokens, t.reused, t.output_tokens);
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
-         `${fmt(t.output_tokens)} written${oSpeed}`;
+         `${fmt(t.output_tokens)} written${oSpeed} · ${fmtCost(cost)} saved`;
 }
 
 function facts(el, rows) {
@@ -815,8 +860,13 @@ function projectionText(c) {
          `${single ? ` (layer ${single.replace("single", "")}'s direction)` : ""}. Per chat in Sampling. Its package ` +
          "describes the vector as a refusal-direction projection; measure the speed yourself";
 }
-function renderAbout(eng, hw, st) {
+function renderAbout(eng, hw, st, m) {
   const kv = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit"}[eng.kv] || eng.kv;
+  const L = (m && m.lifetime) || (m && m.totals) || {};
+  const days = lastDays(L);
+  const today = days[days.length - 1] || {};
+  const lifeCost = calcCost(L.prompt_tokens, L.reused, L.output_tokens);
+  const todayCost = calcCost(today.prompt_tokens, today.reused, today.output_tokens);
   facts($("facts-engine"), [
     ["Model", eng.model],
     ["Engine", eng.version ? `v${eng.version}` : "built from source"],
@@ -826,12 +876,26 @@ function renderAbout(eng, hw, st) {
     ["Speculation", eng.spec ? `MTP drafts up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} tokens${eng.lookup ? ", prompt lookup on" : ""}` : null],
     ["Images", eng.images ? "on" : "off"],
     ["Experimental speed projection", projectionText(eng.cvec)],
+    ["Cost saved", `${fmtCost(lifeCost)} lifetime (${fmtCost(todayCost)} today)`],
   ]);
   facts($("facts-hw"), [
     ["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : (st.gpu_note || "not readable (NVML)")],
     ["CPU", st.cpu_name ? `${st.cpu_name}${st.threads ? `, ${st.threads} threads` : ""}` : null],
     ["RAM", hw.ram_total ? `${gb(hw.ram_total, 0)} GB` : null],
   ]);
+  if ($("facts-cost")) {
+    facts($("facts-cost"), [
+      ["Provider", QWEN_FLASH_PRICING.provider],
+      ["Model baseline", QWEN_FLASH_PRICING.model],
+      ["Input /M", `$${QWEN_FLASH_PRICING.inputPerM.toFixed(2)}`],
+      ["Output /M", `$${QWEN_FLASH_PRICING.outputPerM.toFixed(2)}`],
+      ["Cache read /M", `$${QWEN_FLASH_PRICING.cacheReadPerM.toFixed(3)}`],
+      ["Cache create (5m) /M", `$${QWEN_FLASH_PRICING.cacheCreate5mPerM.toFixed(2)}`],
+      ["Cache read (5m) /M", `$${QWEN_FLASH_PRICING.cacheRead5mPerM.toFixed(3)}`],
+      ["Lifetime saved", `${fmtCost(lifeCost)} (${big(L.prompt_tokens || 0)} input · ${big(L.output_tokens || 0)} output)`],
+      ["Today saved", `${fmtCost(todayCost)} (${big(today.prompt_tokens || 0)} input · ${big(today.output_tokens || 0)} output)`],
+    ]);
+  }
   const base = location.origin;
   facts($("facts-api"), [
     ["OpenAI base URL", `${base}/v1`, true],
@@ -1364,7 +1428,10 @@ async function send() {
   const n = usage ? usage.completion_tokens : null;
   if (n && firstAt) {
     const secs = (performance.now() - firstAt) / 1000;
-    m.meta = `${fmt(n)} tokens${secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : ""}${m.stopped ? " · stopped" : ""}` +
+    const pt = usage.prompt_tokens || 0;
+    const reused = (usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens) || 0;
+    const cost = calcCost(pt, reused, n);
+    m.meta = `${fmt(n)} tokens${secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : ""}${cost > 0 ? ` · ${fmtCost(cost)} saved` : ""}${m.stopped ? " · stopped" : ""}` +
              (projectionLoaded() ? (settings.esp ? " · projection on" : " · projection off") : "");
   } else if (m.stopped) {
     m.meta = "Stopped";
