@@ -218,6 +218,47 @@ static void emit_lp_line(const strata::core::Verifier& ver, int t, int32_t token
     std::printf("\n");
 }
 
+// STRATA_STEP_TOP2=<path> (debug, issue 15; unset: nothing runs): one line per decode row that a window keeps -
+//     S <request> <pos> <fed> <pick> <id1> <logit1> <id2> <logit2>     a solo window's row (--serve)
+//     B <slot>    <pos> <fed> <pick> <id1> <logit1> <id2> <logit2>     a batch window's row
+// <pos> is the position of the token fed, <pick> the token the engine took for it, id1 / id2 the two largest head
+// logits of that row (before penalties and sampling).  A conversation decoded alone and the same one decoded in a slot
+// write lines that agree in <pos> <fed> as long as their texts agree; at the first line whose <pick> differs,
+// logit1 - logit2 on both sides tells a near tie (arithmetic) from a clear pick (state).
+// sycl/tools/step_top2_diff.py prints that line.  Each line reads the row's logits back (about 1 MB over PCIe), so
+// this is for a diagnostic run, not for timing.
+static std::FILE* step_top2_file() {
+    static std::FILE* const f = []() -> std::FILE* {
+        const char* p = std::getenv("STRATA_STEP_TOP2");
+        if (p == nullptr || *p == '\0') return nullptr;
+        std::FILE* x = std::fopen(p, "w");
+        if (x == nullptr) std::fprintf(stderr, "strata: STRATA_STEP_TOP2: cannot write %s\n", p);
+        else std::fprintf(stderr, "strata: STRATA_STEP_TOP2: one line per kept decode row in %s (diagnostics; slows decode)\n", p);
+        return x;
+    }();
+    return f;
+}
+static void step_top2_line(const strata::core::Verifier& ver, char kind, long long who, int row, long long pos,
+                           int32_t fed, int32_t pick) {
+    std::FILE* const f = step_top2_file();
+    if (f == nullptr) return;
+    static std::vector<float> lg;
+    lg.resize((size_t) std::max<int64_t>(ver.vocab(), 0));
+    if (lg.size() < 2 || !ver.copy_logits(row, lg.data())) {
+        std::fprintf(f, "%c %lld %lld %d %d nologits\n", kind, who, pos, (int) fed, (int) pick);
+        std::fflush(f);
+        return;
+    }
+    size_t i1 = lg[1] > lg[0] ? 1 : 0, i2 = 1 - i1;
+    for (size_t v = 2; v < lg.size(); ++v) {
+        if (lg[v] > lg[i1]) { i2 = i1; i1 = v; }
+        else if (lg[v] > lg[i2]) i2 = v;
+    }
+    std::fprintf(f, "%c %lld %lld %d %d %zu %.9g %zu %.9g\n", kind, who, pos, (int) fed, (int) pick, i1, (double) lg[i1],
+                 i2, (double) lg[i2]);
+    std::fflush(f);
+}
+
 namespace {
 namespace nib = strata::core::nibble;
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
@@ -14679,6 +14720,11 @@ int main(int argc, char **argv) try {
                 keep[b] = batch_mtp && outb[i] == tok[i + 1] && !eos && !sl.stop &&
                           sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
             }
+            if (step_top2_file() != nullptr)   // STRATA_STEP_TOP2 (debug): each slot's kept rows, as the solo windows' lines
+                for (int a = 0; a < A; ++a)
+                    for (int j = 0; j < keep[active[a]]; ++j)
+                        step_top2_line(ver, 'B', active[a], first[a] + j, (long long) pos[first[a] + j],
+                                       tok[first[a] + j], outb[first[a] + j]);
             if (!(batch_mtp ? ver.commit_slot_prefixes(keep.data(), err) : ver.commit_slots(err))) {
                 std::printf("ERR %s\n", err.c_str());
                 return false;
@@ -19150,6 +19196,13 @@ int main(int argc, char **argv) try {
                 }
                 int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                if (step_top2_file() != nullptr) {   // STRATA_STEP_TOP2 (debug): the rows this window keeps
+                    static long long top2_request = 0;
+                    if (first_window) ++top2_request;
+                    for (int t = 0; t <= a; ++t)
+                        step_top2_line(ver, 'S', top2_request, t, (long long) (p + t), (int32_t) window[(size_t) t],
+                                       (int32_t) outv[(size_t) t]);
+                }
                 if (!fol.empty() && fol_lp != nullptr && !ver.window_logprobs(fol_tgt, a + 1, produced_n, -1, fol_lp, err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
