@@ -65,6 +65,7 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthro
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve import stream_order  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
 from strata_control import tls  # noqa: E402
@@ -3642,6 +3643,7 @@ class Service:
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
+        self.order = stream_order.StreamOrder()       # who takes the single turn next (serve/stream_order.py)
         self.gpu_locks = None                         # GpuLocks: the config's "gpu_locks", held while the model is loaded
         self.request_stop = None                      # main()'s clean stop, for POST /v1/restart
         self.restart_requested = False                # main() ends, then the process starts itself again (os.execv)
@@ -5038,7 +5040,10 @@ class Service:
         deadline = time.monotonic() + self.queue_timeout_s if self.queue_timeout_s is not None else None
         if deadline is not None:
             setattr(cancel, "_strata_queue_deadline", deadline)
+        order_entry = None
         def queue_started():
+            if order_entry is not None:
+                order_entry.served = True               # the engine began reading this prompt: its stream is the live one
             with self.status_lock:
                 row = self.terminal_requests.get(request_id)
                 if row is not None and row["state"] != "reading":
@@ -5066,23 +5071,39 @@ class Service:
                 # a stream idle timeout does not abort a healthy queued request (and its retry read the prompt again);
                 # a client that left while queued gives its place up instead of taking the turn only to cancel there
                 got = False
-                while not got:
-                    if cancel.is_set():
-                        raise QueueCancelled("the client disconnected while waiting for the engine")
-                    left = deadline - time.monotonic() if deadline is not None else QUEUE_BEAT_S
-                    if left <= 0:
-                        raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                    got = self.fifo.acquire(timeout=min(QUEUE_BEAT_S, left))
-                    if got:
+                beat_at = time.monotonic()
+                order_entry = self.order.enter(ids)
+                turn.callback(self.order.finish, order_entry)       # after the turn (LIFO: the fifo is given back first)
+                try:
+                    while not got:
                         if cancel.is_set():
-                            self.fifo.release()
                             raise QueueCancelled("the client disconnected while waiting for the engine")
-                        if deadline is not None and time.monotonic() >= deadline:
-                            self.fifo.release()
+                        left = deadline - time.monotonic() if deadline is not None else QUEUE_BEAT_S
+                        if left <= 0:
                             raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                        turn.callback(self.fifo.release)
-                    else:
-                        yield "ping", None
+                        # the stream served last goes on first (serve/stream_order.py); the others wait their turn here
+                        if not self.order.wait_turn(order_entry, min(QUEUE_BEAT_S, left, 0.5)):
+                            if time.monotonic() - beat_at >= QUEUE_BEAT_S:
+                                beat_at = time.monotonic()
+                                yield "ping", None
+                            continue
+                        got = self.fifo.acquire(timeout=min(QUEUE_BEAT_S, left))
+                        if got:
+                            if cancel.is_set():
+                                self.fifo.release()
+                                raise QueueCancelled("the client disconnected while waiting for the engine")
+                            if deadline is not None and time.monotonic() >= deadline:
+                                self.fifo.release()
+                                raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                            turn.callback(self.fifo.release)
+                            if order_entry.why:
+                                print(f"[strata] stream order: {order_entry.why} "
+                                      f"(waited {time.monotonic() - order_entry.t0:.1f} s)", flush=True)
+                        else:
+                            yield "ping", None
+                except BaseException:
+                    self.order.finish(order_entry)                  # gave up while waiting (cancel, deadline, client gone)
+                    raise
             with turn:
                 try:
                     with self.status_lock:
