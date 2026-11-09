@@ -147,6 +147,9 @@ struct SessionWriteOptions {
     uint64_t min_free_bytes = 0;
     bool durable = true;            // flush the file before the rename and (POSIX) the folder after it
     SessionProgress progress;
+    // asked before each 16 MiB block (on the writing thread: it may also wait); true stops the write - a failure before the
+    // rename, so the temporary file is removed and nothing was published (the conversation cache's spill writer)
+    std::function<bool()> cancel;
     // "flush" (the file's flush, `bytes` = the file) and "publish" (rename and folder flush), before each starts
     SessionPhase phase;
     // tests: return an errno value to make a step fail ("write", "file_flush", "rename", "dir_flush"), 0 to go on
@@ -222,6 +225,10 @@ struct SessionReadLimits {
     // parse holds at its peak (session_read_peak_bytes); false refuses the file.  Not a reservation.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     SessionProgress progress;
+    // Skip the payload checksum (the file's own atomic write already proves it is whole: the conversation cache's spill
+    // files, written by this engine and read back in seconds, where hashing 4 GiB would cost more than reading it).
+    // The header, identity, bounds and size are still checked.
+    bool skip_payload_hash = false;
 };
 // The largest file these limits admit (UINT64_MAX when one of them is open); session_file_read applies it.
 uint64_t session_read_max_file_bytes(const SessionReadLimits& limits);

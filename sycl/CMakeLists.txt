@@ -304,6 +304,13 @@ if(STRATA_SYCL_PARITY)
   add_executable(gated_proposal_test ${STRATA_ROOT}/src/core/gated_proposal_test.cpp)
   target_include_directories(gated_proposal_test PRIVATE ${STRATA_ROOT}/include)
   add_test(NAME gated_proposal_test COMMAND gated_proposal_test)
+  # Host-only test of the conversation cache's SSD tier (writer thread, index, gate, divergence); no device.
+  add_executable(conversation_spill_test ${STRATA_ROOT}/src/core/conversation_spill_test.cpp
+                 ${STRATA_ROOT}/src/core/conversation_file.cpp ${STRATA_ROOT}/sycl/src/platform/direct_file.cpp)
+  target_include_directories(conversation_spill_test PRIVATE ${STRATA_ROOT}/include ${STRATA_ROOT}/sycl/include)
+  find_package(Threads REQUIRED)
+  target_link_libraries(conversation_spill_test PRIVATE Threads::Threads)
+  add_test(NAME conversation_spill_test COMMAND conversation_spill_test)
   add_executable(spec_admission_test ${STRATA_ROOT}/src/core/spec_admission_test.cpp ${STRATA_ROOT}/src/spec/draft_policy.cpp)
   target_include_directories(spec_admission_test PRIVATE ${STRATA_ROOT}/include)
   add_test(NAME spec_admission_default COMMAND ${CMAKE_COMMAND} -E env --unset=STRATA_SPEC_PROB_GATE $<TARGET_FILE:spec_admission_test>)

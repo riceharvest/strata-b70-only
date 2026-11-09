@@ -565,6 +565,7 @@ public:
         return ok;
     }
     std::optional<Ticker> progress;
+    std::function<bool()> cancel;   // SessionWriteOptions::cancel
     SessionPhase phase;
     uint64_t expected = 0;
     int write_fault = 0, flush_fault = 0;   // tests: errno values injected at the first block write / the file flush
@@ -572,6 +573,7 @@ private:
     void fail_with(int e) { fault_ = true; fault_kind_ = errno_kind(e); fault_msg_ = std::strerror(e); }
     bool drain() {
         if (write_fault) { fail_with(write_fault); return false; }
+        if (cancel && cancel()) { fail_with(EINTR); return false; }
         if (!f_.write_all(buf_.get(), used_)) return false;
         used_ = 0;
         if (progress) (*progress)(total_, expected);
@@ -720,7 +722,7 @@ struct In {
     bool raw(void* p, size_t c) {
         if (c > left) return fail("payload ends early");
         if (c && !f->read(p, c)) { kind = f->kind(); return fail("read error: " + f->error()); }
-        hash.update(p, c);
+        if (!limits.skip_payload_hash) hash.update(p, c);
         left -= c;
         return true;
     }
@@ -1062,6 +1064,7 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     FileSink f(raw);
     if (!f.ok()) { st.error = SessionError::memory; error = "session file: " + f.error(); return false; }
     if (opt.progress) f.progress.emplace(opt.progress);
+    f.cancel = opt.cancel;
     f.phase = opt.phase;
     f.expected = total;
     if (f.progress) (*f.progress)(0, total);   // the temporary file exists: the transfer starts
@@ -1229,7 +1232,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     if (!f.read(t, kTrailer)) { st.error = f.kind(); error = "session file: trailer read error: " + f.error(); return false; }
     uint64_t ph = 0;
     std::memcpy(&ph, t, 8);
-    if (ph != in.hash.digest()) { error = "session file: payload checksum mismatch"; return false; }
+    if (!limits.skip_payload_hash && ph != in.hash.digest()) { error = "session file: payload checksum mismatch"; return false; }
     if (std::memcmp(t + 8, kEnd, 8) != 0) { error = "session file: bad end marker"; return false; }
     image = std::move(parsed);
     bytes = (size_t) size;

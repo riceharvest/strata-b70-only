@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -242,6 +243,19 @@ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<T
     return (int64_t) n;
 }
 
+/// Where `prompt` and `other` part ways when they are SIBLINGS: two conversations that share a start (a sibling agent: the
+/// same tools and system prompt up to its working-directory line) and then differ, so a checkpoint there serves the next
+/// sibling.  The shared start is less than half of both; a conversation that goes on past a client's rewrite of its own
+/// last turn diverges near its end (the turn checkpoints serve that), a conversation going on diverges nowhere (`other`
+/// is a prefix of the prompt).  0 when they are not siblings.
+template<class Token>
+int64_t conversation_divergence(const std::vector<Token>& prompt, const std::vector<int32_t>& other) {
+    const size_t m = std::min(prompt.size(), other.size());
+    size_t k = 0;
+    while (k < m && (int64_t) other[k] == (int64_t) prompt[k]) ++k;
+    return k < other.size() && k * 2 < other.size() && k * 2 < prompt.size() ? (int64_t) k : 0;
+}
+
 class ConversationCache {
 public:
     struct Match {
@@ -261,6 +275,18 @@ public:
     bool wants(int64_t tokens) const { return min_tokens_ <= 0 || tokens >= min_tokens_; }
     size_t bytes() const { return bytes_ + reuse_.bytes(); }
     size_t size() const { return entries_.size(); }
+    /// Gets every entry evict_oldest() removes (the SSD tier writes it to a file); the entry is moved out, so a sink that
+    /// does not keep it just drops it.  It returns true when it kept the entry: that is not an eviction (the "evictions="
+    /// counter the server reads stays as it was: a thread whose conversation went to disk still has its place).  Not called
+    /// for drop_superseded() or clear().
+    void set_victim_sink(std::function<bool(SavedConversation&&)> sink) { sink_ = std::move(sink); }
+    /// The longest divergence point (conversation_divergence) between the prompt and any parked conversation.
+    template<class Token>
+    int64_t divergence(const std::vector<Token>& prompt) const {
+        int64_t best = 0;
+        for (const auto& e : entries_) best = std::max(best, conversation_divergence(prompt, e.live.ids));
+        return best;
+    }
     size_t evictions() const { return evictions_; }
     // the longest parked conversation, in tokens (--kv-grow keeps the K/V that long while it could be restored)
     int64_t longest_tokens() const {
@@ -415,9 +441,10 @@ public:
         // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
-            bytes_ -= entries_[i].bytes();
+            SavedConversation victim = std::move(entries_[i]);
+            bytes_ -= victim.bytes();
             erase(i);
-            ++evictions_;
+            if (!(sink_ && sink_(std::move(victim)))) ++evictions_;
             return true;
         }
         return false;
@@ -542,6 +569,7 @@ private:
     uint64_t next_serial_ = 1, guarded_ = 0;
     bool guard_blocked_ = false;
     ConversationKvReuse reuse_;
+    std::function<bool(SavedConversation&&)> sink_;
 };
 
 } // namespace strata::core
