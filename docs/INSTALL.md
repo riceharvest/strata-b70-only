@@ -214,7 +214,7 @@ strata --version
 Stop models first. The next Terminal command uses the updated Control component. The app, Control and engine have
 separate version numbers, so they can differ.
 
-Use `strata components rollback` to return to the previous engine. See [update details](../packaging/UPDATES.md).
+Use `strata components rollback` to return to the previous engine.
 Source checkouts have a [separate update workflow](SOURCE_INSTALL.md#updating).
 
 ## Where things are stored

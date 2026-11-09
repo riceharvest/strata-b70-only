@@ -72,8 +72,7 @@ Then open it again. If macOS says only "the developer cannot be verified", you c
 System Settings > Privacy & Security and press "Open Anyway" next to the message about Strata. Only remove the mark from a
 file you downloaded from the official release; a warning alone does not show that a file is safe or intact. Installs made
 with `curl ... | sh` carry no mark and need none of this. To see which kind you have: `spctl -a -vv /Applications/Strata.app`
-answers "accepted" and "Notarized Developer ID" for a notarised build. How the builds are signed is in
-[Mac packaging](../packaging/mac/README.md).
+answers "accepted" and "Notarized Developer ID" for a notarised build.
 
 **The Linux AppImage does not open.**
 Make the downloaded file executable. It may need FUSE 2 (`libfuse2` on Ubuntu 22.04, `libfuse2t64` on newer Ubuntu;

@@ -295,12 +295,6 @@ class DocsAndPackagingTests(unittest.TestCase):
             self.assertIn(heading, text)
         self.assertNotIn("do not implement this protocol", text)
 
-    def test_the_terminal_archive_carries_the_fixtures(self):
-        import sys
-        sys.path.insert(0, str(self.ROOT / "packaging"))
-        import package_terminal
-        self.assertIn("bench/prompts/standard-v1", package_terminal.PAYLOAD)
-
     def test_the_launchers_point_at_the_standard_benchmark(self):
         for name in ("bench.sh",):
             self.assertIn("strata.py bench run", (self.ROOT / name).read_text(encoding="utf-8"))
@@ -1137,24 +1131,6 @@ class ArchiveCommitTests(unittest.TestCase):
         sys.path.insert(0, str(self.ROOT / "packaging"))
         import package_terminal
         self.pt = package_terminal
-
-    def test_an_explicit_commit_or_the_variable_wins_over_git(self):
-        sha = "ab" * 20
-        self.assertEqual(self.pt.build_commit(sha.upper()), sha)
-        with mock.patch.dict(os.environ, {"STRATA_COMMIT": "cd" * 20}):
-            self.assertEqual(self.pt.build_commit(None), "cd" * 20)
-
-    def test_a_tree_copy_without_git_has_no_commit(self):
-        with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(self.pt.subprocess, "run") as run:
-            os.environ.pop("STRATA_COMMIT", None)
-            run.return_value = mock.Mock(stdout="fatal: not a git repository\n")
-            self.assertIsNone(self.pt.build_commit("not a sha"))
-
-    def test_a_distributable_build_refuses_to_run_without_a_commit(self):
-        with tempfile.TemporaryDirectory() as out, mock.patch.object(self.pt, "build_commit", return_value=None), mock.patch("sys.argv", ["package_terminal.py", "--out", out]):
-            with self.assertRaises(SystemExit) as raised:
-                self.pt.main()
-        self.assertIn("COMMIT", str(raised.exception))
 
 
 if __name__ == "__main__":
