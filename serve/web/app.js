@@ -909,6 +909,16 @@ async function loadConfig() {
     }
     return `<label for="${id}" title="${esc(k.help)}">${esc(k.help)}<code>${esc(k.key)}</code></label>${input}`;
   }).join("");
+  const pi = cfgKeys.findIndex((k) => k.key === "parallel"), bi = cfgKeys.findIndex((k) => k.key === "batch_mtp");
+  if (pi >= 0 && bi >= 0) {                          // batch_mtp only means something with 2 or more parallel requests
+    const sync = () => {
+      const on = Number($(`cfg-${pi}`).value) >= 2, b = $(`cfg-${bi}`);
+      b.disabled = !on;
+      if (!on) b.value = "";
+    };
+    $(`cfg-${pi}`).addEventListener("input", sync);
+    sync();
+  }
   $("cfg-card").hidden = false;
 }
 function configValue(k, el) {

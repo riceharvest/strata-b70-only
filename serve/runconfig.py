@@ -18,7 +18,8 @@ from strata_control import user_args
 from strata_control import atomic as _atomic_mod
 
 # (key, kind, help).  kind: "bool", "int>=0", "num>=0", ("enum", values), "names", or ("sampling", check) for a key
-# of the "sampling" block, ("arg", flag) for an engine option kept in "args".
+# of the "sampling" block, ("arg", flag) for an engine option with a whole number kept in "args", ("path", flag) for one
+# with an absolute path, ("flag", flag) for one without a value (on or off).
 EDITABLE = [
     ("sampling.temperature", ("sampling", "num>=0"),
      "Default temperature for requests that send none (0 = greedy; without it the model card's: 1.0 thinking, 0.7 not)"),
@@ -50,7 +51,21 @@ EDITABLE = [
     ("parallel", "int>=0",
      "Requests decoding together (batch slots): 1 or empty = one at a time. Each slot takes about 1 GiB of VRAM that the expert "
      "cache would hold, and on the B70 two streams together measured about the same speed as one alone (it saves waiting, not time)"),
+    ("conversation_cache_spill_dir", ("path", "--conversation-cache-spill-dir"),
+     "SSD tier for parked conversations: a folder where a conversation pushed out of RAM is written, and read back when "
+     "its agent returns, so its whole prompt need not be read again. It costs disk space (the two numbers below). Give the "
+     "path as the engine sees it: the engine runs in a container where the folder that holds the repo is /work, e.g. "
+     "/work/strata-spill. Empty: no SSD tier (and the two numbers below go)"),
+    ("conversation_cache_spill_mib", ("arg", "--conversation-cache-spill-mib"),
+     "Disk space in MiB the SSD tier may use at most (empty: 24576, about 24 GiB). Needs the folder above"),
+    ("conversation_cache_spill_min_free_mib", ("arg", "--conversation-cache-spill-min-free-mib"),
+     "Disk space in MiB the SSD tier leaves free on that disk (empty: 40960, about 40 GiB). Needs the folder above"),
+    ("batch_mtp", ("flag", "--batch-mtp"),
+     "One draft proposal per parallel request (--batch-mtp): only with parallel 2 or more; off, or removed when parallel is "
+     "off. Empty: engine default (off)"),
 ]
+SPILL_DIR = "conversation_cache_spill_dir"
+SPILL_DEPENDENTS = ("conversation_cache_spill_mib", "conversation_cache_spill_min_free_mib")
 PARALLEL_MAX = 8      # serve/server.py PARALLEL_MAX: the engine's batch window holds at most 8 rows
 SPEC = {k: kind for k, kind, _ in EDITABLE}
 
@@ -68,8 +83,11 @@ def value_of(cfg: dict, key: str):
     if isinstance(kind, tuple) and kind[0] == "sampling":
         s = cfg.get("sampling")
         return s.get(key.split(".", 1)[1]) if isinstance(s, dict) else None
-    if isinstance(kind, tuple) and kind[0] == "arg":
+    if isinstance(kind, tuple) and kind[0] in ("arg", "path"):
         return _arg(cfg, kind[1])
+    if isinstance(kind, tuple) and kind[0] == "flag":
+        a = cfg.get("args") if isinstance(cfg.get("args"), list) else []
+        return True if kind[1] in a else None
     return cfg.get(key)
 
 
@@ -79,7 +97,8 @@ def view(cfg: dict, path: str | Path) -> dict:
     for key, kind, help_ in EDITABLE:
         k = kind[0] if isinstance(kind, tuple) else kind
         out.append({"key": key, "value": value_of(cfg, key), "help": help_,
-                    "kind": "number" if k in ("sampling", "arg", "int>=0", "num>=0") else k,
+                    "kind": "number" if k in ("sampling", "arg", "int>=0", "num>=0") else "bool" if k == "flag" else
+                    "text" if k == "path" else k,
                     **({"choices": kind[1]} if k == "enum" else {})})
     return {"file": Path(path).name, "keys": out,
             "note": "Saved to the run config; used from the next start of the model."}
@@ -128,6 +147,20 @@ def check(key: str, v, cfg: dict):
         return _number(key, v)
     if k == "arg":
         return _number(key, v, whole=True)
+    if k == "path":
+        if not isinstance(v, str) or not v.strip():
+            if isinstance(v, str):                     # an empty text: the folder is not wanted
+                return None
+            raise ValueError(f"{key}: expected an absolute path, not {v!r}")
+        v = v.strip()
+        if not v.startswith("/") or len(v) > 4096 or any(ord(c) < 32 or c == "\x7f" for c in v):
+            raise ValueError(f"{key}: expected an absolute path as the engine sees it (starting with /, e.g. /work/strata-spill), "
+                             f"not {v!r}")
+        return v
+    if k == "flag":
+        if not isinstance(v, bool):
+            raise ValueError(f"{key}: expected true or false, not {v!r}")
+        return True if v else None                     # off is the flag left out
     rule = kind[1]                                     # a sampling key: the server's own rules
     if rule == "num>=0":
         return float(_number(key, v))
@@ -144,48 +177,75 @@ def apply(cfg: dict, changes: dict) -> tuple[dict, list[str]]:
     if not isinstance(changes, dict) or not changes:
         raise ValueError('send {"set": {"<key>": <value or null>, ...}}')
     checked = {k: check(k, v, cfg) for k, v in changes.items()}
+    after = json.loads(json.dumps(cfg))                # what the file will say, for the rules between keys
+    for key, v in checked.items():
+        _put(after, key, v)
+    if SPILL_DIR in checked and checked[SPILL_DIR] is None:
+        for dep in SPILL_DEPENDENTS:                   # no folder: no SSD tier, the quota and the floor go with it
+            checked[dep] = None
+    for dep in SPILL_DEPENDENTS:
+        if checked.get(dep) is not None and value_of(after, SPILL_DIR) is None:
+            raise ValueError(f"{dep}: set conversation_cache_spill_dir first (the SSD tier is off without a folder)")
+    if checked.get("batch_mtp") and not (value_of(after, "parallel") or 0) >= 2:
+        raise ValueError("batch_mtp: needs parallel 2 or more (one draft proposal per parallel request)")
+    if "parallel" in checked and checked["parallel"] is None and "batch_mtp" not in checked and value_of(cfg, "batch_mtp"):
+        checked["batch_mtp"] = None                    # parallel off: --batch-mtp has no meaning, so it does not stay in the args
     new = json.loads(json.dumps(cfg))                  # a deep copy: the caller's dict is left alone
     changed = []
     for key, v in checked.items():
         if value_of(new, key) == v:
             continue
-        kind = SPEC[key]
-        if isinstance(kind, tuple) and kind[0] == "sampling":
-            s = dict(new.get("sampling") or {}) if isinstance(new.get("sampling"), dict) else {}
-            sub = key.split(".", 1)[1]
-            if v is None:
-                s.pop(sub, None)
-            else:
-                s[sub] = v
-            if s:
-                new["sampling"] = s
-            else:
-                new.pop("sampling", None)
-        elif isinstance(kind, tuple) and kind[0] == "arg":
-            a = list(new.get("args") or [])
-            flag = kind[1]
-            if flag in a[:-1]:
-                i = a.index(flag)
-                if v is None:
-                    del a[i:i + 2]
-                else:
-                    a[i + 1] = str(v)
-            elif v is not None:
-                a += [flag, str(v)]
-            new["args"] = a
-            mine = user_args.set_flag(user_args.capture(new), flag, v)   # a value set here is the person's: it survives setup and the app
-            if mine:
-                new[user_args.USER_KEY] = mine
-            else:
-                new.pop(user_args.USER_KEY, None)
-            if user_args.WRITTEN_KEY in new:
-                new[user_args.WRITTEN_KEY] = list(a)
-        elif v is None:
-            new.pop(key, None)
-        else:
-            new[key] = v
+        _put(new, key, v)
         changed.append(key)
     return new, changed
+
+
+def _put(new: dict, key: str, v) -> None:
+    """Writes `v` (None: remove) for `key` into `new`, in place."""
+    kind = SPEC[key]
+    if isinstance(kind, tuple) and kind[0] == "sampling":
+        s = dict(new.get("sampling") or {}) if isinstance(new.get("sampling"), dict) else {}
+        sub = key.split(".", 1)[1]
+        if v is None:
+            s.pop(sub, None)
+        else:
+            s[sub] = v
+        if s:
+            new["sampling"] = s
+        else:
+            new.pop("sampling", None)
+    elif isinstance(kind, tuple) and kind[0] in ("arg", "path", "flag"):
+        a = list(new.get("args") or [])
+        flag = kind[1]
+        if kind[0] == "flag":
+            if flag in a and v is None:
+                a = [x for x in a if x != flag]
+            elif flag not in a and v is not None:
+                a.append(flag)
+        elif flag in a[:-1]:
+            i = a.index(flag)
+            if v is None:
+                del a[i:i + 2]
+            else:
+                a[i + 1] = str(v)
+        elif v is not None:
+            a += [flag, str(v)]
+        new["args"] = a
+        if kind[0] == "flag":                          # a bare flag: the group is the flag alone
+            mine = [g for g in user_args.groups(user_args.capture(new)) if user_args.flag_of(g) != flag]
+            mine = user_args.flat(mine + ([[flag]] if v is not None else []))
+        else:
+            mine = user_args.set_flag(user_args.capture(new), flag, v)   # a value set here is the person's: it survives setup and the app
+        if mine:
+            new[user_args.USER_KEY] = mine
+        else:
+            new.pop(user_args.USER_KEY, None)
+        if user_args.WRITTEN_KEY in new:
+            new[user_args.WRITTEN_KEY] = list(a)
+    elif v is None:
+        new.pop(key, None)
+    else:
+        new[key] = v
 
 
 def save(path: str | Path, cfg: dict) -> Path:
