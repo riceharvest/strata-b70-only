@@ -56,12 +56,10 @@ def common_prefix(a, b) -> int:
 
 def continues(ids, last) -> bool:
     """Is `ids` the next request of the stream whose prompt was `last`?  It shares all of it but the last TAIL tokens
-    (or 15/16 of it), and not just a system prompt."""
+    (at most 1/16 of a short one), and not just a system prompt."""
     if not last:
         return False
-    shared = common_prefix(ids, last)
-    return shared >= max(len(last) - TAIL, min(len(last), MIN_SHARED)) or \
-        (shared >= MIN_SHARED and shared * 16 >= len(last) * 15)
+    return common_prefix(ids, last) >= max(len(last) - min(TAIL, len(last) // 16 + 1), min(len(last), MIN_SHARED))
 
 
 class Entry:

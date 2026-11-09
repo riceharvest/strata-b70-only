@@ -5048,10 +5048,7 @@ class Service:
         deadline = time.monotonic() + self.queue_timeout_s if self.queue_timeout_s is not None else None
         if deadline is not None:
             setattr(cancel, "_strata_queue_deadline", deadline)
-        order_entry = None
         def queue_started():
-            if order_entry is not None:
-                order_entry.served = True               # the engine began reading this prompt: its stream is the live one
             with self.status_lock:
                 row = self.terminal_requests.get(request_id)
                 if row is not None and row["state"] != "reading":
@@ -5108,6 +5105,7 @@ class Service:
                                 self.fifo.release()
                                 raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
                             turn.callback(self.fifo.release)
+                            order_entry.served = True       # it has the engine: its stream is the live one when it ends
                             if order_entry.why:
                                 print(f"[strata] stream order: {order_entry.why} "
                                       f"(this request waited {time.monotonic() - order_entry.t0:.1f} s)", flush=True)

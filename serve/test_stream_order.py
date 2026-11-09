@@ -37,6 +37,9 @@ class ContinuesTest(unittest.TestCase):
         self.assertTrue(so.continues(a[:-1000] + [9] * 800, a))               # the template dropped the last reply's tail
         self.assertFalse(so.continues(stream(2, 20_000), a))                  # same system prompt, another stream
         self.assertFalse(so.continues(a[:5000] + [9] * 20_000, a))            # diverges early
+        short = stream(1, 500)
+        self.assertFalse(so.continues(stream(2, 500), short))                 # a short prompt: only the system prompt shared
+        self.assertTrue(so.continues(short + [3] * 40, short))
         self.assertFalse(so.continues(a, None))
         self.assertEqual(so.common_prefix(a, a + [1]), len(a))
         self.assertEqual(so.common_prefix([], a), 0)
@@ -156,6 +159,58 @@ class OrderTest(unittest.TestCase):
         a, b = o.enter(self.A), o.enter(self.B)
         self.assertTrue(o.wait_turn(a, 0.1))
         self.assertTrue(o.wait_turn(b, 0.1))
+
+
+class ThroughService(unittest.TestCase):
+    """The real Service.run (one request at a time, no batch hooks): an agent thread runs to its final answer first."""
+
+    CALL = "<tool_call><function=read><parameter=p>x</parameter></function></tool_call>"
+    ANSWER = "all done."
+
+    def test_a_thread_with_tool_calls_is_served_to_its_end_before_a_waiting_stream(self):
+        from serve.frontend import ChatTemplate
+        from serve.server import ByteTokenizer, MockEngine, Service, IM_END
+        tok = ByteTokenizer()
+        end = tok.encode(IM_END, parse_special=True)
+        call, answer = tok.encode(self.CALL, parse_special=True) + end, tok.encode(self.ANSWER, parse_special=True) + end
+        sys_ids = list(range(100, 3100))
+        order, turns = [], {}
+
+        class Eng(MockEngine):                  # (no queue_started call: that is the --batch path's)
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                name = "AB"[(ids[3000] // 10_000) - 1]
+                turns[name] = turns.get(name, 0) + 1
+                order.append(name)
+                for t in (call if name == "A" and turns[name] < 3 else answer):
+                    time.sleep(0.004)
+                    yield t
+
+        svc = Service(Eng(tok, "x"), tok, ChatTemplate(Path(__file__).resolve().parents[1] / "serve/chat_template.jinja"))
+        tools = [{"name": "read", "description": "r",
+                  "parameters": {"type": "object", "properties": {"p": {"type": "string"}}}}]
+
+        def request(ids):
+            return [x.kind for k, x in svc.run(ids, False, tools, 64, {}, threading.Event()) if k == "event"]
+
+        a_kinds = []
+
+        def agent():
+            ids = sys_ids + [10_000 + i for i in range(20_000)]
+            for _ in range(3):
+                a_kinds.append(request(ids))
+                time.sleep(0.4)                                # the tool runs, then the next request
+                ids = ids + [777] * 40 + [10_999]
+
+        with mock.patch.object(so, "HOLD_S", 5.0), mock.patch.object(so, "MAX_WAIT_S", 60.0):
+            ta = threading.Thread(target=agent)
+            tb = threading.Thread(target=lambda: (time.sleep(0.1), request(sys_ids + [20_000 + i for i in range(20_000)])))
+            ta.start()
+            tb.start()
+            ta.join(30)
+            tb.join(30)
+        self.assertTrue(any(k in ("tool_start", "tool_call") for k in a_kinds[0]), a_kinds[0])
+        self.assertFalse(any(k in ("tool_start", "tool_call") for k in a_kinds[2]), a_kinds[2])
+        self.assertEqual(order, ["A", "A", "A", "B"], "B took the engine in the middle of A's thread")
 
 
 if __name__ == "__main__":
