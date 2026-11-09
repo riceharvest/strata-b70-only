@@ -323,7 +323,8 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         x_q8_1 = nw.q8_1;
     }
     // S26 STRATA_LFUSE (gate_deferred): gate and up in one launch where the pair applies (bitwise the two calls)
-    if (!(pair && nw.gate_type == nw.up_type &&
+    // STRATA_XE2_KQ (native_mmvq_pair_wide32): the Q8_0 pair in one launch of the wide kernel, asked for without STRATA_LFUSE
+    if (!((pair || native_mmvq_pair_wide32()) && nw.gate_type == nw.up_type &&
           native_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, x_q8_1, gate, up, (int) n_embd, (int) n_ff, n_tok, stream))) {
         native_mmvq(nw.gate_type, nw.gate_data, x_q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
         native_mmvq(nw.up_type, nw.up_data, x_q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
