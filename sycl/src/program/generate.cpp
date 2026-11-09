@@ -8402,7 +8402,7 @@ int main(int argc, char **argv) try {
                              err.c_str());
                 err.clear();
             } else {
-                std::fprintf(stderr, "strata generate: %lld of %zu experts missing from VRAM (+ %zu in the prompt loan's slots) mirrored in pinned host memory "
+                std::fprintf(stderr, "strata generate: %lld experts mirrored in pinned host memory (%zu missing from VRAM + %zu in the prompt loan's slots) "
                                      "(%.2f GiB, %.1f s); the GPU reads them over PCIe\n", (long long) got, n_true_miss, miss.size() - n_true_miss,
                              (double) gguf_src.mirrored_bytes() / 1073741824.0,
                              std::chrono::duration<double>(Clock::now() - tm).count());
