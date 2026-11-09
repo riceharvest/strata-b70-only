@@ -100,7 +100,7 @@ cmake --build build-sycl --target strata
 | --- | --- |
 | `-DSTRATA_SYCL_AOT=bmg-g31` | Compile ahead of time for Arc Pro B70. Needs `ocloc` (Intel's `intel-ocloc` package). Without it the first start JIT-compiles every kernel (about 47 s). |
 | `-DSTRATA_SYCL_AOT=bmg-g21` | The same for B580, B570 and Pro B60 |
-| `-DSTRATA_SYCL_PARITY=OFF` | Skip the kernel tests (on by default). Run them with `ctest --test-dir build-sycl` on the card. |
+| `-DSTRATA_SYCL_PARITY=ON` | Build the kernel parity tests (off by default; they are most of a full build). Run them with `ctest --test-dir build-sycl` on the card. |
 
 `setup_intel.py` looks for `build-sycl-aot/strata` or `build-sycl/strata` in the checkout. With the top-level option the
 engine is at `build-sycl/sycl/strata`, so use `-S sycl` or set `STRATA_SYCL_BIN`.

@@ -297,26 +297,29 @@ add_executable(strata ${_main})
 target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
 
 # --- the kernel parity self-tests (each runs on the card and compares against a CPU reference) ---------------------
-option(STRATA_SYCL_PARITY "Build the kernel parity tests" ON)
+# Host-only tests (no device, no GPU library): always built, they are small.
+enable_testing()
+# Host-only proposal contracts of the gated MTP proposal; no SYCL runtime or GPU library needed.
+add_executable(gated_proposal_test ${STRATA_ROOT}/src/core/gated_proposal_test.cpp)
+target_include_directories(gated_proposal_test PRIVATE ${STRATA_ROOT}/include)
+add_test(NAME gated_proposal_test COMMAND gated_proposal_test)
+# Host-only test of the conversation cache's SSD tier (writer thread, index, gate, divergence); no device.
+add_executable(conversation_spill_test ${STRATA_ROOT}/src/core/conversation_spill_test.cpp
+               ${STRATA_ROOT}/src/core/conversation_file.cpp ${STRATA_ROOT}/sycl/src/platform/direct_file.cpp)
+target_include_directories(conversation_spill_test PRIVATE ${STRATA_ROOT}/include ${STRATA_ROOT}/sycl/include)
+target_link_libraries(conversation_spill_test PRIVATE Threads::Threads)
+add_test(NAME conversation_spill_test COMMAND conversation_spill_test)
+add_executable(spec_admission_test ${STRATA_ROOT}/src/core/spec_admission_test.cpp ${STRATA_ROOT}/src/spec/draft_policy.cpp)
+target_include_directories(spec_admission_test PRIVATE ${STRATA_ROOT}/include)
+add_test(NAME spec_admission_default COMMAND ${CMAKE_COMMAND} -E env --unset=STRATA_SPEC_PROB_GATE $<TARGET_FILE:spec_admission_test>)
+add_test(NAME spec_admission_pick COMMAND ${CMAKE_COMMAND} -E env STRATA_SPEC_PROB_GATE=pick $<TARGET_FILE:spec_admission_test> pick)
+add_test(NAME spec_admission_top COMMAND ${CMAKE_COMMAND} -E env STRATA_SPEC_PROB_GATE=top $<TARGET_FILE:spec_admission_test> top)
+add_test(NAME spec_admission_exact_top_only COMMAND ${CMAKE_COMMAND} -E env STRATA_SPEC_PROB_GATE=TOP $<TARGET_FILE:spec_admission_test> pick)
+
+# The kernel parity programs, tests and benches run on the card. Each one compiles its own device code, which is most of a
+# full build's time: they are built on request (-DSTRATA_SYCL_PARITY=ON, or build.sh with a target name after configuring with it).
+option(STRATA_SYCL_PARITY "Build the kernel parity tests" OFF)
 if(STRATA_SYCL_PARITY)
-  enable_testing()
-  # Host-only proposal contracts of the gated MTP proposal; no SYCL runtime or GPU library needed.
-  add_executable(gated_proposal_test ${STRATA_ROOT}/src/core/gated_proposal_test.cpp)
-  target_include_directories(gated_proposal_test PRIVATE ${STRATA_ROOT}/include)
-  add_test(NAME gated_proposal_test COMMAND gated_proposal_test)
-  # Host-only test of the conversation cache's SSD tier (writer thread, index, gate, divergence); no device.
-  add_executable(conversation_spill_test ${STRATA_ROOT}/src/core/conversation_spill_test.cpp
-                 ${STRATA_ROOT}/src/core/conversation_file.cpp ${STRATA_ROOT}/sycl/src/platform/direct_file.cpp)
-  target_include_directories(conversation_spill_test PRIVATE ${STRATA_ROOT}/include ${STRATA_ROOT}/sycl/include)
-  find_package(Threads REQUIRED)
-  target_link_libraries(conversation_spill_test PRIVATE Threads::Threads)
-  add_test(NAME conversation_spill_test COMMAND conversation_spill_test)
-  add_executable(spec_admission_test ${STRATA_ROOT}/src/core/spec_admission_test.cpp ${STRATA_ROOT}/src/spec/draft_policy.cpp)
-  target_include_directories(spec_admission_test PRIVATE ${STRATA_ROOT}/include)
-  add_test(NAME spec_admission_default COMMAND ${CMAKE_COMMAND} -E env --unset=STRATA_SPEC_PROB_GATE $<TARGET_FILE:spec_admission_test>)
-  add_test(NAME spec_admission_pick COMMAND ${CMAKE_COMMAND} -E env STRATA_SPEC_PROB_GATE=pick $<TARGET_FILE:spec_admission_test> pick)
-  add_test(NAME spec_admission_top COMMAND ${CMAKE_COMMAND} -E env STRATA_SPEC_PROB_GATE=top $<TARGET_FILE:spec_admission_test> top)
-  add_test(NAME spec_admission_exact_top_only COMMAND ${CMAKE_COMMAND} -E env STRATA_SPEC_PROB_GATE=TOP $<TARGET_FILE:spec_admission_test> pick)
   if(STRATA_NATIVE_EXPERTS)
     # a token's native expert rows are the same bits at every number of tokens that share its expert (host CPU kernels)
     add_executable(native_arithmetic_parity ${STRATA_ROOT}/src/kernels/cpu/native_arithmetic_parity.cpp)
@@ -538,7 +541,8 @@ endif()
 # -----------------------------------------------------------------------------
 # DeepSeek-V4.1-Flash SYCL Engine Path (strata-dsv41)
 # -----------------------------------------------------------------------------
-option(STRATA_BUILD_DSV41 "Build the DeepSeek-V4.1 SYCL engine path (strata-dsv41)" ON)
+# Not maintained since 2026-10-30 (see README.md); off by default.
+option(STRATA_BUILD_DSV41 "Build the DeepSeek-V4.1 SYCL engine path (strata-dsv41), not maintained" OFF)
 if(STRATA_BUILD_DSV41)
   # (the engine's device code, in the library so the synthetic tests below run the same kernels)
   add_library(strata_dsv41_kernels STATIC
