@@ -21,13 +21,13 @@
 //   5. power: at 8 columns, row 0 of the KREG output against a reference with the scale of sub-block 0 of row 0's
 //      first block one step off must fail the bound in some column. A kernel that decodes one sub-block scale wrong
 //      would pass a bound that cannot see this.
-//   6. STRATA_XE2_KQ (native_mmvq_set_xe2_kq): the KREG call again with every part on, bitwise the KREG output (the
+//   6. STRATA_XE2_KQ (native_mmvq_set_xe2_kq): the KREG call again with STRATA_XE2_KQ=1, bitwise the KREG output (the
 //      persistent grid and the 256-register Q5_K tiles change no sum). Over the run some launch must have taken the
 //      grid and some the tile (native_mmvq_xe2_kq_seen), or the check has compared KREG with itself.
 //   7. STRATA_XE2_KQ part 16: native_mmvq_pair on two Q8_0 matrices at 1-8 columns must run and be bitwise the two
 //      native_mmvq calls.
-//   8. STRATA_XE2_KQ part 8: a planar Q6_K matrix (native_q6_k_planar_adopt) at 5-8 columns, the launch with the
-//      part on (256 registers from 6 columns) bitwise the launch with it off.
+//   8. STRATA_XE2_KQ part 8 (opt-in, not in 1): a planar Q6_K matrix (native_q6_k_planar_adopt) at 5-8 columns, the
+//      launch with the part on (256 registers from 6 columns) bitwise the launch with it off.
 //
 // THE DATA. Random weight bytes, except each block's fp16 scales (d, and dmin for Q4_K/Q5_K), which are normal fp16
 // values in +-[2^-10, 2^-5) as in mmvq_multi_parity, so every output is finite and a non-finite one fails. Random
@@ -365,7 +365,7 @@ int selftest() {
                 const std::vector<float> yk = run(dev, f.type, dw, dxq, dy, sh.n_in, sh.n_out, T, 1, false);
                 const std::vector<float> yd = run(dev, f.type, dw, dxq, dy, sh.n_in, sh.n_out, T, 0, false);
                 const std::vector<float> y1 = run(dev, f.type, dw, dxq, dy, sh.n_in, sh.n_out, T, 1, true);
-                k::native_mmvq_xe2_kq_seen();   // 6. the KREG call with every STRATA_XE2_KQ part on
+                k::native_mmvq_xe2_kq_seen();   // 6. the KREG call with STRATA_XE2_KQ=1 (the grid, the tile, the pair)
                 const std::vector<float> yx = run(dev, f.type, dw, dxq, dy, sh.n_in, sh.n_out, T, 1, false, 1);
                 xe2_seen |= k::native_mmvq_xe2_kq_seen();
                 double rk = 0, rd = 0;

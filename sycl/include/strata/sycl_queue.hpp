@@ -198,11 +198,11 @@ inline void apply_b70_defaults() {
         {"STRATA_HC_Q8", "1"},
         // the decode window's hot kernels for the UD-IQ1_S pack (Q5_K / Q6_K / Q8_0 dense, IQ2_XXS gate/up, Q2_0 down), each
         // bitwise the kernel it replaces (2026-11-09, written from the window's unitrace profile; "0" turns one off):
-        // XE2_KQ: KREG Q5_K / Q6_K on a persistent grid at 3-8 columns, the wide Q5_K rows at 5-8 columns and the planar
-        // Q6_K head at 6-8 columns in 256 registers (they spill at 128), the shared expert's Q8_0 gate and up in one launch
-        // (a sum of parts 2 + 4 + 8 + 16 selects them, native_mmvq.dp.cpp); XE2_IQ: vector activation loads and a
-        // three-entry pass in the IQ2_XXS / IQ2_S / Q2_0 expert kernels; HC_Q8_DOWN2: the Q8_0 hyper-connection read's
-        // down kernel with fewer barriers and vector partials
+        // XE2_KQ: KREG Q5_K / Q6_K on a persistent grid at 3-8 columns, the wide Q5_K rows at 5-8 columns in 256 registers
+        // (they spill at 128), the shared expert's Q8_0 gate and up in one launch (a sum of parts 2 + 4 + 16 selects them;
+        // + 8, so 30: also the planar Q6_K head at 6-8 columns in 256 registers, not timed yet; native_mmvq.dp.cpp);
+        // XE2_IQ: vector activation loads and a three-entry pass in the IQ2_XXS / IQ2_S / Q2_0 expert kernels;
+        // HC_Q8_DOWN2: the Q8_0 hyper-connection read's down kernel with one barrier less and vector partials
         {"STRATA_XE2_KQ", "1"},
         {"STRATA_XE2_IQ", "1"},
         {"STRATA_HC_Q8_DOWN2", "1"},

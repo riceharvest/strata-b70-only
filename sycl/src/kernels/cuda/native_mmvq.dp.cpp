@@ -2250,24 +2250,26 @@ inline bool kreg_on() { return g_kreg_override >= 0 ? g_kreg_override != 0 : kre
 // STRATA_XE2_KQ (the B70 default, strata::apply_b70_defaults; unset or 0: off, every launch below as before): the
 // decode window's dense kernels for a pack with Q5_K / Q6_K / Q8_0 dense tensors and a Q6_K head (Unsloth UD-IQ1_S).
 // Each part changes how a kernel is launched, never a sum: every output is bitwise what it is with the switch off.
-// 1 = all parts; any other value is the sum of the parts wanted:
+// 1 = parts 2, 4 and 16; any other value is the sum of the parts wanted (30: all four):
 //   2  KREG Q5_K / Q6_K at 3-8 columns on a persistent grid (kreg_groups_cap): a work-group loads its activation
 //      pieces once and walks the tiles, instead of one work-group per tile;
 //   4  KREG Q5_K rows wider than 4096 at 5-8 columns in 256 registers, 4 rows a tile (the 2-row 128-register form
 //      spills there: 4,352 bytes a thread at 6 columns, 8,704 at 8, measured 2026-11-09 on 6144 x 2560: 66 and 248 us
 //      a call against 35 us at 3 columns);
 //   8  the planar Q6_K heads at 6-8 columns in 256 registers (at 128 the kernel spills 1,536-1,600 bytes a thread:
-//      1,187 us at 6 columns and 1,659 at 8 against 905 at 3, same day);
+//      1,187 us at 6 columns and 1,659 at 8 against 905 at 3, same day).  Not part of 1: 256 registers halve the
+//      threads a core keeps resident and this kernel was not timed that way on a Battlemage card;
 //   16 native_mmvq_pair takes Q8_0 pairs at 1-8 columns in one launch of the wide kernel (the shared expert's gate
 //      and up: one launch less a layer).
 constexpr int kXe2KqGrid = 2, kXe2KqTile = 4, kXe2KqHead = 8, kXe2KqPair = 16;
 constexpr int kXe2KqAll = kXe2KqGrid | kXe2KqTile | kXe2KqHead | kXe2KqPair;
+constexpr int kXe2KqDefault = kXe2KqGrid | kXe2KqTile | kXe2KqPair;   // what "1" turns on
 inline int xe2_kq_env() {   // latched before graph capture
     static const int v = [] {
         const char* e = std::getenv("STRATA_XE2_KQ");
         if (e == nullptr || e[0] == '\0') return 0;
         const int n = std::atoi(e);
-        const int m = n == 1 ? kXe2KqAll : (n & kXe2KqAll);
+        const int m = n == 1 ? kXe2KqDefault : (n & kXe2KqAll);
         if (m != 0)
             std::fprintf(stderr, "strata: STRATA_XE2_KQ=%s: dense decode launches for Q5_K / Q6_K / Q8_0 (parts %d; 0 turns them off)\n", e, m);
         return m;
@@ -5620,7 +5622,7 @@ void native_q6_k_unpack(const void* weights) {
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
 void native_mmvq_set_q6k_wide(bool on) { g_q6k_wide = on; }
 void native_mmvq_set_kreg(int on) { g_kreg_override = on; }
-void native_mmvq_set_xe2_kq(int parts) { g_xe2_kq_override = parts < 0 ? -1 : (parts == 1 ? kXe2KqAll : (parts & kXe2KqAll)); }
+void native_mmvq_set_xe2_kq(int parts) { g_xe2_kq_override = parts < 0 ? -1 : (parts == 1 ? kXe2KqDefault : (parts & kXe2KqAll)); }
 int native_mmvq_xe2_kq_seen() { return g_xe2_kq_seen.exchange(0, std::memory_order_relaxed); }
 void native_q6_k_mmvq_stride224(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                                 void* stream) {

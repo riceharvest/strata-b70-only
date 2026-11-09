@@ -34,9 +34,10 @@ void native_mmvq_set_multi_exact(bool exact);
 void native_mmvq_set_q6k_wide(bool on);   // SYCL port: the 16-byte-load Q6_K kernel (default on)
 void native_mmvq_set_kreg(int on);   // SYCL port: the KREG kernels on (1) / off (0) / as STRATA_MMVQ_KREG (-1, default); 3: on without KREG2
 // SYCL port, STRATA_XE2_KQ (the B70 default; unset or 0: off): the decode window's Q5_K / Q6_K / Q8_0 dense launches,
-// every output bitwise what it is with the switch off. Parts (1 = all, else their sum): 2 KREG Q5_K / Q6_K on a
-// persistent grid at 3-8 columns, 4 KREG Q5_K rows wider than 4096 at 5-8 columns in 256 registers, 8 the planar Q6_K
-// heads at 6-8 columns in 256 registers, 16 native_mmvq_pair for Q8_0 at 1-8 columns in one launch of the wide kernel.
+// every output bitwise what it is with the switch off. Parts (1 = 2 + 4 + 16, else their sum; 30 = all four): 2 KREG
+// Q5_K / Q6_K on a persistent grid at 3-8 columns, 4 KREG Q5_K rows wider than 4096 at 5-8 columns in 256 registers,
+// 8 the planar Q6_K heads at 6-8 columns in 256 registers (opt-in: not timed on a Battlemage card), 16
+// native_mmvq_pair for Q8_0 at 1-8 columns in one launch of the wide kernel.
 // native_mmvq_set_xe2_kq (tests): the parts, 0 = off, -1 = as STRATA_XE2_KQ (the default). Set before graph capture.
 void native_mmvq_set_xe2_kq(int parts);
 // The parts some launch has taken since the last call of this function (it clears them): a test that turned a part on
