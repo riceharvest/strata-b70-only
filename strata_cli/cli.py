@@ -2057,7 +2057,7 @@ def _components_backends(a: argparse.Namespace) -> int:
         print(f"  {row['backend']:<6} {', '.join(row['platforms']):<45} {mark}")
     print()
     print("  Unsupported combinations are not attempted. A combination that is listed but has not")
-    print("  been qualified on real hardware is prepared, not claimed: see packaging/README.md.")
+    print("  been qualified on real hardware is prepared, not claimed.")
     return 0
 
 

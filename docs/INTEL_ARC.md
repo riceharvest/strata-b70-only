@@ -23,15 +23,13 @@ On Linux, `strata update` (Terminal) and Settings > Update (app) download the In
 whose graphics card is made by Intel. One package serves Alchemist and Battlemage: the GPU code is compiled from SPIR-V at the
 first start, because the A-series cards have no FP64 units. The package carries oneAPI's runtime libraries. The Level Zero
 loader and the compute runtime stay the PC's own (see [What you need](#what-you-need)), and your user must be in the `render`
-group (`strata doctor` says so). It was tested on an Arc A750 only. The package is built by `packaging/build_sycl_linux.sh`.
+group (`strata doctor` says so). It was tested on an Arc A750 only.
 
 **Model preparation is separate.** `strata launch` reuses compatible prepared local files, but it does not run the Intel
 source or container setup for you. When a model needs preparation, follow the [source workflow](INTEL.md#setup). Installing the
 engine package alone does not prove the selected model is ready; check a loaded server with a real request.
 
-Docker: the ready-made image is `ghcr.io/niko1221/strata:0.2.3-sycl`, published only for a release that carries a Linux Intel
-engine package. Otherwise [build the image yourself](DOCKER.md#build-it-yourself). The image needs prepared model files
-([Docker: Intel Arc](DOCKER.md#intel-arc)).
+Docker: there is no ready-made image; build the engine in the `strata-sycl-dev` image ([B70.md](B70.md)).
 
 ## What you need
 
@@ -100,7 +98,7 @@ cmake --build build-sycl --target strata
 | --- | --- |
 | `-DSTRATA_SYCL_AOT=bmg-g31` | Compile ahead of time for Arc Pro B70. Needs `ocloc` (Intel's `intel-ocloc` package). Without it the first start JIT-compiles every kernel (about 47 s). |
 | `-DSTRATA_SYCL_AOT=bmg-g21` | The same for B580, B570 and Pro B60 |
-| `-DSTRATA_SYCL_PARITY=OFF` | Skip the kernel tests (on by default). Run them with `ctest --test-dir build-sycl` on the card. |
+| `-DSTRATA_SYCL_PARITY=ON` | Build the kernel parity tests (off by default; they are most of a full build). Run them with `ctest --test-dir build-sycl` on the card. |
 
 `setup_intel.py` looks for `build-sycl-aot/strata` or `build-sycl/strata` in the checkout. With the top-level option the
 engine is at `build-sycl/sycl/strata`, so use `-S sycl` or set `STRATA_SYCL_BIN`.

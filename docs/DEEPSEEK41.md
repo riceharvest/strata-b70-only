@@ -1,5 +1,9 @@
 # DeepSeek-V4.1-Flash
 
+**Not maintained since 2026-10-30.** On one B70 the 2-bit pack plus expert pruning cost too much answer quality: a pruned model was
+fluent but had lost knowledge. The code stays in `sycl/src/dsv41`; its build is off by default (`DSV41=ON` for `sycl/tools/build.sh`,
+CMake `STRATA_BUILD_DSV41`). The text below is as it was on that date.
+
 DeepSeek-V4.1-Flash is a large mixture-of-experts model: 40 layers, 384 experts in each (6 are used for every word), and a 203 GB
 n-gram table next to them. Strata runs it with its own engine, `strata-dsv41` (`sycl/src/dsv41`, ported from Project Maya's
 `maya-ds4`, MIT; the notice is in `third_party/project-maya`). The file is Unsloth's UD-Q8_K_XL, pinned in `setup.py`: nine

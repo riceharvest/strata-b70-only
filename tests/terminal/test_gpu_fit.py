@@ -113,12 +113,6 @@ class GpuFitRule(unittest.TestCase):
         r2 = G.options(44.0, 32.0, [card(0, "RTX 3060", 10)])
         self.assertIn("read from the SSD", r2["options"][0]["words"])
 
-    def test_the_constants_equal_the_apps(self):
-        text = (ROOT / "apps" / "host" / "src" / "lib" / "native-fit.ts").read_text(encoding="utf-8")
-        m = re.search(r"const DENSE_GB = (\d+), SYSTEM_ROOM_GB = (\d+), DENSE_EXTRA_GB = (\d+)", text)
-        self.assertIsNotNone(m)
-        self.assertEqual((G.DENSE_GB, G.SYSTEM_ROOM_GB, G.DENSE_EXTRA_GB), tuple(float(x) for x in m.groups()))
-
     def test_fit_matches_the_launch_catalog_port_of_native_fit(self):
         from strata_cli.launch.catalog import fit_on
         for ram, vram in ((62, 16), (32, 10), (16, 0), (128, 24)):

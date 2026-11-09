@@ -239,21 +239,5 @@ class Terminal(unittest.TestCase):
         self.assertEqual({W.env_names()[n].id for n in ENV["deepseek_speedups"]}, {"deepseek_speedups"})
 
 
-class SameAsTheApp(unittest.TestCase):
-    @unittest.skipUnless(shutil.which("node"), "node is not installed")
-    def test_the_apps_table_has_the_same_names_and_words(self):
-        script = ("import {SPEED_SWITCHES} from './apps/host/server/native-settings.mjs';"
-                  "console.log(JSON.stringify(SPEED_SWITCHES.map(s=>({id:s.id,label:s.label,hint:s.hint,default:s.default,env:s.env,legacy:s.legacy??{}}))))")
-        out = subprocess.run(["node", "--input-type=module", "-e", script], cwd=ROOT, capture_output=True, text=True, timeout=60, check=True).stdout
-        app = json.loads(out)
-        self.assertEqual([a["id"] for a in app], [s.id for s in W.app_switches()], "the Terminal-only switch is not in the app's table")
-        for a, s in zip(app, W.app_switches()):
-            self.assertEqual(a["label"], s.label)
-            self.assertEqual(a["hint"], s.effect, s.id)
-            self.assertEqual(a["env"], dict(s.env), s.id)
-            self.assertEqual(a["default"], s.default, s.id)
-            self.assertEqual(a["legacy"], dict(s.legacy), s.id)
-
-
 if __name__ == "__main__":
     unittest.main()

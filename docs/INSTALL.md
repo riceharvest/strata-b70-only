@@ -24,7 +24,6 @@ install does not need a source checkout or a startup `.bat` file.
 | Linux x86-64 with Intel Arc | [Intel Arc guide](INTEL_ARC.md); install the driver/compute runtime and check model preparation requirements |
 | Apple Silicon Mac, macOS 15 or newer | [Mac guide](MAC.md). Intel Macs are not supported by the Mac package. |
 | AMD Ryzen AI Max / Strix Halo | [Strix Halo guide](STRIX_HALO.md) |
-| NVIDIA DGX Spark (Linux ARM64) | [DGX Spark guide](DGX_SPARK_LINUX.md). Use the Terminal; there is no desktop app for ARM64 Linux. |
 
 Memory and disk needs depend on the **model, quantization, context and enabled features**. Check
 [which model fits](MODELS.md#pick-by-memory); download size is not the same as RAM use. Unified memory counts once.
@@ -164,10 +163,8 @@ Every card must be an RTX 20 series or newer with 8 GB or more. See [MULTI_GPU.m
 
 ## Docker (Linux)
 
-Ready-made images for Intel Arc cards (the SYCL engine), with the Terminal
-inside: `docker run` one command, the model downloads on the first start into a volume, nothing is compiled on your computer.
-The commands, Docker Compose, the API key, updating and troubleshooting: [DOCKER.md](DOCKER.md). Building the engine
-from source: `docker build --pull -t strata-sycl-dev sycl/tools`, then `sycl/tools/build.sh` in that image ([B70.md](B70.md)).
+There is no ready-made image. Build the engine from source: `docker build --pull -t strata-sycl-dev sycl/tools`, then
+`sycl/tools/build.sh` in that image ([B70.md](B70.md)).
 
 ## Older CPUs (experimental)
 
@@ -214,7 +211,7 @@ strata --version
 Stop models first. The next Terminal command uses the updated Control component. The app, Control and engine have
 separate version numbers, so they can differ.
 
-Use `strata components rollback` to return to the previous engine. See [update details](../packaging/UPDATES.md).
+Use `strata components rollback` to return to the previous engine.
 Source checkouts have a [separate update workflow](SOURCE_INSTALL.md#updating).
 
 ## Where things are stored
@@ -234,7 +231,6 @@ See [model discovery](TERMINAL_LAUNCH.md#models-you-already-have).
 
 ## More options
 
-- [Docker](DOCKER.md)
 - [Build or run from a source checkout](SOURCE_INSTALL.md)
 - [Multiple GPUs](MULTI_GPU.md)
 - [Troubleshooting and logs](TROUBLESHOOTING.md)

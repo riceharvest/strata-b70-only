@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# Configure + build the SYCL port inside strata-sycl-dev.  sycl/build.sh [target...]
+# Configure + build the SYCL port inside strata-sycl-dev.  sycl/tools/build.sh [target...]
+#   No target: builds `strata` only. The kernel parity programs, tests and benches are not part of it:
+#   configure with PARITY=ON (a new build folder, or an existing one: the switch is applied to it) and name them, e.g.
+#   PARITY=ON sycl/tools/build.sh gdn_parity   (or PARITY=ON sycl/tools/build.sh all  for every one of them)
+#   The DeepSeek-V4.1 path (strata-dsv41) is not maintained and is off: DSV41=ON adds it.
+#   BUILD_DIR=...       build folder (default <repo>/build-sycl)
+#   HOST_MARCH=x86-64-v3  -march of the engine's host code (empty: baseline x86-64; native: this PC only). Gain not measured.
 #   AOT=bmg-g31         ahead-of-time device code (empty: SPIR-V, JIT at the first start)
 #   IQ_DECODE_FAST=OFF  the earlier IQ/Q2 decode helpers (default ON: bit-exact packed arithmetic, PR #4185)
 #   I8_ESIMD=OFF        no fused int8 ESIMD expert kernels (stubs; the prompt's experts take the XMX path). AUTO (default) or ON otherwise.
@@ -38,10 +44,14 @@ fi
 repo=${REPO:-$(git rev-parse --show-toplevel)}
 b=${BUILD_DIR:-$repo/build-sycl}
 [ -f $b/build.ninja ] || cmake -S $repo/sycl -B $b -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
-    -DSTRATA_SYCL_AOT="${AOT:-}" -DSTRATA_SYCL_SPIN_MAX="${SPIN_MAX:-}" -DSTRATA_SYCL_I8_ESIMD="${I8_ESIMD:-AUTO}" -DSTRATA_SYCL_IQ_DECODE_FAST="${IQ_DECODE_FAST:-ON}" 2>&1 | tail -15
+    -DSTRATA_SYCL_AOT="${AOT:-}" -DSTRATA_SYCL_SPIN_MAX="${SPIN_MAX:-}" -DSTRATA_SYCL_I8_ESIMD="${I8_ESIMD:-AUTO}" -DSTRATA_SYCL_IQ_DECODE_FAST="${IQ_DECODE_FAST:-ON}" \
+    -DSTRATA_HOST_MARCH="${HOST_MARCH:-}" -DSTRATA_SYCL_PARITY="${PARITY:-OFF}" -DSTRATA_BUILD_DSV41="${DSV41:-OFF}" 2>&1 | tail -15
 # an existing build folder keeps its cache: a switch given now reaches it (only this one, so AOT and the rest stay as configured)
 [ -z "${I8_ESIMD:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_SYCL_I8_ESIMD="$I8_ESIMD" >/dev/null 2>&1
-cmake --build $b -j ${JOBS:-12} ${1:+--target "$@"} -- -k 0 2>&1 | tee $b/build.log | grep -E '^FAILED|error:|^ninja: build stopped|Linking|^\[[0-9]+/[0-9]+\] Linking' | tail -40
+[ -z "${HOST_MARCH+x}" ] || cmake -S $repo/sycl -B $b -DSTRATA_HOST_MARCH="$HOST_MARCH" >/dev/null 2>&1
+[ -z "${PARITY:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_SYCL_PARITY="$PARITY" >/dev/null 2>&1
+[ -z "${DSV41:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_BUILD_DSV41="$DSV41" >/dev/null 2>&1
+cmake --build $b -j ${JOBS:-12} --target ${@:-strata} -- -k 0 2>&1 | tee $b/build.log | grep -E '^FAILED|error:|^ninja: build stopped|Linking|^\[[0-9]+/[0-9]+\] Linking' | tail -40
 rc=${PIPESTATUS[0]}                       # cmake's status, kept: the script ends with this, not with the status of the greps below (#2990)
 echo "BUILD EXIT $rc"
 grep -c 'error:' $b/build.log | sed 's/^/errors: /'
