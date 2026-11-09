@@ -139,6 +139,7 @@ void MtpDrafter::release() {
     // buffers first, then the buffers.  Each pointer goes null as it is freed, so release() can run and the
     // destructor can run afterwards without either one touching a buffer the other has already given back.
     if (cs_) cs_->wait();
+    if (side_) side_->wait();   // the shared expert's branch reads the same buffers
     for (auto &e : prefill_exec_) if (e) { delete (e); e = nullptr; }
     for (auto &e : prefill_dev_exec_) if (e) { delete (e); e = nullptr; }
     if (pf_dev_) { sycl::free(pf_dev_, dpct::get_in_order_queue()); pf_dev_ = nullptr; }
@@ -151,8 +152,10 @@ void MtpDrafter::release() {
     if (cring_) { sycl::free(cring_, dpct::get_in_order_queue()); cring_ = nullptr; }
     if (dinv_) { sycl::free(dinv_, dpct::get_in_order_queue()); dinv_ = nullptr; }
     if (cscratch_) { sycl::free(cscratch_, dpct::get_in_order_queue()); cscratch_ = nullptr; }
-    if (h_cparams_) { sycl::free(h_cparams_, dpct::get_in_order_queue()); h_cparams_ = nullptr; }
-    if (h_chist_) { sycl::free(h_chist_, dpct::get_in_order_queue()); h_chist_ = nullptr; }
+    // h_cparams_, h_chist_ and h_q_ come from mapped() (host_malloc_polled: zeMemAllocHost when Level Zero is there),
+    // so they go back through host_free_polled, not sycl::free.
+    if (h_cparams_) { strata::host_free_polled(h_cparams_, dpct::get_in_order_queue()); h_cparams_ = nullptr; }
+    if (h_chist_) { strata::host_free_polled(h_chist_, dpct::get_in_order_queue()); h_chist_ = nullptr; }
     if (h_q_) { strata::host_free_polled(h_q_, dpct::get_in_order_queue()); h_q_ = nullptr; }
     if (owns_weights_ && dense_) { sycl::free(dense_, dpct::get_in_order_queue()); dense_ = nullptr; }
     if (owns_weights_ && experts_) { sycl::free(experts_, dpct::get_in_order_queue()); experts_ = nullptr; }
@@ -165,6 +168,11 @@ void MtpDrafter::release() {
       dhead_ = nullptr;
     }
     if (owns_draft_head_ && dvocab_) { sycl::free(dvocab_, dpct::get_in_order_queue()); dvocab_ = nullptr; }
+    // The mapped staging rows are host USM in the same context: same teardown hazard, so they go here too.
+    int32_t** hosts[] = {&h_tok_, &h_step_, &h_pos_, &h_row_, &h_out_, &h_force_, &h_floor_};
+    for (int32_t** h : hosts) if (*h) { strata::host_free_polled(*h, dpct::get_in_order_queue()); *h = nullptr; }
+    if (h_prob_) { strata::host_free_polled(h_prob_, dpct::get_in_order_queue()); h_prob_ = nullptr; }
+    pf_ring_.release();   // its pinned slots (the member's own destructor would free them after this object's body)
 }
 
 MtpDrafter::~MtpDrafter() {
@@ -175,8 +183,6 @@ MtpDrafter::~MtpDrafter() {
     if (sh_join_) dpct::destroy_event(sh_join_);
     if (ev_chain_) dpct::destroy_event(ev_chain_);
     for (dpct::event_ptr e : ev_step_) if (e) dpct::destroy_event(e);
-    void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_, h_floor_};
-    for (void *h : hosts) if (h) strata::host_free_polled(h, dpct::get_in_order_queue());
 }
 
 const float* MtpDrafter::f32(const char* name) const {
