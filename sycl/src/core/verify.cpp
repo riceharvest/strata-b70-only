@@ -193,6 +193,21 @@ inline bool select_long_on() {
     }();
     return on;
 }
+// STRATA_VERIFY_NO_HOST with experts outside VRAM (the device plans every layer from VRAM and the host mirror, so
+// all_resident_ is false): run() skips its per-layer host loop, and that loop is where the window's PLE rows were
+// gathered (the all-resident branch gathers its own).  Nothing wrote h_ple_ for such a window: layer 1 read zeros, or the
+// rows the last batch window left there (stage_batch gathers), so a solo reply and the same reply decoded in a batch
+// slot differed (issue 15).  On (default): run() gathers the rows before it launches such a window.
+// STRATA_NO_HOST_PLE=0: the windows as they were (A/B only).
+inline bool no_host_ple_on() {
+    static const bool on = [] {
+        const char* nh = std::getenv("STRATA_VERIFY_NO_HOST");
+        if (!(nh != nullptr && *nh != '\0' && std::strcmp(nh, "0") != 0)) return false;   // the host loop gathers them
+        const char* v = std::getenv("STRATA_NO_HOST_PLE");
+        return !(v != nullptr && v[0] == '0');
+    }();
+    return on;
+}
 // STRATA_SELECT_LONG_AT: the threshold in cells (default 65536; 0: always)
 inline int64_t select_long_at() {
     static const int64_t at = [] {
@@ -3388,6 +3403,15 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         *(volatile uint32_t*) h_flag_ = 1;
         std::atomic_thread_fence(std::memory_order_seq_cst);
         flag_raised = true;
+    }
+    // no_host_ple_on(): the window whose layers no host loop serves (STRATA_VERIFY_NO_HOST, not all-resident, not
+    // stepped) gets its PLE rows here, before the launch - its graph copies h_ple_ at layer 1 without waiting for a flag
+    if (!pre && do_ple && !flag_raised && !stepped_run && !ar_on() && no_host_ple_on()) {
+        const Clock::time_point tp = Clock::now();
+        if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        strata_store_fence();
+        ms_host += ms_since(tp);
     }
     if (!pre) {
         if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);   // #649: this window's breadcrumbs only
