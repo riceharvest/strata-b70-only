@@ -13725,6 +13725,9 @@ int main(int argc, char **argv) try {
         // #477: write the learned profile (between requests and at QUIT: a prompt's lent slots are back by then).
         // A swap still in flight counts as done - its expert is resident once the copy lands.  `why`: for the log.
         auto save_profile = [&](const char* why) {
+            // no --expert-profile-save: nothing to write (the device counts also exist for the lean exchange alone, and
+            // the exit call then said "the expert profile was not saved: write_expert_profile: cannot write")
+            if (o.expert_profile_save.empty()) return;
             if (usage_dev_srv != nullptr) {
                 // The cache and the mirror are fixed (no swaps under NO_HOST), so every pair is ranked by its device
                 // count mixed with the start's ranking (a short conversation must not wipe the prior).
