@@ -54,7 +54,7 @@ EDITABLE = [
     ("conversation_cache_spill_dir", ("path", "--conversation-cache-spill-dir"),
      "SSD tier for parked conversations: a folder where a conversation pushed out of RAM is written, and read back when "
      "its agent returns, so its whole prompt need not be read again. It costs disk space (the two numbers below). Give the "
-     "path as the engine sees it: the engine runs in a container where this computer's /home/dario is /work, e.g. "
+     "path as the engine sees it: the engine runs in a container where the folder that holds the repo is /work, e.g. "
      "/work/strata-spill. Empty: no SSD tier (and the two numbers below go)"),
     ("conversation_cache_spill_mib", ("arg", "--conversation-cache-spill-mib"),
      "Disk space in MiB the SSD tier may use at most (empty: 24576, about 24 GiB). Needs the folder above"),
