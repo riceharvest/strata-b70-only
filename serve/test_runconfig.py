@@ -53,6 +53,63 @@ class Apply(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 runconfig.apply(CFG, bad)
 
+    def test_ssd_tier_of_the_conversation_cache(self):
+        new, changed = runconfig.apply(CFG, {"conversation_cache_spill_dir": "/work/strata-spill",
+                                             "conversation_cache_spill_mib": 30000,
+                                             "conversation_cache_spill_min_free_mib": 50000})
+        self.assertEqual(changed, ["conversation_cache_spill_dir", "conversation_cache_spill_mib",
+                                   "conversation_cache_spill_min_free_mib"])
+        self.assertEqual(new["args"][-6:], ["--conversation-cache-spill-dir", "/work/strata-spill",
+                                            "--conversation-cache-spill-mib", "30000",
+                                            "--conversation-cache-spill-min-free-mib", "50000"])
+        self.assertEqual(runconfig.value_of(new, "conversation_cache_spill_dir"), "/work/strata-spill")
+        moved, changed = runconfig.apply(new, {"conversation_cache_spill_mib": 1000, "conversation_cache_spill_dir": "/work/x"})
+        self.assertEqual(sorted(changed), ["conversation_cache_spill_dir", "conversation_cache_spill_mib"])
+        self.assertEqual(runconfig.value_of(moved, "conversation_cache_spill_mib"), 1000)
+        for empty in ("", "  ", None):                  # an empty folder removes all three flags
+            gone, changed = runconfig.apply(new, {"conversation_cache_spill_dir": empty})
+            self.assertEqual(len(changed), 3, empty)
+            self.assertEqual(gone["args"], CFG["args"])
+        only, _ = runconfig.apply(new, {"conversation_cache_spill_mib": None})
+        self.assertNotIn("--conversation-cache-spill-mib", only["args"])
+        self.assertIn("--conversation-cache-spill-dir", only["args"])
+        for bad in ({"conversation_cache_spill_dir": "relative/dir"}, {"conversation_cache_spill_dir": 5},
+                    {"conversation_cache_spill_dir": "/a\nb"}, {"conversation_cache_spill_mib": 100},   # no folder yet
+                    {"conversation_cache_spill_min_free_mib": 100},
+                    {"conversation_cache_spill_dir": "/w", "conversation_cache_spill_mib": -1},
+                    {"conversation_cache_spill_dir": "/w", "conversation_cache_spill_min_free_mib": 1.5}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                runconfig.apply(CFG, bad)
+
+    def test_batch_mtp_needs_parallel(self):
+        with self.assertRaises(ValueError):
+            runconfig.apply(CFG, {"batch_mtp": True})
+        with self.assertRaises(ValueError):
+            runconfig.apply({**CFG, "parallel": 1}, {"batch_mtp": True})
+        with self.assertRaises(ValueError):
+            runconfig.apply(CFG, {"batch_mtp": "yes"})
+        new, changed = runconfig.apply(CFG, {"parallel": 2, "batch_mtp": True})
+        self.assertEqual(changed, ["parallel", "batch_mtp"])
+        self.assertEqual(new["args"][-1], "--batch-mtp")
+        self.assertEqual(runconfig.value_of(new, "batch_mtp"), True)
+        same, changed = runconfig.apply(new, {"batch_mtp": True})
+        self.assertEqual(changed, [])
+        off, changed = runconfig.apply(new, {"batch_mtp": False})
+        self.assertEqual(changed, ["batch_mtp"])
+        self.assertNotIn("--batch-mtp", off["args"])
+        self.assertEqual(off["args"], CFG["args"])
+        none, _ = runconfig.apply(new, {"batch_mtp": None})
+        self.assertNotIn("--batch-mtp", none["args"])
+        down, changed = runconfig.apply(new, {"parallel": 1})   # parallel off takes the flag with it
+        self.assertEqual(changed, ["parallel", "batch_mtp"])
+        self.assertNotIn("--batch-mtp", down["args"])
+        self.assertNotIn("parallel", down)
+        with self.assertRaises(ValueError):
+            runconfig.apply(new, {"parallel": 1, "batch_mtp": True})
+        got = {k["key"]: k for k in runconfig.view(new, "x.json")["keys"]}
+        self.assertEqual(got["batch_mtp"]["kind"], "bool")
+        self.assertEqual(got["conversation_cache_spill_dir"]["kind"], "text")
+
     def test_null_is_the_default_again(self):
         cfg, _ = runconfig.apply(CFG, {"vram_reserve_mib": 2048, "fit_max_tokens": True})
         new, changed = runconfig.apply(cfg, {"vram_reserve_mib": None, "fit_max_tokens": None,
