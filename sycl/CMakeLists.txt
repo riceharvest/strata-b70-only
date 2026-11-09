@@ -232,9 +232,9 @@ if(STRATA_NATIVE_EXPERTS)
     "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni;-mavx512vbmi;-mavx2;-mfma;-mf16c")
   set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
   set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-  set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "-mavx")
+  set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "-mavx;-mno-avx2;-mno-fma;-mno-f16c;-mno-bmi2")   # (the no-flags keep it AVX1 under STRATA_HOST_MARCH)
   set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/q2_avx1.cpp ${STRATA_ROOT}/src/kernels/cpu/iq_avx1.cpp PROPERTIES
-    COMPILE_OPTIONS "-msse4.2;-mavx;-mno-avx2;-mno-fma;-mno-f16c")
+    COMPILE_OPTIONS "-msse4.2;-mavx;-mno-avx2;-mno-fma;-mno-f16c;-mno-bmi2")
   set_property(SOURCE ${STRATA_ROOT}/src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
@@ -295,6 +295,17 @@ target_link_libraries(strata_prefill PUBLIC strata_engine)
 strata_resolve(_main src/program/generate.cpp)
 add_executable(strata ${_main})
 target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
+
+# Host instruction set of the engine's own C++ sources (not ggml, not the device code, which -fsycl-targets decides).
+# Empty keeps the baseline x86-64. x86-64-v3 = AVX2 + FMA + BMI2 (a package for any CPU since Haswell / Zen 1); native = this PC only.
+# Target options come before a source file's COMPILE_OPTIONS, so the per-file -mavx512* / -mno-avx2 lines below still win.
+set(STRATA_HOST_MARCH "" CACHE STRING "-march for the host code of the engine (empty: baseline x86-64; x86-64-v3; native)")
+if(STRATA_HOST_MARCH)
+  foreach(_t strata_spec strata_kernels_cpu strata_core strata_kernels strata_engine strata_prefill strata)
+    target_compile_options(${_t} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-march=${STRATA_HOST_MARCH}>")
+  endforeach()
+  message(STATUS "host code: -march=${STRATA_HOST_MARCH}")
+endif()
 
 # --- the kernel parity self-tests (each runs on the card and compares against a CPU reference) ---------------------
 # Host-only tests (no device, no GPU library): always built, they are small.
