@@ -838,6 +838,9 @@ int main(int argc, char** argv) {
                    8})        // STRATA_GU_FMTS
         for (int dt : {20, 23, 42, 7, 8}) check(gu, dt, 512, 256, s, rng);   // STRATA_D_FMTS; IQ4_XS: n_ff % 256
     check(42, 42, 2560, 640, s, rng);
+    // the served Unsloth UD-IQ1_S pack's expert pairs at the model's 2560 x 640 (IQ2_XXS / IQ2_S gate/up, Q2_0 down; upstream c1d5e4d5)
+    check(16, 42, 2560, 640, s, rng);
+    check(22, 42, 2560, 640, s, rng);
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(21, 23, 2560, 768, s, rng);
     if (do_bench) bench(s, rng);

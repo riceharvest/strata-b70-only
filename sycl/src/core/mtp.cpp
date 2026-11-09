@@ -134,43 +134,55 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
 
 }  // namespace
 
-MtpDrafter::~MtpDrafter() {
+void MtpDrafter::release() {
+    // Everything this object put on the device, given back in the order it was taken: the captures that read the
+    // buffers first, then the buffers.  Each pointer goes null as it is freed, so release() can run and the
+    // destructor can run afterwards without either one touching a buffer the other has already given back.
     if (cs_) cs_->wait();
-    for (auto &e : prefill_exec_) if (e) delete (e);
-    for (auto &e : prefill_dev_exec_) if (e) delete (e);
-    if (pf_dev_) sycl::free(pf_dev_, dpct::get_in_order_queue());
-    if (dense4_) sycl::free(dense4_, dpct::get_in_order_queue());
-    for (auto &e : round_exec_) if (e) delete (e);
-    for (auto &e : step_exec_) if (e) delete (e);
-    for (auto &e : round_exec_c_) if (e) delete (e);
-    for (auto &e : step_exec_c_) if (e) delete (e);
-    if (cparams_) sycl::free(cparams_, dpct::get_in_order_queue());
-    if (cring_) sycl::free(cring_, dpct::get_in_order_queue());
-    if (dinv_) sycl::free(dinv_, dpct::get_in_order_queue());
-    if (cscratch_) sycl::free(cscratch_, dpct::get_in_order_queue());
-    if (h_cparams_) sycl::free(h_cparams_, dpct::get_in_order_queue());
-    if (h_chist_) sycl::free(h_chist_, dpct::get_in_order_queue());
-    if (h_q_) strata::host_free_polled(h_q_, dpct::get_in_order_queue());
+    if (side_) side_->wait();   // the shared expert's branch reads the same buffers
+    for (auto &e : prefill_exec_) if (e) { delete (e); e = nullptr; }
+    for (auto &e : prefill_dev_exec_) if (e) { delete (e); e = nullptr; }
+    if (pf_dev_) { sycl::free(pf_dev_, dpct::get_in_order_queue()); pf_dev_ = nullptr; }
+    if (dense4_) { sycl::free(dense4_, dpct::get_in_order_queue()); dense4_ = nullptr; }
+    for (auto &e : round_exec_) if (e) { delete (e); e = nullptr; }
+    for (auto &e : step_exec_) if (e) { delete (e); e = nullptr; }
+    for (auto &e : round_exec_c_) if (e) { delete (e); e = nullptr; }
+    for (auto &e : step_exec_c_) if (e) { delete (e); e = nullptr; }
+    if (cparams_) { sycl::free(cparams_, dpct::get_in_order_queue()); cparams_ = nullptr; }
+    if (cring_) { sycl::free(cring_, dpct::get_in_order_queue()); cring_ = nullptr; }
+    if (dinv_) { sycl::free(dinv_, dpct::get_in_order_queue()); dinv_ = nullptr; }
+    if (cscratch_) { sycl::free(cscratch_, dpct::get_in_order_queue()); cscratch_ = nullptr; }
+    // h_cparams_, h_chist_ and h_q_ come from mapped() (host_malloc_polled: zeMemAllocHost when Level Zero is there),
+    // so they go back through host_free_polled, not sycl::free.
+    if (h_cparams_) { strata::host_free_polled(h_cparams_, dpct::get_in_order_queue()); h_cparams_ = nullptr; }
+    if (h_chist_) { strata::host_free_polled(h_chist_, dpct::get_in_order_queue()); h_chist_ = nullptr; }
+    if (h_q_) { strata::host_free_polled(h_q_, dpct::get_in_order_queue()); h_q_ = nullptr; }
+    if (owns_weights_ && dense_) { sycl::free(dense_, dpct::get_in_order_queue()); dense_ = nullptr; }
+    if (owns_weights_ && experts_) { sycl::free(experts_, dpct::get_in_order_queue()); experts_ = nullptr; }
+    if (state_arena_) { sycl::free(state_arena_, dpct::get_in_order_queue()); state_arena_ = nullptr; }
+    if (arena_) { sycl::free(arena_, dpct::get_in_order_queue()); arena_ = nullptr; }
+    if (head_logits_) { sycl::free(head_logits_, dpct::get_in_order_queue()); head_logits_ = nullptr; }
+    if (owns_draft_head_ && dhead_) {
+      strata::kernels::native_q6_k_unpack(dhead_);   // pack it back before it goes
+      sycl::free(dhead_, dpct::get_in_order_queue());
+      dhead_ = nullptr;
+    }
+    if (owns_draft_head_ && dvocab_) { sycl::free(dvocab_, dpct::get_in_order_queue()); dvocab_ = nullptr; }
+    // The mapped staging rows are host USM in the same context: same teardown hazard, so they go here too.
+    int32_t** hosts[] = {&h_tok_, &h_step_, &h_pos_, &h_row_, &h_out_, &h_force_, &h_floor_};
+    for (int32_t** h : hosts) if (*h) { strata::host_free_polled(*h, dpct::get_in_order_queue()); *h = nullptr; }
+    if (h_prob_) { strata::host_free_polled(h_prob_, dpct::get_in_order_queue()); h_prob_ = nullptr; }
+    pf_ring_.release();   // its pinned slots (the member's own destructor would free them after this object's body)
+}
+
+MtpDrafter::~MtpDrafter() {
+    release();
     if (cs_) dpct::get_current_device().destroy_queue(cs_);
     if (side_) dpct::get_current_device().destroy_queue(side_);
     if (sh_fork_) dpct::destroy_event(sh_fork_);
     if (sh_join_) dpct::destroy_event(sh_join_);
-    if (owns_weights_ && dense_) sycl::free(dense_, dpct::get_in_order_queue());
-    if (owns_weights_ && experts_)
-        sycl::free(experts_, dpct::get_in_order_queue());
-    if (state_arena_) sycl::free(state_arena_, dpct::get_in_order_queue());
-    if (arena_) sycl::free(arena_, dpct::get_in_order_queue());
-    if (head_logits_) sycl::free(head_logits_, dpct::get_in_order_queue());
-    if (owns_draft_head_ && dhead_) {
-      strata::kernels::native_q6_k_unpack(dhead_);
-      sycl::free(dhead_, dpct::get_in_order_queue());
-    }
-    if (owns_draft_head_ && dvocab_)
-        sycl::free(dvocab_, dpct::get_in_order_queue());
     if (ev_chain_) dpct::destroy_event(ev_chain_);
     for (dpct::event_ptr e : ev_step_) if (e) dpct::destroy_event(e);
-    void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_, h_floor_};
-    for (void *h : hosts) if (h) strata::host_free_polled(h, dpct::get_in_order_queue());
 }
 
 const float* MtpDrafter::f32(const char* name) const {
