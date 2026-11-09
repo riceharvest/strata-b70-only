@@ -818,6 +818,7 @@ class ConvCacheLog:
 
     def __init__(self):
         self.key, self.pos = None, 0
+        self.lock = threading.Lock()                    # the metrics page and the stream order both read the log
         self.reset()
 
     def reset(self):
@@ -825,6 +826,10 @@ class ConvCacheLog:
                       "last_tokens": None, "last_at": None}
 
     def poll(self, path, start) -> dict:
+        with self.lock:
+            return self._poll(path, start)
+
+    def _poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it."""
         if not path or start is None:
             return dict(self.state)
@@ -3643,7 +3648,12 @@ class Service:
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
-        self.order = stream_order.StreamOrder()       # who takes the single turn next (serve/stream_order.py)
+        # who takes the single turn next (serve/stream_order.py); it keeps as many open threads as the engine's cache holds:
+        # its parked conversations (--conversation-cache-slots, else 2) and the live one
+        self.order = stream_order.StreamOrder(capacity=(conversation_slots(engine) or 2) + 1)
+        self.order_evictions = 0                      # the engine cache's evictions the order has been told of
+        self.order_lock = threading.Lock()
+        self.thread_header_seen = False
         self.gpu_locks = None                         # GpuLocks: the config's "gpu_locks", held while the model is loaded
         self.request_stop = None                      # main()'s clean stop, for POST /v1/restart
         self.restart_requested = False                # main() ends, then the process starts itself again (os.execv)
@@ -4952,6 +4962,18 @@ class Service:
             if ka is not None:
                 ka.release()
 
+    def mirror_evictions(self) -> None:
+        """Tell the stream order which parked conversations the engine's cache dropped (its log's evictions=E, oldest
+        first), so the threads it keeps are the ones the cache still holds.  The log is one park behind the turn."""
+        try:
+            st = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+        except Exception:
+            return
+        with self.order_lock:
+            n, self.order_evictions = st.get("evictions", 0) - self.order_evictions, st.get("evictions", 0)
+        if n != 0:
+            self.order.evicted(n if n > 0 else 1 << 10)                 # (fewer than before: the engine started again)
+
     def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
              declared_only=False) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
@@ -5077,11 +5099,13 @@ class Service:
                 # a client that left while queued gives its place up instead of taking the turn only to cancel there
                 got = False
                 beat_at = time.monotonic()
-                order_entry = self.order.enter(ids)
+                self.mirror_evictions()
+                order_entry = self.order.enter(ids, getattr(cancel, "_strata_thread", None))
                 setattr(cancel, "_strata_order_entry", order_entry)
                 def turn_over(oe=order_entry):
                     oe.open = oe.open and not cancel.is_set()       # a client that left does not send a next request
                     self.order.finish(oe)
+                    self.mirror_evictions()
                 turn.callback(turn_over)                            # after the turn (LIFO: the fifo is given back first)
                 try:
                     while not got:
@@ -6472,6 +6496,13 @@ def make_handler(svc: Service):
             request is HTTP/1.0 and fully read here, so no later bytes are expected - data is not a hang-up."""
             done = self.watch_done = threading.Event()
             self.cancel_event = cancel
+            key = stream_order.clean_key(self.headers.get(stream_order.THREAD_HEADER))   # the client's name for this conversation
+            if key is not None:
+                setattr(cancel, "_strata_thread", key)
+                if not svc.thread_header_seen:
+                    svc.thread_header_seen = True
+                    print(f"[strata] the client names its conversations ({stream_order.THREAD_HEADER}: {key[:16]}...): "
+                          "the stream order matches threads by that name", flush=True)
             with svc.status_lock:
                 svc.active_cancels.add(cancel)
             sock = self.connection
