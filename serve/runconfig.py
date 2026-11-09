@@ -41,7 +41,17 @@ EDITABLE = [
     ("open_browser", "bool", "Open the chat page in the browser when the model is ready"),
     ("vram_reserve_mib", ("arg", "--vram-reserve-mib"),
      "VRAM in MiB the engine leaves free for other programs (engine default 700)"),
+    ("conversation_cache_slots", ("arg", "--conversation-cache-slots"),
+     "Parked conversations: how many conversations' states the engine keeps in RAM, so agents can take turns without reading "
+     "their prompts again (empty: up to 4). The memory below also limits it"),
+    ("conversation_cache_mib", ("arg", "--conversation-cache-mib"),
+     "RAM in MiB for the parked conversations (empty: sized from the free RAM, at most 8192). One 70-140K-token conversation "
+     "takes about 2.6-3 GB, so 6400 holds about two"),
+    ("parallel", "int>=0",
+     "Requests decoding together (batch slots): 1 or empty = one at a time. Each slot takes about 1 GiB of VRAM that the expert "
+     "cache would hold, and on the B70 two streams together measured about the same speed as one alone (it saves waiting, not time)"),
 ]
+PARALLEL_MAX = 8      # serve/server.py PARALLEL_MAX: the engine's batch window holds at most 8 rows
 SPEC = {k: kind for k, kind, _ in EDITABLE}
 
 
@@ -108,7 +118,12 @@ def check(key: str, v, cfg: dict):
             raise ValueError(f"{key}: expected a list of model names, not {v!r}")
         return v or None
     if k == "int>=0":
-        return _number(key, v, whole=True)
+        n = _number(key, v, whole=True)
+        if key == "parallel":                          # 0 and 1 are "one at a time": the key goes
+            if n > PARALLEL_MAX:
+                raise ValueError(f"parallel: at most {PARALLEL_MAX} requests decode together, not {n}")
+            return n if n >= 2 else None
+        return n
     if k == "num>=0":
         return _number(key, v)
     if k == "arg":

@@ -393,7 +393,7 @@ function renderConvCache(c) {
   ]);
   $("cc-note").textContent = c.enabled
     ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."
-    : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
+    : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), set Parked conversations and the memory for them under Model and settings, then restart (docs/DETAILS.md).";
 }
 
 // ---- numbers behind the tiles and charts

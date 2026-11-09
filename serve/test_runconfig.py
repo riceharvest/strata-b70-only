@@ -40,6 +40,19 @@ class Apply(unittest.TestCase):
             self.assertEqual(new[k], CFG[k], k)
         self.assertEqual(CFG["sampling"], {"temperature": 0.7, "presence_penalty": 1.5})   # the input is left alone
 
+    def test_parked_conversations_and_parallel(self):
+        new, changed = runconfig.apply(CFG, {"conversation_cache_slots": 3, "conversation_cache_mib": 7000, "parallel": 2})
+        self.assertEqual(changed, ["conversation_cache_slots", "conversation_cache_mib", "parallel"])
+        self.assertEqual(new["args"][-4:], ["--conversation-cache-slots", "3", "--conversation-cache-mib", "7000"])
+        self.assertEqual(new["parallel"], 2)
+        back, changed = runconfig.apply(new, {"parallel": 1, "conversation_cache_slots": None})   # 1 = one at a time: the key goes
+        self.assertEqual(changed, ["parallel", "conversation_cache_slots"])
+        self.assertNotIn("parallel", back)
+        self.assertEqual(back["args"][-2:], ["--conversation-cache-mib", "7000"])
+        for bad in ({"parallel": 9}, {"parallel": -1}, {"parallel": 2.5}, {"conversation_cache_slots": -1}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                runconfig.apply(CFG, bad)
+
     def test_null_is_the_default_again(self):
         cfg, _ = runconfig.apply(CFG, {"vram_reserve_mib": 2048, "fit_max_tokens": True})
         new, changed = runconfig.apply(cfg, {"vram_reserve_mib": None, "fit_max_tokens": None,
