@@ -2151,6 +2151,243 @@ __dpct_inline__ void gr_q8_down_kernel(Args m, Scratch sc, float* xs, float* red
     if (t == 0) sc.cnt[rg] = 0u;   // every arrival of this launch is counted: ready for the next one
 }
 
+// STRATA_HC_Q8_DOWN2 (the B70 default, strata::apply_b70_defaults; unset or 0: off, gr_q8_down_kernel above): the same
+// kernel with a shorter way through its phases.  Measured 2026-11-09 in the engine's decode window, gr_q8_down_kernel
+// takes 17.0 us a call at 3 rows against 12.3 for the up kernel, which reads as many bytes (3.5 MB: 6 us at the card's
+// bandwidth): the kernel is bound by its chain of phases, not by memory - staging (one round trip to global memory per
+// row), six barriers, 12 word stores and 16 word loads of partials per lane, and the last work-group of a row group
+// reading the slab partials after its last barrier.  Here every value is computed by the same operations in the same
+// order (the staged activations, a lane's fma chain, the partials added in sub-group order, the slabs in slab order):
+// bit for bit gr_q8_down_kernel (gr_q8_parity checks it).  What changes:
+//  - a staging thread loads its chunk of w_norm once (it is the same for every row) and, up to 4 rows, issues every
+//    row's R and bo loads before the first product, so they overlap; the pending write's gate (a global load and an
+//    exp per row) is computed by the staging threads only, not by all 256;
+//  - a lane's partials go to their own local array as one 16-byte vector per row k (its 4 weight rows): T stores
+//    instead of 4 T, no barrier between the dots and the stores (the staged slab is not reused), and sub-group k
+//    reduces row k with 16 vector loads a lane instead of 16 word loads per output in 4 T sub-groups;
+//  - the finishing work-group issues its reads of the slab partials before the barrier that publishes rs.
+template <int T, int RPL, int KS>
+__dpct_inline__ void gr_q8_down2_kernel(Args m, Scratch sc, float* xs, float* red, int* flag, float* pr) {
+    constexpr int SLAB = DSG * KS, NSLAB = D / SLAB, SPS = N / SLAB, RPG = SG * RPL;
+    constexpr int NB = KS / 32, NJ = KS / 8, NQ = KS / 16;   // Q8_0 blocks, chunks of 8 values, 16-byte chunks
+    static_assert(KS % 32 == 0 && N % SLAB == 0 && NSLAB <= NSLAB_MAX, "slabs never straddle streams");
+    static_assert(RPL == 4 && SLAB / 4 <= DTH && T * SG <= DTH, "a vector of partials per lane and row; one staged chunk a thread");
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sgp = item.get_sub_group();
+    const int t = (int) item.get_local_id(2), lane = t & (SG - 1), sg = t / SG;
+    const int g = (int) item.get_group(2), rg = g / NSLAB, slab = g - rg * NSLAB, c = slab / SPS;
+    const int col0 = slab * SLAB + sg * KS;
+    // 1. this lane's rows' weights over the sub-group's columns (as gr_q8_down_kernel)
+    const uint8_t* qbase = m.qd;
+    const sycl::half* dbase = reinterpret_cast<const sycl::half*>(m.qd + (size_t) LR * D);
+    sycl::uint4 qv[RPL][NQ];
+    float dv[RPL][NB];
+    sycl::uint4 wi4[NJ];   // an inject row (BF16): row slot 0 of the last row group only
+    const int row0 = rg * RPG + lane;
+    const bool inj0 = row0 >= LR && row0 < PR && m.wi != nullptr;
+#pragma unroll
+    for (int p = 0; p < RPL; ++p) {
+        const int row = rg * RPG + p * SG + lane;
+        if (row < LR) {
+            const sycl::uint4* q4 = reinterpret_cast<const sycl::uint4*>(qbase + (size_t) row * D + col0);
+#pragma unroll
+            for (int j = 0; j < NQ; ++j) qv[p][j] = q4[j];
+#pragma unroll
+            for (int b = 0; b < NB; ++b) dv[p][b] = (float) dbase[(size_t) row * (D / 32) + col0 / 32 + b];
+        } else {
+#pragma unroll
+            for (int j = 0; j < NQ; ++j) qv[p][j] = sycl::uint4(0, 0, 0, 0);
+#pragma unroll
+            for (int b = 0; b < NB; ++b) dv[p][b] = 0.0f;
+        }
+    }
+    if (inj0) {
+        const sycl::uint4* w4 = reinterpret_cast<const sycl::uint4*>(m.wi + (size_t) (row0 - LR) * D + col0);
+#pragma unroll
+        for (int j = 0; j < NJ; ++j) wi4[j] = w4[j];
+    } else {
+#pragma unroll
+        for (int j = 0; j < NJ; ++j) wi4[j] = sycl::uint4(0, 0, 0, 0);
+    }
+    // 2. the slab of R' * w_norm for the T rows (unscaled) and its sums of squares: thread t stages columns 4 t .. 4 t + 3
+    float ssp[T];
+#pragma unroll
+    for (int k = 0; k < T; ++k) ssp[k] = 0.0f;
+    if (t < SLAB / 4) {
+        const int col = slab * SLAB + 4 * t;
+        const sycl::float4 gn = *reinterpret_cast<const sycl::float4*>(m.wn + col);
+        if constexpr (T <= 4) {   // every row's loads first (8 T registers), then the products
+            sycl::float4 rv[T], bv[T];
+            float gw[T];
+#pragma unroll
+            for (int k = 0; k < T; ++k) {
+                rv[k] = *reinterpret_cast<const sycl::float4*>(m.R + (size_t) k * D + col);
+                bv[k] = sycl::float4(0.0f, 0.0f, 0.0f, 0.0f);
+                gw[k] = 0.0f;
+            }
+            if (m.apply) {
+#pragma unroll
+                for (int k = 0; k < T; ++k) bv[k] = *reinterpret_cast<const sycl::float4*>(m.bo + (size_t) k * N + (col - c * N));
+#pragma unroll
+                for (int k = 0; k < T; ++k) gw[k] = 2.0f * sigmoidf_(m.ip[k * HC + c] / (float) HC);
+            }
+#pragma unroll
+            for (int k = 0; k < T; ++k) {
+                sycl::float4 r = rv[k];
+                if (m.apply) {
+                    const sycl::float4 b = bv[k];
+                    r.x() = sycl::fma(b.x(), gw[k], r.x()); r.y() = sycl::fma(b.y(), gw[k], r.y());
+                    r.z() = sycl::fma(b.z(), gw[k], r.z()); r.w() = sycl::fma(b.w(), gw[k], r.w());
+                }
+                ssp[k] += r.x() * r.x() + r.y() * r.y() + r.z() * r.z() + r.w() * r.w();
+                *reinterpret_cast<sycl::float4*>(xs + k * SLAB + 4 * t) =
+                    sycl::float4(r.x() * gn.x(), r.y() * gn.y(), r.z() * gn.z(), r.w() * gn.w());
+            }
+        } else {
+#pragma unroll
+            for (int k = 0; k < T; ++k) {
+                sycl::float4 r = *reinterpret_cast<const sycl::float4*>(m.R + (size_t) k * D + col);
+                if (m.apply) {
+                    const float gw = 2.0f * sigmoidf_(m.ip[k * HC + c] / (float) HC);
+                    const sycl::float4 b = *reinterpret_cast<const sycl::float4*>(m.bo + (size_t) k * N + (col - c * N));
+                    r.x() = sycl::fma(b.x(), gw, r.x()); r.y() = sycl::fma(b.y(), gw, r.y());
+                    r.z() = sycl::fma(b.z(), gw, r.z()); r.w() = sycl::fma(b.w(), gw, r.w());
+                }
+                ssp[k] += r.x() * r.x() + r.y() * r.y() + r.z() * r.z() + r.w() * r.w();
+                *reinterpret_cast<sycl::float4*>(xs + k * SLAB + 4 * t) =
+                    sycl::float4(r.x() * gn.x(), r.y() * gn.y(), r.z() * gn.z(), r.w() * gn.w());
+            }
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < T; ++k) {
+        float v = ssp[k];
+        v += sycl::permute_group_by_xor(sgp, v, 8); v += sycl::permute_group_by_xor(sgp, v, 4);
+        v += sycl::permute_group_by_xor(sgp, v, 2); v += sycl::permute_group_by_xor(sgp, v, 1);
+        if (lane == 0) red[sg * TM + k] = v;
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    if (t < T) {
+        float s = 0.0f;
+#pragma unroll
+        for (int ww = 0; ww < DSG; ++ww) s += red[ww * TM + t];
+        sc.ssg[((size_t) rg * NSLAB + slab) * TM + t] = s;
+    }
+    // 3. this lane's rows over the sub-group's columns; the activations are the same address in every lane
+    float acc[RPL][T];
+#pragma unroll
+    for (int p = 0; p < RPL; ++p)
+#pragma unroll
+        for (int k = 0; k < T; ++k) acc[p][k] = 0.0f;
+    const float* xsg = xs + sg * KS;
+#pragma unroll
+    for (int j = 0; j < NJ; ++j) {
+        float wf[RPL][8];
+#pragma unroll
+        for (int p = 0; p < RPL; ++p) q8x8(qv[p][j / 2], j & 1, dv[p][j / 4], wf[p]);
+        if (inj0) {   // row slot 0 is an inject row in this lane: its BF16 values instead
+            wf[0][0] = bfx(wi4[j].x(), false); wf[0][1] = bfx(wi4[j].x(), true);
+            wf[0][2] = bfx(wi4[j].y(), false); wf[0][3] = bfx(wi4[j].y(), true);
+            wf[0][4] = bfx(wi4[j].z(), false); wf[0][5] = bfx(wi4[j].z(), true);
+            wf[0][6] = bfx(wi4[j].w(), false); wf[0][7] = bfx(wi4[j].w(), true);
+        }
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            const sycl::float4 x0 = *reinterpret_cast<const sycl::float4*>(xsg + k * SLAB + 8 * j);
+            const sycl::float4 x1 = *reinterpret_cast<const sycl::float4*>(xsg + k * SLAB + 8 * j + 4);
+#pragma unroll
+            for (int p = 0; p < RPL; ++p) {
+                float a = acc[p][k];
+                a = sycl::fma(wf[p][0], x0.x(), a); a = sycl::fma(wf[p][1], x0.y(), a);
+                a = sycl::fma(wf[p][2], x0.z(), a); a = sycl::fma(wf[p][3], x0.w(), a);
+                a = sycl::fma(wf[p][4], x1.x(), a); a = sycl::fma(wf[p][5], x1.y(), a);
+                a = sycl::fma(wf[p][6], x1.z(), a); a = sycl::fma(wf[p][7], x1.w(), a);
+                acc[p][k] = a;
+            }
+        }
+    }
+    // the 16 sub-groups' partials of each row, added in sub-group order: pr[thread][k] holds the lane's 4 weight rows
+#pragma unroll
+    for (int k = 0; k < T; ++k)
+        *reinterpret_cast<sycl::float4*>(pr + (t * T + k) * 4) = sycl::float4(acc[0][k], acc[1][k], acc[2][k], acc[3][k]);
+    item.barrier(sycl::access::fence_space::local_space);
+    if (sg < T) {   // sub-group k: row k of the window, this lane's 4 weight rows of every sub-group
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+#pragma unroll
+        for (int ww = 0; ww < DSG; ++ww) {
+            const sycl::float4 v = *reinterpret_cast<const sycl::float4*>(pr + ((ww * SG + lane) * T + sg) * 4);
+            s0 += v.x(); s1 += v.y(); s2 += v.z(); s3 += v.w();
+        }
+        float* po = sc.part + ((size_t) sg * NSLAB + slab) * PR + rg * RPG + lane;   // row slot p at + p * SG
+        if (rg * RPG + lane < PR) po[0] = s0;
+        if (rg * RPG + SG + lane < PR) po[SG] = s1;
+        if (rg * RPG + 2 * SG + lane < PR) po[2 * SG] = s2;
+        if (rg * RPG + 3 * SG + lane < PR) po[3 * SG] = s3;
+    }
+    // 4. the last work-group of this row group finishes it: lo (or inject_out) and rs
+    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+    item.barrier(sycl::access::fence_space::global_and_local);
+    if (t == 0) {
+        sycl::atomic_ref<unsigned, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                         sycl::access::address_space::global_space> cnt(sc.cnt[rg]);
+        *flag = cnt.fetch_add(1u) == (unsigned) (NSLAB - 1) ? 1 : 0;
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    if (*flag == 0) return;
+    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+    // the slab partials of this thread's outputs (x = t, t + DTH, ...), read before the barrier below
+    constexpr int NI = (T * RPG + DTH - 1) / DTH;
+    float pp[NI][HC];
+#pragma unroll
+    for (int i = 0; i < NI; ++i) {
+        const int x = t + i * DTH;
+#pragma unroll
+        for (int cc = 0; cc < HC; ++cc) pp[i][cc] = 0.0f;
+        if (x < T * RPG) {
+            const int k = x / RPG, l = x - k * RPG, r = rg * RPG + l;
+            if (r < LR || (r < PR && m.wi != nullptr)) {
+#pragma unroll
+                for (int cc = 0; cc < HC; ++cc) {
+                    float p = 0.0f;
+#pragma unroll
+                    for (int j = 0; j < SPS; ++j) p += sc.part[((size_t) k * NSLAB + cc * SPS + j) * PR + r];
+                    pp[i][cc] = p;
+                }
+            }
+        }
+    }
+    float* rsS = red;   // [T][HC], reused
+    if (t < T * HC) {
+        const int k = t / HC, cc = t - k * HC;
+        float ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < SPS; ++j) ss += sc.ssg[((size_t) rg * NSLAB + cc * SPS + j) * TM + k];
+        const float r = sycl::rsqrt(ss / (float) N + m.eps);
+        rsS[k * HC + cc] = r;
+        if (rg == 0) m.rs[k * HC + cc] = r;
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+#pragma unroll
+    for (int i = 0; i < NI; ++i) {
+        const int x = t + i * DTH;
+        if (x < T * RPG) {
+            const int k = x / RPG, l = x - k * RPG, r = rg * RPG + l;
+            if (r < LR || (r < PR && m.wi != nullptr)) {
+                float sum = 0.0f;
+#pragma unroll
+                for (int cc = 0; cc < HC; ++cc) sum = sycl::fma(rsS[k * HC + cc], pp[i][cc], sum);
+                if (r >= LR) {
+                    m.inj[k * HC + r - LR] = sum;
+                } else {
+                    const float xx = sum / (float) HC;
+                    m.lo[k * LR + r] = xx / (1.0f + sycl::native::exp(-xx));
+                }
+            }
+        }
+    }
+    if (t == 0) sc.cnt[rg] = 0u;   // every arrival of this launch is counted: ready for the next one
+}
+
 constexpr int UP_COLS_Q8 = 16;                                      // columns per work-group (x 4 streams = 64 rows)
 constexpr int UQ = 5, UKQ = LR / UQ, USG = 4 * UQ, UTH = USG * SG;  // K in 5 fifths of 64; 20 sub-groups, 320 threads
 template <int T>
@@ -2259,6 +2496,38 @@ void launch_down(sycl::queue* st, const Args& m, Scratch sc) {
             });
     });
 }
+// STRATA_HC_Q8_DOWN2: gr_q8_down2_kernel, its partials in a local array of their own
+template <int T>
+void launch_down2(sycl::queue* st, const Args& m, Scratch sc) {
+    constexpr int RPL = DOWN_RPL_Q8, KS = DOWN_KS_Q8;
+    constexpr int SLAB = DSG * KS, NSLAB = D / SLAB, RPG = SG * RPL, NRG = (PR + RPG - 1) / RPG;
+    static_assert(NRG <= NRG_MAX, "the scratch holds every row group");
+    st->submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> xs(sycl::range<1>((size_t) T * SLAB), cgh);
+        sycl::local_accessor<float, 1> red(sycl::range<1>((size_t) DSG * TM), cgh);
+        sycl::local_accessor<int, 1> flag(sycl::range<1>(1), cgh);
+        sycl::local_accessor<float, 1> prt(sycl::range<1>((size_t) DTH * T * RPL), cgh);
+        // without inject rows the row groups past LR hold nothing the read writes: not launched
+        const int nrg = m.wi != nullptr ? NRG : (LR + RPG - 1) / RPG;
+        cgh.parallel_for<dpct_kernel_name<class gr_q8_down2_sycl, dpct_kernel_scalar<T>>>(
+            sycl::nd_range<3>(sycl::range(1, 1, nrg * NSLAB * DTH), sycl::range(1, 1, DTH)),
+            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
+                gr_q8_down2_kernel<T, RPL, KS>(m, sc, xs.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                               red.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                               flag.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                               prt.get_multi_ptr<sycl::access::decorated::no>().get());
+            });
+    });
+}
+std::atomic<int> g_down2_override{-1};   // fused_gr_set_q8_down2 (gr_q8_parity): -1 = STRATA_HC_Q8_DOWN2
+inline bool down2_on() {
+    static const bool env = [] {
+        const char* e = std::getenv("STRATA_HC_Q8_DOWN2");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    const int o = g_down2_override.load(std::memory_order_relaxed);
+    return o >= 0 ? o != 0 : env;
+}
 template <int T>
 void launch_up(sycl::queue* st, const Args& m) {
     st->submit([&](sycl::handler& cgh) {
@@ -2276,7 +2545,8 @@ void launch_up(sycl::queue* st, const Args& m) {
 }
 template <int T>
 void read_t(sycl::queue* st, const Args& m, Scratch sc) {
-    launch_down<T>(st, m, sc);
+    if (down2_on()) launch_down2<T>(st, m, sc);   // STRATA_HC_Q8_DOWN2: the same bits
+    else launch_down<T>(st, m, sc);
     launch_up<T>(st, m);
 }
 
@@ -2628,6 +2898,7 @@ void fused_gr_q8_0_split_host(const uint8_t* blocks, uint8_t* out, int64_t rows,
 }
 
 void fused_gr_set_fused(int on) { gr_fused::g_override.store(on < 0 ? -1 : (on != 0 ? 1 : 0)); }
+void fused_gr_set_q8_down2(int on) { gr_q8::g_down2_override.store(on < 0 ? -1 : (on != 0 ? 1 : 0)); }
 
 // one partials buffer per queue (the verifier's and the drafter's launches never share a queue; within a queue the
 // launches are ordered, and a graph capture records the pointer)

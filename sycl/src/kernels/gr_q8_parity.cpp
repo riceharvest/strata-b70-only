@@ -9,7 +9,12 @@
 //   2. lo, rs, inject and mixed match an FP64 reference computed from the Q8_0 bytes (d * q) within FP32 summation
 //      rounding; R_out (the pending write, the same fma as the BF16 read) is bitwise the BF16 read's;
 //   3. a captured graph replayed twice gives bitwise the direct call's outputs (the arrival counters reset);
-//   4. arguments not at the callers' fixed strides fall back to the BF16 read, bitwise.
+//   4. arguments not at the callers' fixed strides fall back to the BF16 read, bitwise;
+//   5. STRATA_HC_Q8_DOWN2 (fused_gr_set_q8_down2): the same read through the second down kernel, twice in a row
+//      (its arrival counters reset too), bitwise the first kernel's outputs.  Checks 1-4 run with it off.
+//
+// --bench follows STRATA_HC_Q8_DOWN2 in the environment: run it with =0 and =1 and compare the times and the
+// outputs hash (the hash must be the same).
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
@@ -296,6 +301,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    k::fused_gr_set_q8_down2(0);   // checks 1-4: the first down kernel, whatever the environment says
     int bad = 0, cases = 0;
     const double tol = 1e-4;   // FP32 summation order against FP64: a structural error is orders of magnitude larger
     double worst_lo = 0, worst_rs = 0, worst_inj = 0, worst_mixed = 0, min_obs = 1e9, max_obs = 0;
@@ -352,6 +358,21 @@ int main(int argc, char** argv) {
                 }
                 delete gx;
                 delete g;
+                // STRATA_HC_Q8_DOWN2: the second down kernel, two direct reads in a row, bitwise the first kernel's
+                k::fused_gr_set_q8_down2(1);
+                for (int rep = 0; rep < 2; ++rep) {
+                    clear(); reset();
+                    k::fused_gr_read_multi(aq.data(), T, d_xn, stream);
+                    const Out v2 = snapshot(T, inject);
+                    if (!same(v2.r_out, q8.r_out) || !same(v2.lo, q8.lo) || !same(v2.rs, q8.rs) || !same(v2.inject, q8.inject) ||
+                        !same(v2.mixed, q8.mixed)) {
+                        std::printf("  T=%d apply=%d inject=%d: STRATA_HC_Q8_DOWN2 read %d differs from the Q8_0 read (lo %d rs %d inject %d mixed %d)\n",
+                                    T, apply, inject, rep, same(v2.lo, q8.lo) ? 0 : 1, same(v2.rs, q8.rs) ? 0 : 1,
+                                    same(v2.inject, q8.inject) ? 0 : 1, same(v2.mixed, q8.mixed) ? 0 : 1);
+                        ok = false;
+                    }
+                }
+                k::fused_gr_set_q8_down2(0);
                 if (!ok) ++bad;
             }
     std::printf("  Q8_0 read vs FP64 reference on its Q8_0 values, %d cases (T 1..8 x pending write x inject): worst rel lo %.2e rs %.2e "
@@ -359,6 +380,7 @@ int main(int argc, char** argv) {
                 cases, worst_lo, worst_rs, worst_inj, worst_mixed, tol);
     std::printf("  Q8_0 read vs BF16 read, mixed rel RMS %.2e..%.2e: the Q8_0 weights are read (not bitwise, by their rounding)\n",
                 min_obs, max_obs);
+    std::printf("  STRATA_HC_Q8_DOWN2: the second down kernel bitwise the first in every case that did not say otherwise above\n");
 
     // rows not at the fixed strides (token 1's mixed before token 0's): the BF16 read, bitwise
     {
@@ -379,6 +401,7 @@ int main(int argc, char** argv) {
         if (!ok) ++bad;
     }
 
+    k::fused_gr_set_q8_down2(-1);
     std::printf("gr_q8_parity: %s (%d failing of %d cases)\n", bad ? "FAIL" : "pass", bad, cases + 1);
     dpct::get_current_device().destroy_queue(stream);
     for (void* p : {(void*) d_norm, (void*) d_down, (void*) d_up, (void*) d_inj, (void*) d_qdown, (void*) d_qup, (void*) d_R,
