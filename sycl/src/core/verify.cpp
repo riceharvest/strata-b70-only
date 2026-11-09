@@ -4402,7 +4402,11 @@ bool Verifier::capture_batch(const int *rows, int S, int hbase,
     for (int t = 0; t < S; ++t) brow_[t] = rows[t];
     std::string rerr;
     sel_long_ = 0;   // batch rows: the one-CTA select
+    // record_window notes whether the graph it records is the lean one (lean_plan_); a batch graph never is, and
+    // run() reads the flag for the solo windows' plan-error check (h_plan_err_): keep the solo graphs' value
+    const bool lean_solo = lean_plan_;
     const bool ok = record_window(S, cs_, rerr);
+    lean_plan_ = lean_solo;
     batch_rec_ = false;
     row_base_ = 0;
     dpct::experimental::command_graph_ptr graph = nullptr;
