@@ -20,11 +20,11 @@ def stream(tag: int, n: int, system: int = 3000) -> list[int]:
     return list(range(system)) + [10_000 * tag + i for i in range(n)]
 
 
-def serve_one(order: so.StreamOrder, ids, take: float = 0.0) -> so.Entry:
-    """A request that takes the engine, 'reads' for `take` s and ends."""
+def serve_one(order: so.StreamOrder, ids, take: float = 0.0, open_: bool = True) -> so.Entry:
+    """A request that takes the engine, 'reads' for `take` s and ends (its reply ended in a tool call: `open_`)."""
     e = order.enter(ids)
     assert order.wait_turn(e, 5)
-    e.served = True
+    e.served, e.open = True, open_
     time.sleep(take)
     order.finish(e)
     return e
@@ -44,7 +44,7 @@ class ContinuesTest(unittest.TestCase):
 
 class OrderTest(unittest.TestCase):
     def setUp(self):
-        self.patches = [mock.patch.object(so, "LINGER_FIXED_S", 0.0), mock.patch.object(so, "MAX_WAIT_S", 120.0)]
+        self.patches = [mock.patch.object(so, "HOLD_S", 0.0), mock.patch.object(so, "MAX_WAIT_S", 120.0)]
         for p in self.patches:
             p.start()
         self.o = so.StreamOrder(enabled=True)
@@ -87,37 +87,49 @@ class OrderTest(unittest.TestCase):
         d = self.o.enter(stream(4, 20_000))
         self.assertEqual(self.waiters_go(("c", c), ("d", d)), ["c", "d"])
 
-    def test_linger_holds_for_the_next_turn_of_the_stream(self):
-        with mock.patch.object(so, "LINGER_FIXED_S", 0.6):
-            serve_one(self.o, self.A)
+    def test_an_open_thread_holds_the_others_for_its_next_request(self):
+        with mock.patch.object(so, "HOLD_S", 5.0):
+            serve_one(self.o, self.A)                               # A's reply ended in a tool call
             cold = self.o.enter(self.B)
             got = []
-            t = threading.Thread(target=lambda: got.append(self.o.wait_turn(cold, 5)))
-            t0 = time.monotonic()
+            t = threading.Thread(target=lambda: got.append(self.o.wait_turn(cold, 8)))
             t.start()
-            time.sleep(0.3)
-            self.assertEqual(got, [], "B went before the linger was over")
-            nxt = self.o.enter(self.A + [5] * 100)                  # A's tool call finished within the linger
+            time.sleep(0.5)                                         # the tool runs ... (far longer than a few seconds in life)
+            self.assertEqual(got, [], "B went while A's thread was open")
+            nxt = self.o.enter(self.A + [5] * 100)                  # A's tool call finished: its next request
             self.assertTrue(self.o.wait_turn(nxt, 2))
-            nxt.served = True
-            self.assertEqual(got, [], "B went before A's request")
-            self.o.finish(nxt)
+            nxt.served, nxt.open = True, True
+            time.sleep(0.2)
+            self.assertEqual(got, [], "B went before A's thread ended")
+            self.o.finish(nxt)                                      # open again: B still waits
+            time.sleep(0.3)
+            self.assertEqual(got, [])
+            last = self.o.enter(self.A + [5] * 100 + [6] * 50)
+            self.assertTrue(self.o.wait_turn(last, 2))
+            last.served, last.open = True, False                    # the final answer, no tool call: the thread is closed
+            self.o.finish(last)
             t.join(5)
             self.assertEqual(got, [True])
-            self.assertEqual(len(self.o.gaps), 1)
-            self.assertLess(time.monotonic() - t0, 3)
 
-    def test_linger_ends_and_the_cold_waiter_goes(self):
-        with mock.patch.object(so, "LINGER_FIXED_S", 0.3):
+    def test_a_closed_thread_lets_the_next_one_go_at_once(self):
+        with mock.patch.object(so, "HOLD_S", 5.0):
+            serve_one(self.o, self.A, open_=False)
+            cold = self.o.enter(self.B)
+            t0 = time.monotonic()
+            self.assertTrue(self.o.wait_turn(cold, 5))
+            self.assertLess(time.monotonic() - t0, 0.5)
+
+    def test_the_hold_ends_when_the_thread_never_goes_on(self):
+        with mock.patch.object(so, "HOLD_S", 0.3):
             serve_one(self.o, self.A)
             cold = self.o.enter(self.B)
             t0 = time.monotonic()
             self.assertTrue(self.o.wait_turn(cold, 5))
             self.assertGreaterEqual(time.monotonic() - t0, 0.25)
-            self.assertIn("linger", cold.why)
+            self.assertIn("did not go on", cold.why)
 
-    def test_max_wait_lets_a_waiter_pass_a_busy_stream(self):
-        with mock.patch.object(so, "MAX_WAIT_S", 0.2), mock.patch.object(so, "LINGER_FIXED_S", 5.0):
+    def test_max_wait_lets_a_waiter_pass_an_open_thread(self):
+        with mock.patch.object(so, "MAX_WAIT_S", 0.2), mock.patch.object(so, "HOLD_S", 5.0):
             serve_one(self.o, self.A)
             cold = self.o.enter(self.B)
             t0 = time.monotonic()
@@ -144,15 +156,6 @@ class OrderTest(unittest.TestCase):
         a, b = o.enter(self.A), o.enter(self.B)
         self.assertTrue(o.wait_turn(a, 0.1))
         self.assertTrue(o.wait_turn(b, 0.1))
-
-    def test_measured_linger_follows_the_gaps(self):
-        with mock.patch.object(so, "LINGER_FIXED_S", None):
-            o = so.StreamOrder(enabled=True)
-            self.assertEqual(o.linger_s(), so.LINGER_FIRST_S)
-            o.gaps.extend([0.2, 0.3, 0.4, 0.5])
-            self.assertEqual(o.linger_s(), so.LINGER_MIN_S)          # 1.25 x p75 is under the floor
-            o.gaps.extend([30.0] * 12)
-            self.assertEqual(o.linger_s(), so.LINGER_MAX_S)
 
 
 if __name__ == "__main__":

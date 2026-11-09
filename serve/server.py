@@ -4938,9 +4938,17 @@ class Service:
         ka = self.keep_awake
         if ka is not None:
             ka.acquire()
+        inner = self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only)
         try:
-            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only)
+            for kind, x in inner:
+                # a reply that calls a tool leaves its thread open: the agent's next request follows (stream_order.py)
+                if kind == "event" and getattr(x, "kind", None) in ("tool_start", "tool_call"):
+                    oe = getattr(cancel, "_strata_order_entry", None)
+                    if oe is not None:
+                        oe.open = True
+                yield kind, x
         finally:
+            inner.close()
             if ka is not None:
                 ka.release()
 
@@ -5073,7 +5081,11 @@ class Service:
                 got = False
                 beat_at = time.monotonic()
                 order_entry = self.order.enter(ids)
-                turn.callback(self.order.finish, order_entry)       # after the turn (LIFO: the fifo is given back first)
+                setattr(cancel, "_strata_order_entry", order_entry)
+                def turn_over(oe=order_entry):
+                    oe.open = oe.open and not cancel.is_set()       # a client that left does not send a next request
+                    self.order.finish(oe)
+                turn.callback(turn_over)                            # after the turn (LIFO: the fifo is given back first)
                 try:
                     while not got:
                         if cancel.is_set():
@@ -5098,7 +5110,7 @@ class Service:
                             turn.callback(self.fifo.release)
                             if order_entry.why:
                                 print(f"[strata] stream order: {order_entry.why} "
-                                      f"(waited {time.monotonic() - order_entry.t0:.1f} s)", flush=True)
+                                      f"(this request waited {time.monotonic() - order_entry.t0:.1f} s)", flush=True)
                         else:
                             yield "ping", None
                 except BaseException:

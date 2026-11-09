@@ -1,26 +1,26 @@
-"""serve/stream_order.py - who gets the engine's single turn next: the stream that was just served goes on first.
+"""serve/stream_order.py - who gets the engine's single turn next: an agent thread runs to its end, the others wait.
 
 One request at a time, several agent streams: each switch parks the live conversation and restores another.  The cache
 holds 2-3 big conversations (RAM budget), so with more streams than that the returning one is often evicted and its
 whole prompt is read again (50-100K tokens, 15-30 s).  A bare threading.Lock hands the turn to an arbitrary waiter.
 
-StreamOrder sits in front of that lock.  When the engine is free it picks, in this order:
+StreamOrder sits in front of that lock.  A thread is OPEN while its last reply ended in a tool call (the agent runs the
+tool, then sends the next request) and CLOSED when it ended in a plain answer.  When the engine is free it picks:
   1. a waiter that continues the stream served last (its prompt shares the last prompt, to within the tail the
      conversation cache also tolerates: the chat template drops the last reply's thinking);
-  2. a waiter that has waited STRATA_STREAM_MAX_WAIT_S (nobody is held back for good);
-  3. when others wait but none continues the last stream: nobody yet, for a short LINGER after the last turn ended
-     (an agent's tool call, then its next request) - the linger follows the gaps measured on this server;
-  4. the oldest waiter.
+  2. a waiter that has waited STRATA_STREAM_MAX_WAIT_S (default 1 h; 0 = never: a thread is waited for to its end);
+  3. while the last thread is open: nobody, for up to STRATA_STREAM_HOLD_S (default 600) after its turn ended - the
+     tool call and the agent's next request are on their way; the others stay parked;
+  4. the oldest waiter (the last thread is closed, or its next request never came).
 STRATA_STREAM_ORDER=0 turns it off.  Only the order changes, never what is read."""
 from __future__ import annotations
 
-import collections
 import os
 import threading
 import time
 
 
-def _env_float(name: str, default: float | None) -> float | None:
+def _env_float(name: str, default: float) -> float:
     v = os.environ.get(name)
     if v is None or v == "":
         return default
@@ -31,11 +31,8 @@ def _env_float(name: str, default: float | None) -> float | None:
 
 
 ENABLED = os.environ.get("STRATA_STREAM_ORDER", "1") != "0"
-MAX_WAIT_S = _env_float("STRATA_STREAM_MAX_WAIT_S", 900.0) or 0.0   # 0: no escape (the queue behind cold reads is minutes deep)
-LINGER_FIXED_S = _env_float("STRATA_STREAM_LINGER_S", None)         # None: follow the measured gaps; 0: no linger
-LINGER_FIRST_S = 2.0        # until GAPS_MIN gaps are known
-LINGER_MIN_S, LINGER_MAX_S = 1.0, 8.0
-GAPS_MIN = 3
+MAX_WAIT_S = _env_float("STRATA_STREAM_MAX_WAIT_S", 3600.0)   # 0: no escape
+HOLD_S = _env_float("STRATA_STREAM_HOLD_S", 600.0)            # an open thread is waited for this long after its turn
 TAIL = 4096                 # as --conversation-cache-park-tail
 MIN_SHARED = 2048           # sharing less than this (a system prompt) never makes a stream
 
@@ -68,7 +65,7 @@ def continues(ids, last) -> bool:
 
 
 class Entry:
-    __slots__ = ("ids", "t0", "cont_for", "cont", "why", "served", "waited_for_others")
+    __slots__ = ("ids", "t0", "cont_for", "cont", "why", "served", "open")
 
     def __init__(self, ids):
         self.ids = ids
@@ -77,7 +74,7 @@ class Entry:
         self.cont = False
         self.why = ""
         self.served = False           # the engine began reading its prompt (so it is the stream served last)
-        self.waited_for_others = False
+        self.open = False             # its reply ended in a tool call: the thread goes on with the tool's result
 
 
 class StreamOrder:
@@ -87,15 +84,15 @@ class StreamOrder:
         self.waiters: list[Entry] = []
         self.active: Entry | None = None      # picked, until its turn is over
         self.last = None                      # the prompt of the stream served last
+        self.last_open = False                # ... and whether its thread is open
         self.last_done = 0.0                  # when that turn ended
-        self.gaps: collections.deque = collections.deque(maxlen=16)   # end of a turn -> its stream's next request
 
     # -- the caller's side -------------------------------------------------------------------------------------------
     def enter(self, ids) -> Entry:
         e = Entry(ids if isinstance(ids, list) else list(ids))
         with self.cv:
             self.waiters.append(e)
-            self.cv.notify_all()          # a lingering pick may be waiting for exactly this request
+            self.cv.notify_all()          # a held pick may be waiting for exactly this request
         return e
 
     def wait_turn(self, e: Entry, timeout: float) -> bool:
@@ -111,8 +108,6 @@ class StreamOrder:
                     pick, why, hold = self._pick(now)
                     if pick is e:
                         self.active, e.why = e, why
-                        if e.cont and e.cont_for is self.last and e.t0 >= self.last_done:
-                            self.gaps.append(e.t0 - self.last_done)       # the tool-call gap this stream just showed
                         return True
                 left = end - now
                 if left <= 0:
@@ -127,18 +122,10 @@ class StreamOrder:
             if self.active is e:
                 self.active = None
                 if e.served:
-                    self.last, self.last_done = e.ids, time.monotonic()
+                    self.last, self.last_open, self.last_done = e.ids, e.open, time.monotonic()
             self.cv.notify_all()
 
     # -- the choice (cv held) ----------------------------------------------------------------------------------------
-    def linger_s(self) -> float:
-        if LINGER_FIXED_S is not None:
-            return LINGER_FIXED_S
-        if len(self.gaps) < GAPS_MIN:
-            return LINGER_FIRST_S
-        g = sorted(self.gaps)
-        return min(LINGER_MAX_S, max(LINGER_MIN_S, 1.25 * g[int(0.75 * (len(g) - 1))]))
-
     def _continues(self, e: Entry) -> bool:
         if e.cont_for is not self.last:
             e.cont_for = self.last
@@ -146,25 +133,23 @@ class StreamOrder:
         return e.cont
 
     def _pick(self, now: float):
-        """(entry, why, hold): the waiter to go next; or None and how long to hold for the last stream's next request."""
+        """(entry, why, hold): the waiter to go next; or None and how long to hold for the last thread's next request."""
         if not self.waiters:
             return None, "", None
         others = len(self.waiters) > 1
-        for w in self.waiters:
-            w.waited_for_others = w.waited_for_others or others
         if self.last is not None:
             for w in self.waiters:                    # (in arrival order)
                 if self._continues(w):
-                    return w, "kept the stream" if others else "", None
+                    return w, "kept the thread" if others else "", None
         if MAX_WAIT_S > 0:
             for w in self.waiters:
                 if now - w.t0 >= MAX_WAIT_S:
                     return w, f"waited {now - w.t0:.0f} s", None
-        if self.last is not None:
-            hold = self.last_done + self.linger_s() - now
+        if self.last is not None and self.last_open and HOLD_S > 0:
+            hold = self.last_done + HOLD_S - now
             if hold > 0:
                 if MAX_WAIT_S > 0:                    # wake up when the longest waiter's escape is due
                     hold = min(hold, max(0.01, min(w.t0 for w in self.waiters) + MAX_WAIT_S - now))
                 return None, "", hold
-            return self.waiters[0], f"switched after a {self.linger_s():.1f} s linger", None
-        return self.waiters[0], "", None
+            return self.waiters[0], f"its thread did not go on for {HOLD_S:.0f} s", None
+        return self.waiters[0], "switched, the thread had ended" if self.last is not None and others else "", None
