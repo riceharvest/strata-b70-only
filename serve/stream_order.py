@@ -31,7 +31,7 @@ def _env_float(name: str, default: float | None) -> float | None:
 
 
 ENABLED = os.environ.get("STRATA_STREAM_ORDER", "1") != "0"
-MAX_WAIT_S = _env_float("STRATA_STREAM_MAX_WAIT_S", 120.0) or 0.0   # 0: no escape
+MAX_WAIT_S = _env_float("STRATA_STREAM_MAX_WAIT_S", 900.0) or 0.0   # 0: no escape (the queue behind cold reads is minutes deep)
 LINGER_FIXED_S = _env_float("STRATA_STREAM_LINGER_S", None)         # None: follow the measured gaps; 0: no linger
 LINGER_FIRST_S = 2.0        # until GAPS_MIN gaps are known
 LINGER_MIN_S, LINGER_MAX_S = 1.0, 8.0
