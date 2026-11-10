@@ -389,6 +389,7 @@ function render(m) {
   if (tab === "monitor") {
     renderDash(live, hw, st, eng, h, last, reqs, m);
     renderConvCache(m.conversation_cache);
+    renderThreads(m.threads);
   }
   if (tab === "requests") renderRequests(reqs, m);
   if (tab === "about") renderAbout(eng, hw, st, m);
@@ -401,6 +402,57 @@ function since(t) {
   const s = Math.max(0, Date.now() / 1000 - t);
   return s < 60 ? "just now" : s < 3600 ? `${fmt(s / 60)} min ago` : `${fmt(s / 3600, 1)} h ago`;
 }
+// The agent threads card: the stream order's view (server /metrics "threads") and its pin.  A pinned thread is the only
+// one that takes the engine until it ends (a finished reply with no tool call) or the pin is taken off.
+let threadBusy = false;
+async function pinThread(key) {
+  if (threadBusy) return;
+  threadBusy = true;
+  try {
+    const r = await fetch("v1/threads/pin", {method: "POST", headers: headers(true), body: JSON.stringify({thread: key})});
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) renderThreads(j);
+    else $("threads-sub").textContent = (j.error && j.error.message) || `the server answered ${r.status}`;
+  } catch (e) {
+    $("threads-sub").textContent = String(e.message || e);
+  } finally {
+    threadBusy = false;
+  }
+}
+const THREAD_STATE = {running: ["st-badge--generating", "Running"], waiting: ["st-badge--queued", "Waiting"],
+                      "between turns": ["st-badge--reading", "Running a tool"], "not seen yet": ["", "Not seen yet"]};
+function renderThreads(t) {
+  const card = $("threads-card");
+  const rows = (t && t.enabled && t.threads) || [];
+  card.hidden = !t || !t.enabled || (!rows.length && !t.pinned);
+  if (card.hidden) return;
+  const secs = (x) => (x == null ? "" : x >= 90 ? `${fmt(x / 60, 1)} min` : `${fmt(x)} s`);
+  $("threads-sub").textContent = t.pinned
+    ? `pinned for ${secs(t.pinned_for_s)}: only this thread takes the engine${t.held_back ? ` · ${fmt(t.held_back)} waiting behind it` : ""}`
+    : "one request at a time; pin a thread to let it run to its end while the others wait";
+  $("threads-unpin").hidden = !t.pinned;
+  const order = {running: 0, "between turns": 1, waiting: 2, "not seen yet": 3};
+  rows.sort((a, b) => (b.pinned - a.pinned) || (order[a.state] - order[b.state]) || ((b.waited_s || 0) - (a.waited_s || 0)));
+  $("threads").innerHTML = rows.map((r) => {
+    const [cls, label] = THREAD_STATE[r.state] || ["", r.state];
+    const meta = [r.tokens ? `${fmt(r.tokens)} tokens` : null, r.turns ? `${fmt(r.turns)} turns` : null,
+                  r.state === "waiting" ? `waiting ${secs(r.waited_s)}` : r.state === "between turns" ? `idle ${secs(r.waited_s)}` : null]
+      .filter(Boolean).join(" · ");
+    const btn = r.key == null ? `<span class="muted" title="The client sends no ${"X-Strata-Thread"} header for this thread">no name</span>`
+      : r.pinned ? `<button type="button" class="st-btn st-btn--secondary" data-unpin="1">Unpin</button>`
+      : `<button type="button" class="st-btn st-btn--secondary" data-pin="${esc(r.key)}">Pin</button>`;
+    return `<div class="thread" data-pinned="${r.pinned ? 1 : 0}"><div><div class="thread__name" title="${esc(r.key || "")}">` +
+           `<span class="st-badge ${cls}">${label}</span> ${esc(r.key || "unnamed thread")}</div>` +
+           `<div class="thread__preview" title="${esc(r.preview || "")}">${esc(r.preview || "")}</div></div>` +
+           `<div class="thread__meta">${esc(meta)}</div>${btn}</div>`;
+  }).join("");
+}
+document.addEventListener("click", (ev) => {
+  const b = ev.target.closest && ev.target.closest("[data-pin],[data-unpin],#threads-unpin");
+  if (!b) return;
+  pinThread(b.dataset && b.dataset.pin ? b.dataset.pin : null);
+});
+
 function renderConvCache(c) {
   $("cc-card").hidden = !c;
   if (!c) return;                                  // an older server
@@ -421,6 +473,17 @@ function renderConvCache(c) {
     ["Reused since start", c.requests ? `${fmt(c.reused_tokens)} tokens${share}` : null],
     ["Parked / restored", c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}${c.evictions ? ` · ${fmt(c.evictions)} evicted` : ""}` : null],
     ["Last switch", c.enabled ? event : null],
+    // parks that did not happen: each one is a whole prompt read again when that agent returns
+    ["Parks skipped", c.enabled && ((c.skips_budget || 0) + (c.skips_ram || 0) + (c.skips_other || 0)) > 0
+      ? [c.skips_budget ? `${fmt(c.skips_budget)} did not fit the RAM for parked conversations (raise it to hold two conversations, or park on the SSD)` : null,
+         c.skips_ram ? `${fmt(c.skips_ram)} for too little free RAM` : null,
+         c.skips_other ? `${fmt(c.skips_other)} for another reason (see the engine log)` : null].filter(Boolean).join(" · ")
+      : null],
+    ["On the SSD", c.enabled && c.ssd_files != null ? `${fmt(c.ssd_files)} conversation${c.ssd_files === 1 ? "" : "s"}, ${fmt(c.ssd_gib, 1)} GB · ${fmt(c.ssd_restores || 0)} read back · ${fmt((c.ssd_written_mib || 0) / 1024, 1)} GB written since start` : null],
+    // the SSD tier's drive as the engine measured it once
+    ["From the SSD", c.enabled && c.ssd_read_mbps
+      ? `1 GB comes back in about ${fmt(1074 / c.ssd_read_mbps, 2)} s and takes about ${fmt(1074 / c.ssd_write_mbps, 2)} s to write · drive reads ${fmt(c.ssd_read_mbps)} MB/s, writes ${fmt(c.ssd_write_mbps)} MB/s`
+      : null],
   ]);
   $("cc-note").textContent = c.enabled
     ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."
@@ -978,20 +1041,31 @@ async function loadConfig() {
   $("cfg-model").innerHTML = models.map((m) =>
     `<option value="${esc(m.file)}"${m.current ? " selected" : ""}>${esc(m.model)} (${esc(m.file)})${m.current ? " - running" : ""}</option>`).join("");
   $("cfg-file").textContent = c.file || "";
-  $("cfg-form").innerHTML = cfgKeys.map((k, i) => {
+  const row = (k, i) => {
     const id = `cfg-${i}`, v = k.value;
     let input;
     if (k.kind === "bool" || k.kind === "enum") {
       const opts = k.kind === "bool" ? [["true", "on"], ["false", "off"]] : k.choices.map((x) => [x, x]);
       const cur = v == null ? "" : String(v);
+      // a value the file holds that the list lacks stays selected, so Save does not read it as "default" and remove it
+      if (cur !== "" && !opts.some(([val]) => val === cur)) opts.push([cur, cur]);
       input = `<select class="st-input" id="${id}"><option value=""${cur === "" ? " selected" : ""}>default</option>` +
         opts.map(([val, text]) => `<option value="${esc(val)}"${cur === val ? " selected" : ""}>${esc(text)}</option>`).join("") + `</select>`;
     } else {
       const text = v == null ? "" : Array.isArray(v) ? v.join(", ") : String(v);
-      input = `<input class="st-input" id="${id}" ${k.kind === "number" ? 'type="number" step="any" min="0"' : 'type="text"'} ` +
-        `value="${esc(text)}" placeholder="default" autocomplete="off">`;
+      // a number field only for a number: a text the file holds (a hand edit) would show empty there and Save would remove it
+      const num = k.kind === "number" && (v == null || typeof v === "number");
+      const attrs = num ? `type="number" step="${esc(k.step == null ? "any" : k.step)}" min="${esc(k.min == null ? 0 : k.min)}"` +
+        (k.max == null ? "" : ` max="${esc(k.max)}"`) : 'type="text"';   // auto: text, a word or a whole number
+      input = `<input class="st-input" id="${id}" ${attrs} value="${esc(text)}" placeholder="default" autocomplete="off">`;
     }
     return `<label for="${id}" title="${esc(k.help)}">${esc(k.help)}<code>${esc(k.key)}</code></label>${input}`;
+  };
+  // a small heading per group, in the server's order; inside a group the keys keep the server's order (ids stay the key's index)
+  const groups = [...new Set([...(c.groups || []), ...cfgKeys.map((k) => k.group || "")])];
+  $("cfg-form").innerHTML = groups.map((g) => {
+    const rows = cfgKeys.map((k, i) => ((k.group || "") === g ? row(k, i) : "")).join("");
+    return rows && (g ? `<h3 class="cfg-group">${esc(g)}</h3>` : "") + rows;
   }).join("");
   const pi = cfgKeys.findIndex((k) => k.key === "parallel"), bi = cfgKeys.findIndex((k) => k.key === "batch_mtp");
   if (pi >= 0 && bi >= 0) {                          // batch_mtp only means something with 2 or more parallel requests
@@ -1009,7 +1083,8 @@ function configValue(k, el) {
   const s = el.value.trim();
   if (s === "") return null;
   if (k.kind === "bool") return s === "true";
-  if (k.kind === "number") return Number(s);
+  if (k.kind === "number") { const n = Number(s); return Number.isNaN(n) ? s : n; }   // not a number: sent as typed, the server says why
+  if (k.kind === "auto") return /^\d+$/.test(s) ? Number(s) : s;                    // a whole number or a word (auto)
   return s;                                         // enum, or names (the server splits them at commas)
 }
 $("cfg-save").addEventListener("click", async () => {

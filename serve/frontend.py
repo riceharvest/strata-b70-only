@@ -1187,6 +1187,11 @@ class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
+    # The run config's "tool_name_repair" (off unless set): "prefix" reads a call for an undeclared name as the one
+    # declared tool whose name it extends, or that extends it, at an underscore (`process_manage` for `process`,
+    # `read` for `read_file` when no other `read_*` is declared).  Two candidates: not guessed.  Set once at the start.
+    NAME_REPAIR = "off"
+
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  recover: bool = False, declared_only: bool = False):
         self.state = "reasoning" if thinking else "content"
@@ -1219,6 +1224,7 @@ class OutputParser:
                 aliases.setdefault(name.replace("__", "_"), set()).add(name)
         self.aliases = {alias: next(iter(names)) for alias, names in aliases.items()
                         if len(names) == 1 and alias not in self.schemas}
+        self.name_repairs: list[str] = []   # "written -> declared" for every call NAME_REPAIR read as a declared tool
         self.unread = 0              # #3441: `<tool_call>` blocks that opened like a call and were returned as text
         self.unread_names: list[str] = []   # the names (first few) of those that named a tool the request did not declare
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
@@ -1263,7 +1269,16 @@ class OutputParser:
         none declared, only where `declared_only` is off."""
         if not self.schemas:
             return not self.declared_only
-        return name in self.schemas or name in self.aliases
+        if name in self.schemas or name in self.aliases:
+            return True
+        if self.NAME_REPAIR == "prefix" and isinstance(name, str) and name:
+            near = [n for n in self.schemas
+                    if isinstance(n, str) and n and (name.startswith(n + "_") or n.startswith(name + "_"))]
+            if len(near) == 1:
+                self.aliases[name] = near[0]
+                self.name_repairs.append(f"{name} -> {near[0]}")
+                return True
+        return False
 
     def _loose_open(self, after: str):
         """#3441: `after` (text after a `<tool_call>`, whitespace dropped) opens a call in a drifted form that names a

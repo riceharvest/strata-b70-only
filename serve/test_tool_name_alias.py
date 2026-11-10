@@ -237,6 +237,35 @@ class CollapsedUnderscoreNames(unittest.TestCase):
         evs, _ = run_parser(call_text("mcp_playwright_browser_tabs"), tools)
         self.assertEqual([e.call.name for e in evs if e.kind == "tool_call"], ["mcp_playwright_browser_tabs"])
 
+    def test_name_repair_is_opt_in_and_never_guesses_between_two(self):
+        """The run config's tool_name_repair = prefix: `process_manage` is `process` when that is the only declared tool
+        it extends; off by default; two candidates stay text."""
+        tools = [plain_tool("process"), plain_tool("read_file"), plain_tool("terminal")]
+        evs, parser = run_parser(call_text("process_manage"), tools)
+        self.assertEqual([e for e in evs if e.kind == "tool_call"], [])           # off: as before
+        self.assertEqual(parser.unread_names, ["process_manage"])
+        OutputParser.NAME_REPAIR = "prefix"
+        try:
+            for written, declared in (("process_manage", "process"), ("read", "read_file")):
+                for width in (0, 1, 5):
+                    with self.subTest(written=written, width=width):
+                        evs, parser = run_parser("Doing it.\n" + call_text(written), tools, width)
+                        found = [e.call for e in evs if e.kind == "tool_call"]
+                        self.assertEqual([c.name for c in found], [declared])
+                        self.assertEqual(found[0].arguments, {"url": "https://example.com"})
+                        self.assertEqual((parser.unread, parser.unread_names), (0, []))
+                        self.assertEqual(parser.name_repairs, [f"{written} -> {declared}"])
+            two = tools + [plain_tool("process_list")]
+            evs, parser = run_parser(call_text("process_manage"), two)                 # only `process` is a prefix of it: still one
+            self.assertEqual([e.call.name for e in evs if e.kind == "tool_call"], ["process"])
+            evs, parser = run_parser(call_text("read"), tools + [plain_tool("read_dir")])   # read_file or read_dir: not guessed
+            self.assertEqual([e for e in evs if e.kind == "tool_call"], [])
+            self.assertEqual(parser.unread_names, ["read"])
+            evs, parser = run_parser(call_text("shell"), tools)                        # nothing near: text
+            self.assertEqual([e for e in evs if e.kind == "tool_call"], [])
+        finally:
+            OutputParser.NAME_REPAIR = "off"
+
     def test_two_tools_with_the_same_collapsed_spelling_are_not_guessed(self):
         tools = [plain_tool("a__b_c"), plain_tool("a_b__c")]
         evs, parser = run_parser(call_text("a_b_c"), tools)

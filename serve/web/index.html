@@ -137,6 +137,14 @@
         <div class="live__slots" id="slot-bars" hidden></div>
       </div>
 
+      <!-- agent threads: who is running, who waits, and the pin that lets one thread run to its end -->
+      <div class="card threads-card" id="threads-card" hidden>
+        <div class="card__head"><div><span class="card__title">Agent threads</span>
+          <span class="card__sub muted" id="threads-sub">one request at a time; pin a thread to let it run to its end while the others wait</span></div>
+          <button type="button" class="st-btn st-btn--secondary threads__unpin" id="threads-unpin" hidden>Take the pin off</button></div>
+        <div class="threads" id="threads"></div>
+      </div>
+
       <!-- lifetime + speed tiles, filled by app.js -->
       <div class="tiles" id="tiles"></div>
 

@@ -198,6 +198,23 @@ class Monitor(unittest.TestCase):
         self.assertEqual(self.request("/web/../server.py")[0], 404)
 
 
+class ThreadPreview(unittest.TestCase):
+    """GET /metrics "threads": a thread's prompt preview is prompt text, so it is there only with the request monitor on."""
+
+    def view(self, api_monitor):
+        import types
+        rows = {"pinned": None, "held_back": 0, "threads": [{"key": "A", "state": "waiting", "tail_ids": [1, 2, 3]}]}
+        me = types.SimpleNamespace(api_monitor=api_monitor, order=types.SimpleNamespace(snapshot=lambda tail: rows),
+                                   tok=types.SimpleNamespace(decode=lambda ids: "<|im_start|>user fix the login page<|im_end|>"))
+        return Service.threads_view(me)["threads"][0]
+
+    def test_no_prompt_text_unless_the_request_monitor_is_on(self):
+        row = self.view(False)
+        self.assertEqual(row["preview"], "")
+        self.assertNotIn("tail_ids", row)             # the token ids never go out either
+        self.assertEqual(self.view(True)["preview"], "fix the login page")
+
+
 class ConversationCacheCard(unittest.TestCase):
     """#596: /metrics' "conversation_cache": the parked conversations from the engine's log lines, the budget and
     slots from its INFO line, and how much of the prompts the cache gave back."""
@@ -223,7 +240,31 @@ class ConversationCacheCard(unittest.TestCase):
             with open(log, "a", encoding="utf-8") as f:   # the cut line is read once it is whole
                 f.write("che: dropped 1 superseded copy of this conversation; parked=1\n")
             self.assertEqual(c.poll(str(log), start)["parked"], 1)
+            self.assertIsNone(c.poll(str(log), start)["ssd_read_mbps"])            # no SSD tier: no drive line
+            with open(log, "a", encoding="utf-8") as f:   # the SSD tier's drive, as the engine measured it once
+                f.write("strata serve: conversation cache: SSD tier drive: reads 3224 MB/s, writes 2137 MB/s (measured now, "
+                        "once; /work/spill/drive-speed, delete it to measure again). 1 GiB of a parked conversation comes back "
+                        "from this drive in about 0.33 s and takes about 0.50 s to write\n")
+            st = c.poll(str(log), start)
+            self.assertEqual((st["ssd_read_mbps"], st["ssd_write_mbps"], st["parked"]), (3224, 2137, 1))
+            with open(log, "a", encoding="utf-8") as f:   # parks that did not happen, by reason; a continuing conversation is none
+                f.write("strata serve: conversation cache: skip parking (snapshot 2730 MiB exceeds available budget)\n"
+                        "strata serve: conversation cache: skip parking (snapshot 2730 MiB exceeds available budget)\n"
+                        "strata serve: conversation cache: skip parking (physical RAM admission; need 3000 MiB plus 2560 MiB floor)\n"
+                        "strata serve: conversation cache: skip parking (this prompt leaves 1405 of the conversation's 189834 "
+                        "tokens behind, at most 4096: --conversation-cache-park-tail)\n"
+                        # shorter than the minimum: not parked on purpose, so not a lost park; an allocation failure is RAM
+                        "strata serve: conversation cache: skip parking (1200 tokens, below the 4096 minimum; parked=1)\n"
+                        "strata serve: conversation cache: allocation failed; skip parking\n"
+                        "strata serve: conversation cache: parked 150000 tokens in 210.0 ms (to its SSD file, only what changed, "
+                        "148000 tokens kept); parked=0 bytes=0 evictions=0 spilled=3 files, 9.4 GiB; wrote 262.5 MiB of the "
+                        "file's 3051.2 MiB (K/V 36.5 MiB, state 226.0 MiB)\n"
+                        "strata serve: conversation cache: restored 150000 tokens from disk (3051.2 MiB) in 1012 ms\n")
+            st = c.poll(str(log), start)
+            self.assertEqual((st["skips_budget"], st["skips_ram"], st["skips_other"]), (2, 2, 0))
+            self.assertEqual((st["ssd_files"], st["ssd_gib"], st["ssd_restores"], st["ssd_written_mib"]), (3, 9.4, 1, 262.5))
             self.assertEqual(c.poll(str(log), log.stat().st_size)["parked"], 0)   # the engine started again
+            self.assertIsNone(c.poll(str(log), log.stat().st_size)["ssd_read_mbps"])
             self.assertEqual(c.poll(None, None)["parked"], 0)
 
     def test_metrics(self):

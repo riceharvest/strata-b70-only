@@ -236,3 +236,14 @@ body[data-tab="chat"] .topbar { border-bottom-color: transparent; background: va
   .tiles { grid-template-columns: 1fr 1fr; }
   .tile__row:nth-child(2) { display: none; }
 }
+
+/* Monitor: the agent threads card (the stream order's pin) */
+.threads-card { padding-bottom: 8px; }
+.threads { display: flex; flex-direction: column; margin-top: 8px; }
+.thread { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; align-items: center; padding: 8px 0; border-top: 1px solid var(--st-line); }
+.thread__name { font-weight: 600; color: var(--st-ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thread__preview { color: var(--st-ink-muted); font-size: var(--st-fs-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.thread__meta { color: var(--st-ink-muted); font-size: var(--st-fs-sm); white-space: nowrap; text-align: right; }
+.thread[data-pinned="1"] { border-left: 3px solid var(--st-accent); padding-left: 10px; }
+.thread .st-btn, .threads__unpin { height: 32px; padding: 0 12px; }
+@media (max-width: 700px) { .thread { grid-template-columns: minmax(0, 1fr) auto; } .thread__meta { display: none; } }
