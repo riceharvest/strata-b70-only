@@ -196,16 +196,12 @@ inline void apply_b70_defaults() {
         {"STRATA_IQ_DECODE_FAST", "1"},
         {"STRATA_MMVQ_KREG", "1"},
         {"STRATA_HC_Q8", "1"},
-        // the decode window's hot kernels for the UD-IQ1_S pack (Q5_K / Q6_K / Q8_0 dense, IQ2_XXS gate/up, Q2_0 down), each
-        // bitwise the kernel it replaces (2026-11-09, written from the window's unitrace profile; "0" turns one off):
-        // XE2_KQ: KREG Q5_K / Q6_K on a persistent grid at 3-8 columns, the wide Q5_K rows at 5-8 columns in 256 registers
-        // (they spill at 128), the shared expert's Q8_0 gate and up in one launch (a sum of parts 2 + 4 + 16 selects them;
-        // + 8, so 30: also the planar Q6_K head at 6-8 columns in 256 registers, not timed yet; native_mmvq.dp.cpp);
-        // XE2_IQ: vector activation loads and a three-entry pass in the IQ2_XXS / IQ2_S / Q2_0 expert kernels;
-        // HC_Q8_DOWN2: the Q8_0 hyper-connection read's down kernel with one barrier less and vector partials
-        {"STRATA_XE2_KQ", "1"},
-        {"STRATA_XE2_IQ", "1"},
-        {"STRATA_HC_Q8_DOWN2", "1"},
+        // NOT defaults: STRATA_XE2_KQ / STRATA_XE2_IQ / STRATA_HC_Q8_DOWN2 (the decode window's launches for the UD-IQ1_S
+        // pack, native_mmvq.dp.cpp / iq_kernels.dp.cpp / fused_gr.dp.cpp).  Their parity programs pass, but in the engine
+        // (2026-11-10, one B70, ABBA at a fixed expert cache, STRATA_SPEC_COST=0) they were no faster (reference prompts
+        // 114.2 / 95.6 and 120.9 / 95.4 tok/s on, 113.0 / 95.1 and 117.7 / 98.8 off) and two runs with them on gave two
+        // different greedy texts for one prompt, while the two runs with them off were identical.  Opt-in until the
+        // one that is not deterministic is found.
         // a turn checkpoint (118 MB of DeltaNet state) moved to the host off the critical path: card-to-card into one VRAM
         // stage, then a background copy, into a pooled vector (two kept ready: a fresh one faulted in 59 ms of pages),
         // the 37 small pieces as one copy.  An agent's small turn at 203K: 195-236 -> 104-149 ms (the save 77.5 -> 5 ms),
