@@ -74,6 +74,17 @@ public:
     /// STRATA_SPEC_COST: a round time far above what is known for that width (the first use of a width captures its graph; a stalled
     /// round) counts as a tenth of a sample, so one capture cannot price a width out of use.  Off: the cost EMA as it always was.
     void set_robust(bool on) { robust_ = on; }
+    /// STRATA_SPEC_PROBE_MIN=1 (with set_robust): how a window size gets its price.  Off (the default): the mean of its first
+    /// samples, a prior from another context length counted as one of them, and the MTP window never measures a size again once
+    /// its probes are spent.  On: a size's first `probes` real samples are kept as their MINIMUM (a slow round - a first use, a
+    /// stall - is the only kind of outlier a round time has), a prior is replaced by the first real sample, a size not measured
+    /// for `stale_rounds` is measured once more by the MTP window too, and that late sample counts half.  It only moves which rows
+    /// are verified; the output is unchanged.
+    void set_probe_min(bool on) { probe_min_ = on; }
+    /// How often a size whose cost is unknown is tried (STRATA_SPEC_PROBES, 1..64; 3).
+    void set_probes(int n) { probes_ = n < 1 ? 1 : n > 64 ? 64 : n; }
+    /// After how many rounds without a sample a size is measured again (STRATA_SPEC_STALE; 300).  0: never.
+    void set_stale_rounds(double r) { stale_rounds_ = r < 0 ? 0 : r; }
 
     /// COST-AWARE MTP WINDOW (STRATA_SPEC_COST=1): the MTP chain is drafted one step at a time; after draft j (probability p_j)
     ///   E_j = 1 + q_0 + .. + q_j,  q_i = prod_{k<=i} a(p_k)   a() = the acceptance measured for MTP drafts of that probability
@@ -86,6 +97,7 @@ public:
         double best_v = 0.0;
         int best_rows = 1;                ///< the window to verify: 1 + the drafts kept
         int kept = 0;                     ///< best_rows - 1
+        bool probe = false;               ///< probe-min: this round measures best_rows (its price is unknown or stale)
     };
     /// Draft `idx` (0-based, probability p) was just computed: update `st` and say whether to compute draft idx + 1.
     /// idx == 0 starts a new chain.  `cap` = the widest window (rows).
@@ -109,6 +121,12 @@ private:
     double rounds_ = 0;                                    // rounds observed so far
     bool robust_ = false;
     double clamp_sample(int t, double ms) const;
+    void add_cost(int t, double ms);                       // one round time of a window of t rows, in the current bucket
+    double probed(int t) const;                            // the probes a size has had in the current bucket
+    bool probe_min_ = false;
+    int probes_ = 3;
+    double stale_rounds_ = 300.0;
+    std::array<std::array<double, kMaxT + 1>, kCtxBuckets> real_n_{};   // probe-min: real samples by bucket and size (no priors)
     static constexpr int kPBuckets = 8;
     std::array<double, kPBuckets> pa_ok_{}, pa_n_{};       // MTP drafts reached / accepted by probability bucket (decayed)
     std::array<std::array<double, kMaxT + 1>, kCtxBuckets> last_{};   // the round at which each size was last measured

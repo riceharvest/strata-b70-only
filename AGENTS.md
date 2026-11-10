@@ -53,7 +53,7 @@ and gains, are in docs/B70.md.
 - Compare two settings with a fixed `--expert-cache <n>` (not `auto`) and `STRATA_SPEC_COST=0`, so the window sizes do not follow
   timings that differ between runs. Give the numbers with what they were measured on. Make no claim without a measurement.
 - Tests that need no GPU: `python3 -m pytest serve/test_<name>.py -q` for one server test file, `python3 tools/test_setup_sycl.py`
-  for setup. The host-only C++ tests (`conversation_spill_test`, `gated_proposal_test`, `spec_admission_test`) are always configured;
+  for setup. The host-only C++ tests (`conversation_spill_test`, `draft_policy_test`, `gated_proposal_test`, `spec_admission_test`) are always configured;
   build one by name with `build.sh <target>`.
 - Plain words and short sentences in docs and comments.
 

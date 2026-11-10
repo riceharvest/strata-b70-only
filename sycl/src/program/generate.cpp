@@ -3157,6 +3157,44 @@ static void prime_hw_queues() {
 }
 #endif
 
+/// STRATA_SPEC_COST's window policy, the switches read once per process (every one off or at its old value by default):
+///   STRATA_SPEC_PROBE_MIN=1   a window size's price is the fastest of its first probes and a stale price is measured
+///                             again (draft_policy.hpp, set_probe_min); 0 or unset: the mean of the first samples
+///   STRATA_SPEC_PROBES=N      probes of a size whose price is unknown (3)
+///   STRATA_SPEC_STALE=N       rounds without a sample after which a size is measured again (300; 0 = never)
+///   STRATA_SPEC_COST_TABLE=   "T1,T2,..;T1,..;T1,..": round ms by rows for the 3 context buckets (< 6K, < 24K, longer),
+///                             the start of a process that already knows the card; replaced by what it then measures
+static void configure_draft_policy(strata::spec::DraftPolicy& policy, bool spec_cost) {
+    policy.set_robust(spec_cost);
+    if (!spec_cost) return;
+    if (const char* v = std::getenv("STRATA_SPEC_PROBE_MIN"); v != nullptr && v[0] == '1') policy.set_probe_min(true);
+    // (a value that is not a number leaves the default: atoi's 0 would be 1 probe, atof's 0 "never measured again")
+    if (const char* v = std::getenv("STRATA_SPEC_PROBES"); v != nullptr && v[0] != '\0') {
+        char* end = nullptr;
+        const long n = std::strtol(v, &end, 10);
+        if (end != v && *end == '\0') policy.set_probes((int) std::clamp<long>(n, 1, 64));
+    }
+    if (const char* v = std::getenv("STRATA_SPEC_STALE"); v != nullptr && v[0] != '\0') {
+        char* end = nullptr;
+        const double r = std::strtod(v, &end);
+        if (end != v && *end == '\0' && r >= 0.0) policy.set_stale_rounds(r);
+    }
+    if (const char* tab = std::getenv("STRATA_SPEC_COST_TABLE"); tab != nullptr && tab[0] != '\0') {
+        double ms[strata::spec::DraftPolicy::kMaxT] = {};
+        int n = 0, bucket = 0;
+        for (const char* q = tab; *q != '\0' && bucket < strata::spec::DraftPolicy::kCtxBuckets;) {
+            if (n < strata::spec::DraftPolicy::kMaxT) ms[n++] = std::atof(q);
+            while (*q != '\0' && *q != ',' && *q != ';') ++q;
+            const bool end_list = *q == ';' || *q == '\0';
+            if (*q != '\0') ++q;
+            if (end_list) {
+                policy.seed_costs(ms, n, 6.0, bucket++);
+                n = 0;
+            }
+        }
+    }
+}
+
 // STRATA_SPEC_PROB=1 with the default (pick) gate: a draft that fails the confidence gate is still a proposal attempt, and the
 // verifier gets the gated measure (core/gated_proposal.hpp).  That is exact only where the window choice cannot see a draw or a
 // timing that the next rounds draw again.  Where it cannot be kept, say why and return false: the caller keeps the older rule
@@ -14474,7 +14512,7 @@ int main(int argc, char **argv) try {
         const bool spec_cost = [] { const char* v = std::getenv("STRATA_SPEC_COST"); return v != nullptr && v[0] == '1'; }();   // cost-aware MTP window (A/B arm)
         strata::spec::DraftPolicy::ChainState chain_st;
         int chain_rows = 1;   // the window the cost-aware rule kept in the MTP chain just drafted
-        policy.set_robust(spec_cost);
+        configure_draft_policy(policy, spec_cost);
         if (spec_cost && use_mtp)
             mtp.set_chain_rule([&](int idx, float pj) {
                 const bool k = policy.keep_draft(chain_st, idx, pj, S_mtp);
@@ -18590,6 +18628,9 @@ int main(int argc, char **argv) try {
             double dt_adapt_wait = 0, dt_adapt_join = 0;   // the tier's wait before a window / join after the draft (ms, summed)
             const int64_t dt_sw0 = ajob ? a_swapped : adapt_nswaps;
             int64_t dec_windows = 0, dec_T = 0;
+            // STRATA_DECODE_TIMING: the same by window size (rows): how many windows, their verify and draft time
+            double dt_rows_run[17] = {}, dt_rows_draft[17] = {};
+            int64_t dt_rows_n[17] = {};
             // STRATA_FOLLOW=<file> (test path, off by default): this request decodes the token ids in <file> (whitespace
             // separated, read and deleted at the request's start) instead of the argmax, through the real verify windows
             // with the MTP drafts; STRATA_FOLLOW_LOGPOS=<path> appends, for every valid window row, the teacher-forced
@@ -19799,6 +19840,9 @@ int main(int argc, char **argv) try {
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
                     dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
                     ++dec_windows; dec_T += merged ? 1 : T;   // a merged window's prompt rows are not decode rows
+                    if (dec_timing && !merged && T >= 1 && T <= 16) {
+                        dt_rows_run[T] += msd(tw0, tw1); dt_rows_draft[T] += msd(tw2, tw3); ++dt_rows_n[T];
+                    }
                 }
                 pcie_auto_step(req_pcie_frac);   // the default share, refined from the CPU pool's speed (PcieAuto); a request's own share is left alone
                 if (adapt_thr.joinable()) {
@@ -19933,6 +19977,18 @@ int main(int argc, char **argv) try {
                                  (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
                                  (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L),
                                  dt_adapt_wait / w, dt_adapt_join / w, (double) ((ajob ? a_swapped : adapt_nswaps) - dt_sw0) / w);
+                }
+                {   // one more line: verify and draft ms by the window's rows (what one more row costs on this card)
+                    std::string by;
+                    char buf[96];
+                    for (int t = 1; t <= 16; ++t)
+                        if (dt_rows_n[t] > 0) {
+                            std::snprintf(buf, sizeof buf, " T%d n=%lld verify %.2f draft %.2f;", t, (long long) dt_rows_n[t],
+                                          dt_rows_run[t] / (double) dt_rows_n[t], dt_rows_draft[t] / (double) dt_rows_n[t]);
+                            by += buf;
+                        }
+                    if (!by.empty()) std::fprintf(stderr, "strata decode timing by rows:%s\n", by.c_str());
+                    if (spec_cost) std::fprintf(stderr, "strata decode timing window prices: %s\n", policy.cost_table_text().c_str());
                 }
                 if (aov)
                     std::fprintf(stderr, "strata decode adapt overlap: %lld windows took swaps still landing, a layer waited %.2f ms in all so far\n",
@@ -21350,25 +21406,10 @@ int main(int argc, char **argv) try {
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
+        configure_draft_policy(policy, spec_cost);  // (before the copy below: both price a window the same way)
         auto source_policy = policy;   // this generation's: committed outcomes only (observe_committed)
         strata::spec::DraftPolicy::ChainState chain_st;
         int chain_rows = 1;   // STRATA_SPEC_COST: the window the cost-aware rule kept in the MTP chain just drafted
-        if (const char* tab = std::getenv("STRATA_SPEC_COST_TABLE"); spec_cost && tab != nullptr && tab[0] != '\0') {
-            // "T1,T2,..;T1,T2,..;T1,..": the row costs of the 3 context buckets (< 6K, < 24K, longer); one list seeds the first
-            double ms[strata::spec::DraftPolicy::kMaxT] = {};
-            int n = 0, bucket = 0;
-            for (const char* q = tab; *q != '\0' && bucket < strata::spec::DraftPolicy::kCtxBuckets;) {
-                if (n < strata::spec::DraftPolicy::kMaxT) ms[n++] = std::atof(q);
-                while (*q != '\0' && *q != ',' && *q != ';') ++q;
-                const bool end_list = *q == ';' || *q == '\0';
-                if (*q != '\0') ++q;
-                if (end_list) {
-                    policy.seed_costs(ms, n, 6.0, bucket++);
-                    n = 0;
-                }
-            }
-        }
-        policy.set_robust(spec_cost);
         if (spec_cost && use_mtp)
             mtp.set_chain_rule([&](int idx, float pj) {
                 const bool k = policy.keep_draft(chain_st, idx, pj, S_mtp);

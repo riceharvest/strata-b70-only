@@ -327,6 +327,10 @@ add_test(NAME spec_admission_default COMMAND ${CMAKE_COMMAND} -E env --unset=STR
 add_test(NAME spec_admission_pick COMMAND ${CMAKE_COMMAND} -E env STRATA_SPEC_PROB_GATE=pick $<TARGET_FILE:spec_admission_test> pick)
 add_test(NAME spec_admission_top COMMAND ${CMAKE_COMMAND} -E env STRATA_SPEC_PROB_GATE=top $<TARGET_FILE:spec_admission_test> top)
 add_test(NAME spec_admission_exact_top_only COMMAND ${CMAKE_COMMAND} -E env STRATA_SPEC_PROB_GATE=TOP $<TARGET_FILE:spec_admission_test> pick)
+# Host-only test of the draft window policy (STRATA_SPEC_COST's prices, the probe-min mode on a simulated card).
+add_executable(draft_policy_test ${STRATA_ROOT}/src/spec/draft_policy_test.cpp ${STRATA_ROOT}/src/spec/draft_policy.cpp)
+target_include_directories(draft_policy_test PRIVATE ${STRATA_ROOT}/include)
+add_test(NAME draft_policy_test COMMAND draft_policy_test)
 
 # The kernel parity programs, tests and benches run on the card. Each one compiles its own device code, which is most of a
 # full build's time: they are built on request (-DSTRATA_SYCL_PARITY=ON, or build.sh with a target name after configuring with it).
