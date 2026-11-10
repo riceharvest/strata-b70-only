@@ -1226,9 +1226,10 @@ auto &hist =
 // campaign3: also compiled on HIP (gfx11: plain shared/atomic code, no sm_90 features; the dispatch still needs
 // reach > fit, i.e. the deep contexts where the ref radix was the only option on AMD).
 constexpr int TS_MAXQ = 4096;
-inline dpct::global_memory<int, 1>
-    g_tk_fail(TS_MAXQ); // block_topk_sample_kernel: 1 = the query is
-                        // block_topk_wide_kernel<true>'s
+// (the four tables below are never freed: a static object's destructor runs from exit(), after the SYCL runtime is
+// down, and sycl::free then faults in the driver - exit 139 after a one-shot run that had finished)
+inline dpct::global_memory<int, 1>& g_tk_fail = *new dpct::global_memory<int, 1>(TS_MAXQ);   // block_topk_sample_kernel:
+                        // 1 = the query is block_topk_wide_kernel<true>'s
 template <bool ONLY_FAILED = false>
 /*
 DPCT1110: The total declared local variable size in device function
@@ -4222,12 +4223,11 @@ catch (sycl::exception const &exc) {
 // the width; 0 when none) - pure functions of integer counts, so every CTA finds the same digit, and the threshold,
 // `above` and the emitted cells are block_topk_kernel's: identical ids.  STRATA_TOPK_SPLIT=0 keeps the wide kernel.
 constexpr int SP_T = 256, SP_W = SP_T / 32, SP_CH = 2048, SP_MAXQ = 16, SP_MAXCH = 512;
-inline dpct::global_memory<int, 3> g_sp_hist(SP_MAXQ, 4, 256);
-inline dpct::global_memory<int, 3>
-    g_sp_state(5, SP_MAXQ, 2); // after p digits: prefix, above
-inline dpct::global_memory<int, 3>
-    g_sp_cnt(SP_MAXQ, SP_MAXCH,
-             2); // per chunk: cells above the threshold, cells at it
+inline dpct::global_memory<int, 3>& g_sp_hist = *new dpct::global_memory<int, 3>(SP_MAXQ, 4, 256);   // never freed (g_tk_fail)
+inline dpct::global_memory<int, 3>& g_sp_state =
+    *new dpct::global_memory<int, 3>(5, SP_MAXQ, 2); // after p digits: prefix, above
+inline dpct::global_memory<int, 3>& g_sp_cnt =
+    *new dpct::global_memory<int, 3>(SP_MAXQ, SP_MAXCH, 2); // per chunk: cells above the threshold, cells at it
 
 // the digit of pass `p` from its complete histogram: block_topk_kernel's scan as a parallel suffix sum
 inline void sp_digit(const int *__restrict__ h, int width, int above,
