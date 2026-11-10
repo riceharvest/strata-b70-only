@@ -51,6 +51,7 @@
 #include "strata/kernels/pdl.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -2246,6 +2247,63 @@ inline bool kreg_env() {   // latched before graph capture
 int g_kreg_override = -1;   // native_mmvq_set_kreg (tests): -1 = the STRATA_MMVQ_KREG latch
 inline bool kreg_on() { return g_kreg_override >= 0 ? g_kreg_override != 0 : kreg_env(); }
 
+// STRATA_XE2_KQ (the B70 default, strata::apply_b70_defaults; unset or 0: off, every launch below as before): the
+// decode window's dense kernels for a pack with Q5_K / Q6_K / Q8_0 dense tensors and a Q6_K head (Unsloth UD-IQ1_S).
+// Each part changes how a kernel is launched, never a sum: every output is bitwise what it is with the switch off.
+// 1 = parts 2, 4 and 16; any other value is the sum of the parts wanted (30: all four):
+//   2  KREG Q5_K / Q6_K at 3-8 columns on a persistent grid (kreg_groups_cap): a work-group loads its activation
+//      pieces once and walks the tiles, instead of one work-group per tile;
+//   4  KREG Q5_K rows wider than 4096 at 5-8 columns in 256 registers, 4 rows a tile (the 2-row 128-register form
+//      spills there: 4,352 bytes a thread at 6 columns, 8,704 at 8, measured 2026-11-09 on 6144 x 2560: 66 and 248 us
+//      a call against 35 us at 3 columns);
+//   8  the planar Q6_K heads at 6-8 columns in 256 registers (at 128 the kernel spills 1,536-1,600 bytes a thread:
+//      1,187 us at 6 columns and 1,659 at 8 against 905 at 3, same day).  Not part of 1: 256 registers halve the
+//      threads a core keeps resident and this kernel was not timed that way on a Battlemage card;
+//   16 native_mmvq_pair takes Q8_0 pairs at 1-8 columns in one launch of the wide kernel (the shared expert's gate
+//      and up: one launch less a layer).
+constexpr int kXe2KqGrid = 2, kXe2KqTile = 4, kXe2KqHead = 8, kXe2KqPair = 16;
+constexpr int kXe2KqAll = kXe2KqGrid | kXe2KqTile | kXe2KqHead | kXe2KqPair;
+constexpr int kXe2KqDefault = kXe2KqGrid | kXe2KqTile | kXe2KqPair;   // what "1" turns on
+inline int xe2_kq_env() {   // latched before graph capture
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_XE2_KQ");
+        if (e == nullptr || e[0] == '\0') return 0;
+        const int n = std::atoi(e);
+        const int m = n == 1 ? kXe2KqDefault : (n & kXe2KqAll);
+        if (m != 0)
+            std::fprintf(stderr, "strata: STRATA_XE2_KQ=%s: dense decode launches for Q5_K / Q6_K / Q8_0 (parts %d; 0 turns them off)\n", e, m);
+        return m;
+    }();
+    return v;
+}
+int g_xe2_kq_override = -1;   // native_mmvq_set_xe2_kq (tests): -1 = the STRATA_XE2_KQ latch
+inline bool xe2_kq(int part) { return ((g_xe2_kq_override >= 0 ? g_xe2_kq_override : xe2_kq_env()) & part) != 0; }
+// the parts some launch has taken since native_mmvq_xe2_kq_seen was last read (mmvq_kreg_parity: a check whose call
+// never reached the part's launch has checked nothing)
+std::atomic<int> g_xe2_kq_seen{0};
+inline void xe2_kq_note(int part) { g_xe2_kq_seen.fetch_or(part, std::memory_order_relaxed); }
+// The most work-groups a KREG launch starts (STRATA_XE2_KQ part 2). The kernel's tile loop strides by the group count
+// and a tile's sums do not depend on the group that runs it, so any count gives the same output bits. One wave of
+// the card (Xe cores x the hardware threads a core keeps resident / the sub-groups of a work-group) at 3-8 columns
+// when a core holds two or more work-groups; one work-group per tile otherwise (1-2 columns, and rows so wide that
+// one group fills a core). Measured on this card in the dense Qwen3.8-27B tree (2026-11-02, rows up to 6144 wide,
+// Q4_K / Q5_K at 4 columns: 9-20% less time, more at 5-6). STRATA_KREG_WAVES="w1,wN": waves for 1 column and for
+// 2-8 (0 = one group per tile).
+inline int kreg_groups_cap(int ncols, int nsg, int grf, dpct::queue_ptr s) {
+    static const int cu = int(s->get_device().get_info<sycl::info::device::max_compute_units>());
+    static const int cores = std::max(1, cu >= 64 ? cu / 8 : cu);   // Intel reports XVEs (8 a core)
+    static const std::pair<int, int> w = [] {
+        int a = -1, b = -1;
+        if (const char* e = std::getenv("STRATA_KREG_WAVES")) std::sscanf(e, "%d,%d", &a, &b);
+        return std::make_pair(a, b);
+    }();
+    const int per_core = (grf == 256 ? 32 : 64) / nsg;
+    int waves = ncols == 1 ? w.first : w.second;
+    if (waves < 0) waves = ncols >= 3 && per_core >= 2 ? 1 : 0;
+    if (waves <= 0) return 1 << 30;
+    return std::max(1, waves * cores * std::max(1, per_core));
+}
+
 template <int O, int N, int P>
 __dpct_inline__ void kreg_tsum(float (&v)[P], const sycl::sub_group& sg, int lane) {
     if constexpr (O > 0) {
@@ -2469,12 +2527,18 @@ void launch_kreg(const void* weights, const void* x_q8_1, float* y, int n_in, in
     const int nsg = L / KREG_SG;
     constexpr int P = kreg_p<R, NCOLS>();
     const int tiles = (n_out + R - 1) / R;
+    // STRATA_XE2_KQ (part 2): Q5_K / Q6_K on a persistent grid (the kernel's tile loop; the same sums)
+    int groups = tiles;
+    if constexpr (std::is_same_v<F, KregQ5K> || std::is_same_v<F, KregQ6K>) {
+        if (xe2_kq(kXe2KqGrid)) groups = std::min(tiles, kreg_groups_cap(NCOLS, nsg, GRF, s));
+        if (groups < tiles) xe2_kq_note(kXe2KqGrid);
+    }
     s->submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> slm(sycl::range<1>(2 * nsg * P + F::kTableWords), h);
         auto k = [=](sycl::nd_item<1>) [[sycl::reqd_sub_group_size(16)]] {
             native_mmvq_kreg_kernel<F, NCOLS, R>(w, x, y, n_in, n_out, slm.get_multi_ptr<sycl::access::decorated::no>().get());
         };
-        const sycl::nd_range<1> nr(std::size_t(tiles) * L, L);
+        const sycl::nd_range<1> nr(std::size_t(groups) * L, L);
         if constexpr (GRF == 256)
             h.parallel_for<dpct_kernel_name<class native_mmvq_kreg_grf256, F, dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<R>>>(
                 nr, sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>}, k);
@@ -2499,6 +2563,13 @@ void kreg_dispatch(const void* w, const void* x, float* y, int n_in, int n_out, 
         } else if constexpr (NCOLS <= 4) launch_kreg<F, NCOLS, 4, 128>(w, x, y, n_in, n_out, s);
         else if constexpr (std::is_same_v<F, KregQ5K>) {
             if (n_in <= 4096) launch_kreg<F, NCOLS, 8, 256>(w, x, y, n_in, n_out, s);
+            // STRATA_XE2_KQ (part 4): 5-8 columns of a row up to 8192 wide in 256 registers, 4 rows a tile (12
+            // activation registers a column + 12 weight registers a row + the sums: 176 at 8 columns); R and the
+            // register mode change no sum
+            else if (n_in <= 8192 && xe2_kq(kXe2KqTile)) {
+                xe2_kq_note(kXe2KqTile);
+                launch_kreg<F, NCOLS, 4, 256>(w, x, y, n_in, n_out, s);
+            }
             else launch_kreg<F, NCOLS, 2, 128>(w, x, y, n_in, n_out, s);
         } else launch_kreg<F, NCOLS, 8, 256>(w, x, y, n_in, n_out, s);
     }
@@ -2797,6 +2868,51 @@ bool try_wide32(const void* weights, const void* x_q8_1, float* y, int n_in, int
         case 7: launch_wide32<F, 7>(weights, x_q8_1, y, n_in, n_out, s); return true;
         default: launch_wide32<F, 8>(weights, x_q8_1, y, n_in, n_out, s); return true;
     }
+}
+// STRATA_XE2_KQ (part 16): native_mmvq_wide32_kernel for two matrices of one shape on one input in one launch (the
+// shared expert's Q8_0 gate and up). Rows n_out .. 2 n_out - 1 of the launch are w2's rows into y2. A row keeps its
+// lanes, its block order and its butterfly, so y1 and y2 are bitwise what the two launches write.
+template <typename F, int NCOLS>
+void native_mmvq_wide32_pair_kernel(const typename F::Block* w1, const typename F::Block* w2,
+                                    const Q81Block* __restrict__ x, float* y1, float* y2, int n_in, int n_out) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int lane = int(item.get_local_id(2)), warp = int(item.get_local_id(1));
+    int row = int(item.get_group(2)) * WARPS + warp;
+    if (row >= 2 * n_out) return;
+    const typename F::Block* w = w1;
+    float* y = y1;
+    if (row >= n_out) { row -= n_out; w = w2; y = y2; }   // (uniform over the sub-group: the row is the sub-group's)
+    constexpr int BPS = WARP / F::LPB;                  // blocks per sub-group step
+    const int blocks_per_row = n_in / 32;
+    const int l = lane % F::LPB, sub = lane / F::LPB;
+    const typename F::Block* wr = w + std::size_t(row) * blocks_per_row;
+    float acc[NCOLS] = {};
+    for (int kb = sub; kb < blocks_per_row; kb += BPS) {
+        const typename F::W wv = F::load(wr + kb, l);
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) acc[j] += F::apply(wv, x + std::size_t(j) * blocks_per_row + kb);
+    }
+    auto sg = item.get_sub_group();
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        float v = acc[j];
+#pragma unroll
+        for (int o = WARP / 2; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+        if (lane == 0) y[std::size_t(j) * n_out + row] = v;
+    }
+}
+template <typename F, int NCOLS>
+void launch_wide32_pair(const void* weights1, const void* weights2, const void* x_q8_1, float* y1, float* y2, int n_in,
+                        int n_out, dpct::queue_ptr s) {
+    const auto* w1 = static_cast<const typename F::Block*>(weights1);
+    const auto* w2 = static_cast<const typename F::Block*>(weights2);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const unsigned blocks = unsigned((std::size_t(2) * std::size_t(n_out) + WARPS - 1) / WARPS);
+    s->parallel_for<dpct_kernel_name<class native_mmvq_wide32_pair, F, dpct_kernel_scalar<NCOLS>>>(
+        sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
+        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+            native_mmvq_wide32_pair_kernel<F, NCOLS>(w1, w2, x, y1, y2, n_in, n_out);
+        });
 }
 
 // SYCL port: alignment experiment - Q6_K blocks repacked at a 224-byte stride (every block 16-byte aligned).
@@ -4956,7 +5072,9 @@ void q6_planar_launch(const Q6Planar& w, const Q81Block* x, float* y, dpct::queu
     const sycl::half* d = w.d;
     const int n_in = w.n_in, n_out = w.n_out;
     if constexpr (NCOLS > 1) {   // same rule as the GGUF-layout wide kernel (#2207): the multi-column kernel spills at 128 GRF on Alchemist
-        if (mmvq_large_grf(s)) {
+        // STRATA_XE2_KQ (part 8): 6-8 columns in 256 registers on any card (the same kernel: the same bits)
+        if (mmvq_large_grf(s) || (NCOLS >= 6 && xe2_kq(kXe2KqHead))) {
+            if (NCOLS >= 6 && xe2_kq(kXe2KqHead)) xe2_kq_note(kXe2KqHead);
             s->parallel_for<dpct_kernel_name<class native_mmvq_q6k_planar_grf256, dpct_kernel_scalar<NCOLS>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
                 sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>},
@@ -5504,6 +5622,8 @@ void native_q6_k_unpack(const void* weights) {
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
 void native_mmvq_set_q6k_wide(bool on) { g_q6k_wide = on; }
 void native_mmvq_set_kreg(int on) { g_kreg_override = on; }
+void native_mmvq_set_xe2_kq(int parts) { g_xe2_kq_override = parts < 0 ? -1 : (parts == 1 ? kXe2KqDefault : (parts & kXe2KqAll)); }
+int native_mmvq_xe2_kq_seen() { return g_xe2_kq_seen.exchange(0, std::memory_order_relaxed); }
 void native_q6_k_mmvq_stride224(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                                 void* stream) {
     const auto s = strata::q_of(stream);
@@ -6302,8 +6422,32 @@ void q8_0_pair_launch(const Q80Block *w1, const Q80Block *w2, const Q81Block *x,
     }
 }
 
+bool native_mmvq_pair_wide32() { return xe2_kq(kXe2KqPair) && wide_32(); }
+
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                       int n_in, int n_out, int ncols, void* stream) {
+    // STRATA_XE2_KQ (part 16): where each of the two calls would run the wide Q8_0 kernel (native_q8_0_mmvq: not a
+    // packed matrix, try_wide32's conditions), both in one launch of it
+    if (ggml_type == 8 && native_mmvq_pair_wide32() && ncols >= 1 && ncols <= 8 && n_out > 0 && n_in > 0 &&
+        n_in % 32 == 0 && w1 && w2 && x_q8_1 && y1 && y2 && y1 != y2 && stream) {
+        const auto& reg = q8_packed_registry();
+        if (!reg.count(w1) && !reg.count(w2)) {
+            const auto s = strata::q_of(stream);
+            switch (ncols) {
+                case 1: launch_wide32_pair<Wide32Q8, 1>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s); break;
+                case 2: launch_wide32_pair<Wide32Q8, 2>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s); break;
+                case 3: launch_wide32_pair<Wide32Q8, 3>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s); break;
+                case 4: launch_wide32_pair<Wide32Q8, 4>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s); break;
+                case 5: launch_wide32_pair<Wide32Q8, 5>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s); break;
+                case 6: launch_wide32_pair<Wide32Q8, 6>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s); break;
+                case 7: launch_wide32_pair<Wide32Q8, 7>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s); break;
+                default: launch_wide32_pair<Wide32Q8, 8>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s); break;
+            }
+            xe2_kq_note(kXe2KqPair);
+            launch_check();
+            return true;
+        }
+    }
     using F = SmallTraits<Q80Block, 8>;
     // only where both calls would run native_mmvq_multi_kernel<F, ncols, WARPS, 1> (exact layout, not packed)
     if (ggml_type != 8 || !g_multi_exact || ncols < 2 || ncols > 8 || n_out <= 0 || n_in <= 0 || n_in % 32 != 0 ||

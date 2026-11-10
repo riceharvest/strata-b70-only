@@ -13,4 +13,10 @@ namespace strata::kernels {
 /// K must be a multiple of 32.
 void fused_gr_q8_0_split_host(const uint8_t* blocks, uint8_t* out, int64_t rows, int64_t K);
 
+/// STRATA_HC_Q8_DOWN2 (the B70 default; unset or 0: off): the Q8_0 read's down projection through a second kernel
+/// that stages the rows' activations with overlapping loads, keeps the partial sums as 16-byte vectors in local
+/// memory and reads the slab partials before its last barrier. Every output is bitwise the first kernel's.
+/// fused_gr_set_q8_down2 (tests, benches): 1 on, 0 off, -1 as STRATA_HC_Q8_DOWN2. Set before graph capture.
+void fused_gr_set_q8_down2(int on);
+
 }  // namespace strata::kernels

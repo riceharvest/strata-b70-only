@@ -34,6 +34,8 @@ namespace strata::kernels {
 void native_expert_set_kq_split(bool on);
 // SYCL port only: the STRATA_IQ_DECODE_FAST expert kernels on (1) or off (0) whatever the environment says, -1 the environment's
 void native_expert_set_iq_decode_fast(int on);
+// SYCL port only: the STRATA_XE2_IQ variants of those kernels (vector loads, a three-entry pass) on (1) or off (0), -1 the environment's
+void native_expert_set_xe2_iq(int on);
 }
 namespace k = strata::kernels;
 
@@ -494,6 +496,11 @@ void check_kq(int gu, int dt, int64_t H, int64_t FF, dpct::queue_ptr s, std::mt1
 // bitwise: every IQ gate/up format with both IQ down formats, groups of 1..6 entries (the chunks of 4 and 2 and the
 // single tail), entries from 0 and from past 0, scattered destinations, stale scratch; the rows the call must not
 // write included (both start from the same NaN pattern).  The fast kernels take 8 lanes a row (the default split).
+// STRATA_XE2_IQ (native_expert_set_xe2_iq): the fast kernels with the vector loads and the three-entry pass, a third
+// run of every call, bitwise the first two (the groups of 1..6 entries include groups of exactly three: one pass
+// where the kernels without the switch take two).  The first two runs have it off, so they are the kernels as they
+// are without the switch.  (It needs STRATA_IQ_GRID and STRATA_IQ_DT at their defaults: with either off the third run
+// is the second one's kernels.)
 void check_iq(int gu, int dt, int64_t H, int64_t FF, dpct::queue_ptr s, std::mt19937& rng) {
     Setup S(gu, dt, H, FF, 6, 4, 9, rng, s);   // 6 tokens x 4 experts: cap 24 entries
     int calls = 0, bad = 0;
@@ -501,22 +508,32 @@ void check_iq(int gu, int dt, int64_t H, int64_t FF, dpct::queue_ptr s, std::mt1
     for (const int base : {0, 7})
         for (const int groups : {1, 2, 3, 5, 8, 24}) {
             const int ng = S.plan(groups, base, rng);
+            k::native_expert_set_xe2_iq(0);
             k::native_expert_set_iq_decode_fast(0);
             const auto a = S.result(false, 0, 0x00, s);
             k::native_expert_set_iq_decode_fast(1);
             const auto b = S.result(false, 0, 0x7F, s);
+            k::native_expert_set_xe2_iq(1);
+            const auto c = S.result(false, 0, 0x7F, s);
+            k::native_expert_set_xe2_iq(-1);
             k::native_expert_set_iq_decode_fast(-1);
             ++calls;
-            size_t diff = 0;
-            for (size_t i = 0; i < a.size(); ++i) { diff += a[i] != b[i]; written += a[i] != 0xFFFFFFFFu; }
+            size_t diff = 0, diffx = 0;
+            for (size_t i = 0; i < a.size(); ++i) { diff += a[i] != b[i]; diffx += a[i] != c[i]; written += a[i] != 0xFFFFFFFFu; }
             if (diff) {
                 std::printf("  %-8s/%-7s base %d, %d groups: fast vs current: %zu of %zu floats differ  FAIL\n", name_of(gu),
                             name_of(dt), base, ng, diff, a.size());
                 ++bad;
             }
+            if (diffx) {
+                std::printf("  %-8s/%-7s base %d, %d groups: STRATA_XE2_IQ vs current: %zu of %zu floats differ  FAIL\n", name_of(gu),
+                            name_of(dt), base, ng, diffx, a.size());
+                ++bad;
+            }
         }
     std::printf("%-8s/%-7s %5lld x %4lld  %d calls: %s (%zu output floats written in all)\n", name_of(gu), name_of(dt),
-                (long long) H, (long long) FF, calls, bad ? "FAIL" : "fast decode bitwise equal to the current kernels", written);
+                (long long) H, (long long) FF, calls,
+                bad ? "FAIL" : "fast decode and STRATA_XE2_IQ bitwise equal to the current kernels", written);
     if (written == 0) { std::printf("  nothing was written: the check checked nothing  FAIL\n"); ++bad; }
     g_fail += bad;
 }

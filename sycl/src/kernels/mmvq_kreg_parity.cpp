@@ -21,6 +21,13 @@
 //   5. power: at 8 columns, row 0 of the KREG output against a reference with the scale of sub-block 0 of row 0's
 //      first block one step off must fail the bound in some column. A kernel that decodes one sub-block scale wrong
 //      would pass a bound that cannot see this.
+//   6. STRATA_XE2_KQ (native_mmvq_set_xe2_kq): the KREG call again with STRATA_XE2_KQ=1, bitwise the KREG output (the
+//      persistent grid and the 256-register Q5_K tiles change no sum). Over the run some launch must have taken the
+//      grid and some the tile (native_mmvq_xe2_kq_seen), or the check has compared KREG with itself.
+//   7. STRATA_XE2_KQ part 16: native_mmvq_pair on two Q8_0 matrices at 1-8 columns must run and be bitwise the two
+//      native_mmvq calls.
+//   8. STRATA_XE2_KQ part 8 (opt-in, not in 1): a planar Q6_K matrix (native_q6_k_planar_adopt) at 5-8 columns, the
+//      launch with the part on (256 registers from 6 columns) bitwise the launch with it off.
 //
 // THE DATA. Random weight bytes, except each block's fp16 scales (d, and dmin for Q4_K/Q5_K), which are normal fp16
 // values in +-[2^-10, 2^-5) as in mmvq_multi_parity, so every output is finite and a non-finite one fails. Random
@@ -175,7 +182,9 @@ struct Shape { int n_in, n_out; };
 // 300, 77 and 3 end in a partial tile.
 // 2560 x 4099: more tiles than the persistent KREG2 grid (its default engages at 2-4 columns there, KREG at 1 column:
 // check 4 then compares the two kernels bit for bit), and a partial last tile.
-const Shape SHAPES[] = {{2560, 1000}, {6144, 520}, {768, 300}, {256, 77}, {2560, 3}, {2560, 4099}};
+// 6144 x 2563: more tiles than a wave of the card holds 12-sub-group work-groups (check 6: the persistent grid at
+// 3-8 columns), a partial last tile, and Q5_K rows wider than 4096 (check 6: the 256-register tile at 5-8 columns).
+const Shape SHAPES[] = {{2560, 1000}, {6144, 520}, {768, 300}, {256, 77}, {2560, 3}, {2560, 4099}, {6144, 2563}};
 
 struct Dev {
     sycl::queue& q;
@@ -185,8 +194,9 @@ struct Dev {
 };
 
 std::vector<float> run(Dev& dev, int t, const void* dw, const uint8_t* dxq, float* dy, int n_in, int n_out, int T,
-                       int kreg, bool per_column) {
+                       int kreg, bool per_column, int xe2 = 0) {
     k::native_mmvq_set_kreg(kreg);
+    k::native_mmvq_set_xe2_kq(xe2);   // 0: the launches as they are without STRATA_XE2_KQ
     const size_t qcol = k::native_q8_1_bytes(n_in, 1);
     dev.q.memset(dy, 0xff, (size_t) T * n_out * 4).wait();   // NaN fill: an output not written fails
     if (per_column)
@@ -199,13 +209,126 @@ std::vector<float> run(Dev& dev, int t, const void* dw, const uint8_t* dxq, floa
     return y;
 }
 
+// 7. STRATA_XE2_KQ part 16: two Q8_0 matrices of one shape on one input, native_mmvq_pair against the two calls
+int pair_selftest(sycl::queue& q) {
+    Dev dev{q};
+    int bad = 0;
+    const Shape shapes[] = {{2560, 640}, {640, 2560}, {2560, 77}, {96, 5}};
+    const int TMAX = 8;
+    for (const Shape& sh : shapes) {
+        const size_t wbytes = k::native_mmvq_weight_bytes(8, sh.n_in, sh.n_out);
+        std::mt19937 rng(4321u + (unsigned) sh.n_in + 7u * (unsigned) sh.n_out);
+        std::vector<uint8_t> w(2 * wbytes);
+        for (auto& b : w) b = (uint8_t) (rng() & 0xff);
+        for (size_t b = 0; b < w.size() / 34; ++b) {   // a Q8_0 block: its fp16 scale, then 32 quants
+            const uint16_t h = sane_half(rng);
+            std::memcpy(&w[b * 34], &h, 2);
+        }
+        std::vector<float> hx((size_t) TMAX * sh.n_in);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        for (auto& v : hx) v = nd(rng);
+        const size_t ny = (size_t) TMAX * sh.n_out;
+        void* dw1 = dev.alloc(wbytes);
+        void* dw2 = dev.alloc(wbytes);
+        float* dx = (float*) dev.alloc(hx.size() * 4);
+        uint8_t* dxq = (uint8_t*) dev.alloc(k::native_q8_1_bytes(sh.n_in, TMAX));
+        float* dy = (float*) dev.alloc(4 * ny * 4);   // the two calls' outputs, then the pair's
+        dev.put(dw1, w.data(), wbytes);
+        dev.put(dw2, w.data() + wbytes, wbytes);
+        dev.put(dx, hx.data(), hx.size() * 4);
+        k::native_quantize_q8_1(dx, dxq, sh.n_in, TMAX, &q);
+        q.wait_and_throw();
+        for (int T = 1; T <= TMAX; ++T) {
+            q.memset(dy, 0xff, 4 * ny * 4).wait();   // NaN fill: an output not written fails
+            k::native_mmvq_set_xe2_kq(0);
+            k::native_mmvq(8, dw1, dxq, dy, sh.n_in, sh.n_out, T, &q);
+            k::native_mmvq(8, dw2, dxq, dy + ny, sh.n_in, sh.n_out, T, &q);
+            k::native_mmvq_set_xe2_kq(16);
+            k::native_mmvq_xe2_kq_seen();
+            const bool took = k::native_mmvq_pair(8, dw1, dw2, dxq, dy + 2 * ny, dy + 3 * ny, sh.n_in, sh.n_out, T, &q);
+            const bool seen = (k::native_mmvq_xe2_kq_seen() & 16) != 0;
+            q.wait_and_throw();
+            std::vector<float> y(4 * ny);
+            dev.get(y.data(), dy, y.size() * 4);
+            const size_t n = (size_t) T * sh.n_out;
+            long long d1 = 0, d2 = 0, nf = 0;
+            for (size_t i = 0; i < n; ++i) {
+                if (!std::isfinite(y[i]) || !std::isfinite(y[ny + i])) ++nf;
+                d1 += std::memcmp(&y[i], &y[2 * ny + i], 4) != 0;
+                d2 += std::memcmp(&y[ny + i], &y[3 * ny + i], 4) != 0;
+            }
+            const bool ok = took && seen && nf == 0 && d1 == 0 && d2 == 0;
+            std::printf("Q8_0 pair %5d x %5d %2d  ran %d (wide kernel %d)  pair!=calls %lld %lld  nonfinite %lld  %s\n", sh.n_in,
+                        sh.n_out, T, took ? 1 : 0, seen ? 1 : 0, d1, d2, nf, ok ? "ok" : "FAIL");
+            if (!ok) ++bad;
+        }
+        k::native_mmvq_set_xe2_kq(-1);
+        sycl::free(dw1, q); sycl::free(dw2, q); sycl::free(dx, q); sycl::free(dxq, q); sycl::free(dy, q);
+    }
+    return bad;
+}
+
+// 8. STRATA_XE2_KQ part 8: a planar Q6_K matrix at 5-8 columns with the part on and off
+int planar_selftest() {
+    sycl::queue& q = dpct::get_in_order_queue();   // native_q6_k_planar_adopt allocates and frees on this queue
+    Dev dev{q};
+    const int n_in = 2560, n_out = 1501, TMAX = 8;
+    const size_t wbytes = k::native_mmvq_weight_bytes(14, n_in, n_out);
+    std::mt19937 rng(9001u);
+    std::vector<uint8_t> w(wbytes);
+    for (auto& b : w) b = (uint8_t) (rng() & 0xff);
+    for (size_t b = 0; b < wbytes / 210; ++b) {   // a Q6_K block keeps its fp16 scale at byte 208
+        const uint16_t h = sane_half(rng);
+        std::memcpy(&w[b * 210 + 208], &h, 2);
+    }
+    std::vector<float> hx((size_t) TMAX * n_in);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (auto& v : hx) v = nd(rng);
+    void* dw = dev.alloc(wbytes);
+    dev.put(dw, w.data(), wbytes);
+    void* pw = k::native_q6_k_planar_adopt(dw, n_in, n_out, "parity matrix");   // frees dw when it converts
+    if (!k::native_q6_k_is_planar(pw)) {
+        std::printf("Q6_K planar: the matrix was not converted (STRATA_Q6_PLANAR=0?): check 8 skipped\n");
+        sycl::free(pw, q);
+        return 0;
+    }
+    float* dx = (float*) dev.alloc(hx.size() * 4);
+    uint8_t* dxq = (uint8_t*) dev.alloc(k::native_q8_1_bytes(n_in, TMAX));
+    float* dy = (float*) dev.alloc((size_t) TMAX * n_out * 4);
+    dev.put(dx, hx.data(), hx.size() * 4);
+    k::native_quantize_q8_1(dx, dxq, n_in, TMAX, &q);
+    q.wait_and_throw();
+    int bad = 0;
+    for (int T = 5; T <= TMAX; ++T) {
+        const std::vector<float> y0 = run(dev, 14, pw, dxq, dy, n_in, n_out, T, 1, false, 0);
+        k::native_mmvq_xe2_kq_seen();
+        const std::vector<float> y1 = run(dev, 14, pw, dxq, dy, n_in, n_out, T, 1, false, 8);
+        const bool seen = (k::native_mmvq_xe2_kq_seen() & 8) != 0;
+        long long d = 0, nf = 0;
+        for (size_t i = 0; i < y0.size(); ++i) {
+            if (!std::isfinite(y0[i]) || !std::isfinite(y1[i])) ++nf;
+            d += std::memcmp(&y0[i], &y1[i], 4) != 0;
+        }
+        const bool ok = nf == 0 && d == 0 && seen == (T >= 6);
+        std::printf("Q6_K planar %5d x %5d %2d  256 registers %d  on!=off %lld  nonfinite %lld  %s\n", n_in, n_out, T,
+                    seen ? 1 : 0, d, nf, ok ? "ok" : "FAIL");
+        if (!ok) ++bad;
+    }
+    k::native_mmvq_set_kreg(-1);
+    k::native_mmvq_set_xe2_kq(-1);
+    k::native_q6_k_unpack(pw);
+    sycl::free(pw, q); sycl::free(dx, q); sycl::free(dxq, q); sycl::free(dy, q);
+    return bad;
+}
+
 int selftest() {
     sycl::queue q(sycl::gpu_selector_v, sycl::property::queue::in_order());
     Dev dev{q};
     std::printf("mmvq_kreg_parity on %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
-    std::printf("%-7s %5s x %5s %2s  %-11s %-11s %9s %9s %9s %s\n", "type", "n_in", "n_out", "T", "kreg/bound",
-                "dflt/bound", "kreg!=dflt", "multi!=1c", "nonfinite", "");
+    std::printf("%-7s %5s x %5s %2s  %-11s %-11s %9s %9s %9s %9s %s\n", "type", "n_in", "n_out", "T", "kreg/bound",
+                "dflt/bound", "kreg!=dflt", "multi!=1c", "xe2!=kreg", "nonfinite", "");
     int bad = 0;
+    int xe2_seen = 0;   // check 6: the STRATA_XE2_KQ parts some launch took
     for (const Format& f : FORMATS) {
         for (const Shape& sh : SHAPES) {
             const size_t wbytes = k::native_mmvq_weight_bytes(f.type, sh.n_in, sh.n_out);
@@ -242,24 +365,29 @@ int selftest() {
                 const std::vector<float> yk = run(dev, f.type, dw, dxq, dy, sh.n_in, sh.n_out, T, 1, false);
                 const std::vector<float> yd = run(dev, f.type, dw, dxq, dy, sh.n_in, sh.n_out, T, 0, false);
                 const std::vector<float> y1 = run(dev, f.type, dw, dxq, dy, sh.n_in, sh.n_out, T, 1, true);
+                k::native_mmvq_xe2_kq_seen();   // 6. the KREG call with STRATA_XE2_KQ=1 (the grid, the tile, the pair)
+                const std::vector<float> yx = run(dev, f.type, dw, dxq, dy, sh.n_in, sh.n_out, T, 1, false, 1);
+                xe2_seen |= k::native_mmvq_xe2_kq_seen();
                 double rk = 0, rd = 0;
-                long long kd = 0, md = 0, nf = 0;
+                long long kd = 0, md = 0, nf = 0, xd = 0;
                 for (int j = 0; j < T; ++j)
                     for (int r = 0; r < sh.n_out; ++r) {
                         const size_t i = (size_t) j * sh.n_out + r;
                         const double bnd = kBound * mag[i] + 1e-30;
-                        if (!std::isfinite(yk[i]) || !std::isfinite(yd[i]) || !std::isfinite(y1[i])) { ++nf; continue; }
+                        if (!std::isfinite(yk[i]) || !std::isfinite(yd[i]) || !std::isfinite(y1[i]) || !std::isfinite(yx[i])) { ++nf; continue; }
                         rk = std::max(rk, std::fabs(yk[i] - ref[i]) / bnd);
                         rd = std::max(rd, std::fabs(yd[i] - ref[i]) / bnd);
-                        uint32_t a, b, c;
+                        uint32_t a, b, c, e;
                         std::memcpy(&a, &yk[i], 4); std::memcpy(&b, &yd[i], 4); std::memcpy(&c, &y1[i], 4);
+                        std::memcpy(&e, &yx[i], 4);
                         kd += a != b;
                         md += a != c;
+                        xd += a != e;
                     }
                 case_diff += kd;
-                const bool ok = nf == 0 && rk <= 1.0 && rd <= 1.0 && md == 0;
-                std::printf("%-7s %5d x %5d %2d  %-11.3f %-11.3f %9lld %9lld %9lld %s\n", f.name, sh.n_in, sh.n_out, T,
-                            rk, rd, kd, md, nf, ok ? "ok" : "FAIL");
+                const bool ok = nf == 0 && rk <= 1.0 && rd <= 1.0 && md == 0 && xd == 0;
+                std::printf("%-7s %5d x %5d %2d  %-11.3f %-11.3f %9lld %9lld %9lld %9lld %s\n", f.name, sh.n_in, sh.n_out, T,
+                            rk, rd, kd, md, xd, nf, ok ? "ok" : "FAIL");
                 if (!ok) ++bad;
                 if (T == TMAX) {   // 5. power: row 0 against a reference with sub-block 0's scale one step off
                     std::vector<uint8_t> w2(w.begin(), w.begin() + wbytes / sh.n_out);
@@ -285,6 +413,17 @@ int selftest() {
         }
     }
     k::native_mmvq_set_kreg(-1);
+    k::native_mmvq_set_xe2_kq(-1);
+    if ((xe2_seen & 2) == 0) {
+        std::printf("STRATA_XE2_KQ: no KREG launch took the persistent grid: check 6 compared KREG with itself\n");
+        ++bad;
+    }
+    if ((xe2_seen & 4) == 0) {
+        std::printf("STRATA_XE2_KQ: no Q5_K launch took the 256-register tile: check 6 compared KREG with itself\n");
+        ++bad;
+    }
+    bad += pair_selftest(q);
+    bad += planar_selftest();
     std::printf("\nmmvq_kreg_parity: %d failures\n", bad);
     return bad;
 }
