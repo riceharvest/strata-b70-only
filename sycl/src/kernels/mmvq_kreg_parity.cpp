@@ -4,6 +4,7 @@
 //     mmvq_kreg_parity [--selftest]                      the checks below (ctest runs it with --selftest)
 //     mmvq_kreg_parity --bench [types] [ncols] [shape]   us per call, default kernels against KREG
 //                                                        (types=12,13,14,23 ncols=1,2,3,4,6 shape=all|qkv|...|head)
+//                                                        STRATA_KREG_BENCH_STRIP=1|2|3: IQ4_XS with work taken out (kst:: below)
 //
 // Everything goes through the public native_mmvq; native_mmvq_set_kreg switches the KREG kernels on and off (the
 // STRATA_MMVQ_KREG latch is not read). For Q4_K, Q5_K, Q6_K and IQ4_XS at 1-8 columns:
@@ -471,8 +472,301 @@ double time_graph(sycl::queue& q, int nmat, const std::function<void(int)>& laun
     return us[us.size() / 2];
 }
 
+// ---------------------------------------------------------------- --bench STRIP kernels (IQ4_XS)
+// STRATA_KREG_BENCH_STRIP (bench only): the IQ4_XS kernels the engine runs by default (STRATA_MMVQ_KREG=1) with work taken out,
+// to tell whether a call is limited by the weight reads or by the decode.  The kernel is chosen as native_mmvq.dp.cpp's
+// try_kreg<KregIQ4XS> chooses it (the bench's "kreg" column: native_mmvq_set_kreg(1)):
+//   try_kreg2 (1-4 columns here: the strip modes do not follow STRATA_KREG2_R's entries 5-8, those column counts are
+//   stripped as KREG; STRATA_KREG2=0 off; STRATA_KREG2_R="a,b,c,d" rows a tile per column count, default 2,4,4,4):
+//     k2_go: grid = max(1, 60 / nsg) * cores (cores = max_compute_units / 8), tiles = ceil(n_out / R);
+//     1 column takes KREG2 when tiles <= grid, 2-4 columns when tiles > grid; G = min(tiles, grid) work-groups,
+//     kreg2_iq4xs_kernel<NCOLS, R, PF = NCOLS > 1>;
+//   otherwise kreg_dispatch<KregIQ4XS, NCOLS>: native_mmvq_kreg_kernel with R = 8 at 1 column, 4 at 2-8, one work-group a tile.
+// Work-group = L = ceil(n_in / 256 * 8 / 16) * 16 work-items (sub-group size 16), the same nd_range and the same local allocation
+// (2 * nsg * P + the codebook words, as the real launches) as the real launch of the same kernel.  Every work-item loads what the
+// real kernel's lane loads, in the order of the real kernel: weights per row three 8-byte loads (block header, then the two
+// halves of the 16 qs bytes of sub-block g), activations per column two 16-byte vector loads and the fp16 scale of Q8_1 block g.
+//   STRIP=3 weight reads only: the weight loads of every tile (KREG2: with its prefetch order), xor-folded; no activation loads,
+//           no codebook fill, no barrier.
+//   STRIP=1 reads only: STRIP=3 plus the activation loads and the codebook fill and its barrier (the real kernels' fixed
+//           per-work-group part, as kqs keeps its tables in STRIP=1); one table word is folded; no lookups, no dp4a, no products.
+//   STRIP=2 reads + decode, no products: STRIP=1 plus the real weight decode (the table lookups, the lo / hi recombination of
+//           KREG, the two-table form of KREG2, the sub-block scale and the fp16 block scale as float), the decoded words
+//           summed instead of dp4a with the activations.  The activation permute of KREG2 is not done (activation work).
+// Dropped in every variant: the dot products, the 16-lane transposed butterfly, the SLM partial sums with their barrier per tile
+// and the output stores.  A work-item's value is xor-folded over the sub-group and stored once (lane 0, one word a sub-group), so
+// every load stays live.  Its stores are a few words a work-group against the real kernel's n_out * ncols floats.
+namespace kst {
+
+constexpr int kSg = 16;      // = KREG_SG
+constexpr int kIqBlk = 136;  // IQ4XSBlock: half d, u16 scales_h, u8 scales_l[4], u8 qs[128]
+constexpr int kQ81 = 36;     // Q81Block: half2 ds, int8 qs[32]
+
+struct Raw { sycl::int2 hdr, qa, qb; };   // = K2Raw: the block's 8 header bytes, the 16 qs bytes of sub-block g as two 8-byte loads
+
+__dpct_inline__ sycl::int4 ld_i4_a4(const int* p) {   // = ld_i4_a4: a 16-byte vector load of a 4-byte aligned address
+    sycl::int4 v;
+    v.load(0, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(p));
+    return v;
+}
+__dpct_inline__ uint32_t k2_code(int n) {   // = k2_code: kIq4nlTable[n] as a byte, from registers
+    const uint32_t w0 = 0xBFAD9881u, w1 = 0xF6EADDCFu, w2 = 0x26190D01u, w3 = 0x71594535u;
+    const uint32_t wd = n < 8 ? (n < 4 ? w0 : w1) : (n < 12 ? w2 : w3);
+    return (wd >> (8 * (n & 3))) & 0xFFu;
+}
+__dpct_inline__ uint32_t table_kreg(int i) {   // = KregIQ4XS::table_entry
+    return (uint32_t) (uint8_t) kIq4nl[i & 15] | ((uint32_t) (uint8_t) kIq4nl[i >> 4] << 16);
+}
+__dpct_inline__ uint32_t lanes_xor(const sycl::sub_group& sg, uint32_t v) {   // a 16-lane xor butterfly
+#pragma unroll
+    for (int o = kSg / 2; o > 0; o >>= 1) v ^= sycl::permute_group_by_xor(sg, v, o);
+    return v;
+}
+// = F::act per column: Q8_1 block kb * 8 + g of column j (36 bytes: ds at 0, 32 quants at 4), its two 16-byte halves and its fp16 scale
+template <int NC>
+__dpct_inline__ uint32_t act_fold(const uint8_t* x, int x_stride, int kb, int g, bool live) {
+    uint32_t a = 0u;
+#pragma unroll
+    for (int j = 0; j < NC; ++j) {
+        const uint8_t* xb = x + ((size_t) j * x_stride + (size_t) kb * 8 + g) * kQ81;
+        const int* q = reinterpret_cast<const int*>(xb + 4);
+        const sycl::int4 u0 = ld_i4_a4(q), u1 = ld_i4_a4(q + 4);
+        const uint32_t ds = (uint32_t) *reinterpret_cast<const uint16_t*>(xb);
+        const uint32_t v = (uint32_t) (u0.x() ^ u0.y() ^ u0.z() ^ u0.w() ^ u1.x() ^ u1.y() ^ u1.z() ^ u1.w()) ^ ds;
+        a ^= live ? v : 0u;
+    }
+    return a;
+}
+// = k2_load_tile: the raw words of the R rows of tile t for this lane (a row past n_out repeats the last row)
+template <int R>
+__dpct_inline__ void load_tile(Raw (&raw)[R], const uint8_t* w, int t, int bpr, int kb, int g, int n_out) {
+    const int row0 = t * R;
+    const uint8_t* wt = w + ((size_t) row0 * bpr + kb) * kIqBlk;
+    const int rlast = n_out - 1 - row0;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const uint8_t* b = wt + (size_t) (r < rlast ? r : rlast) * bpr * kIqBlk;
+        raw[r].hdr = *reinterpret_cast<const sycl::int2*>(b);
+        const sycl::int2* q2 = reinterpret_cast<const sycl::int2*>(b + 8 + 16 * g);
+        raw[r].qa = q2[0];
+        raw[r].qb = q2[1];
+    }
+}
+__dpct_inline__ uint32_t fold_raw(const Raw& r) {
+    return (uint32_t) (r.hdr.x() ^ r.hdr.y() ^ r.qa.x() ^ r.qa.y() ^ r.qb.x() ^ r.qb.y());
+}
+// STRIP=2: KregIQ4XS::load (K2 false: one table, the P / Q recombination) or k2_decode (K2 true: the table and the table << 8),
+// without the dp4a; the eight decoded words, the sub-block scale and the block scale as float are summed
+template <bool K2>
+__dpct_inline__ uint32_t decode_sum(const Raw& r, int g, const uint32_t* tl) {
+    const uint32_t v[4] = {(uint32_t) r.qa.x(), (uint32_t) r.qa.y(), (uint32_t) r.qb.x(), (uint32_t) r.qb.y()};
+    uint32_t acc = 0u;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        uint32_t lo, hi;
+        if constexpr (K2) {
+            const uint32_t* tb = tl + 256;
+            lo = tl[v[i] & 0xFF] | tb[(v[i] >> 8) & 0xFF];
+            hi = tl[(v[i] >> 16) & 0xFF] | tb[v[i] >> 24];
+        } else {
+            const uint32_t P = tl[v[i] & 0xFF] | (tl[(v[i] >> 8) & 0xFF] << 8);
+            const uint32_t Q = tl[(v[i] >> 16) & 0xFF] | (tl[v[i] >> 24] << 8);
+            lo = (P & 0xFFFFu) | (Q << 16);
+            hi = (P >> 16) | (Q & 0xFFFF0000u);
+        }
+        acc += lo;
+        acc += hi;
+    }
+    const uint32_t h0 = (uint32_t) r.hdr.x(), sl = (uint32_t) r.hdr.y();
+    const int ls = (int) (((sl >> (8 * (g >> 1) + 4 * (g & 1))) & 0x0f) | (((h0 >> (16 + 2 * g)) & 0x03) << 4));
+    const float d = (float) sycl::bit_cast<sycl::half>((uint16_t) (h0 & 0xFFFF)) * (float) (ls - 32);
+    return acc + sycl::bit_cast<uint32_t>(d);
+}
+
+// native_mmvq_kreg_kernel<KregIQ4XS, NC, R>: activations, then the codebook table (SLM fill, barrier), then the tile loop
+// (one iteration where the grid is one work-group a tile).  slm: 2 * nsg * P + 256 floats (the table after the reduction buffers).
+template <int MODE, int NC, int R>
+__dpct_inline__ void kreg_strip_kernel(sycl::nd_item<1> it, const uint8_t* __restrict__ w, const uint8_t* __restrict__ x,
+                                       uint32_t* __restrict__ sink, int n_in, int n_out, float* __restrict__ slm) {
+    const sycl::sub_group sg = it.get_sub_group();
+    constexpr int P = (R * NC + kSg - 1) / kSg * kSg;
+    const int lid = int(it.get_local_id(0)), lane = int(sg.get_local_linear_id()), sgi = lid / kSg;
+    const int L = int(it.get_local_range(0)), nsg = L / kSg;
+    const int bpr = n_in / 256;
+    [[maybe_unused]] const int x_stride = n_in / 32;
+    const bool live = (lid >> 3) < bpr;
+    const int kb = live ? (lid >> 3) : 0, g = lid & 7;
+    uint32_t af = 0u, tseed = 0u;
+    [[maybe_unused]] uint32_t* tw = reinterpret_cast<uint32_t*>(slm + 2 * nsg * P);
+    if constexpr (MODE != 3) {
+        af = act_fold<NC>(x, x_stride, kb, g, live);
+        for (int i = lid; i < 256; i += L) tw[i] = table_kreg(i);
+        it.barrier(sycl::access::fence_space::local_space);
+        tseed = tw[lid & 255];
+    }
+    const int ntiles = (n_out + R - 1) / R;
+    uint32_t s = 0u;
+    for (int t = int(it.get_group(0)); t < ntiles; t += int(it.get_group_range(0))) {
+        Raw raw[R];
+        load_tile<R>(raw, w, t, bpr, kb, g, n_out);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if constexpr (MODE == 2) s += decode_sum<false>(raw[r], g, tw);
+            else s ^= fold_raw(raw[r]);
+        }
+    }
+    s ^= af ^ tseed;
+    slm[lid] = sycl::bit_cast<float>(s);   // keeps the reduction buffers' part of the local allocation in the kernel (2 * nsg * P >= L)
+    s = lanes_xor(sg, s);
+    if (lane == 0) sink[(size_t) it.get_group(0) * nsg + sgi] = s;
+}
+
+// kreg2_iq4xs_kernel<NC, R, PF>: the first tile's weight loads, then the activations, then the table (computed from constants:
+// no loads; the table and the table << 8) and the barrier, then the persistent tile loop with the next tile's loads in flight
+// (PF, 2-4 columns) while this one is folded.  slm: 2 * nsg * P + 512 floats.
+template <int MODE, int NC, int R, bool PF>
+__dpct_inline__ void kreg2_strip_kernel(sycl::nd_item<1> it, const uint8_t* __restrict__ w, const uint8_t* __restrict__ x,
+                                        uint32_t* __restrict__ sink, int n_in, int n_out, float* __restrict__ slm) {
+    const sycl::sub_group sg = it.get_sub_group();
+    constexpr int P = (R * NC + kSg - 1) / kSg * kSg;
+    const int lid = int(it.get_local_id(0)), lane = int(sg.get_local_linear_id()), sgi = lid / kSg;
+    const int L = int(it.get_local_range(0)), nsg = L / kSg;
+    const int bpr = n_in / 256;
+    [[maybe_unused]] const int x_stride = n_in / 32;
+    const bool live = (lid >> 3) < bpr;
+    const int kb = live ? (lid >> 3) : 0, g = lid & 7;
+    const int ntiles = (n_out + R - 1) / R, G = int(it.get_group_range(0));
+    int t = int(it.get_group(0));   // < ntiles: the grid never exceeds the tiles
+    Raw cur[R];
+    load_tile<R>(cur, w, t, bpr, kb, g, n_out);
+    uint32_t af = 0u, tseed = 0u;
+    [[maybe_unused]] uint32_t* tw = reinterpret_cast<uint32_t*>(slm + 2 * nsg * P);
+    if constexpr (MODE != 3) {
+        af = act_fold<NC>(x, x_stride, kb, g, live);
+        for (int i = lid; i < 256; i += L) {
+            const uint32_t te = k2_code(i & 15) | (k2_code(i >> 4) << 16);
+            tw[i] = te;
+            tw[256 + i] = te << 8;
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+        tseed = tw[lid & 255];
+    }
+    uint32_t s = 0u;
+    for (; t < ntiles; t += G) {
+        const int tn = t + G;
+        Raw nxt[R];
+        if constexpr (PF) load_tile<R>(nxt, w, tn < ntiles ? tn : t, bpr, kb, g, n_out);   // (the real kernel's last prefetch repeats tile t)
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if constexpr (MODE == 2) s += decode_sum<true>(cur[r], g, tw);
+            else s ^= fold_raw(cur[r]);
+        }
+        if constexpr (PF) {
+#pragma unroll
+            for (int r = 0; r < R; ++r) cur[r] = nxt[r];
+        } else if (tn < ntiles) {
+            load_tile<R>(cur, w, tn, bpr, kb, g, n_out);
+        }
+    }
+    s ^= af ^ tseed;
+    slm[lid] = sycl::bit_cast<float>(s);
+    s = lanes_xor(sg, s);
+    if (lane == 0) sink[(size_t) it.get_group(0) * nsg + sgi] = s;
+}
+
+struct Plan {
+    bool k2;       // KREG2 (else KREG)
+    int R, groups, L, nsg, grid;
+};
+// try_kreg2 / k2_go / kreg_dispatch for IQ4_XS: which kernel, rows a tile, work-groups
+Plan make_plan(int nc, int n_in, int n_out, int cores, bool k2_on, const int (&kr)[5]) {
+    Plan p;
+    p.L = ((n_in / 256) * 8 + kSg - 1) / kSg * kSg;
+    p.nsg = p.L / kSg;
+    p.grid = std::max(1, 60 / p.nsg) * cores;   // 60 threads per Xe core
+    p.k2 = false;
+    p.R = nc == 1 ? 8 : 4;
+    p.groups = (n_out + p.R - 1) / p.R;
+    if (k2_on && nc >= 1 && nc <= 4) {
+        const int R = kr[nc], tiles = (n_out + R - 1) / R;
+        if (!(nc == 1 ? tiles > p.grid : tiles <= p.grid)) {
+            p.k2 = true;
+            p.R = R;
+            p.groups = tiles < p.grid ? tiles : p.grid;
+        }
+    }
+    return p;
+}
+
+template <int MODE, int NC, int R, bool K2>
+void launch_one(sycl::queue& q, const Plan& p, const uint8_t* w, const uint8_t* x, uint32_t* sink, int n_in, int n_out) {
+    constexpr int P = (R * NC + kSg - 1) / kSg * kSg;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> slm(sycl::range<1>((size_t) (2 * p.nsg * P + (K2 ? 512 : 256))), h);
+        const sycl::nd_range<1> nr(std::size_t(p.groups) * p.L, p.L);
+        h.parallel_for(nr, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            float* sp = slm.get_multi_ptr<sycl::access::decorated::no>().get();
+            if constexpr (K2) kreg2_strip_kernel<MODE, NC, R, (NC > 1)>(it, w, x, sink, n_in, n_out, sp);
+            else kreg_strip_kernel<MODE, NC, R>(it, w, x, sink, n_in, n_out, sp);
+        });
+    });
+}
+template <int MODE, int NC>
+void launch_nc(sycl::queue& q, const Plan& p, const uint8_t* w, const uint8_t* x, uint32_t* sink, int n_in, int n_out) {
+    if constexpr (NC <= 4) {
+        if (p.k2) {
+            if (p.R == 2) launch_one<MODE, NC, 2, true>(q, p, w, x, sink, n_in, n_out);
+            else launch_one<MODE, NC, 4, true>(q, p, w, x, sink, n_in, n_out);
+            return;
+        }
+    }
+    if constexpr (NC == 1) launch_one<MODE, 1, 8, false>(q, p, w, x, sink, n_in, n_out);
+    else launch_one<MODE, NC, 4, false>(q, p, w, x, sink, n_in, n_out);
+}
+template <int MODE>
+void launch_mode(int nc, sycl::queue& q, const Plan& p, const uint8_t* w, const uint8_t* x, uint32_t* sink, int n_in, int n_out) {
+    switch (nc) {
+        case 1: launch_nc<MODE, 1>(q, p, w, x, sink, n_in, n_out); break;
+        case 2: launch_nc<MODE, 2>(q, p, w, x, sink, n_in, n_out); break;
+        case 3: launch_nc<MODE, 3>(q, p, w, x, sink, n_in, n_out); break;
+        case 4: launch_nc<MODE, 4>(q, p, w, x, sink, n_in, n_out); break;
+        case 5: launch_nc<MODE, 5>(q, p, w, x, sink, n_in, n_out); break;
+        case 6: launch_nc<MODE, 6>(q, p, w, x, sink, n_in, n_out); break;
+        case 7: launch_nc<MODE, 7>(q, p, w, x, sink, n_in, n_out); break;
+        default: launch_nc<MODE, 8>(q, p, w, x, sink, n_in, n_out); break;
+    }
+}
+void call(int mode, int nc, sycl::queue& q, const Plan& p, const uint8_t* w, const uint8_t* x, uint32_t* sink, int n_in, int n_out) {
+    if (mode == 1) launch_mode<1>(nc, q, p, w, x, sink, n_in, n_out);
+    else if (mode == 2) launch_mode<2>(nc, q, p, w, x, sink, n_in, n_out);
+    else launch_mode<3>(nc, q, p, w, x, sink, n_in, n_out);
+}
+
+}  // namespace kst
+
 int bench(const char* types_s, const char* ncols_s, const std::string& ssel) {
     const std::vector<int> types = parse_list(types_s), ncl = parse_list(ncols_s);
+    // STRATA_KREG_BENCH_STRIP=1|2|3 (unset or 0: the real kernels, as always): the stripped IQ4_XS kernels (kst::) in place of the
+    // "kreg" column's native_mmvq call; the "default" column (the pre-KREG kernels) is not run and prints "-".  Other types print a skip line.
+    const int strip = std::getenv("STRATA_KREG_BENCH_STRIP") && *std::getenv("STRATA_KREG_BENCH_STRIP") ? std::atoi(std::getenv("STRATA_KREG_BENCH_STRIP")) : 0;
+    if (strip < 0 || strip > 3) { std::fprintf(stderr, "--bench: STRATA_KREG_BENCH_STRIP must be 0, 1, 2 or 3\n"); std::exit(2); }
+    if (strip != 0 && std::getenv("STRATA_BENCH_AB")) { std::fprintf(stderr, "--bench: STRATA_KREG_BENCH_STRIP and STRATA_BENCH_AB do not combine\n"); std::exit(2); }
+    // the kernel choice of try_kreg2 at 1-4 columns (read as kreg2_cfg reads it): STRATA_KREG2=0 off, STRATA_KREG2_R="a,b,c,d"
+    // rows a tile (2 or 4).  Entries 5-8 are not read: a strip run at 5-8 columns is the KREG kernel's.
+    bool k2_on = true;
+    int k2_r[5] = {0, 2, 4, 4, 4};
+    if (strip != 0) {
+        const char* e = std::getenv("STRATA_KREG2");
+        k2_on = !(e && e[0] == '0');
+        if (const char* rl = std::getenv("STRATA_KREG2_R")) {
+            for (int i = 1; i <= 4 && *rl; ++i) {
+                const int v = std::atoi(rl);
+                if (v == 2 || v == 4) k2_r[i] = v;
+                while (*rl && *rl != ',') ++rl;
+                if (*rl == ',') ++rl;
+            }
+        }
+    }
     const size_t POOL = (size_t) 640 << 20;
     sycl::queue q(sycl::gpu_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()});
     struct BShape { int n_in, n_out; const char* name; };
@@ -492,9 +786,22 @@ int bench(const char* types_s, const char* ncols_s, const std::string& ssel) {
     void* xq = sycl::malloc_device(k::native_q8_1_bytes(6144, maxc) + 256, q);
     std::printf("mmvq_kreg_parity --bench on %s: us per call (median), GB/s of weight bytes\n",
                 q.get_device().get_info<sycl::info::device::name>().c_str());
+    const int cores = std::max(1, int(q.get_device().get_info<sycl::info::device::max_compute_units>()) / 8);   // k2_go's count
+    if (strip != 0) {
+        const char* what[] = {"", "reads only: weight and activation loads and the codebook fill + barrier, no lookups / decode / dp4a",
+                              "reads + decode, no products: weight words decoded (lookups, scales) and summed, activations loaded",
+                              "weight reads only: no activation loads, no codebook, no barrier"};
+        std::printf("--bench: STRIP=%d (%s); IQ4_XS only; mirrors the engine's path (native_mmvq_set_kreg(1): KREG2 where try_kreg2 takes it, else KREG)\n",
+                    strip, what[strip]);
+        std::printf("--bench: STRIP=%d: no dot products, reduction or output stores, a few words a work-group are stored instead; "
+                    "outputs are not results; compare with the kreg column of the same run without the switch\n", strip);
+        std::printf("--bench: STRIP=%d: KREG2 %s, R per column count %d,%d,%d,%d, %d cores; each line ends with the kernel mirrored and the weight bytes a call reads\n",
+                    strip, k2_on ? "on" : "off (STRATA_KREG2=0)", k2_r[1], k2_r[2], k2_r[3], k2_r[4], cores);
+    }
     for (const int t : types) {
         const Format* f = format_of(t);
         if (!f) { std::printf("type %d: not a KREG format (12, 13, 14, 23)\n", t); continue; }
+        if (strip != 0 && t != 23) { std::printf("type %d: STRIP=%d skipped (IQ4_XS only)\n", t, strip); continue; }
         fill_pool(*f, hpool);
         q.memcpy(dpool, hpool.data(), POOL).wait();
         for (const BShape& sh : shapes) {
@@ -517,6 +824,21 @@ int bench(const char* types_s, const char* ncols_s, const std::string& ssel) {
                     std::printf("%-6s %-6s %5d x %6d nc %d  kreg %8.2f %8.2f us %5.1f GB/s  kreg2 %8.2f %8.2f us %5.1f GB/s  x%.3f\n",
                                 f->name, sh.name, sh.n_in, sh.n_out, nc, a0, a1, 2 * wb / (a0 + a1) / 1e3, b0, b1,
                                 2 * wb / (b0 + b1) / 1e3, (a0 + a1) / (b0 + b1));
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (strip != 0) {   // the stripped kernel in the kreg column; the default column is not run
+                    const kst::Plan pl = kst::make_plan(nc, sh.n_in, sh.n_out, cores, k2_on, k2_r);
+                    if ((size_t) pl.groups * pl.nsg > (size_t) maxc * maxout) {
+                        std::fprintf(stderr, "--bench STRIP: %d work-groups of %d sub-groups do not fit the sink\n", pl.groups, pl.nsg);
+                        std::exit(2);
+                    }
+                    const double us1 = time_graph(q, nmat, [&](int m) {
+                        kst::call(strip, nc, q, pl, dpool + (size_t) (m % ndist) * slot, (const uint8_t*) xq, (uint32_t*) y, sh.n_in, sh.n_out);
+                    }, wb > (100u << 20) ? 7 : 11);
+                    std::printf("%-6s %-6s %5d x %6d nc %d  default %8s us %5s GB/s  kreg %8.2f us %5.1f GB/s  x%s  strip %d %s R%d groups %d wbytes %zu\n",
+                                f->name, sh.name, sh.n_in, sh.n_out, nc, "-", "-", us1, wb / us1 / 1e3, "-", strip,
+                                pl.k2 ? "kreg2" : "kreg", pl.R, pl.groups, wb);
                     std::fflush(stdout);
                     continue;
                 }

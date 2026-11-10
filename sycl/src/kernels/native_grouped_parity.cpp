@@ -26,6 +26,7 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace strata::kernels {
@@ -679,12 +680,436 @@ void bench(dpct::queue_ptr s, std::mt19937 &rng) {
     dpct::destroy_event(e1);
 }
 
+// ------------------------------------------------------------------------------------------------ --kqbench STRIP kernels
+// STRATA_KQBENCH_STRIP (bench only): the default B70 expert kernels for IQ2_XXS / IQ2_S gate/up and Q2_0 down with work taken
+// out, to tell whether the call is limited by the weight reads or by the decode.  Same nd_range / work-group size / rows per
+// lane / lanes per row / sub-group size, same weight and activation load addresses and widths, in the order of the real kernels:
+//   gate/up: native_gu_kernel_fast<16 or 22, 8, 2, true, false> with rows_dot_fast (launch_gu_fast), iq_kernels.dp.cpp;
+//   down:    native_down_kernel_dt<2> with rows_dot_dt (launch_down_fast), iq_kernels.dp.cpp.
+// That is the engine's default path: STRATA_IQ_DECODE_FAST on, STRATA_IQ_GRID on, STRATA_IQ_DT on, STRATA_XE2_IQ off, 8 lanes a
+// row (kqs::check_env refuses a run where an environment switch makes the real call another kernel).  STRATA_IQ_SGNMUL is a
+// compile-time macro of iq_kernels.dp.cpp: its default (1) is assumed here.  The values these kernels store are not results.
+//   STRIP=1 reads only: the weight words as loaded (and the fp16 block scale), the activation words as loaded (gate/up: the
+//           9 loads per entry and step of acts8; down: the staged words through SLM), xor-folded; no codebook lookups, no sign
+//           masks, no dp4a, no finish.  The gate/up work-groups still stage their codebook tables into SLM and hit the barrier
+//           (a fixed per-work-group cost of the real kernel; one SLM word is folded into the stored value).
+//   STRIP=2 reads + decode, no rows: STRIP=1 plus the real decode of each weight part (codebook lookup, sign masks, scales,
+//           block scale as float), the decoded words summed into one running value instead of dp4a with the activations.
+//           The activation transpose of the down kernel's staging is not done (it is activation work, not weight decode).
+//   STRIP=3 (extra) weight reads only: as 1 without any activation load (gate/up) and without the down kernel's activation
+//           staging, its barriers and its SLM reads.
+// A work-item's value goes through the same 8-lane xor reduction as lanes_sum and is stored where the real kernel stores its
+// float (the lane with sub == 0), so every lane's loads stay live.
+namespace kqs {
+
+constexpr int kDtEnt = 8, kDtW = 10, kDtMaxHb = 32;   // as native_down_kernel_dt: staged entries, words per staged q8_1 block, n_ff / 32 at most
+
+__dpct_inline__ sycl::int2 load8_a2(const uint8_t* p) {   // = iq_kernels.dp.cpp's load8_a2: 8 bytes at a 2-byte-aligned address, as two ints
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    const uint32_t* q = reinterpret_cast<const uint32_t*>(a & ~uintptr_t(3));
+    const uint32_t w0 = q[0], w1 = q[1];
+    if (!(a & 2)) return sycl::int2((int) w0, (int) w1);
+    const uint32_t w2 = q[2];
+    return sycl::int2((int) ((w0 >> 16) | (w1 << 16)), (int) ((w1 >> 16) | (w2 << 16)));
+}
+__dpct_inline__ int load4_a2(const uint8_t* p) {   // = load4_a2: 4 bytes at a 2-byte-aligned address
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    const uint32_t* q = reinterpret_cast<const uint32_t*>(a & ~uintptr_t(3));
+    const uint32_t w0 = q[0];
+    if (!(a & 2)) return (int) w0;
+    return (int) ((w0 >> 16) | (q[1] << 16));
+}
+__dpct_inline__ uint32_t sgn01(uint32_t n) { return (n * 0x00204081u) & 0x01010101u; }   // = iq_fast::sgn01
+__dpct_inline__ int sgn(uint32_t g, uint32_t m, uint32_t m1) { return (int) ((g ^ m) + m1); }   // = iq_fast::sgn
+template <int LANES>
+__dpct_inline__ uint32_t lanes_xor(uint32_t v) {   // lanes_sum's butterfly on words
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+#pragma unroll
+    for (int o = LANES / 2; o > 0; o >>= 1)
+        v ^= sycl::permute_group_by_xor(sg, v, o);
+    return v;
+}
+
+// rows_dot_fast<TG, 8, R, E, true, false>: lane `sub` takes part iqs = 2 * (sub % 8) of block sub / 8, + 1, ... of the R rows
+// (nb = 10 blocks: 10 steps), E entries.  Block bytes: IQ2_XXS 66 (d, 32 x uint16), IQ2_S 82 (d, qs 64, qh 8, scales 8).
+// A q8_1 block is 36 bytes: ds (fp16 pair) at 0, 32 quants at 4.
+template <int TG, bool ACT, bool DEC, int R, int E>
+__dpct_inline__ void gu_rows(const uint8_t* const* rows, const uint8_t* const* xs, int nb, int sub, uint32_t (&out)[R][E], const uint64_t* tab) {
+    constexpr int LANES = 8, IPB = 8, STEP = 2, KSTEP = LANES / IPB, XB = 8, BS = TG == 22 ? 82 : 66;
+    const int iqs = STEP * (sub % IPB);
+    const int kb0 = sub / IPB;
+    uint32_t s[R][E];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int e = 0; e < E; ++e) s[r][e] = 0u;
+    const uint8_t* wp[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) wp[r] = rows[r] + (size_t) kb0 * BS;
+    const uint8_t* xp[E];
+#pragma unroll
+    for (int e = 0; e < E; ++e) xp[e] = xs[e] + (size_t) kb0 * XB * 36;
+    for (int kbx = kb0; kbx < nb; kbx += KSTEP) {
+        uint32_t af[E];
+#pragma unroll
+        for (int e = 0; e < E; ++e) af[e] = 0u;
+        if constexpr (ACT) {   // acts8: block y[iqs / 2], 8 int loads and the fp16 scale
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                const uint8_t* y = xp[e] + (size_t) (iqs / 2) * 36;
+                const int* q = reinterpret_cast<const int*>(y + 4);
+                uint32_t a = (uint32_t) *reinterpret_cast<const uint16_t*>(y);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) a ^= (uint32_t) q[j];
+                af[e] = a;
+                xp[e] += (size_t) KSTEP * XB * 36;
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const uint8_t* blk = wp[r];
+            wp[r] += (size_t) KSTEP * BS;
+            const uint16_t dh = *reinterpret_cast<const uint16_t*>(blk);   // the block's fp16 scale
+            uint32_t wf;
+            if constexpr (TG == 16) {   // IqFast<16>::prep_t<true>: q2 | aux32 as one load8_a2, 4 codebook words, 4 ksigns masks
+                const sycl::int2 qq = load8_a2(blk + 2 + 4 * iqs);
+                if constexpr (!DEC) {
+                    wf = (uint32_t) qq.x() ^ (uint32_t) qq.y() ^ (uint32_t) dh;
+                } else {
+                    const uint32_t q2 = (uint32_t) qq.x(), aux32 = (uint32_t) qq.y();
+                    uint32_t w = 0u;
+#pragma unroll
+                    for (int kk = 0; kk < 4; ++kk) {
+                        const uint64_t v = tab[(q2 >> (8 * kk)) & 0xFF];
+                        const sycl::uint4 sm = reinterpret_cast<const sycl::uint4*>(tab + 256)[(aux32 >> (7 * kk)) & 0x7F];
+                        w += (uint32_t) sgn((uint32_t) v, sm.x(), sm.z()) + (uint32_t) sgn((uint32_t) (v >> 32), sm.y(), sm.w());
+                    }
+                    const uint32_t a = (aux32 >> 27) | 1u;
+                    wf = w ^ a ^ sycl::bit_cast<uint32_t>(static_cast<float>(sycl::bit_cast<sycl::half>(dh)));
+                }
+            } else {   // IqFast<22>::prep_t<true>: qs and the sign bytes as two load4_a2, qh and scales as byte loads
+                const uint32_t qs = (uint32_t) load4_a2(blk + 2 + 4 * (iqs / 2));
+                const uint32_t sp = (uint32_t) load4_a2(blk + 2 + 4 * (8 + iqs / 2));
+                const uint32_t qh = (uint32_t) blk[66 + iqs / 2];
+                const uint32_t sc = (uint32_t) blk[74 + iqs / 2];
+                if constexpr (!DEC) {
+                    wf = qs ^ sp ^ (qh << 8) ^ (sc << 16) ^ (uint32_t) dh;
+                } else {
+                    uint32_t w = 0u;
+#pragma unroll
+                    for (int kk = 0; kk < 4; ++kk) {
+                        const uint32_t gi = ((qs >> (8 * kk)) & 0xFF) | ((qh << (8 - 2 * kk)) & 0x300);
+                        const uint64_t v = tab[gi];
+                        const uint32_t t0 = sgn01((sp >> (8 * kk)) & 0x0F), t1 = sgn01((sp >> (8 * kk + 4)) & 0x0F);
+                        w += (uint32_t) sgn((uint32_t) v, t0 * 0xFFu, t0) + (uint32_t) sgn((uint32_t) (v >> 32), t1 * 0xFFu, t1);
+                    }
+                    wf = w ^ (sc & 0x0F) ^ (sc >> 4) ^ sycl::bit_cast<uint32_t>(static_cast<float>(sycl::bit_cast<sycl::half>(dh)));
+                }
+            }
+#pragma unroll
+            for (int e = 0; e < E; ++e) s[r][e] += wf ^ af[e];
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int e = 0; e < E; ++e) out[r][e] = lanes_xor<LANES>(s[r][e]);
+}
+
+// native_gu_kernel_fast<TG, 8, 2, true, false>: 256 work-items = 32 rows x 8 lanes, 2 rows a lane (64 rows a work-group),
+// entries in passes of 4, 2, 1; the codebook tables in SLM first (tab_src: TN words, IQ2_S 1024, IQ2_XXS 256 codebook + 256 masks)
+template <int TG, bool ACT, bool DEC>
+__dpct_inline__ void gu_kernel(sycl::nd_item<3> item, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                               const int32_t* n_groups, const int32_t* ent_tok, const uint8_t* xq, int n_embd, int n_ff,
+                               size_t gu_row, size_t up_off, float* gate, float* up, const uint64_t* tab_src) {
+    constexpr int LN = 8, RPL = 2, RB = 256 / LN, TN = TG == 22 ? 1024 : 512;
+    const int ng = *n_groups;
+    if ((int) item.get_group(1) >= ng) return;   // (uniform over the work-group)
+    auto& sg4 = *sycl::ext::oneapi::group_local_memory_for_overwrite<sycl::uint4[TN / 2]>(item.get_group());
+    uint64_t* sg = reinterpret_cast<uint64_t*>(&sg4[0]);
+    {
+        const int t = (int) item.get_local_id(2), nt = (int) item.get_local_range(2);
+        for (int i = t; i < TN; i += nt) sg[i] = tab_src[i];
+        item.barrier(sycl::access::fence_space::local_space);
+    }
+    const uint64_t* tab = sg;
+    const int lid = (int) item.get_local_id(2);
+    const uint32_t tseed = (uint32_t) tab[lid];   // keeps the staged tables live in every variant
+    const int rib = lid / LN, sub = lid % LN;
+    const int row0 = (int) item.get_group(2) * RB * RPL + rib;
+    const int nrows = 2 * n_ff;
+    if (row0 >= nrows) return;
+    const int nb = n_embd / 256, xb = n_embd / 32;
+    size_t off[RPL];
+    float* dst[RPL];
+    bool live[RPL];
+#pragma unroll
+    for (int i = 0; i < RPL; ++i) {
+        const int v = row0 + i * RB;
+        live[i] = v < nrows;
+        const int vv = live[i] ? v : row0;
+        const bool is_up = vv >= n_ff;
+        const int r = is_up ? vv - n_ff : vv;
+        off[i] = (is_up ? up_off : (size_t) 0) + (size_t) r * gu_row;
+        dst[i] = (is_up ? up : gate) + r;
+    }
+    for (int g = (int) item.get_group(1); g < ng; g += (int) item.get_group_range(1)) {
+        const uint8_t* base = (const uint8_t*) grp_ptr[g];
+        const uint8_t* rows[RPL];
+#pragma unroll
+        for (int i = 0; i < RPL; ++i) rows[i] = base + off[i];
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        int e = e0;
+        auto pass = [&](auto ec) {
+            constexpr int EC = decltype(ec)::value;
+            const uint8_t* xs[EC];
+#pragma unroll
+            for (int j = 0; j < EC; ++j) xs[j] = xq + (size_t) ent_tok[e + j] * (size_t) xb * 36;
+            uint32_t o[RPL][EC];
+            gu_rows<TG, ACT, DEC, RPL, EC>(rows, xs, nb, sub, o, tab);
+            if (sub == 0)
+#pragma unroll
+                for (int i = 0; i < RPL; ++i)
+                    if (live[i])
+#pragma unroll
+                        for (int j = 0; j < EC; ++j) dst[i][(size_t) (e + j) * n_ff] = sycl::bit_cast<float>(o[i][j] ^ tseed);
+            e += EC;
+        };
+        for (; e + 4 <= e1;) pass(std::integral_constant<int, 4>{});
+        if (e + 2 <= e1) pass(std::integral_constant<int, 2>{});
+        if (e < e1) pass(std::integral_constant<int, 1>{});
+    }
+}
+
+// rows_dot_dt<R, E>: lane `sub` takes part sub % 2 of blocks sub / 2, + 4, + 8 (nb = 10: 3, 3, 2, 2 steps for sub / 2 = 0..3) of R rows;
+// the activations come from the staged SLM words of E entries (kDtW words per q8_1 block: 8 quants, ds, byte sum).
+// A Q2_0 block is 18 bytes: fp16 scale at 0, 16 bytes of 2-bit fields at 2.
+template <bool ACT, bool DEC, int R, int E>
+__dpct_inline__ void down_rows(const uint8_t* const* rows, const uint32_t* ta, int hb, int nb, int sub, uint32_t (&out)[R][E]) {
+    constexpr int LANES = 8, KSTEP = 4, BS = 18;
+    const int iqs = sub % 2, kb0 = sub / 2;
+    uint32_t s[R][E];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int e = 0; e < E; ++e) s[r][e] = 0u;
+    const uint8_t* wp[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) wp[r] = rows[r] + kb0 * BS;
+    for (int kbx = kb0; kbx < nb; kbx += KSTEP) {
+        uint32_t af[E];
+#pragma unroll
+        for (int e = 0; e < E; ++e) af[e] = 0u;
+        if constexpr (ACT) {   // the ten SLM words of each entry's staged block
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                const uint32_t* t = ta + (e * hb + 2 * kbx + iqs) * kDtW;
+                uint32_t a = 0u;
+#pragma unroll
+                for (int kk = 0; kk < 8; ++kk) a ^= t[kk];
+                af[e] = a ^ (t[8] & 0xFFFFu) ^ t[9];
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const uint8_t* bq = wp[r];
+            wp[r] += KSTEP * BS;
+            const uint16_t dh = *reinterpret_cast<const uint16_t*>(bq);
+            const sycl::int2 qq = load8_a2(bq + 2 + 8 * iqs);   // the part's 8 weight bytes
+            uint32_t wf;
+            if constexpr (!DEC) {
+                wf = (uint32_t) qq.x() ^ (uint32_t) qq.y() ^ (uint32_t) dh;
+            } else {   // the dt kernel's weight side: 2-bit fields of each byte, 14 shifts / masks
+                uint32_t w = 0u;
+#pragma unroll
+                for (int kk = 0; kk < 4; ++kk) {
+                    w += (((uint32_t) qq.x() >> (2 * kk)) & 0x03030303u) + (((uint32_t) qq.y() >> (2 * kk)) & 0x03030303u);
+                }
+                wf = w ^ sycl::bit_cast<uint32_t>(static_cast<float>(sycl::bit_cast<sycl::half>(dh)));
+            }
+#pragma unroll
+            for (int e = 0; e < E; ++e) s[r][e] += wf ^ af[e];
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int e = 0; e < E; ++e) out[r][e] = lanes_xor<LANES>(s[r][e]);
+}
+
+// native_down_kernel_dt<2>: 256 work-items = 32 rows x 8 lanes, 2 rows a lane (64 rows a work-group); per chunk of up to 8
+// entries the work-group stages the entries' q8_1 blocks into SLM (barrier, global loads, SLM stores, barrier), then passes of 4, 2, 1
+template <bool ACT, bool DEC>
+__dpct_inline__ void down_kernel(sycl::nd_item<3> item, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                                 const int32_t* n_groups, const int32_t* ent_dst, const uint8_t* hq, int n_embd, int n_ff,
+                                 size_t down_off, size_t d_row, float* out) {
+    constexpr int LN = 8, RB = 256 / LN, RPL = 2;
+    const int ng = *n_groups;
+    if ((int) item.get_group(1) >= ng) return;   // (uniform over the work-group)
+    uint32_t* ta = nullptr;
+    if constexpr (ACT) {
+        auto& taa = *sycl::ext::oneapi::group_local_memory_for_overwrite<uint32_t[kDtEnt * kDtMaxHb * kDtW]>(item.get_group());
+        ta = &taa[0];
+    }
+    const int lid = (int) item.get_local_id(2);
+    const int rib = lid / LN, sub = lid % LN;
+    const int r0 = (int) item.get_group(2) * RB * RPL + rib;   // n_embd % 64 == 0: every lane has its rows
+    const int nb = n_ff / 64, hb = n_ff / 32;
+    int rr[RPL];
+#pragma unroll
+    for (int i = 0; i < RPL; ++i) rr[i] = r0 + i * RB;
+    for (int g = (int) item.get_group(1); g < ng; g += (int) item.get_group_range(1)) {
+        const uint8_t* base = (const uint8_t*) grp_ptr[g] + down_off;
+        const uint8_t* rows[RPL];
+#pragma unroll
+        for (int i = 0; i < RPL; ++i) rows[i] = base + (size_t) rr[i] * d_row;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int ec = e0; ec < e1; ec += kDtEnt) {
+            const int n = e1 - ec < kDtEnt ? e1 - ec : kDtEnt;
+            if constexpr (ACT) {
+                item.barrier(sycl::access::fence_space::local_space);   // the previous chunk's readers are done
+                for (int x = lid; x < n * hb; x += 256) {
+                    const int j = x / hb, b = x - j * hb;
+                    const uint8_t* y = hq + (size_t) ((ec + j) * hb + b) * 36;
+                    const int* yq = reinterpret_cast<const int*>(y + 4);
+                    uint32_t a[8];
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) a[i] = (uint32_t) yq[i];
+                    uint32_t c = 0u;
+                    uint32_t* d = &ta[(j * hb + b) * kDtW];
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) { d[i] = a[i]; c ^= a[i]; }   // (the real kernel stores the 4 x 4 transpose here)
+                    d[8] = *reinterpret_cast<const uint32_t*>(y);
+                    d[9] = c;
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+            }
+            int e = ec;
+            const int ee = ec + n;
+            auto pass = [&](auto ecn) {
+                constexpr int EC = decltype(ecn)::value;
+                const uint32_t* tp = nullptr;
+                if constexpr (ACT) tp = &ta[(e - ec) * hb * kDtW];
+                uint32_t o[RPL][EC];
+                down_rows<ACT, DEC, RPL, EC>(rows, tp, hb, nb, sub, o);
+                if (sub == 0)
+#pragma unroll
+                    for (int i = 0; i < RPL; ++i)
+#pragma unroll
+                        for (int j = 0; j < EC; ++j) out[(size_t) ent_dst[e + j] * n_embd + rr[i]] = sycl::bit_cast<float>(o[i][j]);
+                e += EC;
+            };
+            for (; e + 4 <= ee;) pass(std::integral_constant<int, 4>{});
+            if (e + 2 <= ee) pass(std::integral_constant<int, 2>{});
+            if (e < ee) pass(std::integral_constant<int, 1>{});
+        }
+    }
+}
+
+template <int TG, bool ACT, bool DEC>
+void gu_launch(dpct::queue_ptr s, const k::NativeExpertLayout& L, int64_t gy, const unsigned long long* grp_ptr,
+               const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok, const uint8_t* xq, float* gate,
+               float* up, const uint64_t* tab_src) {
+    const size_t gx = (size_t) ((2 * L.n_ff + 63) / 64);   // (2 * n_ff rows + (256 / 8) * 2 - 1) / ((256 / 8) * 2)
+    const int n_embd = (int) L.n_embd, n_ff = (int) L.n_ff;
+    const size_t gu_row = L.gu_row, up_off = L.up_off;
+    s->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, (size_t) gy, gx * 256), sycl::range<3>(1, 1, 256)),
+                    [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(16)]] {
+                        gu_kernel<TG, ACT, DEC>(item, grp_ptr, grp_start, n_groups, ent_tok, xq, n_embd, n_ff, gu_row, up_off, gate, up, tab_src);
+                    });
+}
+template <bool ACT, bool DEC>
+void down_launch(dpct::queue_ptr s, const k::NativeExpertLayout& L, int64_t gy, const unsigned long long* grp_ptr,
+                 const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst, const uint8_t* hq, float* out) {
+    const size_t gx = (size_t) ((L.n_embd + 63) / 64);
+    const int n_embd = (int) L.n_embd, n_ff = (int) L.n_ff;
+    const size_t down_off = L.down_off, d_row = L.d_row;
+    s->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, (size_t) gy, gx * 256), sycl::range<3>(1, 1, 256)),
+                    [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(16)]] {
+                        down_kernel<ACT, DEC>(item, grp_ptr, grp_start, n_groups, ent_dst, hq, n_embd, n_ff, down_off, d_row, out);
+                    });
+}
+
+// One stripped grouped call (what native_expert_grouped does with phase 0 minus the SwiGLU / q8_1 pass): gate/up when phase is not 2,
+// down when phase is 0 or 2.  The scratch layout is native_expert_grouped's: gate, up, h, then the q8_1 blocks of h.
+// grid y = cap_groups as there (grid_groups 0), the work-groups past *n_groups return.
+void call(int mode, int phase, const k::NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
+          const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap, const uint8_t* xq, uint8_t* scr,
+          float* out, const uint64_t* tab, dpct::queue_ptr s) {
+    if ((L.gu_type != 16 && L.gu_type != 22) || L.d_type != 42 || L.n_embd % 256 != 0 || L.n_embd % 64 != 0 || L.n_ff % 64 != 0 || L.n_ff / 32 > kDtMaxHb) {
+        std::fprintf(stderr, "--kqbench STRIP: pair %d / %d at %lld x %lld is not a shape of the stripped kernels\n", L.gu_type, L.d_type,
+                     (long long) L.n_embd, (long long) L.n_ff);
+        std::exit(2);
+    }
+    const size_t f = (size_t) cap * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;
+    float* gate = (float*) scr;
+    float* up = (float*) (scr + fa);
+    const uint8_t* hq = scr + 3 * fa;
+    if (phase != 2) {
+        if (L.gu_type == 22) {
+            if (mode == 1) gu_launch<22, true, false>(s, L, cap, grp_ptr, grp_start, n_groups, ent_tok, xq, gate, up, tab);
+            else if (mode == 2) gu_launch<22, true, true>(s, L, cap, grp_ptr, grp_start, n_groups, ent_tok, xq, gate, up, tab);
+            else gu_launch<22, false, false>(s, L, cap, grp_ptr, grp_start, n_groups, ent_tok, xq, gate, up, tab);
+        } else {
+            if (mode == 1) gu_launch<16, true, false>(s, L, cap, grp_ptr, grp_start, n_groups, ent_tok, xq, gate, up, tab);
+            else if (mode == 2) gu_launch<16, true, true>(s, L, cap, grp_ptr, grp_start, n_groups, ent_tok, xq, gate, up, tab);
+            else gu_launch<16, false, false>(s, L, cap, grp_ptr, grp_start, n_groups, ent_tok, xq, gate, up, tab);
+        }
+    }
+    if (phase == 0 || phase == 2) {
+        if (mode == 1) down_launch<true, false>(s, L, cap, grp_ptr, grp_start, n_groups, ent_dst, hq, out);
+        else if (mode == 2) down_launch<true, true>(s, L, cap, grp_ptr, grp_start, n_groups, ent_dst, hq, out);
+        else down_launch<false, false>(s, L, cap, grp_ptr, grp_start, n_groups, ent_dst, hq, out);
+    }
+}
+
+// The stripped kernels mirror the default path only: refuse (exit 2) where an environment switch makes the real call another kernel.
+void check_env() {
+    auto on = [](const char* n) { const char* v = std::getenv(n); return v != nullptr && v[0] != '\0' && v[0] != '0'; };
+    auto set = [](const char* n) { const char* v = std::getenv(n); return v != nullptr && v[0] != '\0'; };
+    const char* bad = nullptr;
+    if (set("STRATA_IQ_DECODE_FAST") && !on("STRATA_IQ_DECODE_FAST")) bad = "STRATA_IQ_DECODE_FAST=0 (the real call is the old lane kernels)";
+    else if (set("STRATA_IQ_GRID") && !on("STRATA_IQ_GRID")) bad = "STRATA_IQ_GRID=0 (the real gate/up kernel reads global tables)";
+    else if (set("STRATA_IQ_DT") && !on("STRATA_IQ_DT")) bad = "STRATA_IQ_DT=0 (the real down kernel is the plain fast one)";
+    else if (on("STRATA_XE2_IQ")) bad = "STRATA_XE2_IQ (the real kernels are the vector-load variants)";
+    else if (on("STRATA_IQ_XXS_SGNMUL")) bad = "STRATA_IQ_XXS_SGNMUL (the real IQ2_XXS kernel computes its sign masks; the stripped one reads the table)";
+    else if (set("STRATA_GU_LANES") && std::atoi(std::getenv("STRATA_GU_LANES")) != 8) bad = "STRATA_GU_LANES != 8";
+    else if (set("STRATA_DOWN_LANES") && std::atoi(std::getenv("STRATA_DOWN_LANES")) != 8) bad = "STRATA_DOWN_LANES != 8";
+    else if (on("STRATA_EXPERT_SPLIT")) bad = "STRATA_EXPERT_SPLIT";
+    else if (on("STRATA_GU_SWIGLU")) bad = "STRATA_GU_SWIGLU";
+    else if (on("STRATA_EXPDEC")) bad = "STRATA_EXPDEC";
+    else if (on("STRATA_OLD_IQ_MMVQ")) bad = "STRATA_OLD_IQ_MMVQ";
+    else if (on("STRATA_GROUPED_V1")) bad = "STRATA_GROUPED_V1";
+    if (bad == nullptr && set("STRATA_IQ_DECODE_FAST_FMTS")) {   // the list must hold 16, 22 and 42
+        bool has[64] = {};
+        for (const char* p = std::getenv("STRATA_IQ_DECODE_FAST_FMTS"); *p != '\0';) {
+            char* end = nullptr;
+            const long t = std::strtol(p, &end, 10);
+            if (end == p) break;
+            if (t >= 0 && t < 64) has[t] = true;
+            p = *end == ',' ? end + 1 : end;
+        }
+        if (!has[16] || !has[22] || !has[42]) bad = "STRATA_IQ_DECODE_FAST_FMTS without 16, 22 and 42";
+    }
+    if (bad != nullptr) {
+        std::fprintf(stderr, "--kqbench STRIP: not the default kernels here: %s; unset it\n", bad);
+        std::exit(2);
+    }
+}
+
+}  // namespace kqs
+
 // ------------------------------------------------------------------------------------------------ --kqbench [NL [host]]
 // Unsloth's formats against the IQ packs' at the model's shapes (2560 x 640): microseconds per grouped call and the
 // expert bytes it reads per microsecond.  NL layers (default 16), each with its own experts, so the weights stream from
 // DRAM; a call reads each of its groups' whole blobs (gate + up + down) once.  Shapes: one token (10 groups of 1), a
 // window of 2 tokens (16 groups, 20 entries) and of 4 (28 groups, 40 entries; native_grouped_parity's --bench).
 // STRATA_GU_LANES / STRATA_DOWN_LANES pick the lane split as in the engine.
+// STRATA_KQBENCH_STRIP=1|2|3 (unset or 0: the real kernels, as always): the stripped kernels above (kqs::) in place of
+// native_expert_grouped, for the IQ2_XXS / IQ2_S gate/up with Q2_0 down pairs only (the other pairs print a skip line):
+// 1 reads only, 2 reads + decode without the row products, 3 weight reads only.  Compare with the real kernels at the SAME
+// STRATA_KQBENCH_PHASE (3 gate/up, 2 down; 0 = both: the stripped call has no SwiGLU / q8_1 pass; 1 runs as 3).  Same
+// columns; the MB column is the whole blob of each group even when one phase runs (as for the real kernels).  Checks: skipped.
 void kq_bench(dpct::queue_ptr s, std::mt19937& rng, int nl, bool host) {
     const int pairs[][2] = {{22, 42}, {16, 42}, {21, 20}, {23, 20}, {18, 42}, {12, 7}, {12, 8}, {13, 8},
 #ifdef STRATA_Q6K_EXPERTS
@@ -702,10 +1127,51 @@ void kq_bench(dpct::queue_ptr s, std::mt19937& rng, int nl, bool host) {
     // STRATA_KQBENCH_PAIRS=n: the first n pairs only (2: Flash-Next's own, IQ2_S and IQ2_XXS gate/up with Q2_0 down)
     const int all = (int) (sizeof pairs / sizeof pairs[0]);
     const int npairs = std::getenv("STRATA_KQBENCH_PAIRS") ? std::max(1, std::min(all, std::atoi(std::getenv("STRATA_KQBENCH_PAIRS")))) : all;
+    // STRATA_KQBENCH_STRIP: see above; read once here
+    const int strip = std::getenv("STRATA_KQBENCH_STRIP") && *std::getenv("STRATA_KQBENCH_STRIP") ? std::atoi(std::getenv("STRATA_KQBENCH_STRIP")) : 0;
+    if (strip < 0 || strip > 3) { std::fprintf(stderr, "--kqbench: STRATA_KQBENCH_STRIP must be 0, 1, 2 or 3\n"); std::exit(2); }
+    if (strip != 0) kqs::check_env();
+    int phase = 0;   // STRATA_KQBENCH_PHASE (the stripped kernels read it here; the real ones through native_expert_set_mode)
     // STRATA_KQBENCH_PHASE=p: part of the call only (1 gate/up + swiglu, 2 down, 3 gate/up)
     if (const char* ph = std::getenv("STRATA_KQBENCH_PHASE")) {
+        phase = std::atoi(ph);
         k::native_expert_set_mode(-1, std::atoi(ph));
         std::printf("--kqbench: phase %d only\n", std::atoi(ph));
+    }
+    if (strip != 0) {
+        const char* what[] = {"", "reads only: weight and activation words loaded and folded, no codebook / decode / dp4a",
+                              "reads + decode, no rows: weight parts decoded and summed, activations loaded and folded, no dp4a / finish",
+                              "weight reads only: no activation loads, no activation staging"};
+        std::printf("--kqbench: STRIP=%d (%s); mirrors the default B70 kernels (IQ_DECODE_FAST + IQ_GRID + IQ_DT, XE2_IQ off, 8 lanes, 2 rows a lane)\n",
+                    strip, what[strip]);
+        std::printf("--kqbench: STRIP=%d: parity checks skipped (the stripped kernels' stores are not results); IQ2_XXS / IQ2_S gate/up with Q2_0 down only\n", strip);
+        if (phase == 1) {
+            phase = 3;
+            std::printf("--kqbench: STRIP: phase 1 runs as 3 (gate/up only: no SwiGLU / q8_1 pass in the stripped call)\n");
+        }
+        if (phase == 0) std::printf("--kqbench: STRIP: the call is gate/up + down, without the SwiGLU / q8_1 pass; compare real and stripped at STRATA_KQBENCH_PHASE=3 and =2\n");
+    }
+    uint64_t* kqs_tab = nullptr;   // the stripped gate/up kernels' codebook source: 1024 words (IQ2_S codebook; IQ2_XXS codebook + ksigns masks)
+    if (strip != 0) {
+        std::mt19937 trng(777);   // its own generator: the experts' random layout is the same with and without the switch
+        std::uniform_int_distribution<int> gb(1, 62);
+        std::vector<uint64_t> th(1024);
+        for (auto& v : th) {   // codebook-like words (grid bytes 1..62; the lookups' cost does not depend on the content)
+            v = 0;
+            for (int b = 0; b < 8; ++b) v |= (uint64_t) gb(trng) << (8 * b);
+        }
+        for (int c = 0; c < 128; ++c) {   // IQ2_XXS: kIqKsignMask as words 256..511: {m_lo, m_hi, m_lo & 0x01010101, m_hi & 0x01010101}
+            const uint32_t par = (uint32_t) __builtin_popcount((unsigned) c) & 1u, sgb = (uint32_t) c | (par << 7);
+            uint32_t lo = 0, hi = 0;
+            for (int b = 0; b < 4; ++b) {
+                if ((sgb >> b) & 1u) lo |= 0xFFu << (8 * b);
+                if ((sgb >> (4 + b)) & 1u) hi |= 0xFFu << (8 * b);
+            }
+            th[(size_t) (256 + 2 * c)] = (uint64_t) lo | ((uint64_t) hi << 32);
+            th[(size_t) (256 + 2 * c + 1)] = (uint64_t) (lo & 0x01010101u) | ((uint64_t) (hi & 0x01010101u) << 32);
+        }
+        kqs_tab = dalloc<uint64_t>(th.size());
+        s->memcpy(kqs_tab, th.data(), th.size() * sizeof(uint64_t)).wait();
     }
     // The engine's layout (STRATA_KQBENCH_ARENA_MIB=n): the experts sit at random slots of one n MiB device arena (the
     // engine's expert cache: one allocation, slots in profile order, so a layer's experts are scattered over all of it);
@@ -732,6 +1198,10 @@ void kq_bench(dpct::queue_ptr s, std::mt19937& rng, int nl, bool host) {
     }
     for (int pi = 0; pi < npairs; ++pi) {
         const auto& pr = pairs[pi];
+        if (strip != 0 && !((pr[0] == 16 || pr[0] == 22) && pr[1] == 42)) {
+            std::printf("  %-7s/%-6s skipped in the stripped run (stripped kernels: IQ2_XXS / IQ2_S gate/up with Q2_0 down)\n", name_of(pr[0]), name_of(pr[1]));
+            continue;
+        }
         for (int si = 0; si < 3; ++si) {
             const auto& sh = shapes[si];
             if (!((shape_bits >> (si == 2 ? 2 : si)) & 1)) continue;
@@ -788,8 +1258,12 @@ void kq_bench(dpct::queue_ptr s, std::mt19937& rng, int nl, bool host) {
                 dpct::experimental::command_graph_ptr g;
                 dpct::experimental::begin_recording(s);
                 for (int l = 0; l < nl; ++l)
-                    k::native_expert_grouped(S.L, lp[(size_t) (st * nl + l)], S.start, S.n, S.dst, S.tok, S.cap, S.cap, S.xq, S.scr,
-                                             S.out, s, 0);
+                    if (strip != 0)
+                        kqs::call(strip, phase, S.L, lp[(size_t) (st * nl + l)], S.start, S.n, S.dst, S.tok, S.cap, S.xq, S.scr, S.out,
+                                  kqs_tab, s);
+                    else
+                        k::native_expert_grouped(S.L, lp[(size_t) (st * nl + l)], S.start, S.n, S.dst, S.tok, S.cap, S.cap, S.xq, S.scr,
+                                                 S.out, s, 0);
                 dpct::experimental::end_recording(s, &g);
                 ges.push_back(new sycl::ext::oneapi::experimental::command_graph<
                               sycl::ext::oneapi::experimental::graph_state::executable>(g->finalize()));
@@ -810,6 +1284,7 @@ void kq_bench(dpct::queue_ptr s, std::mt19937& rng, int nl, bool host) {
         }
     }
     if (big != nullptr) sycl::free(big, dpct::get_in_order_queue());
+    if (kqs_tab != nullptr) sycl::free(kqs_tab, dpct::get_in_order_queue());
     dpct::destroy_event(e0);
     dpct::destroy_event(e1);
 }
