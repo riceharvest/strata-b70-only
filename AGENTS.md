@@ -42,6 +42,9 @@ and gains, are in docs/B70.md.
 ## Working rules for agents here
 
 - One configuration: the one in docs/B70.md. Do not add a second model, a second quant or a second GPU path.
+- One stream. The served setup is single-stream (`parallel` unset). Two streams were measured on the B70 and did not beat one:
+  102-118 tok/s solo against 81-102 together, and a prompt read and a decode take turns. `parallel` stays an opt-in setting;
+  work goes into the single stream unless parallel is asked for.
 - Code first. Read the change again several times (indexing, sizes, sync, edge cases, every caller) before any build. Then one
   build and one GPU test, not a build per edit.
 - One GPU job at a time. Never run a benchmark while a build is running: both change the other's numbers.
