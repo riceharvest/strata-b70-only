@@ -242,6 +242,19 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
                        size_t& bytes, std::string& error, const SessionReadLimits& limits = {},
                        SessionStatus* status = nullptr);
 
+// What the drive under a folder does with the session files' own block I/O (16 MiB blocks, direct when the filesystem
+// takes it).  MB/s are 1e6 bytes a second.
+struct SessionDriveSpeed {
+    double read_mbps = 0, write_mbps = 0;
+    uint64_t bytes = 0;      // what was written and read back
+    bool direct = false;     // false: the read came through the file cache, so read_mbps is capped at write_mbps
+};
+// Measures the drive: a temporary file of up to `bytes` of data that does not compress is written and flushed, read back
+// and removed.  Each direction stops after `max_seconds` (a slow drive is measured on less data, one block at least).
+// A file this short shows a drive's burst write speed: a long write on a drive with a small fast cache can be slower.
+bool session_drive_probe(const std::string& dir, uint64_t bytes, double max_seconds, SessionDriveSpeed& out,
+                         std::string& error);
+
 // The folder the free-space preflight asks about for `path`, by the rules of Windows or of POSIX (exposed so both can
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC
 // folder (\\server\share\dir\) and gives a drive root (C:\); empty for a bare file name (the current folder).

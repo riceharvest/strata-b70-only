@@ -1256,4 +1256,67 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
     return ok;
 }
 
+bool session_drive_probe(const std::string& dir, uint64_t bytes, double max_seconds, SessionDriveSpeed& out,
+                         std::string& error) {
+    using Clock = std::chrono::steady_clock;
+    const auto since = [](Clock::time_point t) { return std::chrono::duration<double>(Clock::now() - t).count(); };
+    out = SessionDriveSpeed{};
+    const std::string path = (std::filesystem::path(dir) / "drive-speed.probe").string();
+    bytes = std::max<uint64_t>(bytes, kBlock) / kBlock * kBlock;
+    uint64_t avail = 0;
+    if (free_space(path, avail) && avail < bytes + (uint64_t(1) << 30)) {
+        error = "the drive has less free than the measurement's file and 1 GiB";
+        return false;
+    }
+    Aligned block = aligned_block();
+    if (!block) { error = "out of memory for the measurement's block"; return false; }
+    // data that does not compress: a compressing filesystem or drive would look faster than it is with real K/V
+    uint64_t x = random64() | 1;
+    for (size_t i = 0; i + 8 <= kBlock; i += 8) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        std::memcpy(block.get() + i, &x, 8);
+    }
+    Publisher pub;
+    if (!pub.open(path, error)) return false;
+    uint64_t written = 0;
+    double write_s = 0;
+    {
+        RawFile raw;
+        if (!pub.create_temp(raw, error)) return false;
+        const auto t0 = Clock::now();
+        while (written < bytes && (written == 0 || since(t0) < max_seconds)) {
+            if (!raw.write_all(block.get(), kBlock)) { error = raw.error(); return false; }
+            written += kBlock;
+        }
+        // flushed before the clock stops: the time is the drive's, not the file cache's
+        if (!raw.sync() || !raw.close()) { error = raw.error(); return false; }
+        write_s = since(t0);
+    }
+    SessionStatus st;
+    if (!pub.publish(error, false, st, nullptr)) return false;
+    struct Remove {
+        std::string path;
+        ~Remove() { std::error_code ec; std::filesystem::remove(path, ec); }
+    } remove{path};
+    RawFile in;
+    uint64_t size = 0;
+    if (!in.open_session(path, size)) { error = in.error(); return false; }
+    uint64_t got = 0;
+    const auto t1 = Clock::now();
+    while (got < size && (got == 0 || since(t1) < max_seconds)) {
+        const long long r = in.read_some(block.get(), kBlock);
+        if (r < 0) { error = in.error(); return false; }
+        if (r == 0) break;
+        got += (uint64_t) r;
+    }
+    const double read_s = since(t1);
+    if (got == 0 || write_s <= 0 || read_s <= 0) { error = "the measurement's file could not be read back"; return false; }
+    out.bytes = written;
+    out.direct = in.direct();
+    out.write_mbps = (double) written / 1e6 / write_s;
+    out.read_mbps = (double) got / 1e6 / read_s;
+    if (!out.direct) out.read_mbps = std::min(out.read_mbps, out.write_mbps);
+    return true;
+}
+
 } // namespace strata::core

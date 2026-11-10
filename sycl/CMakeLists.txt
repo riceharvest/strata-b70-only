@@ -274,7 +274,7 @@ strata_resolve(_engine src/core/layer.cpp src/core/session.cpp src/core/expert_s
                        src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                        src/core/conversation_memory.cpp   # 0.1.31: the conversation snapshots (#216)
                        src/core/arch_defaults.cpp src/core/vmm.cpp   # vmm.cpp is the port's stub: no driver VMM on Level Zero
-                       src/core/conversation_file.cpp
+                       src/core/conversation_file.cpp src/core/conversation_kv_store.cpp   # the spill's K/V store files (updated in place)
                        src/core/peer_experts.cpp src/core/remote_expert_opt_stub.cpp)         # 0.1.36+: --peer-device (a stub in the port: no second GPU tier yet)
 add_library(strata_engine STATIC ${_engine} ${CMAKE_CURRENT_SOURCE_DIR}/src/core/gguf_expert_source.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/src/core/copy_queue.cpp   # 0.1.43: a queue on the copy engine
@@ -316,7 +316,8 @@ target_include_directories(gated_proposal_test PRIVATE ${STRATA_ROOT}/include)
 add_test(NAME gated_proposal_test COMMAND gated_proposal_test)
 # Host-only test of the conversation cache's SSD tier (writer thread, index, gate, divergence); no device.
 add_executable(conversation_spill_test ${STRATA_ROOT}/src/core/conversation_spill_test.cpp
-               ${STRATA_ROOT}/src/core/conversation_file.cpp ${STRATA_ROOT}/sycl/src/platform/direct_file.cpp)
+               ${STRATA_ROOT}/src/core/conversation_file.cpp ${STRATA_ROOT}/src/core/conversation_kv_store.cpp
+               ${STRATA_ROOT}/sycl/src/platform/direct_file.cpp)
 target_include_directories(conversation_spill_test PRIVATE ${STRATA_ROOT}/include ${STRATA_ROOT}/sycl/include)
 target_link_libraries(conversation_spill_test PRIVATE Threads::Threads)
 add_test(NAME conversation_spill_test COMMAND conversation_spill_test)

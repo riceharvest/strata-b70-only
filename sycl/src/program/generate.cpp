@@ -36,6 +36,7 @@
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_spill.hpp"
+#include "strata/core/conversation_kv_store.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/auto_cache.hpp"
 #include "strata/core/ple_residency.hpp"
@@ -946,9 +947,22 @@ struct Options {
     int64_t conversation_cache_spill_mib = 24576;           ///< the files together
     int64_t conversation_cache_spill_min_free_mib = 40960;  ///< the disk keeps at least this free after a file
     int64_t conversation_cache_spill_min_tokens = 4096;     ///< shorter conversations are not written
-    int64_t conversation_cache_spill_mbps = 1700;           ///< sustained read speed (MB/s) the restore-vs-read gate assumes
+    int64_t conversation_cache_spill_mbps = 0;              ///< read speed (MB/s) the restore-vs-read gate assumes; 0: the folder's
+                                                            ///< measured one (spill_drive_speed), 1700 when it was not measured
     int64_t conversation_cache_spill_prefill_us = 300;      ///< what one prompt token costs to read (microseconds) in that gate
     bool conversation_cache_spill_verify = false;           ///< check the payload hash when a file is read back
+    int64_t conversation_cache_auto_max_mib = 8192;         ///< no --conversation-cache-mib: the most the automatic size gives
+    int64_t conversation_cache_auto_pct = 40;               ///< ... and the share of the free RAM above the floor it takes
+    bool conversation_cache_park_ssd = false;               ///< parked conversations live in the spill folder, none in RAM
+    bool conversation_cache_park_ssd_whole = false;         ///< ... each park writes the whole conversation (no in-place files)
+    bool conversation_cache_park_on_exit = false;           ///< ... the conversation in use is parked at a clean stop (QUIT)
+    bool conversation_cache_park_ssd_stream = false;        ///< ... a read-back streams the K/V from its file into the session (no copy in RAM)
+    int64_t conversation_cache_park_ssd_checkpoints = 0;    ///< ... 0: every checkpoint has a file; N: the shallowest and the N deepest
+    int64_t conversation_cache_spill_index_mib = 64;        ///< index.log is written again from the live entries above this (0: never)
+    bool conversation_cache_park_ssd_deepest_checkpoint = false; ///< ... a park keeps only the deepest checkpoint, not every one
+    int64_t conversation_cache_park_ssd_keep_pct = 50;      ///< ... a file is updated in place when at least this share of its tokens still holds
+    int64_t conversation_cache_spill_probe_mib = 1024;      ///< the drive measurement's file (0: no measurement)
+    int64_t conversation_cache_spill_probe_s = 3;           ///< ... and the longest each direction may take
     /// --serve: park only after the conversation has advanced this many tokens past the copy it would supersede.
     /// A conversation that moved a few hundred tokens writes a full snapshot again, and the turn after that drops it
     /// (drop_superseded) after writing the same bytes once more, so on a long single conversation every turn pays a
@@ -1110,7 +1124,9 @@ void usage() {
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
-                 "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default: sized from the free RAM, up to 8192; 0 = off)\n"
+                 "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default: sized from the free RAM; 0 = off)\n"
+                 "  --conversation-cache-auto-pct N, --conversation-cache-auto-max-mib N  --serve: that automatic size: N%% of the\n"
+                 "                       RAM free above --conversation-cache-min-free-mib (default 40), at most N MiB (default 8192)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
                  "                       --memory-limit-mib) when parking, saving or restoring a session (default 2560)\n"
@@ -1127,11 +1143,33 @@ void usage() {
                  "                       default 4096; 0 = park every rewind)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
+                 "  --conversation-cache-park-ssd  --serve, with --conversation-cache-spill-dir: every parked conversation goes to\n"
+                 "                       a file there and none stays in RAM (RAM is used only while a conversation is\n"
+                 "                       written or read back). A switch costs the drive's seconds (DIR/drive-speed)\n"
+                 "                       and writes the running state and the K/V that changed since the conversation\n"
+                 "                       was read back (its K/V file is updated in place). -park-ssd-whole: write the whole\n"
+                 "                       conversation at every park instead. -park-ssd-keep-pct N (default 50): a file is\n"
+                 "                       updated in place when at least N%% of its tokens still hold, else a new file is\n"
+                 "                       written. Every checkpoint of the conversation has its own file, written once.\n"
+                 "                       -park-ssd-deepest-checkpoint: keep only the deepest one (less disk and a faster\n"
+                 "                       read-back; a request that rewinds further back reads its prompt again). -park-on-exit: park the\n"
+                 "                       conversation in use at a clean stop too, so the next start reads it back from its\n"
+                 "                       file instead of reading its prompt again (the stop takes that write longer).\n"
+                 "                       -park-ssd-checkpoints N: keep the shallowest checkpoint (the shared start) and\n"
+                 "                       the N deepest instead of all of them (default 0 = all): each one is about 113 MiB\n"
+                 "                       to read at every switch; a rewind to between the kept ones reads more prompt.\n"
+                 "                       -park-ssd-stream: a read-back copies the K/V from its file straight into the\n"
+                 "                       session, block by block, instead of reading the whole conversation into RAM first\n"
                  "  --conversation-cache-spill-dir DIR  --serve: the SSD tier: an evicted parked conversation is written to a\n"
                  "                       file here and read back when a prompt matches it (off by default); also\n"
                  "                       --conversation-cache-spill-mib N (quota, default 24576), -spill-min-free-mib N (disk\n"
                  "                       space kept free, default 40960), -spill-min-tokens N (default 4096), -spill-mbps N\n"
-                 "                       and -spill-prefill-us N (the restore-vs-read gate: 1700 MB/s, 300 us/token),\n"
+                 "                       and -spill-prefill-us N (the restore-vs-read gate: the drive's measured read\n"
+                 "                       speed, 300 us/token; the drive is measured once, at the first start with the\n"
+                 "                       folder, and the result kept in DIR/drive-speed; -spill-probe-mib N sets the\n"
+                 "                       measurement's file, default 1024, 0: do not measure; -spill-probe-s N the\n"
+                 "                       longest each direction may take, default 3; -spill-index-mib N: the folder's\n"
+                 "                       index.log is written again from the live entries above N MiB, default 64, 0: never),\n"
                  "                       -spill-verify (check the payload hash on a read)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
@@ -3558,6 +3596,19 @@ int main(int argc, char **argv) try {
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-spill-dir") o.conversation_cache_spill_dir = next("--conversation-cache-spill-dir");
         else if (a == "--conversation-cache-spill-verify") o.conversation_cache_spill_verify = true;
+        else if (a == "--conversation-cache-park-ssd") o.conversation_cache_park_ssd = true;
+        else if (a == "--conversation-cache-auto-max-mib") o.conversation_cache_auto_max_mib = std::max<int64_t>(0, std::atoll(next("--conversation-cache-auto-max-mib")));
+        else if (a == "--conversation-cache-auto-pct") o.conversation_cache_auto_pct = std::clamp<int64_t>(std::atoll(next("--conversation-cache-auto-pct")), 0, 100);
+        else if (a == "--conversation-cache-park-ssd-whole") o.conversation_cache_park_ssd_whole = true;
+        else if (a == "--conversation-cache-park-on-exit") o.conversation_cache_park_on_exit = true;
+        else if (a == "--conversation-cache-park-ssd-stream") o.conversation_cache_park_ssd_stream = true;
+        else if (a == "--conversation-cache-park-ssd-checkpoints") o.conversation_cache_park_ssd_checkpoints = std::max<int64_t>(0, std::atoll(next("--conversation-cache-park-ssd-checkpoints")));
+        else if (a == "--conversation-cache-spill-index-mib") o.conversation_cache_spill_index_mib = std::max<int64_t>(0, std::atoll(next("--conversation-cache-spill-index-mib")));
+        else if (a == "--conversation-cache-park-ssd-deepest-checkpoint") o.conversation_cache_park_ssd_deepest_checkpoint = true;
+        else if (a == "--conversation-cache-park-ssd-all-checkpoints") { /* the default now: every checkpoint has its own file */ }
+        else if (a == "--conversation-cache-park-ssd-keep-pct") o.conversation_cache_park_ssd_keep_pct = std::clamp<int64_t>(std::atoll(next("--conversation-cache-park-ssd-keep-pct")), 0, 100);
+        else if (a == "--conversation-cache-spill-probe-mib") o.conversation_cache_spill_probe_mib = std::max<int64_t>(0, std::atoll(next("--conversation-cache-spill-probe-mib")));
+        else if (a == "--conversation-cache-spill-probe-s") o.conversation_cache_spill_probe_s = std::max<int64_t>(1, std::atoll(next("--conversation-cache-spill-probe-s")));
         else if (a == "--conversation-cache-spill-mib") o.conversation_cache_spill_mib = std::max<int64_t>(0, std::atoll(next("--conversation-cache-spill-mib")));
         else if (a == "--conversation-cache-spill-min-free-mib") o.conversation_cache_spill_min_free_mib = std::max<int64_t>(0, std::atoll(next("--conversation-cache-spill-min-free-mib")));
         else if (a == "--conversation-cache-spill-min-tokens") o.conversation_cache_spill_min_tokens = std::max<int64_t>(0, std::atoll(next("--conversation-cache-spill-min-tokens")));
@@ -7893,7 +7944,10 @@ int main(int argc, char **argv) try {
             std::fclose(f);
         }
         const char* mv = std::getenv("STRATA_MIRROR_MIB");
-        const uint64_t cap = mv ? (uint64_t) std::atoll(mv) << 20 : (avail > (4ull << 30) ? avail - (4ull << 30) : 0);
+        // STRATA_MIRROR_MARGIN_MIB (default 4096): the RAM the automatic cap leaves free; STRATA_MIRROR_MIB sets the cap itself
+        const char* mg = std::getenv("STRATA_MIRROR_MARGIN_MIB");
+        const uint64_t margin = (uint64_t) (mg ? std::max<long long>(0, std::atoll(mg)) : 4096) << 20;
+        const uint64_t cap = mv ? (uint64_t) std::atoll(mv) << 20 : (avail > margin ? avail - margin : 0);
         const uint64_t need = miss_bytes(o.expert_cache - ring);
         if (need <= cap) {
             o.expert_cache -= (int) ring;
@@ -8440,7 +8494,10 @@ int main(int argc, char **argv) try {
             std::fclose(f);
         }
         const char* mv = std::getenv("STRATA_MIRROR_MIB");
-        const uint64_t cap = mv ? (uint64_t) std::atoll(mv) << 20 : (avail > (4ull << 30) ? avail - (4ull << 30) : 0);
+        // STRATA_MIRROR_MARGIN_MIB (default 4096): the RAM the automatic cap leaves free; STRATA_MIRROR_MIB sets the cap itself
+        const char* mg = std::getenv("STRATA_MIRROR_MARGIN_MIB");
+        const uint64_t margin = (uint64_t) (mg ? std::max<long long>(0, std::atoll(mg)) : 4096) << 20;
+        const uint64_t cap = mv ? (uint64_t) std::atoll(mv) << 20 : (avail > margin ? avail - margin : 0);
         if (!miss.empty() && cap > 0) {
             const auto tm = Clock::now();
             const int64_t got = gguf_src.mirror(miss, cap, 8, err);
@@ -11957,6 +12014,23 @@ int main(int argc, char **argv) try {
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
         // without --mtp the conversation cache stays on: a parked image carries the draft layer's K/V only when there is one
         // (the snapshots accept a null draft)
+        // --conversation-cache-park-ssd: parked conversations live in the spill folder and none in RAM.  The RAM cache stays
+        // on with a budget nothing fits in (1 MiB): no image is put there and no K/V is retained for the next park, so
+        // parking holds RAM only while an image is written or read back.
+        const bool park_ssd = o.conversation_cache_park_ssd && o.serve && o.prompt_cache > 0 && !o.conversation_cache_spill_dir.empty() &&
+                              o.layer_split.empty() && o.batch == 0 && o.peer_device < 1;
+        if (o.conversation_cache_park_ssd && !park_ssd)
+            std::fprintf(stderr, "strata serve: conversation cache: --conversation-cache-park-ssd ignored (it needs --serve, "
+                                 "--conversation-cache-spill-dir and no --layer-split, --batch or --peer-device)\n");
+        if (!park_ssd && o.serve && (o.conversation_cache_park_on_exit || o.conversation_cache_park_ssd_stream))
+            std::fprintf(stderr, "strata serve: conversation cache: --conversation-cache-park-on-exit and "
+                                 "--conversation-cache-park-ssd-stream do nothing without --conversation-cache-park-ssd\n");
+        if (park_ssd) {
+            o.conversation_cache_mib = 1;
+            if (o.conversation_cache_slots <= 0) o.conversation_cache_slots = 1;
+            std::fprintf(stderr, "strata serve: conversation cache: parked conversations go to the SSD tier (%s), none stay in RAM "
+                                 "(--conversation-cache-park-ssd)\n", o.conversation_cache_spill_dir.c_str());
+        }
         // #3493: no --conversation-cache-mib given: size the cache for agent use from the RAM that is free now that the model is
         // loaded (an agent Harness alternates a long main conversation with shorter ones; with the cache off every request read
         // its whole prompt again, Reused 0 on 12 of 12).  An explicit value, 0 included, is never touched.
@@ -11967,7 +12041,8 @@ int main(int argc, char **argv) try {
                 // leaves the automatic cache too little (or none), the lock is given back (the pages stay cached, the OS may reclaim them)
                 // and the cache is sized again.  --ple-io ram asked for by hand and --conversation-cache-mib N are never touched.
                 if (ple_lock_by_policy && ple_table.locked() &&
-                    strata::core::ple_lock_blocks_cache(cache_room, ple_table.table_bytes(), o.conversation_cache_min_free_mib)) {
+                    strata::core::ple_lock_blocks_cache(cache_room, ple_table.table_bytes(), o.conversation_cache_min_free_mib,
+                                                        o.conversation_cache_auto_max_mib, o.conversation_cache_auto_pct)) {
                     const auto before = cache_room;
                     if (ple_table.unlock()) {
                         cache_room = strata::core::available_host_bytes();
@@ -11976,7 +12051,8 @@ int main(int argc, char **argv) try {
                                      before ? (double) *before / (1ull << 30) : 0.0, cache_room ? (double) *cache_room / (1ull << 30) : 0.0);
                     }
                 }
-                o.conversation_cache_mib = strata::core::auto_conversation_cache_mib(cache_room, o.conversation_cache_min_free_mib);
+                o.conversation_cache_mib = strata::core::auto_conversation_cache_mib(cache_room, o.conversation_cache_min_free_mib,
+                                                                                     o.conversation_cache_auto_max_mib, o.conversation_cache_auto_pct);
                 if (o.conversation_cache_mib > 0)
                     std::fprintf(stderr, "strata serve: conversation cache sized from the free RAM: %lld MiB for up to %d parked "
                                          "conversations, so an agent's next turn reuses its prompt (--conversation-cache-mib N sets it, 0 turns it off)\n",
@@ -12070,6 +12146,33 @@ int main(int argc, char **argv) try {
         // --peer-device (the session file refuses them too).  The files are bound to this model and configuration.
         std::unique_ptr<strata::core::ConversationSpill> spill;
         bool spill_wanted = !o.conversation_cache_spill_dir.empty(), spill_tried = false;
+        // The folder's drive, measured once (the first start with the folder; kept in <dir>/drive-speed): the log says what a
+        // conversation on the SSD costs against one in RAM, and the gate below reads with this drive's speed.
+        strata::core::SpillDriveSpeed spill_drive;
+        if (spill_wanted && o.prompt_cache > 0 && conversations.enabled() && o.layer_split.empty() && o.batch == 0 && o.peer_device < 1) {
+            std::string why;
+            // --conversation-cache-spill-probe-mib 0: no measurement, an earlier start's result is still used
+            const bool have = o.conversation_cache_spill_probe_mib > 0
+                ? strata::core::spill_drive_speed(o.conversation_cache_spill_dir, (uint64_t) o.conversation_cache_spill_min_free_mib << 20,
+                                                  spill_drive, why, (uint64_t) o.conversation_cache_spill_probe_mib << 20,
+                                                  (double) o.conversation_cache_spill_probe_s)
+                : strata::core::spill_drive_speed_load(o.conversation_cache_spill_dir, spill_drive);
+            if (have) {
+                const uint64_t gib = 1ull << 30;
+                std::fprintf(stderr, "strata serve: conversation cache: SSD tier drive: reads %.0f MB/s, writes %.0f MB/s (%s; %s/%s, delete it "
+                                     "to measure again). 1 GiB of a parked conversation comes back from this drive in about %.2f s and takes "
+                                     "about %.2f s to write\n",
+                             spill_drive.read_mbps, spill_drive.write_mbps,
+                             spill_drive.measured_now ? (spill_drive.direct ? "measured now, once" : "measured now, once, through the file cache")
+                                                      : "measured at an earlier start",
+                             o.conversation_cache_spill_dir.c_str(), strata::core::spill_speed_file(),
+                             strata::core::spill_read_seconds(spill_drive, gib), strata::core::spill_write_seconds(spill_drive, gib));
+            } else {
+                std::fprintf(stderr, "strata serve: conversation cache: the SSD tier's drive was not measured (%s): the gate assumes "
+                                     "%lld MB/s\n", o.conversation_cache_spill_probe_mib > 0 ? why.c_str() : "--conversation-cache-spill-probe-mib 0",
+                             (long long) (o.conversation_cache_spill_mbps > 0 ? o.conversation_cache_spill_mbps : 1700));
+            }
+        }
         // Opened by the first request that needs it, not at start: the model fingerprint (like a session file's) samples the
         // model inputs the loaders resolved, which are all known then.  True when the tier is on.
         auto spill_open = [&]() -> bool {
@@ -12084,9 +12187,11 @@ int main(int argc, char **argv) try {
                     sc.quota_bytes = (uint64_t) o.conversation_cache_spill_mib << 20;
                     sc.min_free_bytes = (uint64_t) o.conversation_cache_spill_min_free_mib << 20;
                     sc.min_tokens = o.conversation_cache_spill_min_tokens;
-                    sc.disk_mbps = (double) o.conversation_cache_spill_mbps;
+                    sc.disk_mbps = o.conversation_cache_spill_mbps > 0 ? (double) o.conversation_cache_spill_mbps
+                                 : spill_drive.read_mbps > 0 ? spill_drive.read_mbps : 1700.0;
                     sc.prefill_us = (double) o.conversation_cache_spill_prefill_us;
                     sc.verify = o.conversation_cache_spill_verify;
+                    sc.index_compact_bytes = (uint64_t) o.conversation_cache_spill_index_mib << 20;
                     strata::core::SessionFileIdentity sid;
                     std::string why;
                     auto sp = std::make_unique<strata::core::ConversationSpill>(sc);
@@ -12098,7 +12203,7 @@ int main(int argc, char **argv) try {
                                              "min %lld tokens, gate %lld MB/s and %lld us/token\n", sc.dir.c_str(),
                                      (long long) o.conversation_cache_spill_mib, spill->files(), spill->files() == 1 ? "" : "s",
                                      (double) spill->indexed_bytes() / (1u << 30), (long long) sc.min_tokens,
-                                     (long long) o.conversation_cache_spill_mbps, (long long) o.conversation_cache_spill_prefill_us);
+                                     (long long) sc.disk_mbps, (long long) o.conversation_cache_spill_prefill_us);
                     }
                 }
             }
@@ -12127,6 +12232,27 @@ int main(int argc, char **argv) try {
                     std::fprintf(stderr, "strata serve: conversation cache: spill of %lld tokens dropped (%s)\n", (long long) d.tokens, d.why.c_str());
             }
         };
+        // --conversation-cache-park-ssd, store entries (conversation_kv_store.hpp): the K/V of a parked conversation lives in a
+        // file that is updated in place.  A conversation read back from its file keeps the file, and its next park writes
+        // the running state and only the K/V bytes that changed since (the tokens it read and wrote in between).
+        strata::core::KvStoreLayout kv_layout;   // every K/V part's place in the file, from the largest context (empty: not asked yet)
+        auto kv_layout_ready = [&]() -> bool {
+            if (!kv_layout.capacity.empty()) return true;
+            strata::core::SessionReadLimits lim;
+            std::string e;
+            if (!strata::core::conversation_session_read_limits(lim, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                                                               (uint64_t) std::max(o.prompt_cache, 1), e)) return false;
+            kv_layout.capacity = lim.max_kv_bytes;
+            return !kv_layout.capacity.empty();
+        };
+        // the store entry the live conversation was read back from: `tokens` of its K/V are still what the file holds
+        // (lowered by every request that rewrites from an earlier token), `file_tokens` is what the file was written with
+        struct DiskBase { uint64_t seq = 0; int64_t tokens = 0, file_tokens = 0; };
+        DiskBase disk_base, disk_base_next;
+        // --conversation-cache-park-ssd-stream: the incoming conversation's K/V stays in its file until the restore, which
+        // streams it into the session.  `disk_kv`: that file's header; `disk_stream`: this request restores that way.
+        strata::core::KvStoreInfo disk_kv;
+        bool disk_stream = false;
         // What a park captures: the main session's conversation (park_current) or an idle batch slot's (park_slot:
         // the reply it decoded, before an admission overwrites it).  One budget / admission / snapshot path for both.
         struct ParkSource {
@@ -12271,7 +12397,198 @@ int main(int argc, char **argv) try {
             // estimate must stay uncapped: it counts the retained buffers'
             // capacity and directories, and put() charges that same true size -
             // a capped figure would under-evict and overfill the budget.
-            if (!conversations.make_room(estimate, held)) {
+            // --conversation-cache-park-ssd: the image goes to a file and the RAM budget is not asked.  One write at a time:
+            // the one before this (another conversation's) is finished first, which also gives its RAM back.
+            const bool ssd_park = park_ssd && n_st == 0 && spill_open();
+            if (ssd_park && !o.conversation_cache_park_ssd_whole && src.with_reuse && use_mtp && kv_layout_ready()) {
+                // The store park: nothing is captured on the host but the running state and the deepest checkpoint (the
+                // next turn's resume point); the K/V goes from where it lives straight into the file, and only the
+                // bytes that changed when the conversation came from that file.  Synchronous: the session is not run
+                // before the file is whole.
+                const auto ts = Clock::now();
+                if (spill->inflight_bytes() > 0) spill->wait_idle();
+                spill_drain();
+                const DiskBase base = disk_base;
+                disk_base = {};   // whichever way this ends, the live conversation leaves
+                try {
+                    strata::core::SessionSaveLive sl;
+                    {
+                        strata::core::ConversationStateSizes z;
+                        std::string why;
+                        uint64_t state = UINT64_MAX;   // unknown sizes: the preflight refuses rather than guesses
+                        if (strata::core::conversation_session_sizes(g, src.session, z, why)) {
+                            const uint64_t q = (uint64_t) std::max<int64_t>(src.session.qsa_alloc, 0);
+                            const uint64_t per = (uint64_t) z.tail + z.dead + z.block_pos;
+                            if (q == 0 || per <= (UINT64_MAX - z.gdn - z.ple) / q) state = z.gdn + z.ple + q * per;
+                        }
+                        sl.state_bytes = state;
+                        sl.tokens = src.ids.size();
+                        sl.images = src.imgs.size();
+                        sl.kv_layers = (uint64_t) std::max<int64_t>(src.session.qsa_alloc, 0) + 1;
+                    }
+                    const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                    auto admit_store = [&](uint64_t need, std::string& why) {
+                        const auto mem = strata::core::sample_host_memory();
+                        if (strata::core::conversation_memory_admit(mem ? std::optional<uint64_t>(mem->available) : std::nullopt, need, floor))
+                            return true;
+                        why = "not enough RAM (" + (need == UINT64_MAX ? std::string("unknown") : std::to_string(need >> 20)) +
+                              " MiB plus a floor of " + std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " +
+                              ram_note(mem) + ")";
+                        return false;
+                    };
+                    // every checkpoint (each has its own file, written once: rewinds and the shared start stay cheap), or
+                    // only the deepest one, the next turn's resume point (--conversation-cache-park-ssd-deepest-checkpoint)
+                    std::vector<ConvCheckpoint> disk_checks;
+                    std::string why;
+                    bool admitted = false;
+                    const bool all_checks = !o.conversation_cache_park_ssd_deepest_checkpoint;
+                    if (all_checks) {
+                        // (no checkpoint is copied: the chain's own objects are lent to the image below)
+                        uint64_t need = sl.state_bytes;
+                        if (need != UINT64_MAX) need = need > UINT64_MAX - (32u << 20) ? UINT64_MAX : need + (32u << 20);
+                        admitted = admit_store(need, why);
+                    } else {
+                        admitted = strata::core::session_save_checkpoints(checks, sl, admit_store, disk_checks, why);
+                    }
+                    if (!admitted) {
+                        std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n", why.c_str());
+                        return true;
+                    }
+                    const std::vector<ConvCheckpoint> no_checks;
+                    const strata::core::ConversationView dview{src.ids, src.imgs,
+                                                               all_checks ? no_checks : disk_checks, src.cvec};
+                    strata::core::SavedConversation meta;
+                    std::vector<strata::core::SessionKvSource> sources;
+                    if (!strata::core::conversation_snapshot_sources(meta, sources, dview, src.session, g, mtp.kv_state(), err)) {
+                        std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n", err.c_str());
+                        err.clear();
+                        return true;
+                    }
+                    // Every checkpoint: the live chain's own objects are lent to the image for the length of the park - moved
+                    // in, and moved back when this scope ends - so none of their state (about 113 MiB each) is copied.  The
+                    // tier writes only the ones that have no file yet.  Lent: the ones on this conversation's path, without
+                    // pictures, each once (two at the same tokens hold the same state and would name one file).
+                    struct LendChecks {
+                        std::vector<ConvCheckpoint>& chain;
+                        std::vector<ConvCheckpoint>& into;
+                        std::vector<size_t> at;
+                        ~LendChecks() {
+                            for (size_t k2 = 0; k2 < at.size() && k2 < into.size(); ++k2) chain[at[k2]] = std::move(into[k2]);
+                            if (!at.empty()) into.clear();
+                        }
+                    } lend{checks, meta.checkpoints, {}};
+                    if (all_checks) {
+                        // the ones that may be lent, then --conversation-cache-park-ssd-checkpoints N: the shallowest (the start
+                        // new conversations share) and the N deepest (where the next turns resume)
+                        std::vector<size_t> ok_at;
+                        for (size_t i = 0; i < checks.size(); ++i) {
+                            const ConvCheckpoint& c = checks[i];
+                            if (c.ids.empty() || !c.imgs.empty() || !c.stage_parts.empty() || c.ids.size() > src.ids.size() ||
+                                !std::equal(c.ids.begin(), c.ids.end(), src.ids.begin())) continue;
+                            bool twice = false;
+                            for (size_t k2 : ok_at) twice = twice || checks[k2].ids.size() == c.ids.size();   // (prefixes of one conversation)
+                            std::string cerr;
+                            if (twice || !strata::core::conversation_checkpoint_validate(c, src.session, g, cerr)) continue;
+                            ok_at.push_back(i);
+                        }
+                        const size_t keep_n = (size_t) o.conversation_cache_park_ssd_checkpoints;
+                        if (keep_n > 0 && ok_at.size() > keep_n + 1) {
+                            std::vector<size_t> by_depth = ok_at;
+                            std::sort(by_depth.begin(), by_depth.end(), [&](size_t x, size_t y) { return checks[x].ids.size() < checks[y].ids.size(); });
+                            std::vector<size_t> kept{by_depth.front()};
+                            kept.insert(kept.end(), by_depth.end() - (std::ptrdiff_t) keep_n, by_depth.end());
+                            std::sort(kept.begin(), kept.end());   // the chain's own order
+                            ok_at = std::move(kept);
+                        }
+                        for (size_t i : ok_at) {
+                            ConvCheckpoint& c = checks[i];
+                            strata::core::conversation_checkpoint_join(c.gdn.data());   // STRATA_CKPT_ASYNC: its state has landed
+                            lend.at.push_back(i);
+                            meta.checkpoints.push_back(std::move(c));
+                        }
+                    }
+                    // what the file still holds of THIS conversation: the tokens no request rewrote, and only when that
+                    // is enough of the file (else the file stays as it is and a new one is written)
+                    uint64_t base_seq = 0;
+                    int64_t unchanged = 0;
+                    if (base.seq != 0) {
+                        const int64_t u = std::min(base.tokens, spill->common_prefix(base.seq, src.ids));
+                        // --conversation-cache-park-ssd-keep-pct: below that share the file is another conversation's by now
+                        if (u > 0 && u * 100 >= base.file_tokens * o.conversation_cache_park_ssd_keep_pct) { base_seq = base.seq; unchanged = u; }
+                    }
+                    std::vector<std::array<uint64_t, 5>> from;
+                    if (base_seq != 0 && !strata::core::conversation_snapshot_keep_sizes(src.session, g, mtp.kv_state(),
+                                              (int64_t) src.ids.size(), unchanged, from, err)) {
+                        base_seq = 0;
+                        err.clear();
+                    }
+                    if (base_seq == 0) from.assign(sources.size(), std::array<uint64_t, 5>{});
+                    strata::core::ConversationSpill::StorePark sp;
+                    const bool sent = spill->park_store(meta, sources, kv_layout, base_seq, from, sp, why);
+                    std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens%s in %.1f ms (%s%s%s); parked=%zu bytes=%zu evictions=%zu "
+                                         "spilled=%zu files, %.1f GiB; wrote %.1f MiB of the file's %.1f MiB (K/V %.1f MiB, state %.1f MiB, "
+                                         "checkpoints %llu written %llu kept)\n",
+                                 sent ? "parked" : "skipped", src.ids.size(), src.what.c_str(),
+                                 std::chrono::duration<double, std::milli>(Clock::now() - ts).count(),
+                                 sent ? "to its SSD file" : "the SSD tier did not take it: ",
+                                 sent ? (sp.full ? ", written whole" : ", only what changed") : why.c_str(),
+                                 sent && !sp.full ? (", " + std::to_string((long long) unchanged) + " tokens kept").c_str() : "",
+                                 conversations.size(), conversations.bytes(), conversations.evictions(), spill->files(),
+                                 (double) spill->indexed_bytes() / (1u << 30), (double) (sp.written + sp.meta) / (1 << 20),
+                                 (double) sp.bytes / (1 << 20), (double) sp.written / (1 << 20), (double) sp.meta / (1 << 20),
+                                 (unsigned long long) sp.checkpoints_written, (unsigned long long) sp.checkpoints_kept);
+                    // STRATA_SPILL_STORE_VERIFY=1 (a test switch): the file's K/V is read back and compared, byte for byte, with
+                    // the bytes it was written from (the session's own K/V, through the same sources).  A file that differs
+                    // is removed, so it is never read back.
+                    if (sent && std::getenv("STRATA_SPILL_STORE_VERIFY") != nullptr) {
+                        std::vector<strata::core::ConversationKv> back;
+                        std::string verr;
+                        bool same = spill->read_kv(sp.seq, kv_layout, back, verr);
+                        if (same && back.size() != sources.size()) { same = false; verr = "layer count differs"; }
+                        std::vector<uint8_t> tmp(1u << 20);
+                        uint64_t compared = 0;
+                        for (size_t j = 0; same && j < back.size(); ++j) {
+                            const strata::core::ConversationBuffer* parts[5] = {&back[j].k, &back[j].v, &back[j].k_scale, &back[j].v_scale,
+                                                                                &back[j].pooled};
+                            for (size_t pt = 0; same && pt < 5; ++pt) {
+                                if (parts[pt]->size() != sources[j].sizes[pt]) {
+                                    same = false;
+                                    verr = "layer " + std::to_string(j) + " part " + std::to_string(pt) + ": " + std::to_string(parts[pt]->size()) +
+                                           " bytes in the file, " + std::to_string(sources[j].sizes[pt]) + " in the session";
+                                    break;
+                                }
+                                parts[pt]->visit(0, parts[pt]->size(), [&](const uint8_t* d, size_t n, size_t at) {
+                                    for (size_t o2 = 0; o2 < n; o2 += tmp.size()) {
+                                        const size_t c = std::min(tmp.size(), n - o2);
+                                        if (!sources[j].read(pt, at + o2, tmp.data(), c)) { same = false; verr = "the session's K/V could not be read"; return false; }
+                                        if (std::memcmp(tmp.data(), d + o2, c) != 0) {
+                                            size_t k = 0;
+                                            while (k < c && tmp[k] == d[o2 + k]) ++k;
+                                            same = false;
+                                            verr = "layer " + std::to_string(j) + " part " + std::to_string(pt) + " differs at byte " +
+                                                   std::to_string(at + o2 + k) + " of " + std::to_string(parts[pt]->size()) +
+                                                   " (the park kept " + std::to_string(from[j][pt]) + ")";
+                                            return false;
+                                        }
+                                        compared += c;
+                                    }
+                                    return true;
+                                });
+                            }
+                        }
+                        std::fprintf(stderr, "strata serve: STORE_VERIFY %s tokens=%zu %s compared=%.1f MiB%s\n", same ? "ok" : "FAILED", src.ids.size(),
+                                     sp.full ? "whole" : "delta", (double) compared / (1 << 20), same ? "" : (": " + verr).c_str());
+                        if (!same) spill->drop(sp.seq);
+                    }
+                } catch (const std::bad_alloc&) {
+                    std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
+                }
+                return true;
+            }
+            if (ssd_park) {
+                if (spill->inflight_bytes() > 0) spill->wait_idle();
+                spill_drain();
+            } else if (!conversations.make_room(estimate, held)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
                              estimate >> 20);
                 return true;
@@ -12367,6 +12684,18 @@ int main(int argc, char **argv) try {
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
+                if (ssd_park) {
+                    std::string why;
+                    const bool sent = spill->submit(std::move(image),
+                        [](const strata::core::SavedConversation& v) { strata::core::conversation_park_join_for(v); }, why);
+                    std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens%s in %.1f ms (%s%s); parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
+                                 sent ? "parked" : "skipped", src.ids.size(), src.what.c_str(),
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                                 sent ? "to the SSD tier, the file is written in the background" : "the SSD tier did not take it: ",
+                                 sent ? "" : why.c_str(),
+                                 conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes);
+                    return true;
+                }
                 const bool stored = conversations.put(std::move(image), held);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens%s in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", src.ids.size(), src.what.c_str(),
@@ -15473,7 +15802,21 @@ int main(int argc, char **argv) try {
             if ((!heat.empty() || usage_dev_srv != nullptr) && line != "QUIT" && o.expert_profile_save_min > 0 &&
                 Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
                 save_profile("periodic");
-            if (line == "QUIT") break;
+            if (line == "QUIT") {
+                // --conversation-cache-park-on-exit (with --conversation-cache-park-ssd): the conversation in use goes to its
+                // file like any parked one, so the next start reads it back instead of reading its prompt again.  A
+                // whole-file park is written by the writer thread: it is waited for.
+                if (o.conversation_cache_park_on_exit && park_ssd && live_ok && !live.empty()) {
+                    const auto tq = Clock::now();
+                    (void) park_current(0);   // (true also when the park was skipped: its own line says why)
+                    if (spill) { spill->wait_idle(); spill_drain(); }
+                    err.clear();
+                    std::fprintf(stderr, "strata serve: conversation cache: park at exit done in %.0f ms; the SSD tier holds %zu "
+                                         "conversations for the next start\n",
+                                 std::chrono::duration<double, std::milli>(Clock::now() - tq).count(), spill ? spill->files() : (size_t) 0);
+                }
+                break;
+            }
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
             struct BusyScope {
                 BusyScope() {
@@ -16221,7 +16564,14 @@ int main(int argc, char **argv) try {
             // conversation, a batch slot) does, when reading its file is cheaper than reading the prompt.  It then goes the
             // way of a parked conversation that is taken whole: validated, restored, the outgoing one parked.
             bool disk_hit = false;
+            disk_base_next = {};
+            disk_stream = false;
             if (spill_wanted && stages.empty() && o.batch == 0 && want_cvec == cvec_cached && spill_open()) {
+                // --conversation-cache-park-ssd: the conversation this request goes on with may still be on its way to its
+                // file (parked a moment ago).  The file is not in the index before it is whole: wait for it (seconds)
+                // instead of reading the whole prompt again.
+                if (park_ssd && spill->inflight_prefix(ids) > std::max<int64_t>({parked.tokens, resume, slot_tokens}))
+                    spill->wait_idle();
                 spill_drain();
                 const auto dm = spill->best(ids, req_imgs, want_cvec);
                 const int64_t have = std::max<int64_t>({parked.tokens, resume, slot_tokens});
@@ -16249,7 +16599,20 @@ int main(int argc, char **argv) try {
                             };
                             if (strata::core::conversation_session_read_limits(limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
                                                                                (uint64_t) std::max(o.prompt_cache, 1), lerr))
-                                read_ok = spill->take(dm, limits, img, file_bytes, lerr);
+                            {
+                                const bool lay = kv_layout_ready();
+                                // (not from the live conversation's own file: its park below updates that file in place, and
+                                //  the stream would read it after the update - the image in RAM is read before it)
+                                const bool stream = lay && o.conversation_cache_park_ssd_stream && park_ssd && use_mtp && spill->is_store(dm) &&
+                                                    !(disk_base.seq != 0 && spill->seq_of(dm) == disk_base.seq);
+                                read_ok = lay   // (a store entry keeps its files; take() is for whole files only)
+                                              ? spill->checkout(dm, limits, kv_layout, img, file_bytes, disk_base_next.seq, lerr,
+                                                                stream ? &disk_kv : nullptr)
+                                              : spill->take(dm, limits, img, file_bytes, lerr);
+                                disk_stream = read_ok && stream;
+                                // its files stay where they are until the restore has read them (the outgoing park may evict)
+                                if (disk_stream) spill->hold(disk_base_next.seq);
+                            }
                         } catch (const std::bad_alloc&) {
                             lerr = "out of memory";
                         }
@@ -16257,6 +16620,9 @@ int main(int argc, char **argv) try {
                             std::fprintf(stderr, "strata serve: conversation cache: the SSD tier file could not be read (%s); reading the prompt\n",
                                          lerr.c_str());
                         } else {
+                            // what the file holds for the conversation that goes on: the tokens this request takes from it
+                            disk_base_next.tokens = dm.tokens;
+                            disk_base_next.file_tokens = (int64_t) img.live.ids.size();
                             incoming.emplace(std::move(img));
                             parked = {0, dm.tokens, dm.live, 0};
                             disk_hit = true;
@@ -16294,8 +16660,10 @@ int main(int argc, char **argv) try {
                     break;
                 }
             }
-            if (incoming && !strata::core::conversation_snapshot_validate(*incoming, ss, g,
-                    use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err)) {
+            if (incoming && !(disk_stream
+                    ? strata::core::conversation_snapshot_stream_validate(*incoming, disk_kv.layers, ss, g, mtp.kv_state(), err)
+                    : strata::core::conversation_snapshot_validate(*incoming, ss, g,
+                          use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err))) {
                 std::fprintf(stderr, "strata serve: conversation cache: discard invalid snapshot (%s)\n", err.c_str());
                 incoming.reset();
                 err.clear();
@@ -16352,7 +16720,9 @@ int main(int argc, char **argv) try {
                                  (long long) strata::program::conv_cache::kRestoreFirstUseMib);
                     auto retry = std::move(*incoming);
                     incoming.reset();
-                    if (!conversations.put(std::move(retry)))
+                    if (disk_stream) {
+                        // (its files are still in the spill folder: nothing to put back)
+                    } else if (!conversations.put(std::move(retry)))
                         std::fprintf(stderr, "strata serve: conversation cache: could not return the skipped snapshot\n");
                     err.clear();
                 }
@@ -16590,68 +16960,141 @@ int main(int argc, char **argv) try {
                              (long long) resume, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes(), conversations.borrowed());
             }
+            if (!incoming) {
+                disk_stream = false;
+                if (spill) spill->hold(0);
+            }
             if (incoming) {
                 const auto t0 = Clock::now();
-                if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
-                        use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err) !=
-                    strata::core::ConversationRestore::restored) {
+                bool restored_ok = false;
+                if (disk_stream) {
+                    // --conversation-cache-park-ssd-stream: the K/V goes from its file into the session block by block
+                    // A match through a checkpoint needs only the K/V of the tokens up to it (the checkpoint is mounted below,
+                    // as for a borrowed prefix): only those leading bytes of each part are read from the file.
+                    strata::core::KvStoreInfo si;
+                    const bool prefix_only = !parked.live && parked.tokens > 0 && parked.tokens < (int64_t) incoming->live.ids.size();
+                    std::vector<std::array<uint64_t, 5>> only;
+                    restored_ok = (!prefix_only || strata::core::conversation_snapshot_prefix_sizes(ss, g, mtp.kv_state(), parked.tokens,
+                                                                                                    only, err)) &&
+                                  strata::core::conversation_snapshot_stream_begin(*incoming, err) &&
+                                  spill->stream_kv(disk_base_next.seq, kv_layout, {},
+                                      [&](size_t layer, size_t part, uint64_t off, const uint8_t* data, size_t n, std::string& why) {
+                                          return strata::core::conversation_snapshot_stream_put(ss, mtp.kv_state(), disk_kv.layers, layer,
+                                                                                               part, off, data, n, why);
+                                      }, si, err, prefix_only ? &only : nullptr) &&
+                                  (prefix_only
+                                       ? strata::core::conversation_snapshot_stream_finish_prefix(ss, g, mtp.kv_state(), parked.tokens, err)
+                                       : strata::core::conversation_snapshot_stream_finish(*incoming, ss, g, mtp.kv_state(), err)) ==
+                                      strata::core::ConversationRestore::restored;
+                    spill->hold(0);
+                    if (!restored_ok) spill->drop(disk_base_next.seq);   // a file that cannot be read is not tried again
+                    if (restored_ok && prefix_only) {
+                        uint64_t pre = 0;
+                        for (const auto& l : only) for (uint64_t b2 : l) pre += b2;
+                        std::fprintf(stderr, "strata serve: conversation cache: streamed the first %lld tokens' K/V only (about %.1f MiB of the file)\n",
+                                     (long long) parked.tokens, (double) pre / (1 << 20));
+                    }
+                    // STRATA_SPILL_STORE_VERIFY=1 (a test switch): the session's K/V after the streamed restore against the file
+                    // (a prefix: its tokens' bytes only - the rest of the session's K/V is as it was)
+                    if (restored_ok && std::getenv("STRATA_SPILL_STORE_VERIFY") != nullptr) {
+                        std::vector<strata::core::ConversationKv> back;
+                        std::string verr;
+                        const int64_t vt = prefix_only ? parked.tokens : (int64_t) incoming->live.ids.size();
+                        const bool same = spill->read_kv(disk_base_next.seq, kv_layout, back, verr) &&
+                                          strata::core::conversation_snapshot_verify_kv(back, ss, g, mtp.kv_state(), vt, verr, prefix_only);
+                        std::fprintf(stderr, "strata serve: STREAM_VERIFY %s tokens=%lld%s%s\n", same ? "ok" : "FAILED", (long long) vt,
+                                     prefix_only ? " (prefix)" : "", same ? "" : (": " + verr).c_str());
+                    }
+                } else {
+                    restored_ok = strata::core::conversation_snapshot_restore(*incoming, ss, g,
+                                      use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err) ==
+                                  strata::core::ConversationRestore::restored;
+                    // STRATA_SPILL_STORE_VERIFY=1: the same check after a read-back through RAM (the streamed one's control)
+                    if (restored_ok && disk_hit && use_mtp && stages.empty() && std::getenv("STRATA_SPILL_STORE_VERIFY") != nullptr) {
+                        std::string verr;
+                        const bool same = strata::core::conversation_snapshot_verify_kv(incoming->kv, ss, g, mtp.kv_state(),
+                                                                                       (int64_t) incoming->live.ids.size(), verr);
+                        std::fprintf(stderr, "strata serve: RESTORE_VERIFY %s tokens=%zu%s\n", same ? "ok" : "FAILED",
+                                     incoming->live.ids.size(), same ? "" : (": " + verr).c_str());
+                    }
+                }
+                if (!restored_ok && disk_stream) {
+                    // A streamed restore reads its K/V after the checks above, straight into the session: a file that is
+                    // short, damaged or unreadable shows only here.  The file is dropped (above), the outgoing conversation
+                    // is parked already and the session's K/V is partly this file's: it is nobody's, so this request reads
+                    // its whole prompt like one with nothing parked.
+                    std::fprintf(stderr, "strata serve: conversation cache: the parked conversation's K/V file could not be read "
+                                         "(%s): reading the prompt instead\n", err.c_str());
+                    err.clear();
+                    incoming.reset();
+                    disk_stream = false;
+                    disk_hit = false;
+                    disk_base = {};
+                    live.clear();
+                    live_imgs.clear();
+                    resume = 0;
+                    from_live = false;
+                } else if (!restored_ok) {
                     // Already prevalidated above: a failure here is fatal, never
                     // permission to decode from a partially restored session.
                     std::printf("ERR restoring parked conversation: %s\n", err.c_str());
                     return 1;
                 }
-                for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
-                    const strata::core::OnDevice on(stages[i]->dev);
-                    if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
-                            use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
-                        strata::core::ConversationRestore::restored) {
-                        std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
-                                    err.c_str());
-                        return 1;
+                if (incoming) {   // (not after a streamed restore that failed)
+                    for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
+                        const strata::core::OnDevice on(stages[i]->dev);
+                        if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
+                                use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
+                            strata::core::ConversationRestore::restored) {
+                            std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
+                                        err.c_str());
+                            return 1;
+                        }
+                        if (DPCT_CHECK_ERROR(dpct::get_current_device()
+                                                 .queues_wait_and_throw()) != 0) {
+                            std::printf("ERR stage sync\n"); return 1;
+                        }
                     }
-                    if (DPCT_CHECK_ERROR(dpct::get_current_device()
-                                             .queues_wait_and_throw()) != 0) {
-                        std::printf("ERR stage sync\n"); return 1;
+                    if (use_mtp && !disk_stream && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr) {
+                        uint64_t draft_hash = 0;
+                        const auto& draft_kv = stages.empty() || mtp_first ? incoming->kv.back() : incoming->stage_images.back().kv.back();
+                        const strata::core::OnDevice on_d(stages.empty() || mtp_first ? 0 : stages.back()->dev);
+                        if (!strata::core::conversation_kv_verify(draft_kv, mtp.kv_state(), g,
+                                int64_t(incoming->live.ids.size()), false, draft_hash, err)) {
+                            std::printf("ERR verifying restored draft KV: %s\n", err.c_str());
+                            return 1;
+                        }
+                        std::fprintf(stderr, "strata serve: SNAPSHOT_VERIFY draft=%016llx cells=%lld mode=%d source=%s resident=%lld\n",
+                                     (unsigned long long) draft_hash, (long long) draft_kv.cells,
+                                     mtp.kv_state().kv_mode, "ram",
+                                     (long long) (mtp.kv_state().n_slots * strata::kernels::qsa_real_shapes().page_size));
                     }
-                }
-                if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr) {
-                    uint64_t draft_hash = 0;
-                    const auto& draft_kv = stages.empty() || mtp_first ? incoming->kv.back() : incoming->stage_images.back().kv.back();
-                    const strata::core::OnDevice on_d(stages.empty() || mtp_first ? 0 : stages.back()->dev);
-                    if (!strata::core::conversation_kv_verify(draft_kv, mtp.kv_state(), g,
-                            int64_t(incoming->live.ids.size()), false, draft_hash, err)) {
-                        std::printf("ERR verifying restored draft KV: %s\n", err.c_str());
-                        return 1;
+                    live = std::move(incoming->live.ids);
+                    live_imgs = std::move(incoming->live.imgs);
+                    if (stages.empty()) {
+                        checks = std::move(incoming->checkpoints);
+                    } else {   // give each checkpoint back its stage parts (moved, not copied); none if they do not line up
+                        strata::core::ConversationCheckpointSplit cs;
+                        cs.stage0 = std::move(incoming->checkpoints);
+                        for (auto& si : incoming->stage_images) cs.parts.push_back(std::move(si.checkpoints));
+                        if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
                     }
-                    std::fprintf(stderr, "strata serve: SNAPSHOT_VERIFY draft=%016llx cells=%lld mode=%d source=%s resident=%lld\n",
-                                 (unsigned long long) draft_hash, (long long) draft_kv.cells,
-                                 mtp.kv_state().kv_mode, "ram",
-                                 (long long) (mtp.kv_state().n_slots * strata::kernels::qsa_real_shapes().page_size));
+                    cvec_cached = incoming->cvec;
+                    resume = parked.tokens;
+                    from_live = parked.live;
+                    if (!disk_stream && std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
+                        std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
+                        for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
+                        conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv), live);
+                    }
+                    incoming.reset(); // Running-state/checkpoint copies are no longer needed.
+                    disk_base = disk_hit ? disk_base_next : DiskBase{};   // the file the live conversation came from (or none)
+                    lent_slot = -1;   // (the main session holds the parked conversation now)
+                    std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
+                                 (long long) resume, from_live ? "live" : "checkpoint",
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                                 conversations.size(), conversations.bytes());
                 }
-                live = std::move(incoming->live.ids);
-                live_imgs = std::move(incoming->live.imgs);
-                if (stages.empty()) {
-                    checks = std::move(incoming->checkpoints);
-                } else {   // give each checkpoint back its stage parts (moved, not copied); none if they do not line up
-                    strata::core::ConversationCheckpointSplit cs;
-                    cs.stage0 = std::move(incoming->checkpoints);
-                    for (auto& si : incoming->stage_images) cs.parts.push_back(std::move(si.checkpoints));
-                    if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
-                }
-                cvec_cached = incoming->cvec;
-                resume = parked.tokens;
-                from_live = parked.live;
-                if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
-                    std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
-                    for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
-                    conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv), live);
-                }
-                incoming.reset(); // Running-state/checkpoint copies are no longer needed.
-                lent_slot = -1;   // (the main session holds the parked conversation now)
-                std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
-                             (long long) resume, from_live ? "live" : "checkpoint",
-                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                             conversations.size(), conversations.bytes());
             }
             if (want_cvec != cvec_cached) {
                 live_ok = false;
@@ -16777,6 +17220,7 @@ int main(int argc, char **argv) try {
                 mtp.set_cell_floor(resume > 0 && reread_to <= 0 ? kva_floors.floor_for(ids.data(), resume) : 0);
             const int64_t read_from = reread_to > 0 ? 0 : resume;
             conversations.limit_reuse(read_from);
+            disk_base.tokens = std::min(disk_base.tokens, read_from);   // the file's K/V from here on is rewritten too
             pp_total = n;
             pp_from = read_from;
             pp_reached = read_from;
