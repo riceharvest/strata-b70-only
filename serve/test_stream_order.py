@@ -261,5 +261,133 @@ class ThroughService(unittest.TestCase):
         self.assertEqual(order, ["A", "B", "A", "C", "A"])
 
 
+
+class Pin(unittest.TestCase):
+    """The web page's pin: one thread runs to its end, every other request waits (also while the engine is free)."""
+
+    def test_only_the_pinned_thread_takes_the_engine(self):
+        o = so.StreamOrder(enabled=True, capacity=3)
+        a, b = stream(1, 500), stream(2, 500)
+        serve_one(o, a, key="A")                      # A's turn ended in a tool call: its agent is running the tool
+        self.assertTrue(o.pin("A"))
+        wb = o.enter(b + [1], "B")
+        self.assertFalse(o.wait_turn(wb, 0.05))       # the engine is free, B still waits behind the pin
+        wa = o.enter(a + [7], "A")                    # A's next request arrives after B's
+        self.assertFalse(o.wait_turn(wb, 0.05))
+        self.assertTrue(o.wait_turn(wa, 1))
+        self.assertEqual(wa.why, "the pinned thread")
+        wa.served, wa.open = True, True
+        o.finish(wa)
+        self.assertEqual(o.pinned, "A")               # a tool call: the thread goes on, so does the pin
+        self.assertFalse(o.wait_turn(wb, 0.05))
+        o.finish(wb)
+
+    def test_the_pin_ends_with_the_thread_and_not_on_a_cancelled_turn(self):
+        o = so.StreamOrder(enabled=True, capacity=3)
+        a, b = stream(1, 500), stream(2, 500)
+        serve_one(o, a, key="A")
+        o.pin("A")
+        wb = o.enter(b, "B")
+        e = o.enter(a + [7], "A")                     # this turn is cancelled (the client left): the agent sends it again
+        self.assertTrue(o.wait_turn(e, 1))
+        e.served, e.open, e.finish = True, False, "cancel"
+        o.finish(e)
+        self.assertEqual(o.pinned, "A")
+        self.assertFalse(o.wait_turn(wb, 0.05))
+        e = o.enter(a + [7], "A")                     # the same turn again, now a finished answer with no tool call
+        self.assertTrue(o.wait_turn(e, 1))
+        e.served, e.open, e.finish = True, False, "stop"
+        o.finish(e)
+        self.assertIsNone(o.pinned)                   # the thread is complete: the pin is gone
+        self.assertTrue(o.wait_turn(wb, 1))           # and the request that waited goes on
+        o.finish(wb)
+
+    def test_unpin_lets_the_waiting_requests_go(self):
+        o = so.StreamOrder(enabled=True, capacity=3)
+        o.pin("A")
+        wb = o.enter(stream(2, 500), "B")
+        self.assertFalse(o.wait_turn(wb, 0.05))
+        snap = o.snapshot()
+        self.assertEqual((snap["pinned"], snap["held_back"]), ("A", 1))
+        self.assertEqual({r["key"]: r["state"] for r in snap["threads"]}, {"B": "waiting", "A": "not seen yet"})
+        self.assertTrue(next(r for r in snap["threads"] if r["key"] == "A")["pinned"])
+        o.unpin()
+        self.assertTrue(o.wait_turn(wb, 1))
+        self.assertEqual(o.snapshot()["threads"][0]["state"], "running")
+        o.finish(wb)
+        self.assertFalse(o.pin("   "))                # no usable name: nothing is pinned
+        self.assertIsNone(o.pinned)
+
+    def test_a_set_max_wait_also_ends_the_wait_behind_a_pin(self):
+        o = so.StreamOrder(enabled=True, capacity=3)
+        o.pin("never-comes")                          # a thread that never sends a request (a typo, a crashed agent)
+        wb = o.enter(stream(2, 500), "B")
+        self.assertFalse(o.wait_turn(wb, 0.3))        # no max wait (the default): B waits until the pin is taken off
+        with mock.patch.object(so, "MAX_WAIT_S", 0.2):
+            self.assertTrue(o.wait_turn(wb, 2))       # it has waited longer than the max wait: it goes
+            self.assertIn("behind the pin", wb.why)
+        self.assertEqual(o.pinned, "never-comes")     # the pin itself stays
+        o.finish(wb)
+
+
+
+class Linger(unittest.TestCase):
+    """The run config's stream_linger_s: when the thread served last has a tool running, another thread's request is held
+    back that long for its next request.  Off (0) nothing waits; the return gaps are counted either way."""
+
+    def setUp(self):
+        self.before = so.LINGER_S
+
+    def tearDown(self):
+        so.LINGER_S = self.before
+
+    @staticmethod
+    def turn(o, ids, key, timeout=1.0):
+        e = o.enter(ids, key)
+        if not o.wait_turn(e, timeout):
+            return e, False
+        e.served, e.open = True, True
+        o.finish(e)
+        return e, True
+
+    def test_off_the_other_thread_goes_at_once(self):
+        so.LINGER_S = 0.0
+        o = so.StreamOrder(capacity=3)
+        self.assertTrue(self.turn(o, list(range(5000)), "A")[1])
+        t = time.monotonic()
+        self.assertTrue(self.turn(o, list(range(9000, 14000)), "B")[1])
+        self.assertLess(time.monotonic() - t, 0.2)
+        self.assertEqual(o.snapshot()["lingered"], 0)
+
+    def test_the_thread_that_comes_back_in_time_keeps_the_engine(self):
+        so.LINGER_S = 0.6
+        o = so.StreamOrder(capacity=3)
+        self.assertTrue(self.turn(o, list(range(5000)), "A")[1])
+        b = o.enter(list(range(9000, 14000)), "B")
+        self.assertFalse(o.wait_turn(b, 0.2))                       # held: A's tool is running
+        a2 = o.enter(list(range(5000)) + [7, 8, 9], "A")
+        self.assertTrue(o.wait_turn(a2, 0.2))                       # A is back in time and goes first
+        self.assertIn("within the linger", a2.why)
+        a2.served, a2.open = True, True
+        o.finish(a2)
+        t = time.monotonic()
+        self.assertTrue(o.wait_turn(b, 2.0))                        # A does not come back again: B goes when the linger ends
+        self.assertTrue(0.3 < time.monotonic() - t < 1.2)
+        snap = o.snapshot()
+        self.assertEqual((snap["linger_s"], snap["lingered"], snap["linger_kept"]), (0.6, 2, 1))
+        self.assertEqual(snap["return_gap"]["n"], 1)
+        self.assertLessEqual(snap["return_gap"]["p50_s"], 1.0)
+
+    def test_a_closed_thread_is_not_waited_for(self):
+        so.LINGER_S = 0.6
+        o = so.StreamOrder(capacity=3)
+        a = o.enter(list(range(5000)), "A")
+        self.assertTrue(o.wait_turn(a, 1.0))
+        a.served, a.open = True, False                              # a plain answer: nothing comes after it
+        o.finish(a)
+        t = time.monotonic()
+        self.assertTrue(self.turn(o, list(range(9000, 14000)), "B")[1])
+        self.assertLess(time.monotonic() - t, 0.2)
+
 if __name__ == "__main__":
     unittest.main()

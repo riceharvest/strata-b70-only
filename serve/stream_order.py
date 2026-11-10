@@ -15,6 +15,9 @@ When the engine is free it picks:
 A thread is recognised by the header the client sends per conversation (Hermes: `session_affinity_header: x-strata-thread`,
 exact and stable through compaction), else by prompt: it shares all of the thread's last prompt but a tail.
 A reply with a plain answer (no tool call) closes its thread: it leaves `recent` and frees its place.
+A PIN (the web page's "Agent threads" card, POST /v1/threads/pin) names one thread by its key: while it is set only that
+thread's requests take the engine and every other request waits, also while the pinned agent runs a tool and the engine
+is free.  The pin ends when the thread ends (a finished reply with no tool call) or when it is taken off by hand.
 STRATA_STREAM_ORDER=0 turns it off; STRATA_STREAM_MAX_WAIT_S=N (default 0 = never) lets a waiter that long go first."""
 from __future__ import annotations
 
@@ -35,6 +38,11 @@ def _env_float(name: str, default: float) -> float:
 
 ENABLED = os.environ.get("STRATA_STREAM_ORDER", "1") != "0"
 MAX_WAIT_S = _env_float("STRATA_STREAM_MAX_WAIT_S", 0.0)      # 0: no escape; a thread is waited for to its end
+# The run config's "stream_linger_s" (0 = off, the default): when the engine falls free and the thread it just served has a
+# tool running, a waiter of ANOTHER thread is held back this long for that thread's next request.  If it arrives in time
+# the engine goes on with the live conversation (no park, no restore); if not, the waiter goes after the wait.
+LINGER_S = 0.0
+GAPS_KEPT = 256             # the last gaps (a thread's reply end to its next request) kept for the snapshot's statistics
 TAIL = 4096                 # as --conversation-cache-park-tail
 MIN_SHARED = 2048           # sharing less than this (a system prompt) never makes a thread
 KEY_MAX = 128               # a thread key is cut to this
@@ -76,14 +84,15 @@ def clean_key(key) -> str | None:
 
 class Thread:
     """A conversation the engine's cache may still hold: its last prompt, its key (if the client names threads)."""
-    __slots__ = ("key", "ids", "ver")
+    __slots__ = ("key", "ids", "ver", "turns", "last")
 
     def __init__(self, key, ids):
         self.key, self.ids, self.ver = key, ids, 0
+        self.turns, self.last = 0, time.monotonic()   # turns served; when the last one ended
 
 
 class Entry:
-    __slots__ = ("ids", "key", "t0", "cache", "why", "served", "open")
+    __slots__ = ("ids", "key", "t0", "cache", "why", "served", "open", "finish")
 
     def __init__(self, ids, key=None):
         self.ids = ids
@@ -93,6 +102,7 @@ class Entry:
         self.why = ""
         self.served = False           # the engine began reading its prompt (so it is the live conversation)
         self.open = False             # its reply ended in a tool call: the thread goes on with the tool's result
+        self.finish = None            # how its reply ended ("stop", "length", "cancel", "error", ...), when the server said
 
 
 class StreamOrder:
@@ -103,6 +113,13 @@ class StreamOrder:
         self.waiters: list[Entry] = []
         self.active: Entry | None = None      # picked, until its turn is over
         self.recent: list[Thread] = []        # open threads the cache holds, least recently served first
+        self.pinned: str | None = None        # the key of the one thread that may take the engine (None: no pin)
+        self.pinned_at = 0.0
+        self.gaps: list[float] = []           # seconds from a thread's reply end (a tool call) to its next request
+        self.lingered = 0                     # waits LINGER_S began; `linger_kept`: the thread came back within one
+        self.linger_kept = 0
+        self._hold_until = 0.0                # _pick is holding the waiters back until then (0: it is not)
+        self._held_for: Thread | None = None
 
     # -- the caller's side -------------------------------------------------------------------------------------------
     def enter(self, ids, key=None) -> Entry:
@@ -128,7 +145,8 @@ class StreamOrder:
                 left = end - now
                 if left <= 0:
                     return False
-                self.cv.wait(left)
+                # a linger ends by the clock, not by a notify: wake then
+                self.cv.wait(min(left, max(0.01, self._hold_until - now)) if self._hold_until > now else left)
 
     def finish(self, e: Entry) -> None:
         """`e` is over (done, cancelled or expired).  Idempotent."""
@@ -145,6 +163,58 @@ class StreamOrder:
         """The engine's cache dropped `n` parked conversations (its oldest first): the least recent threads are gone."""
         with self.cv:
             del self.recent[:max(0, n)]
+
+    def pin(self, key) -> bool:
+        """Only the thread named `key` takes the engine from now on, until it ends or unpin() (a request that has waited
+        STRATA_STREAM_MAX_WAIT_S, when that is set, still goes).  False: no usable key."""
+        key = clean_key(key)
+        if key is None:
+            return False
+        with self.cv:
+            self.pinned, self.pinned_at = key, time.monotonic()
+            self.cv.notify_all()
+        return True
+
+    def unpin(self) -> None:
+        with self.cv:
+            self.pinned = None
+            self.cv.notify_all()
+
+    def snapshot(self, tail: int = 48) -> dict:
+        """What the web page shows: the pin, and each thread seen now - running, waiting or between two turns (its agent
+        runs a tool).  `tail_ids`: the last tokens of its newest prompt, for a preview the server decodes."""
+        now = time.monotonic()
+        with self.cv:
+            rows: dict = {}
+
+            def put(key, state, ids, waited=None, turns=None):
+                k = key if key is not None else f"\0{len(rows)}"        # a thread without a name stays its own row
+                if k in rows and rows[k]["state"] != "between turns":
+                    return
+                old = rows.get(k) or {}
+                rows[k] = {"key": key, "state": state, "tokens": len(ids), "tail_ids": list(ids[-tail:]) if tail > 0 else [],
+                           "waited_s": round(waited, 1) if waited is not None else None,
+                           "turns": turns if turns is not None else old.get("turns")}
+
+            for t in self.recent:
+                put(t.key, "between turns", t.ids, now - t.last, t.turns)
+            if self.active is not None:
+                put(self.active.key, "running", self.active.ids)
+            for w in self.waiters:
+                if w is not self.active:
+                    put(w.key, "waiting", w.ids, now - w.t0)
+            if self.pinned is not None and self.pinned not in rows:
+                rows[self.pinned] = {"key": self.pinned, "state": "not seen yet", "tokens": 0, "tail_ids": [],
+                                     "waited_s": None, "turns": None}
+            held = sum(1 for w in self.waiters if w is not self.active and w.key != self.pinned) if self.pinned else 0
+            g = sorted(self.gaps)
+            gap = {"n": len(g), "p50_s": round(g[len(g) // 2], 2) if g else None,
+                   "p90_s": round(g[min(len(g) - 1, len(g) * 9 // 10)], 2) if g else None,
+                   "within_1s": sum(1 for x in g if x <= 1.0), "within_3s": sum(1 for x in g if x <= 3.0)}
+            return {"enabled": self.enabled, "linger_s": LINGER_S, "lingered": self.lingered, "linger_kept": self.linger_kept,
+                    "return_gap": gap, "pinned": self.pinned,
+                    "pinned_for_s": round(now - self.pinned_at, 1) if self.pinned else None, "held_back": held,
+                    "threads": [dict(r, pinned=r["key"] is not None and r["key"] == self.pinned) for r in rows.values()]}
 
     def set_capacity(self, n: int) -> None:
         with self.cv:
@@ -166,13 +236,35 @@ class StreamOrder:
         """(entry, why): the waiter to go next."""
         if not self.waiters:
             return None, ""
+        if self.pinned is not None:                             # a pin: its thread or nobody (the others wait)
+            for w in self.waiters:
+                if w.key == self.pinned:
+                    return w, "the pinned thread" if len(self.waiters) > 1 else ""
+            if MAX_WAIT_S > 0:                                  # ... but not longer than the max wait, when one is set:
+                for w in self.waiters:                          # a pin on a thread that never comes back holds nobody for good
+                    if now - w.t0 >= MAX_WAIT_S:
+                        return w, f"waited {now - w.t0:.0f} s behind the pin"
+            return None, ""
         others = len(self.waiters) > 1
         for i in range(len(self.recent) - 1, -1, -1):          # the thread served last first
             t = self.recent[i]
             for w in self.waiters:                              # (in arrival order)
                 if self._belongs(w, t):
                     why = ("kept the thread" if i == len(self.recent) - 1 else "back to a parked thread") if others else ""
+                    if i == len(self.recent) - 1 and self._held_for is t:
+                        self.linger_kept += 1                   # it came back within the linger: no switch
+                        why = "kept the thread (it came back within the linger)"
+                    self._hold_until, self._held_for = 0.0, None
                     return w, why
+            if i == len(self.recent) - 1 and LINGER_S > 0 and now - t.last < LINGER_S:
+                # stream_linger_s: the thread served last has a tool running and none of the waiters is its next request;
+                # nobody else goes before the linger is over
+                if self._held_for is not t:
+                    self._held_for = t
+                    self.lingered += 1
+                self._hold_until = t.last + LINGER_S
+                return None, ""
+        self._hold_until, self._held_for = 0.0, None
         if MAX_WAIT_S > 0:
             for w in self.waiters:
                 if now - w.t0 >= MAX_WAIT_S:
@@ -191,11 +283,20 @@ class StreamOrder:
                 t = k                 # a tool-calling turn that does not continue its prompt (the history was rewritten)
         if t is not None:
             self.recent.remove(t)
+            if e.t0 >= t.last:                 # how long its agent took to come back (a tool's run time)
+                self.gaps.append(e.t0 - t.last)
+                del self.gaps[:max(0, len(self.gaps) - GAPS_KEPT)]
         if not e.open:
-            return                    # no tool call: nothing comes after it, so no place is kept for it
+            # no tool call: nothing comes after it, so no place is kept for it.  A pinned thread that ended this way
+            # (a finished reply, not a cancelled or failed one, which its agent sends again) is complete: the pin ends.
+            if self.pinned is not None and e.key == self.pinned and e.finish == "stop":
+                self.pinned = None
+                print(f"[strata] stream order: the pinned thread {e.key[:24]} ended; the others go on", flush=True)
+            return
         if t is None:
             t = Thread(e.key, e.ids)
         else:
             t.key, t.ids, t.ver = e.key or t.key, e.ids, t.ver + 1
+        t.turns, t.last = t.turns + 1, time.monotonic()
         self.recent.append(t)
         del self.recent[:max(0, len(self.recent) - self.capacity)]
