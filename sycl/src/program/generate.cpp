@@ -8414,8 +8414,14 @@ int main(int argc, char **argv) try {
         if (!o.no_prefill_borrow && o.prefill_chunk > 0 && !multi_gpu) {
             const char* lm = std::getenv("STRATA_LEND_MIRROR");
             const int64_t blob_b = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+            // The tail is counted as the loan is (split_lend_slots over the cache's own slot offsets, as part_slots): a
+            // native pack's blobs differ per layer, and bytes / max_blob came out short of the slots the loan takes.
+            // B70, UD-IQ1_S pack: 5,004 slots mirrored, 5,165 lent, so 161 lent experts had no mirror.  A lean batch
+            // window between two chunks of a prompt past ~55K tokens met one of them and ended the engine (a shorter
+            // read's loan stayed inside the mirrored part: STRATA_PF_STAGE_FIT).
             const int64_t loan = blob_b > 0
-                ? ((int64_t) strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk, srcp != nullptr) + blob_b - 1) / blob_b + 64
+                ? strata::program::split_lend_slots(xcache.slots(), xcache.bytes(), xcache.slot_offsets(), (uint64_t) blob_b,
+                      strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk, srcp != nullptr)) + 64
                 : std::min<int64_t>(xcache.slots() / 10, 1200);
             const int64_t want_tail = lm ? std::atoll(lm) : loan;
             if (want_tail > 0) {
@@ -11083,6 +11089,17 @@ int main(int argc, char **argv) try {
             if (borrow != nullptr)
                 std::fprintf(stderr, "strata serve: the prompt path borrows %lld CUDA0 cache slots (%.2f GiB)\n",
                              (long long) (xcache.slots() - lend_first), (double) borrow_bytes / 1073741824.0);
+            // The loan's experts that have no host mirror (the mirror's cap or STRATA_LEND_MIRROR left them out): while a
+            // loan is out they are in neither place.  Said once here; `lend` counts them for each read.
+            if (borrow != nullptr && mirror_table_d != nullptr && srcp == &gguf_src && !host_res.empty()) {
+                int64_t bare = 0;
+                for (size_t i = 0; i < host_res.size(); ++i)
+                    if (host_res[i] >= lend_first && !gguf_src.pinned((int64_t) i / g.n_expert, (int64_t) i % g.n_expert)) ++bare;
+                if (bare > 0)
+                    std::fprintf(stderr, "strata serve: %lld experts in the prompt loan's slots have no host mirror (raise "
+                                         "STRATA_MIRROR_MIB or STRATA_LEND_MIRROR): with STRATA_BATCH_LEAN the slots wait for "
+                                         "a prompt read that lends them instead of decoding between its chunks\n", (long long) bare);
+            }
             for (size_t i = 1; i < pf_parts.size(); ++i)   // one loan per stage, from that stage's own cache
                 if (pf_parts[i].first >= 0) std::fprintf(stderr, "strata serve:   CUDA%d prompt path borrows %lld of its %lld slots (%.2f GiB)\n",
                              pf_parts[i].dev, (long long) (pf_parts[i].cache->slots() - pf_parts[i].first),
@@ -17145,10 +17162,12 @@ int main(int argc, char **argv) try {
             // participant's own cache, and marking only that participant's own layers
             int64_t seg_lend = 0;   // the loan the last lend left (the largest participant's chunk; 0: none)
             int64_t lend_to = 0;    // STRATA_PF_STAGE_FIT: the end of the part the next lend is for (its K/V stage's cells)
+            int64_t lent_no_mirror = 0;   // the last lend's experts that have no host mirror (in neither place while it is out)
             auto lend = [&](int64_t tokens, std::string &e,
                             int64_t exact) -> bool {
                 try {
             seg_lend = 0;
+            lent_no_mirror = 0;
                 // STRATA_PF_STAGE_FIT (read by the prompt path): the K/V stage priced and laid out for this part's end only
                 struct StageCells {
                     explicit StageCells(int64_t c) { strata::prefill::Prefill::set_stage_cells(c); }
@@ -17226,6 +17245,10 @@ int main(int argc, char **argv) try {
                 }
                 for (const PfPart& p : pf_parts)
                     if (p.first >= 0) seg_lend = std::max(seg_lend, p.lent_chunk);
+                if (srcp == &gguf_src)
+                    for (const PfPart& p : pf_parts)
+                        for (const auto& [i, slot] : p.lent)
+                            if (!gguf_src.pinned((int64_t) i / g.n_expert, (int64_t) i % g.n_expert)) ++lent_no_mirror;
                 if (any) res_upload();
                 if (trace) {
                     int64_t n_lent = 0;
@@ -17738,6 +17761,16 @@ int main(int argc, char **argv) try {
                         continue;
                     }
                     if (decode_share <= 0.0 || !batch_on()) continue;
+                    // STRATA_BATCH_LEAN: a lean batch window has no host share, so a lent expert without a mirror would
+                    // end it (and the engine).  The slots wait for this read's end instead.
+                    static const bool lean_batch_env = [] { const char* v = std::getenv("STRATA_BATCH_LEAN"); return v != nullptr && v[0] == '1'; }();
+                    if (lean_batch_env && lent_no_mirror > 0) {
+                        if (q - a0 <= piece)   // once a read
+                            std::fprintf(stderr, "strata batch: %lld lent experts have no host mirror: the slots wait for this "
+                                                 "prompt read (to %lld) instead of decoding between its chunks\n",
+                                         (long long) lent_no_mirror, (long long) b0);
+                        continue;
+                    }
                     const double budget = decode_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
                     const auto td = Clock::now();
                     in_prompt_read = true;
