@@ -129,7 +129,7 @@ Several cards are not always faster than one; measure the workload you care abou
 
 ## Docker (Linux)
 
-Use [DOCKER.md](DOCKER.md) for released images, GPU access and the container build instructions.
+The engine builds in the `strata-sycl-dev` image ([B70.md](B70.md)).
 A container is a separate installation route. Intel model preparation and host driver requirements still apply.
 
 ## Older CPUs (experimental)

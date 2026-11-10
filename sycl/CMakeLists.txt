@@ -232,9 +232,9 @@ if(STRATA_NATIVE_EXPERTS)
     "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni;-mavx512vbmi;-mavx2;-mfma;-mf16c")
   set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
   set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-  set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "-mavx")
+  set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "-mavx;-mno-avx2;-mno-fma;-mno-f16c;-mno-bmi2")   # (the no-flags keep it AVX1 under STRATA_HOST_MARCH)
   set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/q2_avx1.cpp ${STRATA_ROOT}/src/kernels/cpu/iq_avx1.cpp PROPERTIES
-    COMPILE_OPTIONS "-msse4.2;-mavx;-mno-avx2;-mno-fma;-mno-f16c")
+    COMPILE_OPTIONS "-msse4.2;-mavx;-mno-avx2;-mno-fma;-mno-f16c;-mno-bmi2")
   set_property(SOURCE ${STRATA_ROOT}/src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
@@ -274,7 +274,7 @@ strata_resolve(_engine src/core/layer.cpp src/core/session.cpp src/core/expert_s
                        src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                        src/core/conversation_memory.cpp   # 0.1.31: the conversation snapshots (#216)
                        src/core/arch_defaults.cpp src/core/vmm.cpp   # vmm.cpp is the port's stub: no driver VMM on Level Zero
-                       src/core/conversation_file.cpp
+                       src/core/conversation_file.cpp src/core/conversation_kv_store.cpp   # the spill's K/V store files (updated in place)
                        src/core/peer_experts.cpp src/core/remote_expert_opt_stub.cpp)         # 0.1.36+: --peer-device (a stub in the port: no second GPU tier yet)
 add_library(strata_engine STATIC ${_engine} ${CMAKE_CURRENT_SOURCE_DIR}/src/core/gguf_expert_source.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/src/core/copy_queue.cpp   # 0.1.43: a queue on the copy engine
@@ -296,20 +296,46 @@ strata_resolve(_main src/program/generate.cpp)
 add_executable(strata ${_main})
 target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
 
+# Host instruction set of the engine's own C++ sources (not ggml, not the device code, which -fsycl-targets decides).
+# Empty keeps the baseline x86-64. x86-64-v3 = AVX2 + FMA + BMI2 (a package for any CPU since Haswell / Zen 1); native = this PC only.
+# Target options come before a source file's COMPILE_OPTIONS, so the per-file -mavx512* / -mno-avx2 lines below still win.
+set(STRATA_HOST_MARCH "" CACHE STRING "-march for the host code of the engine (empty: baseline x86-64; x86-64-v3; native)")
+if(STRATA_HOST_MARCH)
+  foreach(_t strata_spec strata_kernels_cpu strata_core strata_kernels strata_engine strata_prefill strata)
+    target_compile_options(${_t} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-march=${STRATA_HOST_MARCH}>")
+  endforeach()
+  message(STATUS "host code: -march=${STRATA_HOST_MARCH}")
+endif()
+
 # --- the kernel parity self-tests (each runs on the card and compares against a CPU reference) ---------------------
-option(STRATA_SYCL_PARITY "Build the kernel parity tests" ON)
+# Host-only tests (no device, no GPU library): always built, they are small.
+enable_testing()
+# Host-only proposal contracts of the gated MTP proposal; no SYCL runtime or GPU library needed.
+add_executable(gated_proposal_test ${STRATA_ROOT}/src/core/gated_proposal_test.cpp)
+target_include_directories(gated_proposal_test PRIVATE ${STRATA_ROOT}/include)
+add_test(NAME gated_proposal_test COMMAND gated_proposal_test)
+# Host-only test of the conversation cache's SSD tier (writer thread, index, gate, divergence); no device.
+add_executable(conversation_spill_test ${STRATA_ROOT}/src/core/conversation_spill_test.cpp
+               ${STRATA_ROOT}/src/core/conversation_file.cpp ${STRATA_ROOT}/src/core/conversation_kv_store.cpp
+               ${STRATA_ROOT}/sycl/src/platform/direct_file.cpp)
+target_include_directories(conversation_spill_test PRIVATE ${STRATA_ROOT}/include ${STRATA_ROOT}/sycl/include)
+target_link_libraries(conversation_spill_test PRIVATE Threads::Threads)
+add_test(NAME conversation_spill_test COMMAND conversation_spill_test)
+add_executable(spec_admission_test ${STRATA_ROOT}/src/core/spec_admission_test.cpp ${STRATA_ROOT}/src/spec/draft_policy.cpp)
+target_include_directories(spec_admission_test PRIVATE ${STRATA_ROOT}/include)
+add_test(NAME spec_admission_default COMMAND ${CMAKE_COMMAND} -E env --unset=STRATA_SPEC_PROB_GATE $<TARGET_FILE:spec_admission_test>)
+add_test(NAME spec_admission_pick COMMAND ${CMAKE_COMMAND} -E env STRATA_SPEC_PROB_GATE=pick $<TARGET_FILE:spec_admission_test> pick)
+add_test(NAME spec_admission_top COMMAND ${CMAKE_COMMAND} -E env STRATA_SPEC_PROB_GATE=top $<TARGET_FILE:spec_admission_test> top)
+add_test(NAME spec_admission_exact_top_only COMMAND ${CMAKE_COMMAND} -E env STRATA_SPEC_PROB_GATE=TOP $<TARGET_FILE:spec_admission_test> pick)
+# Host-only test of the draft window policy (STRATA_SPEC_COST's prices, the probe-min mode on a simulated card).
+add_executable(draft_policy_test ${STRATA_ROOT}/src/spec/draft_policy_test.cpp ${STRATA_ROOT}/src/spec/draft_policy.cpp)
+target_include_directories(draft_policy_test PRIVATE ${STRATA_ROOT}/include)
+add_test(NAME draft_policy_test COMMAND draft_policy_test)
+
+# The kernel parity programs, tests and benches run on the card. Each one compiles its own device code, which is most of a
+# full build's time: they are built on request (-DSTRATA_SYCL_PARITY=ON, or build.sh with a target name after configuring with it).
+option(STRATA_SYCL_PARITY "Build the kernel parity tests" OFF)
 if(STRATA_SYCL_PARITY)
-  enable_testing()
-  # Host-only proposal contracts of the gated MTP proposal; no SYCL runtime or GPU library needed.
-  add_executable(gated_proposal_test ${STRATA_ROOT}/src/core/gated_proposal_test.cpp)
-  target_include_directories(gated_proposal_test PRIVATE ${STRATA_ROOT}/include)
-  add_test(NAME gated_proposal_test COMMAND gated_proposal_test)
-  add_executable(spec_admission_test ${STRATA_ROOT}/src/core/spec_admission_test.cpp ${STRATA_ROOT}/src/spec/draft_policy.cpp)
-  target_include_directories(spec_admission_test PRIVATE ${STRATA_ROOT}/include)
-  add_test(NAME spec_admission_default COMMAND ${CMAKE_COMMAND} -E env --unset=STRATA_SPEC_PROB_GATE $<TARGET_FILE:spec_admission_test>)
-  add_test(NAME spec_admission_pick COMMAND ${CMAKE_COMMAND} -E env STRATA_SPEC_PROB_GATE=pick $<TARGET_FILE:spec_admission_test> pick)
-  add_test(NAME spec_admission_top COMMAND ${CMAKE_COMMAND} -E env STRATA_SPEC_PROB_GATE=top $<TARGET_FILE:spec_admission_test> top)
-  add_test(NAME spec_admission_exact_top_only COMMAND ${CMAKE_COMMAND} -E env STRATA_SPEC_PROB_GATE=TOP $<TARGET_FILE:spec_admission_test> pick)
   if(STRATA_NATIVE_EXPERTS)
     # a token's native expert rows are the same bits at every number of tokens that share its expert (host CPU kernels)
     add_executable(native_arithmetic_parity ${STRATA_ROOT}/src/kernels/cpu/native_arithmetic_parity.cpp)
@@ -531,7 +557,8 @@ endif()
 # -----------------------------------------------------------------------------
 # DeepSeek-V4.1-Flash SYCL Engine Path (strata-dsv41)
 # -----------------------------------------------------------------------------
-option(STRATA_BUILD_DSV41 "Build the DeepSeek-V4.1 SYCL engine path (strata-dsv41)" ON)
+# Not maintained since 2026-10-30 (see README.md); off by default.
+option(STRATA_BUILD_DSV41 "Build the DeepSeek-V4.1 SYCL engine path (strata-dsv41), not maintained" OFF)
 if(STRATA_BUILD_DSV41)
   # (the engine's device code, in the library so the synthetic tests below run the same kernels)
   add_library(strata_dsv41_kernels STATIC

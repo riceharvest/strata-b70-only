@@ -5911,6 +5911,33 @@ __dpct_inline__ void acts8(const block_q8_1* y, int iqs, int* u, float& ds) {   
     for (int j = 0; j < 8; ++j) u[j] = get_int_b4(y[iqs / 2].qs, j);
     ds = y[iqs / 2].ds[0];
 }
+// STRATA_XE2_IQ: the same words by fewer loads.
+// four ints from a 4-byte aligned address as one dword-vector load (native_mmvq's ld_i4_a4)
+__dpct_inline__ sycl::int4 ld_i4(const int* p) {
+    sycl::int4 v;
+    v.load(0, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(p));
+    return v;
+}
+// the 8 ints and the scale of q8_1 block `b` (its quants sit at offset 4 of the 36-byte block: 4-byte aligned) as two
+// vector loads and one half load: acts8's values for b = y + iqs / 2, Multi<42>::acts's for b = y + iqs
+__dpct_inline__ void acts8v(const block_q8_1* b, int* u, float& ds) {
+    const int* p = reinterpret_cast<const int*>(b->qs);
+    const sycl::int4 lo = ld_i4(p), hi = ld_i4(p + 4);
+    u[0] = lo.x(); u[1] = lo.y(); u[2] = lo.z(); u[3] = lo.w();
+    u[4] = hi.x(); u[5] = hi.y(); u[6] = hi.z(); u[7] = hi.w();
+    ds = b->ds[0];
+}
+// load8_a2 with its two aligned words as one 2-int vector load; the third word as there, only when the address is
+// unaligned (it then holds needed bytes, so it cannot cross a page)
+__dpct_inline__ sycl::int2 load8_a2v(const uint8_t* p) {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    const int* q = reinterpret_cast<const int*>(a & ~uintptr_t(3));
+    sycl::int2 w;
+    w.load(0, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(q));
+    if (!(a & 2)) return w;
+    const uint32_t w0 = (uint32_t) w.x(), w1 = (uint32_t) w.y(), w2 = (uint32_t) q[2];
+    return sycl::int2((int) ((w0 >> 16) | (w1 << 16)), (int) ((w1 >> 16) | (w2 << 16)));
+}
 }  // namespace iq_fast
 
 // The decode of one part as Multi<TY>: prep (the weights, from the block at `blk`), acts, finish.  BS = block bytes.
@@ -5919,10 +5946,14 @@ template <> struct IqFast<16> {   // iq2_xxs: as vec_dot_iq2_xxs_q8_1
     static constexpr bool has = true; static constexpr int NW = 8, BS = sizeof(block_iq2_xxs);
     __dpct_inline__ static void prep(const uint8_t* blk, int iqs, MultiW& m) { prep_t<false>(blk, iqs, m, nullptr); }
     // TS: the codebook (256 words) and the ksigns masks (kIqKsignMask, from word 256) from the work-group's SLM copy
-    template <bool TS>
+    // V2 (STRATA_XE2_IQ): the part's 8 bytes through load8_a2v (the same two ints)
+    // SM (STRATA_IQ_XXS_SGNMUL, with TS): the ksigns masks by arithmetic instead of the SLM table: s = c | parity(c) << 7,
+    // then IQ2_S's sgn01 on its two nibbles - the same four words as kIqKsignMask[4c..], one table read less per 8 weights
+    template <bool TS, bool V2 = false, bool SM = false>
     __dpct_inline__ static void prep_t(const uint8_t* blk, int iqs, MultiW& m, const uint64_t* tab) {
         const block_iq2_xxs* bq2 = (const block_iq2_xxs*) blk;
-        const sycl::int2 qq = load8_a2((const uint8_t*) bq2->qs + 4 * iqs);   // q2 | aux32
+        const sycl::int2 qq = V2 ? iq_fast::load8_a2v((const uint8_t*) bq2->qs + 4 * iqs)
+                                 : load8_a2((const uint8_t*) bq2->qs + 4 * iqs);   // q2 | aux32
         const uint32_t q2 = (uint32_t) qq.x(), aux32 = (uint32_t) qq.y();
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
@@ -5932,7 +5963,14 @@ template <> struct IqFast<16> {   // iq2_xxs: as vec_dot_iq2_xxs_q8_1
             if constexpr (TS) {
                 const uint64_t v = tab[gi];
                 g = sycl::uint2((uint32_t) v, (uint32_t) (v >> 32));
-                s = reinterpret_cast<const sycl::uint4*>(tab + 256)[(aux32 >> (7 * k)) & 0x7F];
+                if constexpr (SM) {
+                    const uint32_t c7 = (aux32 >> (7 * k)) & 0x7F;
+                    const uint32_t sb = c7 | ((sycl::popcount(c7) & 1u) << 7);
+                    const uint32_t t0 = iq_fast::sgn01(sb & 0x0F), t1 = iq_fast::sgn01(sb >> 4);
+                    s = sycl::uint4(t0 * 0xFFu, t1 * 0xFFu, t0, t1);
+                } else {
+                    s = reinterpret_cast<const sycl::uint4*>(tab + 256)[(aux32 >> (7 * k)) & 0x7F];
+                }
             } else {
                 g = ((const sycl::uint2*) iq2xxs_grid)[gi];
                 s = iq_fast::ks_mask(aux32 >> (7 * k));
@@ -6095,12 +6133,15 @@ template <> struct IqFast<20> {   // iq4_nl (down): as Multi<20>, the codebook t
 // R rows x E entries per lane.  The loop walks block pointers: with LANES % ipb == 0, lane `sub` always takes part
 // iqs = step * (sub % ipb) of the blocks sub / ipb, + LANES / ipb, ... - the k order of row_dot_lanes / row_dot_multi_iq,
 // and each entry's sum and lanes_sum are theirs.
-template <int TY, int LANES, int R, int E, bool TS = false>
+// VL (STRATA_XE2_IQ, IQ2_XXS / IQ2_S with the SLM tables): the activation words through acts8v and the IQ2_XXS part
+// through load8_a2v - the same integers from vector loads, so every sum is the same bits.
+template <int TY, int LANES, int R, int E, bool TS = false, bool VL = false, bool SM = false>
 __dpct_inline__ void rows_dot_fast(const uint8_t* const* rows, const block_q8_1* const* xs, int nb, int sub,
                                    float (&out)[R][E], const uint64_t* tab = nullptr) {
     using M = IqFast<TY>;
     using F = Fmt<TY>;
     static_assert(LANES % F::ipb == 0, "a lane's part index must be fixed");
+    static_assert(!VL || (TS && (TY == 16 || TY == 22)), "acts8v stands for acts8 (IQ2_XXS) and Multi<22>::acts only");
     constexpr int KSTEP = LANES / F::ipb, XB = F::qk / 32;
     const int iqs = F::step * (sub % F::ipb);
     const int kb0 = sub / F::ipb;
@@ -6119,11 +6160,17 @@ __dpct_inline__ void rows_dot_fast(const uint8_t* const* rows, const block_q8_1*
         int u[E][8];
         float ds[E];
 #pragma unroll
-        for (int e = 0; e < E; ++e) { M::acts(xp[e], iqs, u[e], ds[e]); xp[e] += KSTEP * XB; }
+        for (int e = 0; e < E; ++e) {
+            if constexpr (VL) iq_fast::acts8v(xp[e] + iqs / 2, u[e], ds[e]);
+            else M::acts(xp[e], iqs, u[e], ds[e]);
+            xp[e] += KSTEP * XB;
+        }
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             MultiW m;
-            if constexpr (TS && (TY == 16 || TY == 22)) M::template prep_t<true>(wp[r], iqs, m, tab);
+            if constexpr (VL && TY == 16) M::template prep_t<true, true>(wp[r], iqs, m, tab);
+            else if constexpr (SM && TS && TY == 16) M::template prep_t<true, false, true>(wp[r], iqs, m, tab);
+            else if constexpr (TS && (TY == 16 || TY == 22)) M::template prep_t<true>(wp[r], iqs, m, tab);
             else M::prep(wp[r], iqs, m);
             wp[r] += KSTEP * M::BS;
 #pragma unroll
@@ -6145,7 +6192,10 @@ __dpct_inline__ void rows_dot_fast(const uint8_t* const* rows, const block_q8_1*
 
 // native_gu_kernel with the IqFast decodes, RPL rows per lane (row0, row0 + 256 / LN, ...), the entries in chunks
 // of 4, 2 and 1 as row_entries
-template <int TG, int LN, int RPL, bool TS = false>
+// XE (STRATA_XE2_IQ): rows_dot_fast's vector loads, and a tail of exactly three entries in ONE pass (2 + 1 read and
+// decode the group's rows twice).  An entry's sum does not depend on the pass that computes it (its own k order, its
+// own lanes_sum), so the outputs are the same bits.
+template <int TG, int LN, int RPL, bool TS = false, bool XE = false, bool SM = false>
 __dpct_inline__ void native_gu_kernel_fast(
     const unsigned long long *__restrict__ grp_ptr,
     const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
@@ -6157,12 +6207,13 @@ __dpct_inline__ void native_gu_kernel_fast(
     const uint64_t* tab = nullptr;
     if constexpr (TS && (TG == 16 || TG == 22)) {   // the tables into SLM before any lane leaves
         // IQ2_S: the codebook (1024 words); IQ2_XXS: the codebook (256) and the ksigns masks (128 x 16 bytes)
-        constexpr int GN = TG == 22 ? 1024 : 256, TN = TG == 22 ? 1024 : 512;
+        // (SM: no masks to copy, the IQ2_XXS table is the codebook alone)
+        constexpr int GN = TG == 22 ? 1024 : 256, TN = TG == 22 ? 1024 : (SM ? 256 : 512);
         auto& sg = *sycl::ext::oneapi::group_local_memory_for_overwrite<uint64_t[TN]>(item_ct1.get_group());
         const uint64_t* src = TG == 22 ? (const uint64_t*) iq2s_grid : (const uint64_t*) iq2xxs_grid;
         const int t = (int) item_ct1.get_local_id(2), nt = (int) item_ct1.get_local_range(2);
         for (int i = t; i < GN; i += nt) sg[i] = src[i];
-        if constexpr (TG == 16)
+        if constexpr (TG == 16 && !SM)
             for (int i = t; i < TN - GN; i += nt) sg[GN + i] = reinterpret_cast<const uint64_t*>(kIqKsignMask)[i];
         item_ct1.barrier(sycl::access::fence_space::local_space);
         tab = &sg[0];
@@ -6200,7 +6251,7 @@ __dpct_inline__ void native_gu_kernel_fast(
 #pragma unroll
             for (int j = 0; j < EC; ++j) xs[j] = xq + (size_t) ent_tok[e + j] * xb;
             float o[RPL][EC];
-            rows_dot_fast<TG, LN, RPL, EC, TS>(rows, xs, nb, sub, o, tab);
+            rows_dot_fast<TG, LN, RPL, EC, TS, XE, SM>(rows, xs, nb, sub, o, tab);
             if (sub == 0)
 #pragma unroll
                 for (int i = 0; i < RPL; ++i)
@@ -6210,6 +6261,9 @@ __dpct_inline__ void native_gu_kernel_fast(
             e += EC;
         };
         for (; e + 4 <= e1;) pass(std::integral_constant<int, 4>{});
+        if constexpr (XE) {
+            if (e + 3 == e1) pass(std::integral_constant<int, 3>{});
+        }
         if (e + 2 <= e1) pass(std::integral_constant<int, 2>{});
         if (e < e1) pass(std::integral_constant<int, 1>{});
     }
@@ -6352,6 +6406,133 @@ __dpct_inline__ void native_down_kernel_dt(
     }
 }
 
+// STRATA_XE2_IQ: native_down_kernel_dt with a staged q8_1 block as three 16-byte SLM vectors (words 0-3 and 4-7 of
+// the transposed activations, then ds and the byte sum) where it keeps ten words, so a row part's activations are
+// three vector loads instead of ten word loads; the q8_1 quants are read for staging as two vector loads; and a tail
+// of exactly three entries is one pass.  The same words into the same dots, each entry with its own k order and
+// lanes_sum: bit for bit native_down_kernel_dt.
+constexpr int kDtV = 3;   // 16-byte vectors per staged q8_1 block
+template <int R, int E>
+__dpct_inline__ void rows_dot_dtx(const uint8_t* const* rows, const sycl::uint4* tv, int hb, int nb, int sub, float (&out)[R][E]) {
+    constexpr int LANES = 8, KSTEP = 4, BS = sizeof(block_q2_0);   // as rows_dot_dt
+    const int iqs = sub % 2, kb0 = sub / 2;
+    float s[R][E];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int e = 0; e < E; ++e) s[r][e] = 0.f;
+    const uint8_t* wp[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) wp[r] = rows[r] + kb0 * BS;
+    for (int kbx = kb0; kbx < nb; kbx += KSTEP) {
+        uint32_t U[E][8];
+        float ds[E];
+        int c[E];
+#pragma unroll
+        for (int e = 0; e < E; ++e) {
+            const sycl::uint4* t = tv + (e * hb + 2 * kbx + iqs) * kDtV;
+            const sycl::uint4 t0 = t[0], t1 = t[1], t2 = t[2];
+            U[e][0] = t0.x(); U[e][1] = t0.y(); U[e][2] = t0.z(); U[e][3] = t0.w();
+            U[e][4] = t1.x(); U[e][5] = t1.y(); U[e][6] = t1.z(); U[e][7] = t1.w();
+            ds[e] = iq_fast::h2f(sycl::bit_cast<sycl::half>((uint16_t) (t2.x() & 0xFFFFu)));
+            c[e] = (int) t2.y();
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const block_q2_0* bq = (const block_q2_0*) wp[r];
+            const sycl::int2 qq = load8_a2(bq->qs + 8 * iqs);
+            MultiW m;
+            m.d = bq->d;
+            wp[r] += KSTEP * BS;
+            uint32_t A[8];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                A[k] = ((uint32_t) qq.x() >> (2 * k)) & 0x03030303u;
+                A[4 + k] = ((uint32_t) qq.y() >> (2 * k)) & 0x03030303u;
+            }
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                int s0 = c[e], s1 = 0;
+#pragma unroll
+                for (int k = 0; k < 4; ++k) s0 = ggml_cuda_dp4a((int) A[k], (int) U[e][k], s0);
+#pragma unroll
+                for (int k = 4; k < 8; ++k) s1 = ggml_cuda_dp4a((int) A[k], (int) U[e][k], s1);
+                s[r][e] += IqFast<42>::finish(s0, s1, m, ds[e]);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int e = 0; e < E; ++e) out[r][e] = lanes_sum<LANES>(s[r][e]);
+}
+template <int RPL>
+__dpct_inline__ void native_down_kernel_dtx(
+    const unsigned long long *__restrict__ grp_ptr,
+    const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
+    const int32_t *__restrict__ ent_dst, const block_q8_1 *__restrict__ hq,
+    NativeExpertLayout L, float *__restrict__ out) {
+    constexpr int LN = 8, RB = 256 / LN;
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int ng = *n_groups;
+    if ((int) item_ct1.get_group(1) >= ng) return;   // (uniform over the work-group)
+    auto& tv = *sycl::ext::oneapi::group_local_memory_for_overwrite<sycl::uint4[kDtEnt * kDtMaxHb * kDtV]>(item_ct1.get_group());
+    const int lid = (int) item_ct1.get_local_id(2);
+    const int rib = lid / LN, sub = lid % LN;
+    const int r0 = (int) item_ct1.get_group(2) * RB * RPL + rib;   // n_embd % (RB * RPL) == 0: every lane has its rows
+    const int nb = (int) (L.n_ff / Fmt<42>::qk), hb = (int) (L.n_ff / 32);
+    int rr[RPL];
+#pragma unroll
+    for (int i = 0; i < RPL; ++i) rr[i] = r0 + i * RB;
+    for (int g = (int) item_ct1.get_group(1); g < ng; g += (int) item_ct1.get_group_range(1)) {
+        const uint8_t* base = (const uint8_t*) grp_ptr[g] + L.down_off;
+        const uint8_t* rows[RPL];
+#pragma unroll
+        for (int i = 0; i < RPL; ++i) rows[i] = base + (size_t) rr[i] * L.d_row;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int ec = e0; ec < e1; ec += kDtEnt) {
+            const int n = e1 - ec < kDtEnt ? e1 - ec : kDtEnt;
+            item_ct1.barrier(sycl::access::fence_space::local_space);   // the previous chunk's readers are done
+            for (int x = lid; x < n * hb; x += 256) {
+                const int j = x / hb, b = x - j * hb;
+                const block_q8_1* y = hq + (size_t) (ec + j) * hb + b;
+                const int* yq = reinterpret_cast<const int*>(y->qs);
+                const sycl::int4 q0 = iq_fast::ld_i4(yq), q1 = iq_fast::ld_i4(yq + 4);
+                const uint32_t a[8] = {(uint32_t) q0.x(), (uint32_t) q0.y(), (uint32_t) q0.z(), (uint32_t) q0.w(),
+                                       (uint32_t) q1.x(), (uint32_t) q1.y(), (uint32_t) q1.z(), (uint32_t) q1.w()};
+                int c = 0;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) c = ggml_cuda_dp4a(-1, (int) a[i], c);
+                uint32_t t[8];
+                iq_tr4x4(a[0], a[1], a[2], a[3], t);
+                iq_tr4x4(a[4], a[5], a[6], a[7], t + 4);
+                sycl::uint4* d = &tv[(j * hb + b) * kDtV];
+                d[0] = sycl::uint4(t[0], t[1], t[2], t[3]);
+                d[1] = sycl::uint4(t[4], t[5], t[6], t[7]);
+                d[2] = sycl::uint4(*reinterpret_cast<const uint32_t*>(&y->ds), (uint32_t) c, 0u, 0u);
+            }
+            item_ct1.barrier(sycl::access::fence_space::local_space);
+            int e = ec;
+            const int ee = ec + n;
+            auto pass = [&](auto ecn) {
+                constexpr int EC = decltype(ecn)::value;
+                float o[RPL][EC];
+                rows_dot_dtx<RPL, EC>(rows, &tv[(e - ec) * hb * kDtV], hb, nb, sub, o);
+                if (sub == 0)
+#pragma unroll
+                    for (int i = 0; i < RPL; ++i)
+#pragma unroll
+                        for (int j = 0; j < EC; ++j) out[(size_t) ent_dst[e + j] * L.n_embd + rr[i]] = o[i][j];
+                e += EC;
+            };
+            for (; e + 4 <= ee;) pass(std::integral_constant<int, 4>{});
+            if (e + 3 == ee) pass(std::integral_constant<int, 3>{});
+            if (e + 2 <= ee) pass(std::integral_constant<int, 2>{});
+            if (e < ee) pass(std::integral_constant<int, 1>{});
+        }
+    }
+}
+
 // native_down_kernel with the IqFast decodes, RPL rows per lane
 template <int TD, int LN, int RPL>
 __dpct_inline__ void native_down_kernel_fast(
@@ -6443,6 +6624,27 @@ bool iq_fast_on(int ty, const sycl::queue& q) {
     return on && ty >= 0 && ty < 64 && ((fmts >> ty) & 1) != 0;
 }
 constexpr int kIqFastRows = 2;   // rows per lane: 16-lane sub-groups of 8 lanes x 2 rows
+// STRATA_XE2_IQ (opt-in, not a B70 default; unset or 0: off, the kernels as before): the decode
+// window's expert kernels for IQ2_XXS / IQ2_S gate/up and Q2_0 down with fewer loads and fewer passes, every output
+// bitwise the same:
+//  - a q8_1 block's 8 activation words as two 16-byte vector loads instead of 8 int loads (gate/up: 9 loads an entry
+//    and step become 3); the Q2_0 down kernel's transposed activations as 16-byte SLM vectors (10 loads become 3);
+//  - the IQ2_XXS part's 8 bytes as one 8-byte vector load;
+//  - a group's tail of exactly three entries in one pass over its rows instead of two (2 + 1 reads and decodes the
+//    rows twice; a 3-row window's fullest groups have three entries).
+// Taken where STRATA_IQ_DECODE_FAST's kernels run with their SLM tables (STRATA_IQ_GRID, gate/up) and with the
+// transposed activations (STRATA_IQ_DT, down); elsewhere the kernels as before.  Read once, at the first expert call;
+// native_expert_set_xe2_iq overrides it (native_grouped_parity --iq).
+int g_xe2_iq_force = -1;   // >= 0 overrides the environment
+bool xe2_iq_on() {
+    static const bool env = [] {
+        const char* v = std::getenv("STRATA_XE2_IQ");
+        const bool b = v != nullptr && v[0] != '\0' && v[0] != '0';
+        if (b) std::fprintf(stderr, "strata: STRATA_XE2_IQ: vector activation loads and three-entry passes in the grouped expert kernels (0 turns them off)\n");
+        return b;
+    }();
+    return g_xe2_iq_force >= 0 ? g_xe2_iq_force != 0 : env;
+}
 template <int TG, int LN>
 bool launch_gu_fast(unsigned groups, dpct::queue_ptr s, const unsigned long long *grp_ptr, const int32_t *grp_start,
                     const int32_t *n_groups, const int32_t *ent_tok, const block_q8_1 *X,
@@ -6466,6 +6668,28 @@ bool launch_gu_fast(unsigned groups, dpct::queue_ptr s, const unsigned long long
                 });
         };
         if constexpr (TG == 16 || TG == 22) {
+            if (ts && xe2_iq_on()) {   // STRATA_XE2_IQ: the same kernel with the vector loads and the three-entry pass
+                s->parallel_for<dpct_kernel_name<class native_gu_fast_x, dpct_kernel_scalar<TG>, dpct_kernel_scalar<LN>>>(
+                    sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
+                    [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
+                        native_gu_kernel_fast<TG, LN, kIqFastRows, true, true>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+                    });
+                return true;
+            }
+            if constexpr (TG == 16) {
+                // STRATA_IQ_XXS_SGNMUL=1 (off by default; needs STRATA_IQ_GRID on; with STRATA_XE2_IQ=1 that kernel is taken above
+                // and this switch does nothing): the IQ2_XXS sign masks by
+                // arithmetic instead of the SLM table (IqFast<16>::prep_t's SM).  The same integers, so the same bits.
+                static const bool sm = [] { const char* v = std::getenv("STRATA_IQ_XXS_SGNMUL"); return v && v[0] == '1'; }();
+                if (ts && sm) {
+                    s->parallel_for<dpct_kernel_name<class native_gu_fast_sm, dpct_kernel_scalar<TG>, dpct_kernel_scalar<LN>>>(
+                        sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
+                        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
+                            native_gu_kernel_fast<TG, LN, kIqFastRows, true, false, true>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+                        });
+                    return true;
+                }
+            }
             if (ts) { go(std::true_type{}); return true; }
         }
         go(std::false_type{});
@@ -6485,6 +6709,14 @@ bool launch_down_fast(unsigned groups, dpct::queue_ptr s, const unsigned long lo
         if constexpr (TD == 42) {
             static const bool dt = [] { const char* e = std::getenv("STRATA_IQ_DT"); return !(e && e[0] == '0'); }();
             if (dt && L.n_embd % ROWS == 0 && L.n_ff % 64 == 0 && L.n_ff / 32 <= kDtMaxHb) {
+                if (xe2_iq_on()) {   // STRATA_XE2_IQ: 16-byte SLM vectors and the three-entry pass
+                    s->parallel_for<dpct_kernel_name<class native_down_dtx, dpct_kernel_scalar<TD>>>(
+                        sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
+                        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
+                            native_down_kernel_dtx<kIqFastRows>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+                        });
+                    return true;
+                }
                 s->parallel_for<dpct_kernel_name<class native_down_dt, dpct_kernel_scalar<TD>>>(
                     sycl::nd_range<3>(sycl::range<3>(1, groups, (size_t) gx * 256), sycl::range<3>(1, 1, 256)), exp_props,
                     [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
@@ -7109,6 +7341,8 @@ void iq_set_old_kernels(bool old) { g_old_kernels = old; }
 void native_expert_set_kq_split(bool on) { g_kq_split = on; }
 // native_grouped_parity --iq: the STRATA_IQ_DECODE_FAST kernels on (1) or off (0) whatever the environment says, -1 the environment's
 void native_expert_set_iq_decode_fast(int on) { g_iq_fast_force = on; }
+// native_grouped_parity --iq: the STRATA_XE2_IQ kernels on (1) or off (0) whatever the environment says, -1 the environment's
+void native_expert_set_xe2_iq(int on) { g_xe2_iq_force = on; }
 bool iq_old_kernels() { return g_old_kernels; }
 
 // APR (prism.hadamard): see iq_kernels.hpp.  A block that is not a power of two in [2, 1024] dividing the row width exits with a

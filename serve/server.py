@@ -65,6 +65,7 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthro
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve import stream_order  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
 from strata_control import tls  # noqa: E402
@@ -282,6 +283,8 @@ def focused_recovery_prompt(tok, ids, generated):
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
+METRICS_REQUESTS = 12       # how many of the last finished requests GET /metrics lists (the Monitor's table)
+API_MONITOR_REQUESTS = 100  # how many requests /api-monitor keeps in memory
 # Anthropic clients add /v1/messages to their base URL themselves. A base URL that already ends in /v1 (copied from an OpenAI-style
 # setup) makes them post /v1/v1/messages; these two paths mean the same as the real ones. Nothing else is aliased.
 V1_V1_ALIASES = {"/v1/v1/messages": "/v1/messages", "/v1/v1/messages/count_tokens": "/v1/messages/count_tokens"}
@@ -813,17 +816,32 @@ class ConvCacheLog:
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
+    # the SSD tier's drive, measured once by the engine (its first start with the spill folder) and said at every start
+    DRIVE = re.compile(r"conversation cache: SSD tier drive: reads (\d+) MB/s, writes (\d+) MB/s")
+    # --conversation-cache-park-ssd: a conversation read back from its file, and what the spill folder holds
+    DISK = re.compile(r"conversation cache: restored (\d+) tokens from disk")
+    SPILLED = re.compile(r"spilled=(\d+) files, ([\d.]+) GiB")
+    WROTE = re.compile(r"wrote ([\d.]+) MiB of the file's|spilled \d+ tokens, ([\d.]+) MiB to ")   # a store park, a whole file
+    # a park that did not happen: the conversation is read again from its start when its agent returns
+    SKIP = re.compile(r"conversation cache: skip parking \(([^)]*)")
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
     def __init__(self):
         self.key, self.pos = None, 0
+        self.lock = threading.Lock()                    # the metrics page and the stream order both read the log
         self.reset()
 
     def reset(self):
         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
-                      "last_tokens": None, "last_at": None}
+                      "last_tokens": None, "last_at": None, "ssd_read_mbps": None, "ssd_write_mbps": None,
+                      "ssd_files": None, "ssd_gib": None, "ssd_restores": 0, "ssd_written_mib": 0.0,
+                      "skips_budget": 0, "skips_ram": 0, "skips_other": 0}
 
     def poll(self, path, start) -> dict:
+        with self.lock:
+            return self._poll(path, start)
+
+    def _poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it."""
         if not path or start is None:
             return dict(self.state)
@@ -847,6 +865,26 @@ class ConvCacheLog:
         for line in data[:end].decode("utf-8", "replace").splitlines():
             if "conversation cache:" not in line:
                 continue
+            m = self.SPILLED.search(line)               # what the spill folder holds and what a park wrote: on any line
+            if m:
+                self.state["ssd_files"], self.state["ssd_gib"] = int(m.group(1)), float(m.group(2))
+            m = self.WROTE.search(line)
+            if m:
+                self.state["ssd_written_mib"] += float(m.group(1) or m.group(2))
+            m = self.SKIP.search(line)
+            if m:
+                why = m.group(1)
+                if "leaves" in why and "behind" in why:      # the same conversation goes on: nothing was lost
+                    continue
+                if "below the" in why:                       # shorter than conversation_cache_min_tokens: not parked on purpose
+                    continue
+                key = ("skips_budget" if "exceeds available budget" in why else
+                       "skips_ram" if "RAM" in why else "skips_other")
+                self.state[key] += 1
+                continue
+            if "allocation failed; skip parking" in line:    # (this one has no reason in brackets)
+                self.state["skips_ram"] += 1
+                continue
             m = self.EVENT.search(line)
             if m:
                 st = self.state
@@ -860,6 +898,15 @@ class ConvCacheLog:
             m = self.DROPPED.search(line)
             if m:
                 self.state["parked"] = int(m.group(1))
+                continue
+            m = self.DRIVE.search(line)
+            if m:
+                self.state["ssd_read_mbps"], self.state["ssd_write_mbps"] = int(m.group(1)), int(m.group(2))
+                continue
+            m = self.DISK.search(line)
+            if m:
+                self.state["ssd_restores"] += 1               # (the restore itself is counted by its own line, below it in the log)
+                continue
         return dict(self.state)
 
 
@@ -2015,7 +2062,7 @@ class StrataEngine:
                     head = f"BGENI {slot} {left}{keys}{pf} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}{pf}"
                     live = {"slot": slot, "request_id": getattr(cancel, "_strata_request_id", None),
                             "state": "reading", "prompt_tokens": len(prompt), "prompt_read": 0, "generated": 0,
-                            "started": time.time(), "first_token": None}
+                            "started": time.time(), "first_token": None, "max_tokens": int(max_new)}
                     deadline = getattr(cancel, "_strata_queue_deadline", None)
                     if deadline is not None and time.monotonic() >= deadline:
                         raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
@@ -2264,7 +2311,8 @@ class StrataEngine:
             ft = r.get("first_token")
             view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
                          "prompt_read": r.get("prompt_read") if r["state"] == "reading" else None,
-                         "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
+                         "generated": r["generated"], "max_tokens": r.get("max_tokens"),
+                         "elapsed_s": round(now - r["started"], 1),
                          "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
         return view
 
@@ -3642,6 +3690,12 @@ class Service:
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
+        # who takes the single turn next (serve/stream_order.py); it keeps as many open threads as the engine's cache holds:
+        # its parked conversations (--conversation-cache-slots, else 2) and the live one
+        self.order = stream_order.StreamOrder(capacity=(conversation_slots(engine) or 2) + 1)
+        self.order_evictions = 0                      # the engine cache's evictions the order has been told of
+        self.order_lock = threading.Lock()
+        self.thread_header_seen = False
         self.gpu_locks = None                         # GpuLocks: the config's "gpu_locks", held while the model is loaded
         self.request_stop = None                      # main()'s clean stop, for POST /v1/restart
         self.restart_requested = False                # main() ends, then the process starts itself again (os.execv)
@@ -3684,10 +3738,10 @@ class Service:
         self.client_disconnect_cancels = 0
         self.draining = False
         self.active_cancels: set[threading.Event] = set()
-        # #332: the API request monitor (/api-monitor) keeps the last 100 requests' prompts and answers in memory,
+        # #332: the API request monitor (/api-monitor) keeps the last 100 (api_monitor_requests) requests' prompts and answers in memory,
         # so it is off unless the config's "api_monitor" (or --api-monitor) turns it on
         self.api_monitor = False
-        self.api_requests = collections.deque(maxlen=100)  # bounded I/O in memory; no headers or API keys
+        self.api_requests = collections.deque(maxlen=API_MONITOR_REQUESTS)  # bounded I/O in memory; no headers or API keys
         self.request_trace = threading.local()
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
@@ -4430,8 +4484,13 @@ class Service:
         the hardware (with a minute of history per series)."""
         with self.status_lock:
             s = dict(self.status)
-            if self.live_reqs:                          # parallel requests: the newest one's status
-                s = {**s, **dict(list(self.live_reqs.values())[-1][0]), "queued": s.get("queued", 0)}
+            many = [dict(st) for st, _ in self.live_reqs.values()]
+            if many:                                    # parallel requests: the ones that decode, else the newest
+                decoding = [x for x in many if x.get("busy") and x.get("first_token")]
+                s = {**s, **(decoding[0] if decoding else many[-1]), "queued": s.get("queued", 0)}
+                if len(decoding) > 1:                   # together: the tokens so far add up, the oldest one's clock
+                    s["generated"] = sum(x["generated"] for x in decoding)
+                    s["prompt_tokens"] = max(x.get("prompt_tokens") or 0 for x in decoding)
             hist = list(self.history)
             totals = dict(self.totals)
         now = time.time()
@@ -4458,11 +4517,13 @@ class Service:
         par = int(getattr(self.engine, "batch", 0) or 0)
         if par:                                         # #465: the requests running together, slot by slot
             with self.status_lock:
-                running = len(self.live_reqs)
+                in_flight = len(self.live_reqs)
+                solo = sum(1 for st, _ in self.live_reqs.values() if st.get("first_token"))
             slots = self.engine.slots_view() if hasattr(self.engine, "slots_view") else []
             # the requests in flight that are not in a slot: the one alone on the solo path, or waiting their turn
             in_slots = sum(1 for x in slots if x["state"] != "idle")
-            live.update(parallel=par, running=running, slots=slots, outside_slots=max(0, running - in_slots),
+            running = in_slots or solo                  # running: in a slot (or alone on the solo path), not waiting
+            live.update(parallel=par, running=running, slots=slots, outside_slots=max(0, in_flight - running),
                         waiting=int(getattr(self.engine, "waiting", 0) or 0),
                         admitting=int(getattr(self.engine, "admitting", 0) or 0))
             if running and state == "idle":
@@ -4475,8 +4536,9 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
-        return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+        return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else METRICS_REQUESTS],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+                "threads": self.threads_view(),
                 "requests_kept": len(hist), "totals": totals, "lifetime": self.lifetime.view(),
                 "hardware": tel["now"],
                 "hardware_static":
@@ -4936,11 +4998,50 @@ class Service:
         ka = self.keep_awake
         if ka is not None:
             ka.acquire()
+        inner = self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only)
         try:
-            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only)
+            for kind, x in inner:
+                # a reply that calls a tool leaves its thread open: the agent's next request follows (stream_order.py)
+                if kind == "event" and getattr(x, "kind", None) in ("tool_start", "tool_call"):
+                    oe = getattr(cancel, "_strata_order_entry", None)
+                    if oe is not None:
+                        oe.open = True
+                yield kind, x
         finally:
+            inner.close()
             if ka is not None:
                 ka.release()
+
+    def threads_view(self) -> dict:
+        """GET /metrics "threads": the stream order's pin and the agent threads it sees (stream_order.snapshot).  With
+        the API request monitor on ("api_monitor", the one switch that lets prompt text out of the server) each has a
+        short preview of where its newest prompt ends, so a thread can be told from the others; without it the
+        preview is empty and a thread is told by its name."""
+        snap = self.order.snapshot(tail=160)
+        for row in snap["threads"]:
+            ids = row.pop("tail_ids", None) or []
+            if not self.api_monitor:
+                row["preview"] = ""
+                continue
+            try:
+                # the chat template's own marks (turn starts and ends, the role names after them, think tags) say nothing
+                text = re.sub(r"<\|im_start\|>\s*\w*|<\|im_end\|>|</?think>|</?tool_response>", " ", self.tok.decode(ids)) if ids else ""
+                row["preview"] = " ".join(text.split())[-160:]
+            except Exception:  # noqa: BLE001 - a preview is a label, never a reason to fail /metrics
+                row["preview"] = ""
+        return snap
+
+    def mirror_evictions(self) -> None:
+        """Tell the stream order which parked conversations the engine's cache dropped (its log's evictions=E, oldest
+        first), so the threads it keeps are the ones the cache still holds.  The log is one park behind the turn."""
+        try:
+            st = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+        except Exception:
+            return
+        with self.order_lock:
+            n, self.order_evictions = st.get("evictions", 0) - self.order_evictions, st.get("evictions", 0)
+        if n != 0:
+            self.order.evicted(n if n > 0 else 1 << 10)                 # (fewer than before: the engine started again)
 
     def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
              declared_only=False) -> Iterator[tuple[str, object]]:
@@ -5066,23 +5167,46 @@ class Service:
                 # a stream idle timeout does not abort a healthy queued request (and its retry read the prompt again);
                 # a client that left while queued gives its place up instead of taking the turn only to cancel there
                 got = False
-                while not got:
-                    if cancel.is_set():
-                        raise QueueCancelled("the client disconnected while waiting for the engine")
-                    left = deadline - time.monotonic() if deadline is not None else QUEUE_BEAT_S
-                    if left <= 0:
-                        raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                    got = self.fifo.acquire(timeout=min(QUEUE_BEAT_S, left))
-                    if got:
+                beat_at = time.monotonic()
+                self.mirror_evictions()
+                order_entry = self.order.enter(ids, getattr(cancel, "_strata_thread", None))
+                setattr(cancel, "_strata_order_entry", order_entry)
+                def turn_over(oe=order_entry):
+                    oe.open = oe.open and not cancel.is_set()       # a client that left does not send a next request
+                    self.order.finish(oe)
+                    self.mirror_evictions()
+                turn.callback(turn_over)                            # after the turn (LIFO: the fifo is given back first)
+                try:
+                    while not got:
                         if cancel.is_set():
-                            self.fifo.release()
                             raise QueueCancelled("the client disconnected while waiting for the engine")
-                        if deadline is not None and time.monotonic() >= deadline:
-                            self.fifo.release()
+                        left = deadline - time.monotonic() if deadline is not None else QUEUE_BEAT_S
+                        if left <= 0:
                             raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                        turn.callback(self.fifo.release)
-                    else:
-                        yield "ping", None
+                        # the stream served last goes on first (serve/stream_order.py); the others wait their turn here
+                        if not self.order.wait_turn(order_entry, min(QUEUE_BEAT_S, left, 0.5)):
+                            if time.monotonic() - beat_at >= QUEUE_BEAT_S:
+                                beat_at = time.monotonic()
+                                yield "ping", None
+                            continue
+                        got = self.fifo.acquire(timeout=min(QUEUE_BEAT_S, left))
+                        if got:
+                            if cancel.is_set():
+                                self.fifo.release()
+                                raise QueueCancelled("the client disconnected while waiting for the engine")
+                            if deadline is not None and time.monotonic() >= deadline:
+                                self.fifo.release()
+                                raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                            turn.callback(self.fifo.release)
+                            order_entry.served = True       # it has the engine: its stream is the live one when it ends
+                            if order_entry.why:
+                                print(f"[strata] stream order: {order_entry.why} "
+                                      f"(this request waited {time.monotonic() - order_entry.t0:.1f} s)", flush=True)
+                        else:
+                            yield "ping", None
+                except BaseException:
+                    self.order.finish(order_entry)                  # gave up while waiting (cancel, deadline, client gone)
+                    raise
             with turn:
                 try:
                     with self.status_lock:
@@ -5417,6 +5541,9 @@ class Service:
                             if hit_msg and pcie_share:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
                             rate_txt = f"{rate:.1f} tok/s" if rate is not None else "no speed"
+                            oe = getattr(cancel, "_strata_order_entry", None)
+                            if oe is not None:
+                                oe.finish = finish                  # (stream_order.py: a pinned thread ends on "stop")
                             print(f"[strata] done: {n} tokens in {el:.0f} s ({rate_txt}) "
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                             if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
@@ -5471,6 +5598,10 @@ class Service:
             self.totals["stray_think_closers"] = self.totals.get("stray_think_closers", 0) + parser.stray_think
             print(f"[strata] {parser.stray_think} extra closing think tag(s) in the answer were dropped (the model wrote one "
                   "while thinking, so the rest of its reasoning went out as the answer; a call after it still counts)", flush=True)
+        if getattr(parser, "name_repairs", None):      # the run config's "tool_name_repair"
+            self.totals["tool_names_repaired"] = self.totals.get("tool_names_repaired", 0) + len(parser.name_repairs)
+            print(f"[strata] {len(parser.name_repairs)} tool call name(s) read as a declared tool (tool_name_repair): "
+                  f"{'; '.join(sorted(set(parser.name_repairs)))}", flush=True)
         if getattr(parser, "notes", None):
             self.totals["tool_args_repaired"] = self.totals.get("tool_args_repaired", 0) + len(parser.notes)
             print(f"[strata] {len(parser.notes)} tool call argument(s) repaired: {'; '.join(sorted(set(parser.notes)))}", flush=True)
@@ -6441,6 +6572,13 @@ def make_handler(svc: Service):
             request is HTTP/1.0 and fully read here, so no later bytes are expected - data is not a hang-up."""
             done = self.watch_done = threading.Event()
             self.cancel_event = cancel
+            key = stream_order.clean_key(self.headers.get(stream_order.THREAD_HEADER))   # the client's name for this conversation
+            if key is not None:
+                setattr(cancel, "_strata_thread", key)
+                if not svc.thread_header_seen:
+                    svc.thread_header_seen = True
+                    print(f"[strata] the client names its conversations ({stream_order.THREAD_HEADER}: {key[:16]}...): "
+                          "the stream order matches threads by that name", flush=True)
             with svc.status_lock:
                 svc.active_cancels.add(cancel)
             sock = self.connection
@@ -6814,7 +6952,7 @@ def make_handler(svc: Service):
                     records = svc.request_records(request_id)
                     self._json(404 if records is None else 200,
                                {"error": {"message": "request no longer retained"}} if records is None else
-                               records if request_id else {"requests": records, "retention": 100, "persistent": False,
+                               records if request_id else {"requests": records, "retention": svc.api_requests.maxlen, "persistent": False,
                                                           "loaded": svc.loaded(), "auto_load": hasattr(svc.engine, "restart")})
                 return
             if path == "/settings":
@@ -7042,6 +7180,20 @@ def make_handler(svc: Service):
                           "): the run config is read again", flush=True)
                     self._json(200, {"status": "restarting"})
                     threading.Timer(0.3, svc.request_stop, args=("restart",)).start()
+                    return
+                if path == "/v1/threads/pin":                # the Monitor tab's "Agent threads" card (stream_order.py)
+                    if not self._own_page("a thread can be pinned"):
+                        return
+                    key = req.get("thread") if isinstance(req, dict) else None
+                    if key is None:
+                        svc.order.unpin()
+                        print("[strata] stream order: the pin was taken off; the waiting requests go on", flush=True)
+                    elif not svc.order.pin(key):
+                        raise ValueError('thread: the name of a thread (its X-Strata-Thread value), or null to take the pin off')
+                    else:
+                        print(f"[strata] stream order: thread {stream_order.clean_key(key)[:24]} is pinned: every other "
+                              "request waits until it ends or the pin is taken off", flush=True)
+                    self._json(200, svc.threads_view())
                     return
                 if path == "/v1/vram":                       # #533: give VRAM back to other programs, or take it
                     if not self._own_page("the VRAM reserve can be changed"):
@@ -8425,6 +8577,52 @@ def tool_call_recovery_setting(cfg: dict) -> bool:
     return recovery
 
 
+# The fixed numbers a client can see.  Each is a top-level key of the run config (serve/runconfig.py checks the value and lists
+# it on the Settings page) and the constant it replaces: a name is a global of this module, "Class.name" an attribute of that
+# class.  A key the config leaves out keeps the constant's value.  SESSION_WAIT_MAX_S is not here: it must match the engine's own
+# bound (session_phase_limit_s), and a lower value would end the engine at an SWAIT it announced in good order.
+# repeat_stop_tokens is read in main() (it is a Service attribute).
+SERVER_NUMBERS = {
+    "loop_check_every": "LOOP_CHECK_EVERY", "loop_coverage": "LOOP_COVERAGE", "loop_history_words": "LOOP_HISTORY_WORDS",
+    "loop_tail_chars": "LOOP_TAIL_CHARS", "loop_tail_period": "LOOP_TAIL_PERIOD",
+    "answer_room_min_cap": "ANSWER_ROOM_MIN_CAP", "answer_reserve_min": "ANSWER_RESERVE_MIN",
+    "yields_max": "StrataEngine.YIELDS_MAX", "admit_short_first": "ADMIT_SHORT_FIRST",
+    "unload_wait_s": "Service.UNLOAD_WAIT_S", "restart_retry_s": "StrataEngine.RESTART_RETRY_S",
+    "queue_beat_s": "QUEUE_BEAT_S", "keepalive_s": "KEEPALIVE_S",
+    "stream_linger_s": "stream_order.LINGER_S",
+    "monitor_requests": "METRICS_REQUESTS", "api_monitor_requests": "API_MONITOR_REQUESTS",
+}
+
+
+def _number_home(where: str):
+    cls, _, name = where.rpartition(".")
+    return (globals()[cls] if cls else sys.modules[__name__]), name
+
+
+NUMBER_DEFAULTS = {where: getattr(*_number_home(where)) for where in SERVER_NUMBERS.values()}   # as the code has them now
+
+
+def server_numbers(cfg: dict) -> dict:
+    """{where: value} for every number in SERVER_NUMBERS: the config's, else its default.  ValueError names a bad key."""
+    out = {}
+    for key, where in SERVER_NUMBERS.items():
+        out[where] = NUMBER_DEFAULTS[where] if cfg.get(key) is None else runconfig.check(key, cfg[key], cfg)
+    if out["LOOP_TAIL_PERIOD"] * 2 > out["LOOP_TAIL_CHARS"]:     # a period as long as the tail reads every text as repeating
+        raise ValueError(f'"loop_tail_period" is at most half of "loop_tail_chars" ({out["LOOP_TAIL_CHARS"] // 2}), '
+                         f'not {out["LOOP_TAIL_PERIOD"]}')
+    return out
+
+
+def apply_server_numbers(cfg: dict) -> list[str]:
+    """Puts the config's numbers in place of the constants (the default for a key the config lacks), once at the start.
+    Returns the keys the config set, for the log line.  ValueError for a bad value: nothing is changed then."""
+    values = server_numbers(cfg)
+    for where, v in values.items():
+        home, name = _number_home(where)
+        setattr(home, name, v)
+    return [k for k in SERVER_NUMBERS if cfg.get(k) is not None]
+
+
 def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> int:
     try:                                               # files made by a run as administrator still belong to the user
         from strata_control import private_files as _pf
@@ -8505,7 +8703,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     ap.add_argument("--lazy", action="store_true", help="start the API unloaded (the engine and the vision encoder start with the first request)")
     ap.add_argument("--api-monitor", action="store_true",
                     help="the API request monitor at /api-monitor: keeps the last 100 requests' prompts and answers in "
-                         "memory (also \"api_monitor\": true in the config; off by default)")
+                         "memory (also \"api_monitor\": true in the config; \"api_monitor_requests\" sets the number; "
+                         "off by default)")
     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
                     help="unload the model after this many seconds without requests, so other programs (games, other "
                          "model servers) can use the VRAM; the next request loads it again (also \"idle_unload_s\" "
@@ -8665,6 +8864,19 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             blocked = []
         if blocked:
             ap.error("--offline cannot be strict for this profile: " + "; ".join(blocked))
+    try:                                               # the fixed numbers a client can see (the Settings page's server keys)
+        set_numbers = apply_server_numbers(cfg or {})
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}")
+    if set_numbers:
+        print("[strata] from the config: " + ", ".join(f"{k} {cfg[k]}" for k in set_numbers), flush=True)
+    if (cfg or {}).get("tool_name_repair"):            # opt-in: an undeclared tool name read as the one declared tool near it
+        try:
+            import serve.frontend as _fe_names                # (main() imports it under another name further down)
+            _fe_names.OutputParser.NAME_REPAIR = runconfig.check("tool_name_repair", cfg["tool_name_repair"], cfg)
+        except ValueError as e:
+            raise SystemExit(f"[strata] config {e}")
+        print(f"[strata] from the config: tool_name_repair {cfg['tool_name_repair']}", flush=True)
     lazy = False
     gpu_locks = None
     if a.engine == "strata":
@@ -8866,8 +9078,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
               else f"[strata] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)", flush=True)
     svc.api_monitor = a.api_monitor or cfg.get("api_monitor") is True
     if svc.api_monitor:
-        print("[strata] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "
-              "memory" + ("" if svc.api_key else "; anyone who can reach this server can read them (no API key)"),
+        print(f"[strata] API request monitor on (/api-monitor): the last {svc.api_requests.maxlen} requests' prompts and "
+              "answers are kept in memory" + ("" if svc.api_key else "; anyone who can reach this server can read them (no API key)"),
               flush=True)
     if svc.cors_origins:
         print(f"[strata] CORS on /v1/* for {', '.join(svc.cors_origins)}"

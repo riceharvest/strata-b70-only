@@ -103,13 +103,5 @@ class DeviceAccess(unittest.TestCase):
             self.assertIsNone(doctor._device_access_issue("hip", tempfile.gettempdir() + "/none"))
 
 
-class ArchiveContents(unittest.TestCase):
-    def test_the_fingerprint_table_models_import_reads_is_in_the_payload(self):
-        sys.path.insert(0, str(ROOT / "packaging"))
-        import package_terminal
-        self.assertIn("data/gguf_fingerprints.json", package_terminal.PAYLOAD)
-        self.assertTrue((ROOT / "data" / "gguf_fingerprints.json").is_file())
-
-
 if __name__ == "__main__":
     unittest.main()

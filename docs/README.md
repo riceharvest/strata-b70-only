@@ -8,7 +8,7 @@
 | --- | --- |
 | Install or update | [Desktop app and Terminal](INSTALL.md) |
 | Choose a model and check memory | [Models and quantizations](MODELS.md) |
-| Run DeepSeek V4.1-Flash (app and Terminal) | [DeepSeek V4.1-Flash](MODELS.md#deepseek-v41-flash) |
+| DeepSeek V4.1-Flash (not maintained since 2026-10-30) | [DeepSeek V4.1-Flash](MODELS.md#deepseek-v41-flash) |
 | Start from the command line | [Terminal launch](TERMINAL_LAUNCH.md) |
 | Connect a coding tool | [Tool connections](TERMINAL_LAUNCH.md#connect-your-apps-strata-connect) |
 | Fix an install or startup problem | [Troubleshooting](TROUBLESHOOTING.md) |
@@ -32,12 +32,10 @@ Use the guide for your GPU and operating system. Model and feature support can d
 ## Developers and contributors
 
 - [Build or run from a source checkout](SOURCE_INSTALL.md)
-- [Docker](DOCKER.md)
 - [Contribution rules](../CONTRIBUTING.md)
 - [Community benchmarks](COMMUNITY_BENCHMARKS.md) and the [standard benchmark protocol](BENCHMARK_PROTOCOL.md)
 - [How the engine works](HOW_IT_WORKS.md), [technical reference](DETAILS.md) and [Terminal reference](TERMINAL.md)
 - [KVA: approximate prompt processing for the late layers (experimental, opt-in)](KVA.md)
-- [App development](../apps/host/README.md) and [packaging](../packaging/README.md)
 
 ## AI tools and media
 

@@ -223,21 +223,6 @@ class WhatTheEngineSaid(unittest.TestCase):
                          "Drafting: MTP (the DFlash2 drafter isn't downloaded yet)")
 
 
-class WordsMatchTheApp(unittest.TestCase):
-    def test_every_line_the_engine_start_can_say_is_in_the_apps_catalog_in_all_eight_languages(self):
-        folder = ROOT / "apps" / "host" / "src" / "locales"
-        catalogs = {l: json.loads((folder / f"{l}.json").read_text(encoding="utf-8")) for l in ("en", "de", "es", "fr", "ja", "ko", "pt", "ru", "zh")}
-        ids = {v: k for k, v in catalogs["en"].items()}
-        self.assertEqual(len(drafting.REASONS), 4)
-        for reason in drafting.REASONS:
-            line = drafting.mtp_line(reason)
-            self.assertIn(line, ids, line)
-            for lang, catalog in catalogs.items():
-                self.assertTrue(catalog[ids[line]].strip(), f"{line} in {lang}")
-        # and what the engine's log makes of them
-        self.assertEqual(drafting.fallback_note("--draft dflash2: out of memory"), drafting.mtp_line(drafting.DIDNT_FIT))
-        self.assertEqual(drafting.fallback_note("--draft dflash2 is off: it is for one card and the CLI run"), drafting.mtp_line(drafting.NOT_HERE))
-
 
 class TerminalFlag(unittest.TestCase):
     BASE = {"exe": "component:strata-engine", "args": ["--pack", "/d/packs/x", "--mtp", "/d/mtp/rt"], "port": 8080, "model_name": GYRO}

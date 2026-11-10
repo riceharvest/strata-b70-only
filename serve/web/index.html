@@ -134,6 +134,15 @@
           </span>
         </div>
         <div class="st-progress live__bar" id="state-progress"><div class="st-progress__bar" id="state-bar" style="width:0%"></div></div>
+        <div class="live__slots" id="slot-bars" hidden></div>
+      </div>
+
+      <!-- agent threads: who is running, who waits, and the pin that lets one thread run to its end -->
+      <div class="card threads-card" id="threads-card" hidden>
+        <div class="card__head"><div><span class="card__title">Agent threads</span>
+          <span class="card__sub muted" id="threads-sub">one request at a time; pin a thread to let it run to its end while the others wait</span></div>
+          <button type="button" class="st-btn st-btn--secondary threads__unpin" id="threads-unpin" hidden>Take the pin off</button></div>
+        <div class="threads" id="threads"></div>
       </div>
 
       <!-- lifetime + speed tiles, filled by app.js -->
@@ -204,8 +213,9 @@
         <div class="table-wrap">
           <table class="st-table dt" id="dash-req">
             <thead><tr><th>Time</th><th>Status</th><th class="num">Input</th><th class="num">Cached</th><th class="num">Output</th>
-              <th class="num">TTFT</th><th class="num">Prefill t/s</th><th class="num">Decode t/s</th><th class="num">Duration</th></tr></thead>
-            <tbody id="dash-req-body"><tr><td colspan="9" class="muted">No requests yet</td></tr></tbody>
+              <th class="num">TTFT</th><th class="num">Prefill t/s</th><th class="num">Decode t/s</th><th class="num">Duration</th>
+              <th class="num" title="Estimated cost saved vs Alibaba Cloud Qwen-Flash ($0.15/M input, $0.47/M output, $0.016/M cache read)">Saved</th></tr></thead>
+            <tbody id="dash-req-body"><tr><td colspan="10" class="muted">No requests yet</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -254,8 +264,9 @@
               <th class="num">Decode t/s</th>
               <th class="num" title="Share of the experts looked up that were already in VRAM; the share read over PCIe (--pcie-frac) follows it">VRAM hit</th>
               <th class="num" title="Speculative drafts accepted">Drafts</th>
-              <th class="num">Duration</th></tr></thead>
-            <tbody id="req-body"><tr><td colspan="10" class="muted">No requests yet</td></tr></tbody>
+              <th class="num">Duration</th>
+              <th class="num" title="Estimated cost saved vs Alibaba Cloud Qwen-Flash ($0.15/M input, $0.47/M output, $0.016/M cache read)">Saved</th></tr></thead>
+            <tbody id="req-body"><tr><td colspan="11" class="muted">No requests yet</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -268,6 +279,11 @@
       <div class="st-card">
         <span class="card-title">Model and engine</span>
         <dl class="facts" id="facts-engine"></dl>
+      </div>
+      <div class="st-card">
+        <span class="card-title">Cloud cost baseline</span>
+        <p class="muted">Estimated savings for self-hosting Qwen-Flash on B70 vs. Alibaba Cloud International API.</p>
+        <dl class="facts" id="facts-cost"></dl>
       </div>
       <div class="st-card">
         <span class="card-title">This PC</span>

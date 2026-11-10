@@ -12,6 +12,37 @@ const kfmt = (n) => (n == null ? "–" : n >= 1000 ? `${fmt(n / 1000, n >= 10000
 const ctxfmt = (n) => (n && n % 1024 === 0 ? `${fmt(n / 1024)}K` : kfmt(n));
 const gb = (b, d = 1) => (b == null ? "–" : fmt(b / 1073741824, d));   // memory: binary GB, as Windows shows it
 
+// Cloud baseline: Alibaba Cloud Int. rates for Qwen-Flash
+const QWEN_FLASH_PRICING = {
+  provider: "Alibaba Cloud Int.",
+  model: "Qwen-Flash",
+  inputPerM: 0.15,
+  outputPerM: 0.47,
+  cacheReadPerM: 0.016,
+  cacheCreate5mPerM: 0.20,
+  cacheRead5mPerM: 0.016,
+};
+function calcCost(promptTokens = 0, reusedTokens = 0, outputTokens = 0) {
+  const p = Number(promptTokens) || 0;
+  const r = Math.min(p, Math.max(0, Number(reusedTokens) || 0));
+  const f = Math.max(0, p - r);
+  const o = Math.max(0, Number(outputTokens) || 0);
+  return (f * QWEN_FLASH_PRICING.inputPerM + r * QWEN_FLASH_PRICING.cacheReadPerM + o * QWEN_FLASH_PRICING.outputPerM) / 1e6;
+}
+function fmtCost(n, precision) {
+  if (n == null || Number.isNaN(n)) return "–";
+  const v = Number(n);
+  if (v === 0) return "$0.00";
+  if (v >= 1e6) return `$${fmt(v / 1e6, 2)}M`;
+  if (v >= 1e4) return `$${fmt(v / 1e3, 1)}k`;
+  if (v >= 100) return `$${v.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+  if (v >= 1) return `$${v.toFixed(precision != null ? precision : 2)}`;
+  if (v >= 0.01) return `$${v.toFixed(precision != null ? precision : 2)}`;
+  if (v >= 0.001) return `$${v.toFixed(precision != null ? precision : 3)}`;
+  if (v >= 0.0001) return `$${v.toFixed(precision != null ? precision : 4)}`;
+  return `$${v.toFixed(precision != null ? precision : 4)}`;
+}
+
 const store = {
   get(k, d) { try { const v = localStorage.getItem("strata." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem("strata." + k, JSON.stringify(v)); return true; } catch (e) { return false; } },
@@ -358,9 +389,10 @@ function render(m) {
   if (tab === "monitor") {
     renderDash(live, hw, st, eng, h, last, reqs, m);
     renderConvCache(m.conversation_cache);
+    renderThreads(m.threads);
   }
   if (tab === "requests") renderRequests(reqs, m);
-  if (tab === "about") renderAbout(eng, hw, st);
+  if (tab === "about") renderAbout(eng, hw, st, m);
 }
 
 // #596: the conversation cache - the prompt's state the engine keeps between requests (always), and the whole
@@ -370,6 +402,57 @@ function since(t) {
   const s = Math.max(0, Date.now() / 1000 - t);
   return s < 60 ? "just now" : s < 3600 ? `${fmt(s / 60)} min ago` : `${fmt(s / 3600, 1)} h ago`;
 }
+// The agent threads card: the stream order's view (server /metrics "threads") and its pin.  A pinned thread is the only
+// one that takes the engine until it ends (a finished reply with no tool call) or the pin is taken off.
+let threadBusy = false;
+async function pinThread(key) {
+  if (threadBusy) return;
+  threadBusy = true;
+  try {
+    const r = await fetch("v1/threads/pin", {method: "POST", headers: headers(true), body: JSON.stringify({thread: key})});
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) renderThreads(j);
+    else $("threads-sub").textContent = (j.error && j.error.message) || `the server answered ${r.status}`;
+  } catch (e) {
+    $("threads-sub").textContent = String(e.message || e);
+  } finally {
+    threadBusy = false;
+  }
+}
+const THREAD_STATE = {running: ["st-badge--generating", "Running"], waiting: ["st-badge--queued", "Waiting"],
+                      "between turns": ["st-badge--reading", "Running a tool"], "not seen yet": ["", "Not seen yet"]};
+function renderThreads(t) {
+  const card = $("threads-card");
+  const rows = (t && t.enabled && t.threads) || [];
+  card.hidden = !t || !t.enabled || (!rows.length && !t.pinned);
+  if (card.hidden) return;
+  const secs = (x) => (x == null ? "" : x >= 90 ? `${fmt(x / 60, 1)} min` : `${fmt(x)} s`);
+  $("threads-sub").textContent = t.pinned
+    ? `pinned for ${secs(t.pinned_for_s)}: only this thread takes the engine${t.held_back ? ` · ${fmt(t.held_back)} waiting behind it` : ""}`
+    : "one request at a time; pin a thread to let it run to its end while the others wait";
+  $("threads-unpin").hidden = !t.pinned;
+  const order = {running: 0, "between turns": 1, waiting: 2, "not seen yet": 3};
+  rows.sort((a, b) => (b.pinned - a.pinned) || (order[a.state] - order[b.state]) || ((b.waited_s || 0) - (a.waited_s || 0)));
+  $("threads").innerHTML = rows.map((r) => {
+    const [cls, label] = THREAD_STATE[r.state] || ["", r.state];
+    const meta = [r.tokens ? `${fmt(r.tokens)} tokens` : null, r.turns ? `${fmt(r.turns)} turns` : null,
+                  r.state === "waiting" ? `waiting ${secs(r.waited_s)}` : r.state === "between turns" ? `idle ${secs(r.waited_s)}` : null]
+      .filter(Boolean).join(" · ");
+    const btn = r.key == null ? `<span class="muted" title="The client sends no ${"X-Strata-Thread"} header for this thread">no name</span>`
+      : r.pinned ? `<button type="button" class="st-btn st-btn--secondary" data-unpin="1">Unpin</button>`
+      : `<button type="button" class="st-btn st-btn--secondary" data-pin="${esc(r.key)}">Pin</button>`;
+    return `<div class="thread" data-pinned="${r.pinned ? 1 : 0}"><div><div class="thread__name" title="${esc(r.key || "")}">` +
+           `<span class="st-badge ${cls}">${label}</span> ${esc(r.key || "unnamed thread")}</div>` +
+           `<div class="thread__preview" title="${esc(r.preview || "")}">${esc(r.preview || "")}</div></div>` +
+           `<div class="thread__meta">${esc(meta)}</div>${btn}</div>`;
+  }).join("");
+}
+document.addEventListener("click", (ev) => {
+  const b = ev.target.closest && ev.target.closest("[data-pin],[data-unpin],#threads-unpin");
+  if (!b) return;
+  pinThread(b.dataset && b.dataset.pin ? b.dataset.pin : null);
+});
+
 function renderConvCache(c) {
   $("cc-card").hidden = !c;
   if (!c) return;                                  // an older server
@@ -390,10 +473,21 @@ function renderConvCache(c) {
     ["Reused since start", c.requests ? `${fmt(c.reused_tokens)} tokens${share}` : null],
     ["Parked / restored", c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}${c.evictions ? ` · ${fmt(c.evictions)} evicted` : ""}` : null],
     ["Last switch", c.enabled ? event : null],
+    // parks that did not happen: each one is a whole prompt read again when that agent returns
+    ["Parks skipped", c.enabled && ((c.skips_budget || 0) + (c.skips_ram || 0) + (c.skips_other || 0)) > 0
+      ? [c.skips_budget ? `${fmt(c.skips_budget)} did not fit the RAM for parked conversations (raise it to hold two conversations, or park on the SSD)` : null,
+         c.skips_ram ? `${fmt(c.skips_ram)} for too little free RAM` : null,
+         c.skips_other ? `${fmt(c.skips_other)} for another reason (see the engine log)` : null].filter(Boolean).join(" · ")
+      : null],
+    ["On the SSD", c.enabled && c.ssd_files != null ? `${fmt(c.ssd_files)} conversation${c.ssd_files === 1 ? "" : "s"}, ${fmt(c.ssd_gib, 1)} GB · ${fmt(c.ssd_restores || 0)} read back · ${fmt((c.ssd_written_mib || 0) / 1024, 1)} GB written since start` : null],
+    // the SSD tier's drive as the engine measured it once
+    ["From the SSD", c.enabled && c.ssd_read_mbps
+      ? `1 GB comes back in about ${fmt(1074 / c.ssd_read_mbps, 2)} s and takes about ${fmt(1074 / c.ssd_write_mbps, 2)} s to write · drive reads ${fmt(c.ssd_read_mbps)} MB/s, writes ${fmt(c.ssd_write_mbps)} MB/s`
+      : null],
   ]);
   $("cc-note").textContent = c.enabled
     ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."
-    : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
+    : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), set Parked conversations and the memory for them under Model and settings, then restart (docs/DETAILS.md).";
 }
 
 // ---- numbers behind the tiles and charts
@@ -551,6 +645,8 @@ for (const id of ["chart-tp", "chart-day", "chart-pr", "chart-ttft"]) {
 const legend = (items) => items.map(([name, color]) => `<span><i style="background:${color}"></i>${esc(name)}</span>`).join("");
 let chartSig = "";
 
+// the batch slots that hold a request (reading or decoding); empty without "parallel"
+const busySlots = (live) => ((live && live.slots) || []).filter((x) => x.state === "reading" || x.state === "decoding");
 function renderDash(live, hw, st, eng, h, last, reqs, m) {
   // the live strip
   const prog = $("state-progress");
@@ -579,6 +675,21 @@ function renderDash(live, hw, st, eng, h, last, reqs, m) {
   $("state-label").textContent = label;
   $("state-detail").textContent = detail;
   $("state-bar").style.width = `${pct}%`;
+  // parallel: with two or more requests running at once, one bar each (a slot is a request); one alone keeps the single bar
+  const busy = busySlots(live);
+  const several = busy.length > 1;
+  $("state-progress").hidden = several;
+  const sb = $("slot-bars");
+  sb.hidden = !several;
+  const sbHtml = several ? busy.map((x) => {
+    const reading = x.state === "reading";
+    const bp = reading ? (x.prompt_tokens ? (100 * (x.prompt_read || 0)) / x.prompt_tokens : 0) : (x.max_tokens ? Math.min(100, (100 * x.generated) / x.max_tokens) : 0);
+    const text = reading ? `Reading prompt · ${fmt(x.prompt_read || 0)} / ${fmt(x.prompt_tokens)} tokens · ${fmt(bp)}%`
+                         : `Generating · ${fmt(x.generated)} tokens · ${fmt(x.tok_s, 1)} tok/s`;
+    return `<div class="live__slot"><span><b>Request ${x.slot + 1}</b> <span class="muted">${text}</span></span>` +
+           `<div class="st-progress live__bar"${reading ? ' data-tone="info"' : ""}><div class="st-progress__bar" style="width:${bp}%"></div></div></div>`;
+  }).join("") : "";
+  if (sb.dataset.sig !== sbHtml) { sb.innerHTML = sbHtml; sb.dataset.sig = sbHtml; }
   $("page-sub").textContent = m.lifetime && m.lifetime.since ? `Lifetime counters since ${new Date(m.lifetime.since * 1000).toLocaleDateString([], {year: "numeric", month: "short", day: "numeric"})}` : "";
 
   // data: finished requests, oldest first
@@ -597,8 +708,17 @@ function renderDash(live, hw, st, eng, h, last, reqs, m) {
   const errs = done.filter((r) => r.finish === "error").length, cut = done.length - ok - errs;
   const cacheShare = L.prompt_tokens ? (100 * L.reused) / L.prompt_tokens : null;
   const day = (f) => days.map(f);
+  const speeds = busySlots(live).filter((x) => x.state === "decoding" && x.tok_s != null).map((x) => x.tok_s);   // each request's own
   const nowSpeed = live.state === "generating" ? live.tok_s : dNow;
+  const lifeFresh = Math.max(0, (L.prompt_tokens || 0) - (L.reused || 0));
+  const lifeCost = calcCost(L.prompt_tokens, L.reused, L.output_tokens);
+  const todayCost = calcCost(today.prompt_tokens, today.reused, today.output_tokens);
+  const ydayCost = calcCost(yday.prompt_tokens, yday.reused, yday.output_tokens);
+  const dayCost = (d) => calcCost(d.prompt_tokens, d.reused, d.output_tokens);
   const tiles = [
+    tile("Cost saved", fmtCost(lifeCost), "", [
+      row(`${chip(todayCost, ydayCost)} <span class="muted">${fmtCost(todayCost)} today</span>`),
+      row(`<span class="muted">${fmtCost(calcCost(lifeFresh, 0, 0))} in · ${fmtCost(calcCost(0, 0, L.output_tokens))} out</span>`)], day(dayCost), "cost", "Estimated API cost saved vs Alibaba Cloud Qwen-Flash ($0.15/M input, $0.47/M output, $0.016/M cache read)"),
     tile("Input tokens", big(L.prompt_tokens), "", [
       row(`${chip(today.prompt_tokens, yday.prompt_tokens)} <span class="muted">${big(today.prompt_tokens)} today</span>`),
       row(`<span class="muted">${big(L.prompt_tokens - L.reused)} read · ${big(L.reused)} reused</span>`)], day((d) => d.prompt_tokens), "", "All prompt tokens the server has processed, lifetime"),
@@ -611,8 +731,11 @@ function renderDash(live, hw, st, eng, h, last, reqs, m) {
     tile("Requests", big(L.requests), "", [
       row(`${chip(today.requests, yday.requests)} <span class="muted">${fmt(today.requests)} today</span>`),
       row(`<span class="muted">${fmt(m.totals.requests)} since this start</span>`)], day((d) => d.requests)),
+    tile("Completed", done.length ? fmt((100 * ok) / done.length, ok === done.length ? 0 : 1) : "–", done.length ? "%" : "", [
+      row(`<span class="${errs ? "bad" : "muted"}">${fmt(errs)} errors</span> <span class="muted">· ${fmt(cut)} cut short</span>`),
+      row(`<span class="muted">of ${fmt(done.length)} kept requests</span>`)], null),
     tile("Decode speed", nowSpeed == null ? "–" : fmt(nowSpeed, 1), "tok/s", [
-      row(`${chip(dNow, dPrev)} <span class="muted">${live.state === "generating" ? "live" : "median of last 10"}</span>`),
+      row(`${chip(dNow, dPrev)} <span class="muted">${live.state === "generating" ? (speeds.length > 1 ? `live, ${speeds.length} requests: ${speeds.map((v) => fmt(v, 1)).join(" + ")}` : "live") : "median of last 10"}</span>`),
       row(`<span class="muted">${lifeDecode ? `${fmt(lifeDecode, 1)} lifetime avg` : "&nbsp;"}</span>`)], decodes, "decode"),
     tile("Prefill speed", pNow == null ? "–" : fmt(pNow), "tok/s", [
       row(`${chip(pNow, pPrev)} <span class="muted">median of last 10</span>`),
@@ -620,9 +743,6 @@ function renderDash(live, hw, st, eng, h, last, reqs, m) {
     tile("Time to first token", tNow == null ? "–" : fmt(tNow, tNow < 10 ? 2 : 1), "s", [
       row(`${chip(tNow, tPrev, "down")} <span class="muted">median of last 10</span>`),
       row(`<span class="muted">p95 ${quant(ttfts, 0.95) == null ? "–" : `${fmt(quant(ttfts, 0.95), 1)} s`}</span>`)], ttfts, "ttft"),
-    tile("Completed", done.length ? fmt((100 * ok) / done.length, ok === done.length ? 0 : 1) : "–", done.length ? "%" : "", [
-      row(`<span class="${errs ? "bad" : "muted"}">${fmt(errs)} errors</span> <span class="muted">· ${fmt(cut)} cut short</span>`),
-      row(`<span class="muted">of ${fmt(done.length)} kept requests</span>`)], null),
   ].join("");
   if ($("tiles").dataset.sig !== tiles) { $("tiles").innerHTML = tiles; $("tiles").dataset.sig = tiles; }
 
@@ -639,6 +759,7 @@ function renderDash(live, hw, st, eng, h, last, reqs, m) {
     $("tp-legend").innerHTML = legend([["Decode (left axis)", COLORS.decode], ["Prefill (right axis)", COLORS.prefill]]);
     const dl = days.map((d) => dayLabel(d.key));
     drawChart("chart-day", {kind: "bars", labels: dl, xlabels: dl, empty: "No tokens counted yet",
+      tips: dl.map((d, i) => `${days[i].key} · ${fmtCost(dayCost(days[i]))} saved`),
       series: [{name: "Cached input", color: COLORS.cached, values: days.map((d) => d.reused), fmt: big},
                {name: "Fresh input", color: COLORS.fresh, values: days.map((d) => d.prompt_tokens - d.reused), fmt: big},
                {name: "Output", color: COLORS.out, values: days.map((d) => d.output_tokens), fmt: big}]});
@@ -669,12 +790,14 @@ function renderDash(live, hw, st, eng, h, last, reqs, m) {
   // context in use: the running request, else the last one
   const ctx = eng.max_context || 0;
   let used = 0;
-  if (live.state !== "idle" && live.state !== "unloaded") used = (live.prompt_tokens || 0) + (live.generated || 0);
+  const each = busySlots(live).map((x) => (x.prompt_tokens || 0) + (x.generated || 0));
+  if (each.length > 1) used = Math.max(...each);                    // a slot has its own context: the fullest one
+  else if (live.state !== "idle" && live.state !== "unloaded") used = (live.prompt_tokens || 0) + (live.generated || 0);
   else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
   const frac = ctx ? Math.min(1, used / ctx) : 0;
   $("ctx-bar").style.width = `${frac * 100}%`;
   $("ctx-sub").textContent = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)} · ${fmt(frac * 100, frac < 0.1 ? 1 : 0)}%` : "–";
-  $("ctx-note").textContent = live.state !== "idle" && live.state !== "unloaded" ? "the running request" : last ? "the last request" : "";
+  $("ctx-note").textContent = live.state !== "idle" && live.state !== "unloaded" ? (each.length > 1 ? "the fullest running request" : "the running request") : last ? "the last request" : "";
 
   // model and engine
   const loaded = live.state !== "unloaded";
@@ -690,7 +813,7 @@ function renderDash(live, hw, st, eng, h, last, reqs, m) {
     ["KV cache", kv ? `${kv}${eng.kv_resident ? `, ${fmt(eng.kv_resident)} positions per layer in VRAM` : ", all in VRAM"}` : null],
     ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
     ["Speculation", eng.spec ? `MTP, up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} drafts${t.drafts_offered ? ` · ${fmt((100 * t.drafts_accepted) / t.drafts_offered)}% accepted` : ""}` : null],
-    ["Parallel slots", live.parallel ? `${fmt(live.running || 0)} running of ${fmt(live.parallel)}` : null],
+    ["Parallel slots", live.parallel ? `${fmt(live.running || 0)} running of ${fmt(live.parallel)}${live.outside_slots ? ` · ${fmt(live.outside_slots)} waiting` : ""}` : null],
     ["Images", eng.images ? "on" : "off"],
     ["Since start", t.requests ? `${renderTotalsShort(t)}` : null],
   ]);
@@ -737,14 +860,15 @@ function renderDash(live, hw, st, eng, h, last, reqs, m) {
 
   // the latest requests (compact)
   const body = $("dash-req-body");
-  const html = reqs.length ? reqs.slice(0, 8).map((r) => reqCells(r, false)).join("") : `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
+  const html = reqs.length ? reqs.slice(0, 8).map((r) => reqCells(r, false)).join("") : `<tr><td colspan="10" class="muted">No requests yet</td></tr>`;
   if (body.dataset.sig !== html) { body.innerHTML = html; body.dataset.sig = html; }
 }
 $("goto-requests").onclick = () => showTab("requests");
 
 function renderTotalsShort(t) {
   const read = t.prompt_tokens - t.reused;
-  return `${fmt(t.requests)} requests · ${big(read)} read · ${big(t.output_tokens)} written`;
+  const cost = calcCost(t.prompt_tokens, t.reused, t.output_tokens);
+  return `${fmt(t.requests)} requests · ${big(read)} read · ${big(t.output_tokens)} written · ${fmtCost(cost)} saved`;
 }
 function statusBadge(r) {
   const [cls, text] = FINISH[r.finish] || ["", r.finish || "–"];
@@ -755,10 +879,12 @@ function statusBadge(r) {
 function reqCells(r, full) {
   const fresh = freshOf(r), pf = prefillOf(r), tt = ttftOf(r);
   const t = clock(r.time);
+  const cost = calcCost(r.prompt_tokens, r.reused, r.output_tokens);
   if (!full) {
     return `<tr><td>${esc(t)}</td><td>${statusBadge(r)}</td><td class="num">${fmt(fresh)}</td><td class="num">${fmt(r.reused)}</td>` +
       `<td class="num">${fmt(r.output_tokens)}</td><td class="num">${tt == null ? "–" : `${fmt(tt, 2)} s`}</td><td class="num">${fmt(pf)}</td>` +
-      `<td class="num">${fmt(r.decode_tok_s, 1)}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
+      `<td class="num">${fmt(r.decode_tok_s, 1)}</td><td class="num">${fmt(r.duration_s, 1)} s</td>` +
+      `<td class="num">${fmtCost(cost)}</td></tr>`;
   }
   const total = r.prompt_tokens || 0, share = total ? (100 * (r.reused || 0)) / total : 0;
   const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%` +
@@ -768,7 +894,8 @@ function reqCells(r, full) {
     `<td><div class="pcell"><span>${fmt(total)}</span><div class="pbar" title="${fmt(r.reused || 0)} reused of ${fmt(total)}"><i style="width:${share.toFixed(1)}%"></i></div>` +
     `<em>${share >= 1 ? `${fmt(share)}% cached` : "fresh"}</em></div></td>` +
     `<td class="num">${fmt(r.output_tokens)}</td><td class="num">${tt == null ? "–" : `${fmt(tt, 2)} s`}</td><td class="num">${fmt(pf)}</td>` +
-    `<td class="num">${fmt(r.decode_tok_s, 1)}</td><td class="num">${hit}</td><td class="num">${drafts}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
+    `<td class="num">${fmt(r.decode_tok_s, 1)}</td><td class="num">${hit}</td><td class="num">${drafts}</td><td class="num">${fmt(r.duration_s, 1)} s</td>` +
+    `<td class="num">${fmtCost(cost)}</td></tr>`;
 }
 let reqFilter = "all";
 for (const b of $("req-filter").children) b.onclick = () => {
@@ -786,7 +913,7 @@ function renderRequests(reqs, m) {
   if (body.dataset.sig !== sig) {
     body.dataset.sig = sig;
     body.innerHTML = shown.length ? shown.map((r) => reqCells(r, true)).join("")
-                                  : `<tr><td colspan="10" class="muted">${reqs.length ? "No request matches this filter" : "No requests yet"}</td></tr>`;
+                                  : `<tr><td colspan="11" class="muted">${reqs.length ? "No request matches this filter" : "No requests yet"}</td></tr>`;
   }
   const kept = m.requests_kept == null ? reqs.length : m.requests_kept;
   $("req-count").textContent = `${fmt(shown.length)}${reqFilter === "all" ? "" : ` of ${fmt(reqs.length)}`} requests · the server keeps the last ${fmt(Math.max(kept, 500))}`;
@@ -798,8 +925,9 @@ function renderTotals(t) {
   const read = t.prompt_tokens - t.reused;
   const pSpeed = t.prompt_ms > 0 && read > 0 ? ` at ${fmt(read / (t.prompt_ms / 1000))} tok/s` : "";
   const oSpeed = t.decode_ms > 0 && t.output_tokens > 0 ? ` at ${fmt(t.output_tokens / (t.decode_ms / 1000), 1)} tok/s` : "";
+  const cost = calcCost(t.prompt_tokens, t.reused, t.output_tokens);
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
-         `${fmt(t.output_tokens)} written${oSpeed}`;
+         `${fmt(t.output_tokens)} written${oSpeed} · ${fmtCost(cost)} saved`;
 }
 
 function facts(el, rows) {
@@ -815,8 +943,13 @@ function projectionText(c) {
          `${single ? ` (layer ${single.replace("single", "")}'s direction)` : ""}. Per chat in Sampling. Its package ` +
          "describes the vector as a refusal-direction projection; measure the speed yourself";
 }
-function renderAbout(eng, hw, st) {
+function renderAbout(eng, hw, st, m) {
   const kv = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit"}[eng.kv] || eng.kv;
+  const L = (m && m.lifetime) || (m && m.totals) || {};
+  const days = lastDays(L);
+  const today = days[days.length - 1] || {};
+  const lifeCost = calcCost(L.prompt_tokens, L.reused, L.output_tokens);
+  const todayCost = calcCost(today.prompt_tokens, today.reused, today.output_tokens);
   facts($("facts-engine"), [
     ["Model", eng.model],
     ["Engine", eng.version ? `v${eng.version}` : "built from source"],
@@ -826,12 +959,26 @@ function renderAbout(eng, hw, st) {
     ["Speculation", eng.spec ? `MTP drafts up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} tokens${eng.lookup ? ", prompt lookup on" : ""}` : null],
     ["Images", eng.images ? "on" : "off"],
     ["Experimental speed projection", projectionText(eng.cvec)],
+    ["Cost saved", `${fmtCost(lifeCost)} lifetime (${fmtCost(todayCost)} today)`],
   ]);
   facts($("facts-hw"), [
     ["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : (st.gpu_note || "not readable (NVML)")],
     ["CPU", st.cpu_name ? `${st.cpu_name}${st.threads ? `, ${st.threads} threads` : ""}` : null],
     ["RAM", hw.ram_total ? `${gb(hw.ram_total, 0)} GB` : null],
   ]);
+  if ($("facts-cost")) {
+    facts($("facts-cost"), [
+      ["Provider", QWEN_FLASH_PRICING.provider],
+      ["Model baseline", QWEN_FLASH_PRICING.model],
+      ["Input /M", `$${QWEN_FLASH_PRICING.inputPerM.toFixed(2)}`],
+      ["Output /M", `$${QWEN_FLASH_PRICING.outputPerM.toFixed(2)}`],
+      ["Cache read /M", `$${QWEN_FLASH_PRICING.cacheReadPerM.toFixed(3)}`],
+      ["Cache create (5m) /M", `$${QWEN_FLASH_PRICING.cacheCreate5mPerM.toFixed(2)}`],
+      ["Cache read (5m) /M", `$${QWEN_FLASH_PRICING.cacheRead5mPerM.toFixed(3)}`],
+      ["Lifetime saved", `${fmtCost(lifeCost)} (${big(L.prompt_tokens || 0)} input · ${big(L.output_tokens || 0)} output)`],
+      ["Today saved", `${fmtCost(todayCost)} (${big(today.prompt_tokens || 0)} input · ${big(today.output_tokens || 0)} output)`],
+    ]);
+  }
   const base = location.origin;
   facts($("facts-api"), [
     ["OpenAI base URL", `${base}/v1`, true],
@@ -894,28 +1041,50 @@ async function loadConfig() {
   $("cfg-model").innerHTML = models.map((m) =>
     `<option value="${esc(m.file)}"${m.current ? " selected" : ""}>${esc(m.model)} (${esc(m.file)})${m.current ? " - running" : ""}</option>`).join("");
   $("cfg-file").textContent = c.file || "";
-  $("cfg-form").innerHTML = cfgKeys.map((k, i) => {
+  const row = (k, i) => {
     const id = `cfg-${i}`, v = k.value;
     let input;
     if (k.kind === "bool" || k.kind === "enum") {
       const opts = k.kind === "bool" ? [["true", "on"], ["false", "off"]] : k.choices.map((x) => [x, x]);
       const cur = v == null ? "" : String(v);
+      // a value the file holds that the list lacks stays selected, so Save does not read it as "default" and remove it
+      if (cur !== "" && !opts.some(([val]) => val === cur)) opts.push([cur, cur]);
       input = `<select class="st-input" id="${id}"><option value=""${cur === "" ? " selected" : ""}>default</option>` +
         opts.map(([val, text]) => `<option value="${esc(val)}"${cur === val ? " selected" : ""}>${esc(text)}</option>`).join("") + `</select>`;
     } else {
       const text = v == null ? "" : Array.isArray(v) ? v.join(", ") : String(v);
-      input = `<input class="st-input" id="${id}" ${k.kind === "number" ? 'type="number" step="any" min="0"' : 'type="text"'} ` +
-        `value="${esc(text)}" placeholder="default" autocomplete="off">`;
+      // a number field only for a number: a text the file holds (a hand edit) would show empty there and Save would remove it
+      const num = k.kind === "number" && (v == null || typeof v === "number");
+      const attrs = num ? `type="number" step="${esc(k.step == null ? "any" : k.step)}" min="${esc(k.min == null ? 0 : k.min)}"` +
+        (k.max == null ? "" : ` max="${esc(k.max)}"`) : 'type="text"';   // auto: text, a word or a whole number
+      input = `<input class="st-input" id="${id}" ${attrs} value="${esc(text)}" placeholder="default" autocomplete="off">`;
     }
     return `<label for="${id}" title="${esc(k.help)}">${esc(k.help)}<code>${esc(k.key)}</code></label>${input}`;
+  };
+  // a small heading per group, in the server's order; inside a group the keys keep the server's order (ids stay the key's index)
+  const groups = [...new Set([...(c.groups || []), ...cfgKeys.map((k) => k.group || "")])];
+  $("cfg-form").innerHTML = groups.map((g) => {
+    const rows = cfgKeys.map((k, i) => ((k.group || "") === g ? row(k, i) : "")).join("");
+    return rows && (g ? `<h3 class="cfg-group">${esc(g)}</h3>` : "") + rows;
   }).join("");
+  const pi = cfgKeys.findIndex((k) => k.key === "parallel"), bi = cfgKeys.findIndex((k) => k.key === "batch_mtp");
+  if (pi >= 0 && bi >= 0) {                          // batch_mtp only means something with 2 or more parallel requests
+    const sync = () => {
+      const on = Number($(`cfg-${pi}`).value) >= 2, b = $(`cfg-${bi}`);
+      b.disabled = !on;
+      if (!on) b.value = "";
+    };
+    $(`cfg-${pi}`).addEventListener("input", sync);
+    sync();
+  }
   $("cfg-card").hidden = false;
 }
 function configValue(k, el) {
   const s = el.value.trim();
   if (s === "") return null;
   if (k.kind === "bool") return s === "true";
-  if (k.kind === "number") return Number(s);
+  if (k.kind === "number") { const n = Number(s); return Number.isNaN(n) ? s : n; }   // not a number: sent as typed, the server says why
+  if (k.kind === "auto") return /^\d+$/.test(s) ? Number(s) : s;                    // a whole number or a word (auto)
   return s;                                         // enum, or names (the server splits them at commas)
 }
 $("cfg-save").addEventListener("click", async () => {
@@ -1354,7 +1523,10 @@ async function send() {
   const n = usage ? usage.completion_tokens : null;
   if (n && firstAt) {
     const secs = (performance.now() - firstAt) / 1000;
-    m.meta = `${fmt(n)} tokens${secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : ""}${m.stopped ? " · stopped" : ""}` +
+    const pt = usage.prompt_tokens || 0;
+    const reused = (usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens) || 0;
+    const cost = calcCost(pt, reused, n);
+    m.meta = `${fmt(n)} tokens${secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : ""}${cost > 0 ? ` · ${fmtCost(cost)} saved` : ""}${m.stopped ? " · stopped" : ""}` +
              (projectionLoaded() ? (settings.esp ? " · projection on" : " · projection off") : "");
   } else if (m.stopped) {
     m.meta = "Stopped";

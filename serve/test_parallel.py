@@ -4,6 +4,7 @@ A fake engine (a Python script speaking the engine's GEN / BGEN / BT / BDONE / B
 real StrataEngine and Service, so the server's side is tested without a GPU: requests up to N run at once, more
 wait for a slot, /metrics shows the slots, each request's history row is its own, and a conversation's next turn
 goes back to the slot that holds it."""
+import collections
 import json
 import sys
 import tempfile
@@ -748,6 +749,42 @@ class ParallelService(FakeEngineCase):
         self.start(4, fit=0)
         self.assertEqual(self.engine.batch, 0)
         self.assertEqual(self.chat("hi")["choices"][0]["message"]["content"], "ok, done.")
+
+    def test_metrics_with_two_decoding_requests_and_one_waiting(self):
+        """/metrics while two requests decode in the two slots and a third waits for a slot: the top-level figures are
+        the two together (not the waiting request's), running counts the slots, each slot reports its own."""
+        self.start(2)
+        now = time.time()
+
+        def req(generated, prompt, age, first):
+            st = {"busy": True, "phase": "answering" if first else "reading the prompt", "prompt_tokens": prompt,
+                  "generated": generated, "started": now - age, "first_token": now - first if first else None,
+                  "max_tokens": 1000}
+            rate = collections.deque([(now - 1, generated - generated // 10), (now, generated)] if first else [], maxlen=32)
+            return st, rate
+
+        a, b, waiting = req(400, 100, 30, 20), req(300, 50, 25, 10), req(0, 9000, 1, 0)
+        with self.svc.status_lock:
+            for st in (a, b, waiting):
+                self.svc.live_reqs[id(st[0])] = st
+        for i, (st, _) in enumerate((a, b)):
+            self.engine.slot_live[i] = {"slot": i, "state": "decoding", "prompt_tokens": st["prompt_tokens"],
+                                        "generated": st["generated"], "started": st["started"],
+                                        "first_token": st["first_token"], "max_tokens": 1000}
+        try:
+            live = self.get("/metrics")["live"]
+        finally:
+            with self.svc.status_lock:
+                self.svc.live_reqs.clear()
+            self.engine.slot_live[:] = [None] * len(self.engine.slot_live)
+        self.assertEqual(live["state"], "generating", "two decode: not 'reading' for the newest, waiting one")
+        self.assertEqual(live["generated"], 700, "both requests' tokens")
+        self.assertEqual(live["tok_s"], 70.0, "the sum of the two windowed speeds (40 + 30)")
+        self.assertEqual((live["parallel"], live["running"], live["outside_slots"]), (2, 2, 1))
+        self.assertEqual([x["state"] for x in live["slots"]], ["decoding", "decoding"])
+        self.assertEqual([x["generated"] for x in live["slots"]], [400, 300])
+        self.assertEqual([x["max_tokens"] for x in live["slots"]], [1000, 1000])
+        self.assertEqual([x["tok_s"] for x in live["slots"]], [20.0, 30.0])
 
     def test_concurrent_requests_share_the_slots(self):
         self.start(2)

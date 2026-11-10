@@ -19,10 +19,9 @@ constexpr double kDecay = 0.97;       // lookup counts: older windows fade
 // on the same thing); worth 4 observations, so a few real windows override it
 constexpr double kPriorQ[DraftPolicy::kBuckets] = {0.75, 0.88, 0.93, 0.96};
 constexpr double kPriorN = 4.0;
-constexpr int kProbes = 3;       // a lookup window size is tried this often before its guessed cost can veto it
-// A size not measured for this many rounds is tried again when a confident lookup could use it: its cost was set in
-// one stretch (a prompt's cache refill, say) and, priced high, it would never be measured again (#1252)
-constexpr double kStaleRounds = 300.0;
+// probes_ (3): a lookup window size is tried this often before its guessed cost can veto it.
+// stale_rounds_ (300): a size not measured for this many rounds is tried again when a confident lookup could use it: its
+// cost was set in one stretch (a prompt's cache refill, say) and, priced high, it would never be measured again (#1252)
 
 }  // namespace
 
@@ -113,7 +112,36 @@ std::string DraftPolicy::cost_table_text() const {
     return out;
 }
 
-bool DraftPolicy::stale(int t) const { return cost_n_[bk_][t] > 0 && rounds_ - last_[bk_][t] > kStaleRounds; }
+bool DraftPolicy::stale(int t) const {
+    return stale_rounds_ > 0 && cost_n_[bk_][t] > 0 && rounds_ - last_[bk_][t] > stale_rounds_;
+}
+
+double DraftPolicy::probed(int t) const { return probe_min_ && robust_ ? real_n_[bk_][t] : cost_n_[bk_][t]; }
+
+void DraftPolicy::add_cost(int t, double ms) {
+    if (probe_min_ && robust_) {
+        double& c = cost_[bk_][t];
+        double& r = real_n_[bk_][t];
+        if (r < probes_) {
+            // probing: the fastest real sample is the price; the first one replaces a prior or a guess outright
+            c = r == 0 ? ms : std::min(c, ms);
+        } else {
+            // measured: a late sample after a long gap is worth as much as the old belief, any other a tenth; one slow
+            // round moves the price by at most that share of itself
+            const double alpha = stale(t) ? 0.5 : kCostAlpha;
+            c = (1.0 - alpha) * c + alpha * std::min(ms, 2.0 * c);
+        }
+        r += 1.0;
+        cost_n_[bk_][t] = std::max(cost_n_[bk_][t] + 1.0, r);
+        last_[bk_][t] = rounds_;
+        return;
+    }
+    ms = clamp_sample(t, ms);
+    const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
+    cost_[bk_][t] = cost_n_[bk_][t] > 0 ? (1.0 - alpha) * cost_[bk_][t] + alpha * ms : ms;
+    cost_n_[bk_][t] += 1.0;
+    last_[bk_][t] = rounds_;
+}
 
 double DraftPolicy::mtp_tokens(int t) const {
     if (mtp_n_[t] > 0) return mtp_tok_[t];
@@ -144,7 +172,7 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
     }
     // a guessed cost can keep the policy from ever measuring a size: the first few times a confident lookup would
     // need a size not measured yet, it is tried (verification keeps the output; only the one round's speed is at stake)
-    if (t_full > p.t && (cost_n_[bk_][t_full] - delayed_n_[bk_][t_full] + tried_[bk_][t_full] < kProbes || stale(t_full)) && q >= 0.85) {
+    if (t_full > p.t && (probed(t_full) - delayed_n_[bk_][t_full] + tried_[bk_][t_full] < probes_ || stale(t_full)) && q >= 0.85) {
         p.lookup = true;
         p.t = t_full;
     }
@@ -153,13 +181,7 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
 
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
     t = std::clamp(t, 1, kMaxT);
-    if (round_ms > 0) {
-        round_ms = clamp_sample(t, round_ms);
-        const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
-        cost_[bk_][t] = cost_n_[bk_][t] > 0 ? (1.0 - alpha) * cost_[bk_][t] + alpha * round_ms : round_ms;
-        cost_n_[bk_][t] += 1.0;
-        last_[bk_][t] = rounds_;
-    }
+    if (round_ms > 0) add_cost(t, round_ms);
     rounds_ += 1.0;
     if (lookup) {
         const int b = bucket(match);
@@ -198,12 +220,8 @@ void DraftPolicy::apply_costs(int64_t committed) {
     for (; n < held_.size() && held_[n].end < committed; ++n) {
         const HeldCost& h = held_[n];
         bk_ = h.bucket;   // observe()'s update, in the bucket the round ran in
-        const double ms = clamp_sample(h.t, h.ms);
-        const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][h.t] + 1.0)) : kCostAlpha;
-        cost_[bk_][h.t] = cost_n_[bk_][h.t] > 0 ? (1.0 - alpha) * cost_[bk_][h.t] + alpha * ms : ms;
-        cost_n_[bk_][h.t] += 1.0;
+        add_cost(h.t, h.ms);
         delayed_n_[bk_][h.t] += 1.0;   // a round already counted by observe_committed
-        last_[bk_][h.t] = rounds_;
     }
     bk_ = bucket_now;
     held_.erase(held_.begin(), held_.begin() + (std::ptrdiff_t) n);
@@ -247,17 +265,24 @@ bool DraftPolicy::keep_draft(ChainState& st, int idx, float p, int cap) const {
         const double v = st.e / cost_ms(rows);
         if (v > st.best_v * (1.0 + margin_ / 3.0)) {
             st.best_v = v;
-            st.best_rows = rows;
+            if (!st.probe) st.best_rows = rows;
         }
         // a width not measured yet is tried a few times when the chain is likely to hold that far
-        if (cost_n_[bk_][rows] < kProbes && st.q >= 0.15) st.best_rows = rows;
+        // (probe-min: one whose price has gone stale too, so one slow stretch cannot price it out for good; and the probe
+        // stands against a wider width that looks better, or a width under the best one would keep a wrong price for good)
+        if ((probed(rows) < probes_ || (probe_min_ && stale(rows))) && st.q >= 0.15) {
+            st.best_rows = rows;
+            st.probe = probe_min_ && robust_;
+        }
     }
     st.kept = st.best_rows - 1;
     if (rows + 1 > cap) return false;                       // no row left for another draft
+    if (st.probe)                                           // this round measures a width: only a wider one to measure goes on
+        return (probed(rows + 1) < probes_ || stale(rows + 1)) && st.q * a >= 0.15;
     // one or two more drafts, each as likely to hold as this one did, could they beat the best width so far?
     const double v1 = (st.e + st.q * a) / cost_ms(rows + 1);
     const double v2 = rows + 2 <= cap ? (st.e + st.q * a + st.q * a * a) / cost_ms(rows + 2) : 0.0;
-    return std::max(v1, v2) > st.best_v * (1.0 + margin_ / 3.0) || (cost_n_[bk_][rows + 1] < kProbes && st.q * a >= 0.15);
+    return std::max(v1, v2) > st.best_v * (1.0 + margin_ / 3.0) || ((probed(rows + 1) < probes_ || (probe_min_ && stale(rows + 1))) && st.q * a >= 0.15);
 }
 
 double DraftPolicy::chain_rate(int match) const {
@@ -288,19 +313,13 @@ int DraftPolicy::chain(int t_mtp, double p_mtp, int k_avail, int match) const {
         return best_k;
     }
     // as choose(): a size whose cost is only guessed is tried a few times when the continuation looks likely
-    if ((cost_n_[bk_][t_full] < kProbes || stale(t_full)) && p_mtp * c >= 0.6) return kmax;
+    if ((probed(t_full) < probes_ || stale(t_full)) && p_mtp * c >= 0.6) return kmax;
     return 0;
 }
 
 void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, double round_ms) {
     const int t = std::clamp(t_mtp + k, 1, kMaxT);
-    if (round_ms > 0) {
-        round_ms = clamp_sample(t, round_ms);
-        const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
-        cost_[bk_][t] = cost_n_[bk_][t] > 0 ? (1.0 - alpha) * cost_[bk_][t] + alpha * round_ms : round_ms;
-        cost_n_[bk_][t] += 1.0;
-        last_[bk_][t] = rounds_;
-    }
+    if (round_ms > 0) add_cost(t, round_ms);
     rounds_ += 1.0;
     // the MTP part is an ordinary MTP window as far as its own drafts go
     const int mtp_acc = std::min(accepted, t_mtp - 1);

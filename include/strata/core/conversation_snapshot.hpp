@@ -2,6 +2,7 @@
 
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/conversation_kv_store.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 
@@ -49,6 +50,19 @@ bool conversation_kv_source(SessionKvSource& source, const QsaState& state, cons
 // The bytes of each K/V part (k, v, k_scale, v_scale, pooled) a snapshot of `upto` tokens holds: no state read.
 bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
                                 std::array<uint64_t, 5>& sizes, std::string& error);
+// A layer's K/V streamed into place from a K/V file (conversation_kv_store.hpp), without the layer in RAM:
+// head_validate checks the file's header numbers against this state as conversation_kv_validate checks an image; put
+// copies one block to `offset` of a part (the caller keeps it inside the validated size); put_done is the step after
+// the last block (the VRAM slots of a streamed state follow the rewritten pools).  Caller synchronizes first.
+bool conversation_kv_head_validate(const KvStoreLayer& head, const QsaState& state, const ModelGeometry& g, int64_t upto,
+                                   bool include_index, std::string& error);
+bool conversation_kv_put(const QsaState& state, size_t part, uint64_t offset, const uint8_t* data, size_t n, std::string& error);
+bool conversation_kv_put_done(const QsaState& state, const ModelGeometry& g, int64_t upto, std::string& error);
+// The leading bytes of each K/V part that a snapshot of `upto` tokens shares with an earlier one of the same
+// conversation whose first `unchanged` tokens were not rewritten since (conversation_kv_save's reuse rule: whole pages,
+// completed indexer rows).  A file that holds the earlier snapshot needs only the bytes from there on.  No state read.
+bool conversation_kv_keep_sizes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
+                                int64_t unchanged, std::array<uint64_t, 5>& keep, std::string& error);
 // Disk sessions: the read limits this session can ever restore - its geometry and layer range, at most
 // min(max_tokens, its cells) tokens, `max_checkpoints` checkpoints, the exact running-state sizes and the K/V part
 // sizes at that many tokens - so session_file_read refuses an oversized or foreign file before it allocates.
@@ -139,6 +153,15 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& session,
                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
+// conversation_kv_keep_sizes for every source conversation_snapshot_sources gives (the QSA layers, then the draft).
+bool conversation_snapshot_keep_sizes(const SessionState& session, const ModelGeometry& g, const QsaState& draft,
+                                      int64_t upto, int64_t unchanged, std::vector<std::array<uint64_t, 5>>& keep,
+                                      std::string& error);
+// Diagnostic: K/V layers read back from a file (same order) against the session's own bytes.  Never changes state.
+// `prefix`: `kv` holds a longer conversation and only its first `upto` tokens' bytes are compared.
+bool conversation_snapshot_verify_kv(const std::vector<ConversationKv>& kv, const SessionState& session,
+                                     const ModelGeometry& g, const QsaState& draft, int64_t upto, std::string& error,
+                                     bool prefix = false);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
 /// #2409: true when a restore (or a copy) on CUDA device `device` from the calling thread creates no copy stream: this
@@ -146,6 +169,26 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
 /// already; a new stream is the one thing it can allocate (see program/conv_cache.hpp restore_fits).
 bool conversation_copy_stream_ready(int device);
 enum class ConversationRestore { restored, invalid, transfer_failed };
+// Only a prefix of the parked conversation is needed (a checkpoint inside it is mounted next, as for a borrowed
+// prefix: conversation_snapshot_restore_prefix): prefix_sizes says how many leading bytes of each K/V part hold `upto`
+// tokens; after those blocks finish_prefix refreshes the streamed states for `upto`.  No running state is restored.
+bool conversation_snapshot_prefix_sizes(const SessionState& session, const ModelGeometry& g, const QsaState& draft, int64_t upto,
+                                        std::vector<std::array<uint64_t, 5>>& sizes, std::string& error);
+ConversationRestore conversation_snapshot_stream_finish_prefix(SessionState& session, const ModelGeometry& g,
+                                                               const QsaState& draft, int64_t upto, std::string& error);
+// A parked conversation restored with its K/V streamed from a file: `meta` is the image without K/V, `kv` the K/V
+// file's layer headers (the QSA layers, then the draft).  validate is conversation_snapshot_validate for that pair and
+// runs before the outgoing conversation is parked; begin waits for copies in flight and synchronizes; put takes the
+// blocks in any order; finish refreshes the streamed states and restores the running state.
+bool conversation_snapshot_stream_validate(const SavedConversation& meta, const std::vector<KvStoreLayer>& kv,
+                                           const SessionState& session, const ModelGeometry& g, const QsaState& draft,
+                                           std::string& error);
+bool conversation_snapshot_stream_begin(const SavedConversation& meta, std::string& error);
+bool conversation_snapshot_stream_put(const SessionState& session, const QsaState& draft, const std::vector<KvStoreLayer>& kv,
+                                      size_t layer, size_t part, uint64_t offset, const uint8_t* data, size_t n,
+                                      std::string& error);
+ConversationRestore conversation_snapshot_stream_finish(const SavedConversation& meta, SessionState& session,
+                                                        const ModelGeometry& g, const QsaState& draft, std::string& error);
 // Invalid images are rejected before any CUDA call/write. Transfer failure may
 // leave partial state: caller MUST NOT continue inference from that session.
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,

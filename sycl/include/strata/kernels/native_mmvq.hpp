@@ -33,6 +33,16 @@ std::size_t native_q8_1_bytes(int n_in, int ncols = 1);
 void native_mmvq_set_multi_exact(bool exact);
 void native_mmvq_set_q6k_wide(bool on);   // SYCL port: the 16-byte-load Q6_K kernel (default on)
 void native_mmvq_set_kreg(int on);   // SYCL port: the KREG kernels on (1) / off (0) / as STRATA_MMVQ_KREG (-1, default); 3: on without KREG2
+// SYCL port, STRATA_XE2_KQ (the B70 default; unset or 0: off): the decode window's Q5_K / Q6_K / Q8_0 dense launches,
+// every output bitwise what it is with the switch off. Parts (1 = 2 + 4 + 16, else their sum; 30 = all four): 2 KREG
+// Q5_K / Q6_K on a persistent grid at 3-8 columns, 4 KREG Q5_K rows wider than 4096 at 5-8 columns in 256 registers,
+// 8 the planar Q6_K heads at 6-8 columns in 256 registers (opt-in: not timed on a Battlemage card), 16
+// native_mmvq_pair for Q8_0 at 1-8 columns in one launch of the wide kernel.
+// native_mmvq_set_xe2_kq (tests): the parts, 0 = off, -1 = as STRATA_XE2_KQ (the default). Set before graph capture.
+void native_mmvq_set_xe2_kq(int parts);
+// The parts some launch has taken since the last call of this function (it clears them): a test that turned a part on
+// and reads 0 here never reached that part's launch.
+int native_mmvq_xe2_kq_seen();
 void native_q6_k_mmvq_stride224(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                                 void* stream);   // SYCL port: experiment, Q6_K blocks at a 224-byte stride
 bool native_mmvq_multi_exact();
@@ -167,6 +177,10 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
 /// bitwise the two calls. Returns false (nothing launched) where that is not the case (Q8_0, 2-8 columns only).
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                       int n_in, int n_out, int ncols, void* stream);
+/// SYCL port, STRATA_XE2_KQ (part 16): true when native_mmvq_pair runs a Q8_0 pair at 1-8 columns as one launch of the
+/// wide Q8_0 kernel, bitwise the two native_mmvq calls. A caller with two Q8_0 matrices of one shape on one input
+/// (the shared expert's gate and up) then asks for the pair whatever STRATA_LFUSE says.
+bool native_mmvq_pair_wide32();
 
 // Fork F4 (Eddoursul): 2..4 columns also INTERLEAVED, so one 16-byte load reads a position of every column: CP = 2 (2
 // columns) or 4 (3-4), zero-padded; nb = n_in / 32 blocks; int32 bm[nb][8][CP] (block-major), int32 pm[8][nb][CP]

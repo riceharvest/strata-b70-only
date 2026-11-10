@@ -8,6 +8,7 @@
 //   5. the policy never proposes a window beyond its cap.
 #include "strata/spec/draft_policy.hpp"
 
+#include <cstdint>
 #include <cstdio>
 
 using strata::spec::DraftPolicy;
@@ -161,6 +162,90 @@ int main() {
         fresh.observe_committed(true, 6, 5, 40);
         check(fresh.choose(4, 5, 40).lookup && fresh.choose(4, 5, 40).t == 6,
               "delayed: a held time does not count as another probe");
+    }
+    {
+        // PROBE-MIN (STRATA_SPEC_PROBE_MIN=1).  One B70's measured round times (ms by rows) and drafts that hold 92% of the
+        // time: 5 or 6 rows give the most tokens per ms (143-144 tok/s), 4 rows 136, 3 rows 120.  The first use of a size in a
+        // context bucket is ~20 ms slower.  The policy has to end up on 5-6 rows with every price close to the real one.
+        static const double real[9] = {0, 18.1, 20.6, 23.4, 26.4, 30.0, 34.3, 42.1, 49.7};
+        struct Sim {
+            DraftPolicy pol;
+            bool used[3][9] = {};
+            int bucket = 0;
+            uint32_t rng = 12345;
+            double extra[9] = {};          // ms added to every round of a size (a slow stretch)
+            explicit Sim(int cap) : pol(cap) {}
+            int round(int cap) {
+                DraftPolicy::ChainState st;
+                float pr[8] = {};
+                for (int idx = 0; idx < cap - 1; ++idx) {
+                    pr[idx] = 0.92f;
+                    if (!pol.keep_draft(st, idx, pr[idx], cap)) break;
+                }
+                const int t = st.best_rows;
+                int acc = 0;
+                for (; acc < t - 1; ++acc) {
+                    rng = rng * 1664525u + 1013904223u;
+                    if ((rng >> 8) % 100 >= 92) break;
+                }
+                double ms = real[t] + extra[t];
+                if (!used[bucket][t]) { used[bucket][t] = true; ms += 20.0; }
+                pol.observe_probs(pr, t - 1, acc);
+                pol.observe(false, t, acc, 0, ms);
+                return t;
+            }
+        };
+        auto run = [](Sim& s, int rounds, int cap) {
+            double sum = 0;
+            for (int i = 0; i < rounds; ++i) sum += s.round(cap);
+            return sum / rounds;
+        };
+        for (const int cap : {4, 6, 8}) {
+            Sim s(cap);
+            s.pol.set_robust(true);
+            s.pol.set_probe_min(true);
+            s.pol.set_context(1000);
+            run(s, 400, cap);
+            s.pol.set_context(8000);   // a new bucket: priors from the first, and every size's first use is slow again
+            s.bucket = 1;
+            run(s, 400, cap);
+            const double rows = run(s, 200, cap);
+            const int best = cap < 5 ? cap : 5;   // 5 and 6 rows are within 1% of each other
+            char what[96];
+            std::snprintf(what, sizeof what, "probe-min, cap %d: settles on the best size (%.2f rows)", cap, rows);
+            check(rows >= best - 0.25 && rows <= 6.25, what);
+            bool close = true;
+            for (int t = 2; t <= cap; ++t) close = close && s.pol.cost_ms(t) > 0.9 * real[t] && s.pol.cost_ms(t) < 1.1 * real[t];
+            std::snprintf(what, sizeof what, "probe-min, cap %d: every size's price is within 10%% of the real one", cap);
+            check(close, what);
+        }
+        {
+            // a slow stretch prices 5 and 6 rows out; once it is over, the stale sizes are measured again and come back
+            Sim s(6);
+            s.pol.set_robust(true);
+            s.pol.set_probe_min(true);
+            s.pol.set_context(8000);
+            s.bucket = 1;
+            s.extra[5] = s.extra[6] = 15.0;
+            run(s, 200, 6);
+            check(s.pol.cost_ms(5) > 1.3 * real[5], "probe-min: a slow stretch raises a size's price");
+            s.extra[5] = s.extra[6] = 0.0;
+            run(s, 1500, 6);
+            check(s.pol.cost_ms(5) < 1.1 * real[5] && s.pol.cost_ms(6) < 1.1 * real[6],
+                  "probe-min: a stale price is measured again and recovers");
+            check(run(s, 200, 6) >= 4.75, "probe-min: the window is back on 5-6 rows after the slow stretch");
+            Sim never(6);
+            never.pol.set_robust(true);
+            never.pol.set_probe_min(true);
+            never.pol.set_stale_rounds(0);
+            never.pol.set_context(8000);
+            never.bucket = 1;
+            never.extra[5] = never.extra[6] = 15.0;
+            run(never, 200, 6);
+            never.extra[5] = never.extra[6] = 0.0;
+            run(never, 1500, 6);
+            check(never.pol.cost_ms(6) > 1.2 * real[6], "probe-min: stale rounds 0 never measures a priced-out size again");
+        }
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;

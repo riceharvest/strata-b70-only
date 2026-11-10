@@ -147,6 +147,9 @@ struct SessionWriteOptions {
     uint64_t min_free_bytes = 0;
     bool durable = true;            // flush the file before the rename and (POSIX) the folder after it
     SessionProgress progress;
+    // asked before each 16 MiB block (on the writing thread: it may also wait); true stops the write - a failure before the
+    // rename, so the temporary file is removed and nothing was published (the conversation cache's spill writer)
+    std::function<bool()> cancel;
     // "flush" (the file's flush, `bytes` = the file) and "publish" (rename and folder flush), before each starts
     SessionPhase phase;
     // tests: return an errno value to make a step fail ("write", "file_flush", "rename", "dir_flush"), 0 to go on
@@ -222,6 +225,10 @@ struct SessionReadLimits {
     // parse holds at its peak (session_read_peak_bytes); false refuses the file.  Not a reservation.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     SessionProgress progress;
+    // Skip the payload checksum (the file's own atomic write already proves it is whole: the conversation cache's spill
+    // files, written by this engine and read back in seconds, where hashing 4 GiB would cost more than reading it).
+    // The header, identity, bounds and size are still checked.
+    bool skip_payload_hash = false;
 };
 // The largest file these limits admit (UINT64_MAX when one of them is open); session_file_read applies it.
 uint64_t session_read_max_file_bytes(const SessionReadLimits& limits);
@@ -234,6 +241,19 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes);
 bool session_file_read(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
                        size_t& bytes, std::string& error, const SessionReadLimits& limits = {},
                        SessionStatus* status = nullptr);
+
+// What the drive under a folder does with the session files' own block I/O (16 MiB blocks, direct when the filesystem
+// takes it).  MB/s are 1e6 bytes a second.
+struct SessionDriveSpeed {
+    double read_mbps = 0, write_mbps = 0;
+    uint64_t bytes = 0;      // what was written and read back
+    bool direct = false;     // false: the read came through the file cache, so read_mbps is capped at write_mbps
+};
+// Measures the drive: a temporary file of up to `bytes` of data that does not compress is written and flushed, read back
+// and removed.  Each direction stops after `max_seconds` (a slow drive is measured on less data, one block at least).
+// A file this short shows a drive's burst write speed: a long write on a drive with a small fast cache can be slower.
+bool session_drive_probe(const std::string& dir, uint64_t bytes, double max_seconds, SessionDriveSpeed& out,
+                         std::string& error);
 
 // The folder the free-space preflight asks about for `path`, by the rules of Windows or of POSIX (exposed so both can
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC

@@ -196,6 +196,12 @@ inline void apply_b70_defaults() {
         {"STRATA_IQ_DECODE_FAST", "1"},
         {"STRATA_MMVQ_KREG", "1"},
         {"STRATA_HC_Q8", "1"},
+        // NOT defaults: STRATA_XE2_KQ / STRATA_XE2_IQ / STRATA_HC_Q8_DOWN2 (the decode window's launches for the UD-IQ1_S
+        // pack, native_mmvq.dp.cpp / iq_kernels.dp.cpp / fused_gr.dp.cpp).  Their parity programs pass, but in the engine
+        // (2026-11-10, one B70, ABBA at a fixed expert cache, STRATA_SPEC_COST=0) they were no faster (reference prompts
+        // 114.2 / 95.6 and 120.9 / 95.4 tok/s on, 113.0 / 95.1 and 117.7 / 98.8 off) and two runs with them on gave two
+        // different greedy texts for one prompt, while the two runs with them off were identical.  Opt-in until the
+        // one that is not deterministic is found.
         // a turn checkpoint (118 MB of DeltaNet state) moved to the host off the critical path: card-to-card into one VRAM
         // stage, then a background copy, into a pooled vector (two kept ready: a fresh one faulted in 59 ms of pages),
         // the 37 small pieces as one copy.  An agent's small turn at 203K: 195-236 -> 104-149 ms (the save 77.5 -> 5 ms),

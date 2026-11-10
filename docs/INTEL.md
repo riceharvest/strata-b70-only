@@ -844,7 +844,7 @@ Packed Q2 / IQ4 lookup / IQ3_S sign arithmetic (the build option) and fourteen d
 +9.7% on a 4K prompt and +11.1% on a free-form answer against the build without them, same generated tokens, same logprobs to six
 decimals. Prompt speed is unchanged.
 
-* `STRATA_SYCL_IQ_DECODE_FAST` (CMake, default ON; `IQ_DECODE_FAST=OFF` for `sycl/tools/build.sh` and `packaging/build_sycl_linux.sh`):
+* `STRATA_SYCL_IQ_DECODE_FAST` (CMake, default ON; `IQ_DECODE_FAST=OFF` for `sycl/tools/build.sh`):
   integer arithmetic with the same results as the helpers it replaces. It is the largest part of the gain (+5.9% alone).
 * Runtime controls. Unset: on for a Battlemage device, off for every other device (Arc A-series keeps the earlier kernels).
   `STRATA_<name>=0` turns a control off, `=1` turns it on whatever the device. Restart after changing one.

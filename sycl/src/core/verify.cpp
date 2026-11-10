@@ -193,6 +193,21 @@ inline bool select_long_on() {
     }();
     return on;
 }
+// STRATA_VERIFY_NO_HOST with experts outside VRAM (the device plans every layer from VRAM and the host mirror, so
+// all_resident_ is false): run() skips its per-layer host loop, and that loop is where the window's PLE rows were
+// gathered (the all-resident branch gathers its own).  Nothing wrote h_ple_ for such a window: layer 1 read zeros, or the
+// rows the last batch window left there (stage_batch gathers), so a solo reply and the same reply decoded in a batch
+// slot differed (issue 15).  On (default): run() gathers the rows before it launches such a window.
+// STRATA_NO_HOST_PLE=0: the windows as they were (A/B only).
+inline bool no_host_ple_on() {
+    static const bool on = [] {
+        const char* nh = std::getenv("STRATA_VERIFY_NO_HOST");
+        if (!(nh != nullptr && *nh != '\0' && std::strcmp(nh, "0") != 0)) return false;   // the host loop gathers them
+        const char* v = std::getenv("STRATA_NO_HOST_PLE");
+        return !(v != nullptr && v[0] == '0');
+    }();
+    return on;
+}
 // STRATA_SELECT_LONG_AT: the threshold in cells (default 65536; 0: always)
 inline int64_t select_long_at() {
     static const int64_t at = [] {
@@ -306,6 +321,40 @@ struct Bump {
 bool env_on(const char* name) {
     const char* e = std::getenv(name);
     return e != nullptr && e[0] != 0 && e[0] != '0';
+}
+
+// STRATA_LAYER_HASH_FILE=<path> (debug, off by default): after every CPU-expert service the host writes one text line
+// "window layer rows xhash idshash whash yhash" (FNV-1a over the host-visible payload the GPU published for the CPU
+// experts - the activation rows, the routed ids, the weights - and over the CPU experts' output rows).  Two runs of the
+// same teacher-forced window are compared line by line: the first line that differs names the first layer whose input
+// differs (CLEAN-6.0).  The activation rows are published only when a routed expert is not resident, or with
+// STRATA_DOORBELL_CHECK=1 for every layer.
+std::FILE* layer_hash_file() {
+    static std::FILE* f = [] {
+        const char* p = std::getenv("STRATA_LAYER_HASH_FILE");
+        return p != nullptr && p[0] != 0 ? std::fopen(p, "w") : nullptr;
+    }();
+    return f;
+}
+uint64_t layer_hash_fnv(const void* p, size_t bytes) {
+    uint64_t h = 1469598103934665603ull;
+    const auto* b = static_cast<const uint8_t*>(p);
+    for (size_t i = 0; i < bytes; ++i) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+
+// STRATA_STATE_HASH_FILE=<path> (debug, off by default): before every window the host waits for the queue and writes
+// "window gdn <ordinal> <fnv>" for every GDN layer's recurrent+conv state and "window qsa <ordinal> <fnv>" for the
+// int8 K/V codes and scales of the pages the window's position already filled (page table taken as the identity),
+// so two runs can be compared at the first window to see whether the prompt path left the same state (CLEAN-6.0).
+// With --kv-resident (streamed K/V) only the VRAM slots are hashed, as they lie, at most n_slots pages.
+// STRATA_STATE_DUMP=<prefix> with it: the raw state of the first four GDN layers at the first window, <prefix>_gdn<i>.bin.
+std::FILE* state_hash_file() {
+    static std::FILE* f = [] {
+        const char* p = std::getenv("STRATA_STATE_HASH_FILE");
+        return p != nullptr && p[0] != 0 ? std::fopen(p, "w") : nullptr;
+    }();
+    return f;
 }
 #if defined(STRATA_USE_HIP)
 const bool g_coherent = env_on("STRATA_VERIFY_COHERENT");
@@ -1412,7 +1461,8 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
     // Not for a batch window (batch_rec_): unless the stage is all-resident, run_slot_rows / batch_poll wait for each
     // layer's doorbell, so a lean batch graph finishes with the ring silent ("verify batch: layer 0 never rang (graph
     // finished)", then the engine dies). Batch windows keep the doorbell nodes; the solo window stays lean.
-    const bool lean = lean_env && no_host_env && device_plan_ && !batch_rec_ && !step_hook_ && !step_hook2_ && !remote_opt_ && !always_publish_ && !g_stepped;
+    // STRATA_BATCH_LEAN=1 (opt-in, capture_batch decides): a batch window is lean too, and run_slot_rows waits for the whole graph.
+    const bool lean = lean_env && no_host_env && device_plan_ && (!batch_rec_ || batch_lean_ == 1) && !step_hook_ && !step_hook2_ && !remote_opt_ && !always_publish_ && !g_stepped;
     lean_plan_ = lean;
     const WeightTable& wt = *wt_;
     SessionState& ss = *ss_;
@@ -3389,8 +3439,49 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         std::atomic_thread_fence(std::memory_order_seq_cst);
         flag_raised = true;
     }
+    // no_host_ple_on(): the window whose layers no host loop serves (STRATA_VERIFY_NO_HOST, not all-resident, not
+    // stepped) gets its PLE rows here, before the launch - its graph copies h_ple_ at layer 1 without waiting for a flag
+    if (!pre && do_ple && !flag_raised && !stepped_run && !ar_on() && no_host_ple_on()) {
+        const Clock::time_point tp = Clock::now();
+        if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        strata_store_fence();
+        ms_host += ms_since(tp);
+    }
     if (!pre) {
         if (trace_h_ != nullptr) std::memset(trace_h_, 0, trace_n_ * 8);   // #649: this window's breadcrumbs only
+        if (std::FILE* sf = state_hash_file()) {   // debug only (STRATA_STATE_HASH_FILE)
+            cs_->wait();
+            const uint64_t gf = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+            std::vector<char> hb(std::max<uint64_t>(gf * 4, 1u << 20));
+            for (int64_t i = 0; i < ss.gdn_alloc; ++i) {
+                cs_->memcpy(hb.data(), ss.gdn_state + (size_t) i * gf, gf * 4).wait();
+                if (const char* dp = std::getenv("STRATA_STATE_DUMP"); dp != nullptr && windows == 0 && i < 4) {   // raw state of the first GDN layers
+                    const std::string fn = std::string(dp) + "_gdn" + std::to_string(ss.gdn_ord0 + i) + ".bin";
+                    if (std::FILE* df = std::fopen(fn.c_str(), "wb")) { std::fwrite(hb.data(), 1, gf * 4, df); std::fclose(df); }
+                }
+                std::fprintf(sf, "%lld gdn %lld %016llx\n", (long long) windows, (long long) (ss.gdn_ord0 + i),
+                             (unsigned long long) layer_hash_fnv(hb.data(), gf * 4));
+            }
+            for (int64_t i = 0; i < ss.qsa_alloc; ++i) {
+                const QsaState& q = ss.qsa_states[i];
+                if (!q.kv_int8 || q.k_q == nullptr) continue;
+                // pages of 4 cells; a streamed or ring pool holds only n_slots pages in VRAM
+                const int64_t pages = std::min<int64_t>((pos0 + 3) / 4, q.kv_mode != 0 ? q.n_slots : q.n_pages);
+                const size_t kb = (size_t) pages * g.n_head_kv * 4 * g.head_dim;
+                uint64_t h = 1469598103934665603ull;
+                auto mix = [&](const void* dev, size_t bytes) {
+                    if (bytes == 0) return;
+                    if (bytes > hb.size()) hb.resize(bytes);
+                    cs_->memcpy(hb.data(), dev, bytes).wait();
+                    h ^= layer_hash_fnv(hb.data(), bytes); h *= 1099511628211ull;
+                };
+                mix(q.k_q, kb); mix(q.v_q, kb); mix(q.k_scale, kb / 64 * 2); mix(q.v_scale, kb / 64 * 2);
+                std::fprintf(sf, "%lld qsa %lld %016llx\n", (long long) windows, (long long) (ss.qsa_ord0 + i), (unsigned long long) h);
+            }
+            std::fflush(sf);
+        }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
         ms_host += ms_since(t0);
@@ -3661,6 +3752,14 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
         if (remote_opt_) remote_opt_->end();
+        if (std::FILE* lf = layer_hash_file()) {   // debug only (STRATA_LAYER_HASH_FILE)
+            std::fprintf(lf, "%lld %lld %d %016llx %016llx %016llx %016llx\n", (long long) windows, (long long) l, n,
+                         (unsigned long long) layer_hash_fnv(h_x_ + (size_t) tb * g.n_embd, (size_t) n * g.n_embd * 4),
+                         (unsigned long long) layer_hash_fnv(h_ids_ + (size_t) tb * ss.k, (size_t) n * ss.k * 4),
+                         (unsigned long long) layer_hash_fnv(h_w_ + (size_t) tb * ss.k, (size_t) n * ss.k * 4),
+                         (unsigned long long) layer_hash_fnv(h_ymiss_ + (size_t) tb * ss.k * g.n_embd, (size_t) n * ss.k * g.n_embd * 4));
+            std::fflush(lf);
+        }
         VDBG("layer %lld served\n", (long long) l);
         if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", k, l,
                               (int64_t) ms_since(b));   // aux: ms the CPU experts took
@@ -4369,6 +4468,33 @@ bool Verifier::capture_batch(const int *rows, int S, int hbase,
     dpct::experimental::command_graph_exec_ptr &ex =
         exec_bm_[bkey(rows, S, hbase)];
     if (ex != nullptr) return true;
+    if (batch_lean_ < 0) {
+        // STRATA_BATCH_LEAN=1 (opt-in; default off = the doorbell graphs as before), decided once per verifier.  With the
+        // device plan under STRATA_VERIFY_NO_HOST every routed expert is in VRAM or in the host mirror and the device
+        // plans every layer of a batch window as well (resident_plan: skip == ring), so the doorbell graph's host side
+        // is work nobody reads: the CPU pool computes the "missed" experts' rows, which copy_or_zero_from_mapped then
+        // replaces by zeros, the PCIe share is copied into a staging buffer the plan does not point at, and the
+        // mirrored experts are read from host memory inside the expert kernels in every window (no staging, no VRAM
+        // ring).  The lean graph is the solo window's: the plan stages the mirrored experts or finds them in the ring,
+        // no doorbell, no flag waits; run_slot_rows waits for the whole graph.  The same expert kernels on the same
+        // bytes.  One GPU only: a layer split's pipelined groups (batch_launch / batch_poll) serve doorbells.
+        static const bool want = [] { const char* v = std::getenv("STRATA_BATCH_LEAN"); return v != nullptr && v[0] == '1'; }();
+        static const bool no_host = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
+        static const bool lean_off = [] { const char* v = std::getenv("STRATA_VERIFY_LEAN"); return v && v[0] == '0'; }();
+        const char* why = !device_plan_ ? "no device plan: STRATA_VERIFY_DEVICE_PLAN is off or every expert is in VRAM"
+                        : !no_host ? "STRATA_VERIFY_NO_HOST is off"
+                        : lean_off ? "STRATA_VERIFY_LEAN=0"
+                        : (next_ != nullptr || lb_ > 0 || le_ != g_->n_layers || hbase != 0) ? "a layer split"
+                        : (step_hook_ || step_hook2_ || remote_opt_ || always_publish_ || g_stepped || h_plan_err_ == nullptr)
+                              ? "the window is stepped, published or has no plan-error word" : nullptr;
+        batch_lean_ = want && why == nullptr ? 1 : 0;
+        if (want)
+            std::fprintf(stderr, "strata verify: STRATA_BATCH_LEAN=1: %s%s\n",
+                         why == nullptr ? "the batch windows are lean graphs (the device plans every layer, no CPU share; "
+                                          "the host waits for the whole window)"
+                                        : "off, the batch windows stay doorbell graphs: ",
+                         why == nullptr ? "" : why);
+    }
     if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs_)) != 0) {
         err = "verify: begin batch capture failed";
         return false;
@@ -4378,7 +4504,15 @@ bool Verifier::capture_batch(const int *rows, int S, int hbase,
     for (int t = 0; t < S; ++t) brow_[t] = rows[t];
     std::string rerr;
     sel_long_ = 0;   // batch rows: the one-CTA select
-    const bool ok = record_window(S, cs_, rerr);
+    // record_window notes whether the graph it records is the lean one (lean_plan_); a batch graph never is, and
+    // run() reads the flag for the solo windows' plan-error check (h_plan_err_): keep the solo graphs' value
+    const bool lean_solo = lean_plan_;
+    bool ok = record_window(S, cs_, rerr);
+    if (ok && lean_plan_ != (batch_lean_ == 1)) {   // run_slot_rows serves every batch graph of this verifier one way
+        rerr = "verify: a batch window graph was recorded as the other kind (lean / doorbell) than STRATA_BATCH_LEAN decided";
+        ok = false;
+    }
+    lean_plan_ = lean_solo;
     batch_rec_ = false;
     row_base_ = 0;
     dpct::experimental::command_graph_ptr graph = nullptr;
@@ -5077,6 +5211,13 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
     const ModelGeometry& g = *g_;
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
+    // STRATA_BATCH_LEAN (capture_batch decided, at the latest in the stage_batch above): this window's graph is lean
+    const bool lean_b = batch_lean_ == 1;
+    if (lean_b) {   // the device plan's miss word, as run() clears it for a solo lean window
+        *(volatile uint32_t*) h_plan_err_ = 0;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        strata_store_fence();
+    }
     const dpct::err0 le =
         DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*exec_bm_[bkey(rows, S, 0)]));
     /*
@@ -5096,6 +5237,30 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
       return false;
     }
     (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
+    if (lean_b) {
+        // The lean batch graph (STRATA_BATCH_LEAN): no doorbell and no flag wait in it (its PLE rows were gathered by
+        // stage_batch before the launch), so the host has nothing to serve per layer: wait for the graph, as run()
+        // does for a solo lean window.  A routed expert that is neither in VRAM nor mirrored leaves an empty plan and
+        // the miss word set: the window is refused instead of committed.
+        const Clock::time_point a = Clock::now();
+        progress_at("verify batch: waiting for the GPU to finish the lean window", (int64_t) S);
+        if (DPCT_CHECK_ERROR(cs_->wait()) != 0) { err = "verify batch: the lean window failed on the GPU"; return false; }
+        copy_->wait();
+        ms_wait += ms_since(a);
+        if (*(volatile uint32_t*) h_plan_err_ != 0) {
+            *(volatile uint32_t*) h_plan_err_ = 0;
+            err = "verify batch: the device plan met an expert that is neither in VRAM nor mirrored";
+            return false;
+        }
+        if (prof_on_) collect_profile();
+        ++windows;
+        if (!sample_rows(S, err)) return false;
+        for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+        note_nonfinite(S, last_pos_b_);
+        progress_at("decode");
+        progress_beat();
+        return true;
+    }
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
     const int64_t steps = le_ - lb_;

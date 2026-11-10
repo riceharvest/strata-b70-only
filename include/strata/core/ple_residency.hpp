@@ -40,9 +40,12 @@ inline bool ple_auto_ram_allowed(const char* env_value, bool v026) {
 /// conversation is 1.1 s against 30 s to read it again, the lock was measured at 2-3% of prompt speed), so once the cache is to be sized:
 /// does giving the lock back make the automatic cache bigger?  `available` is the RAM the cache sees now (the table locked), the table's
 /// pages count as available again once unlocked (clean file pages).  Unknown telemetry: no.
-inline bool ple_lock_blocks_cache(std::optional<uint64_t> available, uint64_t table_bytes, int64_t min_free_mib) {
+/// `max_mib` and `pct`: the automatic cache's cap and share (--conversation-cache-auto-max-mib / -auto-pct), as it will be sized.
+inline bool ple_lock_blocks_cache(std::optional<uint64_t> available, uint64_t table_bytes, int64_t min_free_mib,
+                                  int64_t max_mib = 8192, int64_t pct = 40) {
     if (!available || table_bytes == 0 || *available > UINT64_MAX - table_bytes) return false;
-    return auto_conversation_cache_mib(*available + table_bytes, min_free_mib) > auto_conversation_cache_mib(available, min_free_mib);
+    return auto_conversation_cache_mib(*available + table_bytes, min_free_mib, max_mib, pct) >
+           auto_conversation_cache_mib(available, min_free_mib, max_mib, pct);
 }
 
 } // namespace strata::core

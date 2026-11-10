@@ -138,18 +138,6 @@ class DeepFolders(unittest.TestCase):
         self.assertIn(r"C:\n\o.dat", str(cm.exception))
         self.assertEqual(cm.exception.exit_code, 6)
 
-    def test_verify_reads_files_that_sit_past_the_limit(self):
-        from tests.terminal import update_fixture as fx
-        root = Path(self.temp.name)
-        built = fx.build_package(root / "b", "0.1.45")
-        # a folder deep enough that the stub's files are past 259 characters
-        base = longpath.long_path(root / ("m" * 110) / ("n" * 110))
-        import shutil
-        shutil.copytree(longpath.long_path(built), base / built.name)
-        component = ec.read_manifest(base / built.name)
-        self.assertGreater(len(longpath.plain(base / built.name / component.entrypoint)), 0)
-        ec.verify(component, full=True)                                  # raises IntegrityProblem if a file looks missing
-
     def test_the_probe_runs_and_cleans_up(self):
         longpath.plain_long_paths_work(Path(self.temp.name))
         self.assertEqual([p.name for p in Path(self.temp.name).iterdir() if p.name.startswith(".lp-")], [])

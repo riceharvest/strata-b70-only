@@ -67,7 +67,13 @@ async function showDetail() {
   text("detail-load", seconds(value.load_s)); text("detail-queue", seconds(value.queue_s)); text("detail-first", seconds(value.first_token_s));
   text("detail-prompt", value.usage?.prompt_tokens ?? value.usage?.input_tokens ?? "—");
   text("detail-tokens", value.usage?.completion_tokens ?? value.usage?.output_tokens ?? "—");
-  text("detail-speed", speed(value.timings?.predicted_per_second)); text("detail-format", value.response_format || "text");
+  text("detail-speed", speed(value.timings?.predicted_per_second));
+  const pt = value.usage?.prompt_tokens ?? value.usage?.input_tokens ?? 0;
+  const cached = value.usage?.prompt_tokens_details?.cached_tokens ?? 0;
+  const ot = value.usage?.completion_tokens ?? value.usage?.output_tokens ?? 0;
+  const cost = (Math.max(0, pt - cached) * 0.15 + cached * 0.016 + ot * 0.47) / 1e6;
+  text("detail-cost", (pt || ot) ? `$${cost.toFixed(4)}` : "—");
+  text("detail-format", value.response_format || "text");
   $("detail-error").hidden = !value.error; text("detail-error", value.error?.message || ""); content();
 }
 async function refresh() {
