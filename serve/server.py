@@ -2021,7 +2021,7 @@ class StrataEngine:
                     head = f"BGENI {slot} {left}{keys}{pf} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}{pf}"
                     live = {"slot": slot, "request_id": getattr(cancel, "_strata_request_id", None),
                             "state": "reading", "prompt_tokens": len(prompt), "prompt_read": 0, "generated": 0,
-                            "started": time.time(), "first_token": None}
+                            "started": time.time(), "first_token": None, "max_tokens": int(max_new)}
                     deadline = getattr(cancel, "_strata_queue_deadline", None)
                     if deadline is not None and time.monotonic() >= deadline:
                         raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
@@ -2270,7 +2270,8 @@ class StrataEngine:
             ft = r.get("first_token")
             view.append({"slot": b, "state": r["state"], "prompt_tokens": r["prompt_tokens"],
                          "prompt_read": r.get("prompt_read") if r["state"] == "reading" else None,
-                         "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
+                         "generated": r["generated"], "max_tokens": r.get("max_tokens"),
+                         "elapsed_s": round(now - r["started"], 1),
                          "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
         return view
 
@@ -4442,8 +4443,13 @@ class Service:
         the hardware (with a minute of history per series)."""
         with self.status_lock:
             s = dict(self.status)
-            if self.live_reqs:                          # parallel requests: the newest one's status
-                s = {**s, **dict(list(self.live_reqs.values())[-1][0]), "queued": s.get("queued", 0)}
+            many = [dict(st) for st, _ in self.live_reqs.values()]
+            if many:                                    # parallel requests: the ones that decode, else the newest
+                decoding = [x for x in many if x.get("busy") and x.get("first_token")]
+                s = {**s, **(decoding[0] if decoding else many[-1]), "queued": s.get("queued", 0)}
+                if len(decoding) > 1:                   # together: the tokens so far add up, the oldest one's clock
+                    s["generated"] = sum(x["generated"] for x in decoding)
+                    s["prompt_tokens"] = max(x.get("prompt_tokens") or 0 for x in decoding)
             hist = list(self.history)
             totals = dict(self.totals)
         now = time.time()
@@ -4470,11 +4476,13 @@ class Service:
         par = int(getattr(self.engine, "batch", 0) or 0)
         if par:                                         # #465: the requests running together, slot by slot
             with self.status_lock:
-                running = len(self.live_reqs)
+                in_flight = len(self.live_reqs)
+                solo = sum(1 for st, _ in self.live_reqs.values() if st.get("first_token"))
             slots = self.engine.slots_view() if hasattr(self.engine, "slots_view") else []
             # the requests in flight that are not in a slot: the one alone on the solo path, or waiting their turn
             in_slots = sum(1 for x in slots if x["state"] != "idle")
-            live.update(parallel=par, running=running, slots=slots, outside_slots=max(0, running - in_slots),
+            running = in_slots or solo                  # running: in a slot (or alone on the solo path), not waiting
+            live.update(parallel=par, running=running, slots=slots, outside_slots=max(0, in_flight - running),
                         waiting=int(getattr(self.engine, "waiting", 0) or 0),
                         admitting=int(getattr(self.engine, "admitting", 0) or 0))
             if running and state == "idle":

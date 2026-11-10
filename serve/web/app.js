@@ -582,6 +582,8 @@ for (const id of ["chart-tp", "chart-day", "chart-pr", "chart-ttft"]) {
 const legend = (items) => items.map(([name, color]) => `<span><i style="background:${color}"></i>${esc(name)}</span>`).join("");
 let chartSig = "";
 
+// the batch slots that hold a request (reading or decoding); empty without "parallel"
+const busySlots = (live) => ((live && live.slots) || []).filter((x) => x.state === "reading" || x.state === "decoding");
 function renderDash(live, hw, st, eng, h, last, reqs, m) {
   // the live strip
   const prog = $("state-progress");
@@ -610,6 +612,21 @@ function renderDash(live, hw, st, eng, h, last, reqs, m) {
   $("state-label").textContent = label;
   $("state-detail").textContent = detail;
   $("state-bar").style.width = `${pct}%`;
+  // parallel: with two or more requests running at once, one bar each (a slot is a request); one alone keeps the single bar
+  const busy = busySlots(live);
+  const several = busy.length > 1;
+  $("state-progress").hidden = several;
+  const sb = $("slot-bars");
+  sb.hidden = !several;
+  const sbHtml = several ? busy.map((x) => {
+    const reading = x.state === "reading";
+    const bp = reading ? (x.prompt_tokens ? (100 * (x.prompt_read || 0)) / x.prompt_tokens : 0) : (x.max_tokens ? Math.min(100, (100 * x.generated) / x.max_tokens) : 0);
+    const text = reading ? `Reading prompt · ${fmt(x.prompt_read || 0)} / ${fmt(x.prompt_tokens)} tokens · ${fmt(bp)}%`
+                         : `Generating · ${fmt(x.generated)} tokens · ${fmt(x.tok_s, 1)} tok/s`;
+    return `<div class="live__slot"><span><b>Request ${x.slot + 1}</b> <span class="muted">${text}</span></span>` +
+           `<div class="st-progress live__bar"${reading ? ' data-tone="info"' : ""}><div class="st-progress__bar" style="width:${bp}%"></div></div></div>`;
+  }).join("") : "";
+  if (sb.dataset.sig !== sbHtml) { sb.innerHTML = sbHtml; sb.dataset.sig = sbHtml; }
   $("page-sub").textContent = m.lifetime && m.lifetime.since ? `Lifetime counters since ${new Date(m.lifetime.since * 1000).toLocaleDateString([], {year: "numeric", month: "short", day: "numeric"})}` : "";
 
   // data: finished requests, oldest first
@@ -628,6 +645,7 @@ function renderDash(live, hw, st, eng, h, last, reqs, m) {
   const errs = done.filter((r) => r.finish === "error").length, cut = done.length - ok - errs;
   const cacheShare = L.prompt_tokens ? (100 * L.reused) / L.prompt_tokens : null;
   const day = (f) => days.map(f);
+  const speeds = busySlots(live).filter((x) => x.state === "decoding" && x.tok_s != null).map((x) => x.tok_s);   // each request's own
   const nowSpeed = live.state === "generating" ? live.tok_s : dNow;
   const lifeFresh = Math.max(0, (L.prompt_tokens || 0) - (L.reused || 0));
   const lifeCost = calcCost(L.prompt_tokens, L.reused, L.output_tokens);
@@ -654,7 +672,7 @@ function renderDash(live, hw, st, eng, h, last, reqs, m) {
       row(`<span class="${errs ? "bad" : "muted"}">${fmt(errs)} errors</span> <span class="muted">· ${fmt(cut)} cut short</span>`),
       row(`<span class="muted">of ${fmt(done.length)} kept requests</span>`)], null),
     tile("Decode speed", nowSpeed == null ? "–" : fmt(nowSpeed, 1), "tok/s", [
-      row(`${chip(dNow, dPrev)} <span class="muted">${live.state === "generating" ? "live" : "median of last 10"}</span>`),
+      row(`${chip(dNow, dPrev)} <span class="muted">${live.state === "generating" ? (speeds.length > 1 ? `live, ${speeds.length} requests: ${speeds.map((v) => fmt(v, 1)).join(" + ")}` : "live") : "median of last 10"}</span>`),
       row(`<span class="muted">${lifeDecode ? `${fmt(lifeDecode, 1)} lifetime avg` : "&nbsp;"}</span>`)], decodes, "decode"),
     tile("Prefill speed", pNow == null ? "–" : fmt(pNow), "tok/s", [
       row(`${chip(pNow, pPrev)} <span class="muted">median of last 10</span>`),
@@ -709,12 +727,14 @@ function renderDash(live, hw, st, eng, h, last, reqs, m) {
   // context in use: the running request, else the last one
   const ctx = eng.max_context || 0;
   let used = 0;
-  if (live.state !== "idle" && live.state !== "unloaded") used = (live.prompt_tokens || 0) + (live.generated || 0);
+  const each = busySlots(live).map((x) => (x.prompt_tokens || 0) + (x.generated || 0));
+  if (each.length > 1) used = Math.max(...each);                    // a slot has its own context: the fullest one
+  else if (live.state !== "idle" && live.state !== "unloaded") used = (live.prompt_tokens || 0) + (live.generated || 0);
   else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
   const frac = ctx ? Math.min(1, used / ctx) : 0;
   $("ctx-bar").style.width = `${frac * 100}%`;
   $("ctx-sub").textContent = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)} · ${fmt(frac * 100, frac < 0.1 ? 1 : 0)}%` : "–";
-  $("ctx-note").textContent = live.state !== "idle" && live.state !== "unloaded" ? "the running request" : last ? "the last request" : "";
+  $("ctx-note").textContent = live.state !== "idle" && live.state !== "unloaded" ? (each.length > 1 ? "the fullest running request" : "the running request") : last ? "the last request" : "";
 
   // model and engine
   const loaded = live.state !== "unloaded";
@@ -730,7 +750,7 @@ function renderDash(live, hw, st, eng, h, last, reqs, m) {
     ["KV cache", kv ? `${kv}${eng.kv_resident ? `, ${fmt(eng.kv_resident)} positions per layer in VRAM` : ", all in VRAM"}` : null],
     ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
     ["Speculation", eng.spec ? `MTP, up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} drafts${t.drafts_offered ? ` · ${fmt((100 * t.drafts_accepted) / t.drafts_offered)}% accepted` : ""}` : null],
-    ["Parallel slots", live.parallel ? `${fmt(live.running || 0)} running of ${fmt(live.parallel)}` : null],
+    ["Parallel slots", live.parallel ? `${fmt(live.running || 0)} running of ${fmt(live.parallel)}${live.outside_slots ? ` · ${fmt(live.outside_slots)} waiting` : ""}` : null],
     ["Images", eng.images ? "on" : "off"],
     ["Since start", t.requests ? `${renderTotalsShort(t)}` : null],
   ]);

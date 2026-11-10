@@ -98,6 +98,9 @@ body[data-tab="chat"] .topbar { border-bottom-color: transparent; background: va
 .live__state[data-s="unloaded"] i { background: var(--st-danger); }
 .live__state b { font-weight: 600; }
 .live__bar { height: 4px; border: 0; }
+.live__slots { display: grid; gap: 8px; }
+.live__slot { display: grid; gap: 4px; font-size: var(--st-fs-sm); }
+.live__slot .st-progress { height: 4px; border: 0; }
 
 /* insight tiles */
 .tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
