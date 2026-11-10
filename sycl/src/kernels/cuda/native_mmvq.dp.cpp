@@ -2574,7 +2574,8 @@ void kreg_dispatch(const void* w, const void* x, float* y, int n_in, int n_out, 
         } else launch_kreg<F, NCOLS, 8, 256>(w, x, y, n_in, n_out, s);
     }
 }
-// KREG2 (IQ4_XS at 1-4 columns under STRATA_MMVQ_KREG=1; STRATA_KREG2=0: off): the KREG IQ4_XS per-output arithmetic
+// KREG2 (IQ4_XS at 1-4 columns under STRATA_MMVQ_KREG=1, at 5-8 columns when STRATA_KREG2_R names them; STRATA_KREG2=0:
+// off): the KREG IQ4_XS per-output arithmetic
 // (a column's sum is bitwise the KREG one: the 16-lane butterfly and the sub-group-ordered SLM sum do not depend on
 // the work-group, the tile or R) on another schedule:
 //   - a persistent grid of 60 threads per Xe core walks the tiles; at 2-4 columns the next tile's raw block words
@@ -2586,8 +2587,9 @@ void kreg_dispatch(const void* w, const void* x, float* y, int n_in, int n_out, 
 // Taken where it measured faster than KREG on the Arc Pro B70 (2026-11-01): 2-4 columns when the matrix has more
 // tiles (R = 4 rows) than the grid (2560 x 6144..248320 and 6144 x 2560: 1.05-1.26x), and 1 column at R = 2 (one
 // work-group per tile) when the tiles fit in the grid (2560 x 512 / x 640: 1.2-1.36x; KREG's R = 8 leaves cores
-// idle). Elsewhere KREG. STRATA_KREG2_R="a,b,c,d": R (2 or 4) per column count (2,4,2,2 measured faster at 3-4
-// columns on all but the head; bitwise either way).
+// idle). Elsewhere KREG. STRATA_KREG2_R="a,b,c,d[,e,f,g,h]": R (2 or 4) per column count (2,4,2,2 measured faster at 3-4
+// columns on all but the head; bitwise either way).  Entries 5-8 are 0 by default (KREG at those column counts);
+// "2,4,4,4,2,2,2,2" measured faster at 5-6 columns (qkv 40.1 -> 32.7 us at 5, 45.6 -> 33.3 at 6, 2026-11-10).
 struct K2Raw { sycl::int2 hdr, qa, qb; };
 __dpct_inline__ uint32_t k2_code(int n) {   // kIq4nlTable[n] as a byte, from registers
     const uint32_t w0 = 0xBFAD9881u, w1 = 0xF6EADDCFu, w2 = 0x26190D01u, w3 = 0x71594535u;
@@ -2715,17 +2717,19 @@ void launch_kreg2(const void* weights, const void* x_q8_1, float* y, int n_in, i
 }
 struct Kreg2Cfg {
     bool on = true;
-    int r[5] = {0, 2, 4, 4, 4};   // R per column count
+    // R per column count; 0 = KREG2 not used at that count.  5-8 columns are off unless STRATA_KREG2_R names them: the kernel
+    // is the same template (a column's sum does not depend on R or the tile), only never measured there before 2026-11-10.
+    int r[9] = {0, 2, 4, 4, 4, 0, 0, 0, 0};
 };
 inline const Kreg2Cfg& kreg2_cfg() {   // latched before graph capture
     static const Kreg2Cfg c = [] {
         Kreg2Cfg k;
         const char* e = std::getenv("STRATA_KREG2");
         k.on = !(e && e[0] == '0');
-        if (const char* rl = std::getenv("STRATA_KREG2_R")) {   // "a,b,c,d": 2 or 4; anything else keeps the default
-            for (int i = 1; i <= 4 && *rl; ++i) {
+        if (const char* rl = std::getenv("STRATA_KREG2_R")) {   // "a,b,c,d[,e,f,g,h]": 2 or 4; anything else keeps the default
+            for (int i = 1; i <= 8 && *rl; ++i) {                 // (entries 5-8: 0 keeps KREG at that column count)
                 const int v = std::atoi(rl);
-                if (v == 2 || v == 4) k.r[i] = v;
+                if (v == 2 || v == 4 || (v == 0 && i > 4 && (*rl == '0'))) k.r[i] = v;
                 while (*rl && *rl != ',') ++rl;
                 if (*rl == ',') ++rl;
             }
@@ -2739,7 +2743,9 @@ bool k2_go(const Kreg2Cfg& c, const void* w, const void* x, float* y, int n_in, 
     static const int cores = std::max(1, int(s->get_device().get_info<sycl::info::device::max_compute_units>()) / 8);
     const int nsg = ((n_in / QK) * 8 + KREG_SG - 1) / KREG_SG;
     const int grid = std::max(1, 60 / nsg) * cores;   // 60 threads per Xe core (max_compute_units / 8 XVEs)
-    const int R = c.r[NC], tiles = (n_out + R - 1) / R;
+    const int R = c.r[NC];
+    if (R == 0) return false;
+    const int tiles = (n_out + R - 1) / R;
     if (NC == 1 ? tiles > grid : tiles <= grid) return false;
     const int G = tiles < grid ? tiles : grid;
     if (R == 2) launch_kreg2<NC, 2>(w, x, y, n_in, n_out, G, s);
@@ -2754,6 +2760,10 @@ inline bool try_kreg2(const void* w, const void* x, float* y, int n_in, int n_ou
         case 2: return k2_go<2>(c, w, x, y, n_in, n_out, s);
         case 3: return k2_go<3>(c, w, x, y, n_in, n_out, s);
         case 4: return k2_go<4>(c, w, x, y, n_in, n_out, s);
+        case 5: return k2_go<5>(c, w, x, y, n_in, n_out, s);
+        case 6: return k2_go<6>(c, w, x, y, n_in, n_out, s);
+        case 7: return k2_go<7>(c, w, x, y, n_in, n_out, s);
+        case 8: return k2_go<8>(c, w, x, y, n_in, n_out, s);
         default: return false;
     }
 }
