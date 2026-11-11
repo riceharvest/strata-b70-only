@@ -42,6 +42,7 @@
 #include "strata/qwen35/engine.hpp"
 #include "q36_kernels.dp.hpp"
 #include "q36_prefill.dp.hpp"
+#include "q36_sampling.hpp"
 #include <dpct/blas_utils.hpp>
 
 #if defined(STRATA_Q36_CPU_POOL)
@@ -1433,6 +1434,26 @@ auto &bv =
 }
 constexpr int kArgBlocks = 128;   // (the row stride of k_argmax's partials)
 
+// ------------------------------------------------------------------------------------------------ drafting beyond greedy
+// A greedy request with a penalty and a sampled request (a temperature above 0) draft too: the verify window returns each
+// row's M highest raw logits (q36_sampling.hpp) and the host picks the row's token as the plain sampler would, then
+// compares it with the draft.  Both switches are read once; 0 gives that class of requests the plain decode.
+using strata::qwen35::kSpecRowWords;
+using strata::qwen35::kSpecTopM;
+using strata::qwen35::kSpecChunk;
+bool q36_spec_pen_on() {   // STRATA_Q36_SPEC_PEN: a greedy request with a penalty drafts
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_SPEC_PEN"); return !(e && e[0] == '0'); }();
+    return on;
+}
+bool q36_spec_sample_on() {   // STRATA_Q36_SPEC_SAMPLE: a request with a temperature above 0 drafts
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_SPEC_SAMPLE"); return !(e && e[0] == '0'); }();
+    return on;
+}
+bool q36_spec_check_on() {   // STRATA_Q36_SPEC_CHECK=1: compare each window's rows with the host's top M (a debug aid)
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_SPEC_CHECK"); return e && e[0] != '0' && e[0] != '\0'; }();
+    return on;
+}
+
 unsigned grid1(int64_t n, int b = kThreads) { return (unsigned) ((n + b - 1) / b); }
 
 /// out[t][o] = W[o] . x[t] in FP32 for a prompt chunk's small F32 projections (the router, the GDN alpha / beta,
@@ -2516,6 +2537,19 @@ struct Engine {
     void *q8, *xq, *escr;
     int32_t *ids, *grp_start, *n_groups, *ent_dst, *ent_tok, *tok, *pos0, *pick;
     int32_t* hpin = nullptr;   // pinned staging: [0] decode token, [1] position, [2..9] picks, [10] max rows, [16..] tokens
+    // drafting beyond greedy (STRATA_Q36_SPEC_PEN / _SAMPLE): a verify window's rows as their M highest raw logits
+    uint64_t* sp_cand = nullptr;   // [kVerify][sp_nch][kSpecTopM]: each 4,096-logit chunk's best keys (first stage)
+    int32_t* sp_rows = nullptr;    // [kVerify][kSpecRowWords]: a row's ids, then its logits' bits (second stage)
+    int32_t* sp_m = nullptr;       // [1] the candidates a row returns, set before each window (the kernels read it)
+    int32_t* sp_h = nullptr;       // pinned: [0] the M to send, [1 ..] the rows as copied back
+    int sp_nch = 0;                // chunks of a logit row
+    /// The host's say in a verify window (its rows are drawn by the host after the one wait): the request's sampler.
+    struct SpecSel {
+        const strata::qwen35::Sampling* s;
+        int kk, M;                           // the candidate cap and the raw candidates a row returns
+        const std::vector<int32_t>* hist;    // the tokens before the window, including its first
+        std::mt19937_64* rng;
+    };
     unsigned long long* grp_ptr;
     float *pacc, *pm, *pl, *amv;
     int32_t* ami;
@@ -2928,6 +2962,15 @@ struct Engine {
         pick = dalloc_t<int32_t>(kVerify);
         amv = dalloc((size_t) kArgBlocks * kVerify);
         ami = dalloc_t<int32_t>((size_t) kArgBlocks * kVerify);
+        if (q36_spec_pen_on() || q36_spec_sample_on()) {   // (about 0.5 MB of the card and 8 KB of pinned memory)
+            sp_nch = (int) ((g.n_vocab + kSpecChunk - 1) / kSpecChunk);
+            if (sp_nch >= 1 && sp_nch <= kThreads) {   // (the second stage gives each chunk a work-item)
+                sp_cand = dalloc_t<uint64_t>((size_t) kVerify * (size_t) sp_nch * kSpecTopM);
+                sp_rows = dalloc_t<int32_t>((size_t) kVerify * kSpecRowWords);
+                sp_m = dalloc_t<int32_t>(1);
+                CK(DPCT_CHECK_ERROR(sp_h = sycl::malloc_host<int32_t>(1 + (size_t) kVerify * kSpecRowWords, q_ct1)));
+            }
+        }
         /*
         DPCT1048:0: The original value cudaHostAllocDefault is not meaningful in
         the migrated code and was removed or replaced with 0. You may need to
@@ -6174,6 +6217,105 @@ work-group size if needed.
     /// advanced there), each pick written into the verify window's token row, then the verify window.  Graph C (per kept count):
     /// the commit and hlast.  The same kernels on the same rows as the eager form, so the same picks.
     bool spec_graphs() const { return use_graph && mtp_graph && n_sess == 1 && !main_hybrid; }
+    /// Whether a window may return its rows' top candidates for the host to draw (STRATA_Q36_SPEC_PEN / _SAMPLE): the
+    /// graph form of the verify window only (one session, no hybrid experts, a window that fits kGemmT rows).
+    bool sp_window_ok() const { return sp_cand != nullptr && mtp_d >= 1 && mtp_d + 1 <= kGemmT && spec_graphs(); }
+    /// The M highest raw logits of each of the first T rows of `logits` (M = *sp_m, at most kSpecTopM), ranked by (logit, then
+    /// the lowest id), into sp_rows: a row's ids, then the logits' bits (ids -1 past the vocabulary).  Two kernels.  Stage 1:
+    /// a work-group takes one 4,096-logit chunk of one row into shared memory as keys (q36_sampling.hpp spec_key32) and
+    /// takes the best key M times (each work-item keeps the best of its own 16 keys and looks again only when its key was
+    /// taken).  Stage 2: a work-group per row merges the chunks' lists, M times the best of the chunks' heads.  The keys carry
+    /// the id, so there are no ties.  For the windows of the verify graph variant (key 70000 + ...); not part of the greedy graph.
+    void sp_topm(int T) {
+        const int V = (int) m->g.n_vocab, nch = sp_nch;
+        const float* lg = logits;
+        uint64_t* cand = sp_cand;
+        int32_t* rows = sp_rows;
+        const int32_t* mp = sp_m;
+        st->parallel_for<class q36_sp_top1>(
+            sycl::nd_range<3>(sycl::range<3>(1, (size_t) T, (size_t) nch) * sycl::range<3>(1, 1, kThreads),
+                              sycl::range<3>(1, 1, kThreads)),
+            [=](sycl::nd_item<3> it) {
+                auto& sk = *sycl::ext::oneapi::group_local_memory_for_overwrite<uint32_t[kSpecChunk]>(it.get_group());
+                const int tid = (int) it.get_local_id(2), row = (int) it.get_group(1), ch = (int) it.get_group(2);
+                const int M = mp[0];
+                const int base = ch * kSpecChunk;
+                const int n = V - base < kSpecChunk ? V - base : kSpecChunk;   // the chunk's logits (the last chunk's fewer)
+                const float* x = lg + (size_t) row * V + base;
+                for (int i = tid; i < kSpecChunk; i += kThreads) sk[i] = i < n ? strata::qwen35::spec_key32(x[i]) : 0u;
+                it.barrier();
+                // the best key of this work-item's elements (i = tid, tid + kThreads, ...); a removed or absent key is 0
+                uint64_t best = 0;
+                for (int i = tid; i < kSpecChunk; i += kThreads) {
+                    const uint32_t k = sk[i];
+                    if (k != 0u) {
+                        const uint64_t key = strata::qwen35::spec_key64(k, (uint32_t) (base + i));
+                        if (key > best) best = key;
+                    }
+                }
+                uint64_t* out = cand + ((size_t) row * nch + ch) * kSpecTopM;
+                for (int r = 0; r < M; ++r) {
+                    const uint64_t w = sycl::reduce_over_group(it.get_group(), best, sycl::maximum<uint64_t>());
+                    if (tid == 0) out[r] = w;
+                    if (w == 0) break;   // (every work-item has the same w: the chunk is used up)
+                    const int e = strata::qwen35::spec_key_id(w) - base;   // the taken element: its work-item takes it out
+                    if (e % kThreads == tid) {
+                        sk[e] = 0u;
+                        best = 0;
+                        for (int i = tid; i < kSpecChunk; i += kThreads) {
+                            const uint32_t k = sk[i];
+                            if (k != 0u) {
+                                const uint64_t key = strata::qwen35::spec_key64(k, (uint32_t) (base + i));
+                                if (key > best) best = key;
+                            }
+                        }
+                    }
+                }
+            });
+        st->parallel_for<class q36_sp_top2>(
+            sycl::nd_range<3>(sycl::range<3>(1, (size_t) T, 1) * sycl::range<3>(1, 1, kThreads), sycl::range<3>(1, 1, kThreads)),
+            [=](sycl::nd_item<3> it) {
+                const int tid = (int) it.get_local_id(2), row = (int) it.get_group(1);
+                const int M = mp[0];
+                const uint64_t* mine = tid < nch ? cand + ((size_t) row * nch + tid) * kSpecTopM : nullptr;
+                int p = 0;
+                uint64_t head = mine != nullptr ? mine[0] : 0;
+                int32_t* out = rows + (size_t) row * kSpecRowWords;
+                for (int r = 0; r < M; ++r) {
+                    const uint64_t w = sycl::reduce_over_group(it.get_group(), head, sycl::maximum<uint64_t>());
+                    if (tid == 0) {
+                        out[r] = w != 0 ? strata::qwen35::spec_key_id(w) : -1;
+                        out[kSpecTopM + r] =
+                            w != 0 ? __builtin_bit_cast(int32_t, strata::qwen35::spec_key_float(strata::qwen35::spec_key_hi(w))) : 0;
+                    }
+                    if (w != 0 && head == w) {   // this chunk's best was the row's next: its next one is the head
+                        ++p;
+                        head = p < kSpecTopM && p < M ? mine[p] : 0;
+                    }
+                }
+            });
+    }
+    /// STRATA_Q36_SPEC_CHECK=1: each row's candidates from the device against the host's top M of the whole row (the window's
+    /// logits are untouched, so the two must agree to the bit).  A debug aid: it copies the rows.  A mismatch goes to stderr.
+    void sp_check(int T) {
+        const int M = (int) sp_h[0], V = (int) m->g.n_vocab;
+        static int reported = 0;
+        std::vector<float> row;
+        std::vector<int32_t> ids((size_t) M), bits((size_t) M);
+        for (int r = 0; r < T; ++r) {
+            host_logits_row(r, row);
+            strata::qwen35::spec_topm_ref(row.data(), V, M, ids.data(), bits.data());
+            const int32_t* d = sp_h + 1 + (size_t) r * kSpecRowWords;
+            for (int i = 0; i < M; ++i) {
+                if (d[i] == ids[(size_t) i] && d[kSpecTopM + i] == bits[(size_t) i]) continue;
+                if (reported++ < 20)
+                    std::fprintf(stderr, "strata-q36: spec check: row %d of %d, candidate %d of %d: device id %d bits %08x, host id %d "
+                                 "bits %08x\n", r, T, i, M, (int) d[i], (unsigned) d[kSpecTopM + i], (int) ids[(size_t) i],
+                                 (unsigned) bits[(size_t) i]);
+                break;
+            }
+        }
+    }
     void commit_graph(int n_keep) {
         const int N = (int) m->g.n_embd;
         run_graph_key(60000 + n_keep, [&] {
@@ -6182,7 +6324,7 @@ work-group size if needed.
         });
     }
     int spec_step_g(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
-                    const std::atomic<bool>* cancel) {
+                    const std::atomic<bool>* cancel, const SpecSel* sel = nullptr) {
         const int N = (int) m->g.n_embd;
         const int T0 = (int) fix.size() + 1, T = D + 1;
         CK(DPCT_CHECK_ERROR(st->wait()));
@@ -6198,8 +6340,12 @@ work-group size if needed.
         float* seeds = mtp_seed();
         if (!fix.empty()) CK(DPCT_CHECK_ERROR(st->memcpy(seeds, hmain, fix.size() * (size_t) N * 4)));
         CK(DPCT_CHECK_ERROR(st->memcpy(seeds + fix.size() * (size_t) N, hlast, (size_t) N * 4)));
+        if (sel != nullptr) {   // the rows come back as their top candidates: how many (read by the kernels)
+            sp_h[0] = sel->M;
+            CK(DPCT_CHECK_ERROR(st->memcpy(sp_m, sp_h, 4)));
+        }
         rows_deferred = true;
-        run_graph_key(50000 + T0 * 16 + D, [&] {
+        const auto body = [&] {
             forward_mtp(T0, pos - (int64_t) fix.size(), seeds, true, true);
             int last_row = T0 - 1;
             for (int d = 1; d <= D; ++d) {
@@ -6217,27 +6363,37 @@ work-group size if needed.
                 forward_mtp(1, pos + d, seeds, true, true);
             }
             forward(T, pos, T, true, true);
-        });
+        };
+        if (sel == nullptr) run_graph_key(50000 + T0 * 16 + D, body);   // (greedy: the graph as before)
+        else run_graph_key(70000 + T0 * 16 + D, [&] { body(); sp_topm(T); });
         rows_deferred = false;
-        CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 2, pick, (size_t) T * 4)));
+        if (sel == nullptr) CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 2, pick, (size_t) T * 4)));
+        else CK(DPCT_CHECK_ERROR(st->memcpy(sp_h + 1, sp_rows, (size_t) T * kSpecRowWords * 4)));   // one copy: every row's candidates
         CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 48, tok + 1, (size_t) D * 4)));
         CK(DPCT_CHECK_ERROR(st->wait()));
         drafts.assign((size_t) D, 0);
         for (int d = 0; d < D; ++d) drafts[(size_t) d] = hpin[48 + d];
         int a = 0;
-        while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
-        if (cancel != nullptr && cancel->load()) a = 0;
-        for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+        if (sel == nullptr) {
+            while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+            if (cancel != nullptr && cancel->load()) a = 0;
+            for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+        } else {
+            if (q36_spec_check_on()) sp_check(T);
+            // the host draws row 0, then row 1 only if row 0 gave draft 0, and so on: picks[0 .. a], one draw a row, as the plain path
+            a = strata::qwen35::decide_window(*sel->s, sel->kk, sel->M, D, *sel->hist, drafts.data(), sp_h + 1, *sel->rng, picks);
+            if (cancel != nullptr && cancel->load()) a = 0;   // (picks[0] is row 0's draw, a token the plain path could have drawn)
+        }
         commit_graph(a + 1);
         pos += a + 1;
         after_rows(a + 1);
         return a;
     }
     int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
-                  const std::atomic<bool>* cancel = nullptr) {
+                  const std::atomic<bool>* cancel = nullptr, const SpecSel* sel = nullptr) {
         const int N = (int) m->g.n_embd;
         if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
-        if (D >= 1 && D + 1 <= kGemmT && spec_graphs()) return spec_step_g(x_tok, fix, D, drafts, picks, cancel);   // (T0 <= kGemmT: no host position in a grid)
+        if (D >= 1 && D + 1 <= kGemmT && spec_graphs()) return spec_step_g(x_tok, fix, D, drafts, picks, cancel, sel);   // (T0 <= kGemmT: no host position in a grid; a sel only with sp_window_ok())
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
         CK(DPCT_CHECK_ERROR(st->wait()));
         // rows of the first MTP call: (hmain row i, fix[i]) at positions pos - fix.size() + i, then (hlast, x) at pos
@@ -6403,6 +6559,20 @@ work-group size if needed.
                 for (int f = 1; f <= mtp_d; ++f) {
                     fix.assign((size_t) f, filler);
                     spec_step(filler, fix, mtp_d, drafts, picks);
+                }
+                // the graph variant that returns the rows' top candidates (the same T0 and D keys): a request with a penalty or a
+                // temperature above 0 would else make each of them on first use
+                if (sp_window_ok() && pos + (int64_t) (mtp_d + 1) * (mtp_d + 2) < ctx) {
+                    strata::qwen35::Sampling ws;
+                    ws.temperature = 1.f;
+                    ws.top_k = 4;
+                    const std::vector<int32_t> wh(1, filler);
+                    std::mt19937_64 wr(1);
+                    const SpecSel wsel{&ws, 4, 4, &wh, &wr};
+                    for (int f = 0; f <= mtp_d; ++f) {
+                        fix.assign((size_t) f, filler);
+                        spec_step(filler, fix, mtp_d, drafts, picks, nullptr, &wsel);
+                    }
                 }
                 for (int n = 1; n <= mtp_d + 1; ++n) commit_graph(n);
             }
@@ -6704,50 +6874,11 @@ catch (sycl::exception const &exc) {
 }
 
 // ------------------------------------------------------------------------------------------------ sampling
-struct Sampling {
-    float temperature = 0.f, top_p = 1.f, min_p = 0.f, repeat = 1.f, freq = 0.f, present = 0.f;
-    int top_k = 20, last_n = 0;
-    unsigned long long seed = 0;
-    bool needs_logits() const { return temperature > 0.f || repeat != 1.f || freq != 0.f || present != 0.f; }
-};
+using strata::qwen35::Sampling;
 
+/// One token from a full logit row, the plain path (q36_sampling.hpp: the same functions the verify windows draw with).
 int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
-    if (s.last_n != 0 && (s.repeat != 1.f || s.freq != 0.f || s.present != 0.f)) {
-        std::map<int, int> cnt;
-        const size_t from = s.last_n < 0 || (size_t) s.last_n >= hist.size() ? 0 : hist.size() - (size_t) s.last_n;
-        for (size_t i = from; i < hist.size(); ++i) ++cnt[hist[i]];
-        for (const auto& [id, c] : cnt) {
-            float& v = lg[(size_t) id];
-            if (s.repeat != 1.f) v = v > 0 ? v / s.repeat : v * s.repeat;
-            v -= (float) c * s.freq + s.present;
-        }
-    }
-    if (s.temperature <= 0.f) return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
-    const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
-    std::vector<int> idx(lg.size());
-    for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
-    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
-    idx.resize((size_t) kk);
-    std::vector<double> p(idx.size());
-    const double mx = lg[(size_t) idx[0]];
-    double sum = 0;
-    for (size_t i = 0; i < idx.size(); ++i) sum += (p[i] = std::exp((lg[(size_t) idx[i]] - mx) / s.temperature));
-    size_t keep = idx.size();
-    double cum = 0;
-    for (size_t i = 0; i < idx.size(); ++i) {
-        if (p[i] / sum < s.min_p * (p[0] / sum)) { keep = i; break; }
-        cum += p[i] / sum;
-        if (cum >= s.top_p) { keep = i + 1; break; }
-    }
-    keep = std::max<size_t>(1, keep);
-    double tot = 0;
-    for (size_t i = 0; i < keep; ++i) tot += p[i];
-    std::uniform_real_distribution<double> u(0.0, tot);
-    double r = u(rng);
-    for (size_t i = 0; i < keep; ++i) {
-        if ((r -= p[i]) <= 0) return idx[i];
-    }
-    return idx[keep - 1];
+    return strata::qwen35::sample_row(lg, s, hist, rng);
 }
 
 std::vector<int32_t> parse_ids(const char* s) {
@@ -7309,10 +7440,21 @@ struct Serve {
         long long produced = 0, offered = 0, accepted = 0;
         const char* finish = "length";
         // greedy requests alone with the MTP block: speculative steps of mtp_d drafts (verified, so the text is the greedy
-        // text); sampled ones, and requests beside others, one token at a time
-        const bool spec = E.mtp_d > 0 && !smp.needs_logits() && !adm;
+        // text); requests beside others, one token at a time.  A request that the device argmax cannot serve (a penalty, a
+        // temperature above 0) drafts when the window can hand its rows' top candidates to the host (E.sp_window_ok(): graphs,
+        // one session) and q36_sampling.hpp's spec_plan() takes it: the host then draws each row as the plain sampler would
+        // (the same draw of the same stream) and keeps a draft when it equals the draw, so the text is the plain path's.
+        // STRATA_Q36_SPEC_PEN=0 / STRATA_Q36_SPEC_SAMPLE=0: those requests take the plain path.
+        strata::qwen35::SpecPlan plan;
+        if (E.mtp_d > 0 && smp.needs_logits() && !adm && E.sp_window_ok()) {
+            plan = strata::qwen35::spec_plan(smp, (int) E.m->g.n_vocab);
+            if (plan.ok && !(plan.sampled ? q36_spec_sample_on() : q36_spec_pen_on())) plan.ok = false;
+        }
+        const bool spec = E.mtp_d > 0 && !adm && (!smp.needs_logits() || plan.ok);
+        const Engine::SpecSel sel{&smp, plan.kk, plan.M, &hist, &rng};
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
+        bool decided = false;   // nx is the token a verify window drew: the loop's own draw below would be a second one
         int nx = smp.needs_logits() ? -1 : E.greedy();
         if (adm) {
             if (smp.needs_logits()) {
@@ -7349,10 +7491,11 @@ struct Serve {
             return;
         }
         for (;;) {
-            if (smp.needs_logits()) {
+            if (smp.needs_logits() && !decided) {
                 E.host_logits(lg);
                 nx = sample(lg, smp, hist, rng);
             }
+            decided = false;
             auto emit = [&](int t) {   // false: the answer ends here
                 /*
                 DPCT1040:44: Use sycl::stream instead of printf if your code is
@@ -7370,7 +7513,7 @@ struct Serve {
             if (!emit(nx)) break;
             if (n_active > 0) window();
             if (spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
-                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop);
+                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop, plan.ok ? &sel : nullptr);
                 offered += E.mtp_d;
                 accepted += a;
                 // the state now holds x and every accepted draft, whether or not the answer ends inside them (an end of
@@ -7385,6 +7528,7 @@ struct Serve {
                     if (!emit(drafts[(size_t) i])) ended = true;
                 if (ended) break;
                 nx = picks[a];
+                decided = true;   // (only read when the request needs logits: a greedy one has its pick already)
                 continue;
             }
             if (E.pos + 1 > E.ctx) break;
