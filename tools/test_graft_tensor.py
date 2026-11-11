@@ -17,6 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import graft_tensor as G  # noqa: E402
+G.BACKOFF = 0.0
 from gguf_reader import GGUFFile  # noqa: E402
 
 IQ2_XXS, IQ2_S, Q2_0 = 16, 22, 42
@@ -310,6 +311,77 @@ class Compact(Files):
         self.assertEqual(G.main(args), 0)
         self.contiguous(self.target)
         self.assertEqual(G.main(["--target", str(self.target), "--compact"]), 0)
+
+
+class Safety(Files):
+    def test_a_hard_link_or_symlink_is_refused_and_the_other_path_is_untouched(self):
+        raw = self.target.read_bytes()
+        link = self.dir / "hard.gguf"
+        link.hardlink_to(self.target)
+        with self.assertRaisesRegex(G.Refused, "hard links"):
+            self.run_graft()
+        with self.assertRaisesRegex(G.Refused, "hard links"):
+            G.compact(self.target)
+        self.assertEqual(link.read_bytes(), raw)
+        link.unlink()
+        sym = self.dir / "sym.gguf"
+        sym.symlink_to(self.target)
+        with self.assertRaisesRegex(G.Refused, "symlink"):
+            self.run_graft(target=sym)
+        self.assertEqual(self.target.read_bytes(), raw)
+        out = self.dir / "copy.gguf"                                  # --out works on a linked file: it writes a copy
+        self.assertEqual(self.run_graft(target=sym, out=out), "grafted")
+
+    def test_a_non_gguf_or_cut_target_is_a_refusal_everywhere(self):
+        for junk in (b"<html>nope</html>" * 10, target_bytes()[:100]):
+            self.target.write_bytes(junk)
+            with self.assertRaisesRegex(G.Refused, "not a whole GGUF"):
+                self.run_graft()
+            with self.assertRaises(G.Refused):
+                G.grafted(self.target, NAME, "IQ2_XXS")
+            with self.assertRaises(G.Refused):
+                G.compact(self.target)
+            self.assertEqual(G.main(["--target", str(self.target), "--tensor", NAME, "--source", str(self.source)]), 1)
+            self.assertEqual(self.target.read_bytes(), junk)
+
+    def test_a_pending_journal_means_main_only_finishes_the_compact(self):
+        (self.dir / "target.gguf.compact").write_text("{}")
+        with self.assertRaises(Exception):                            # the journal here is empty: compact stops on it
+            G.main(["--target", str(self.target), "--tensor", NAME, "--source", str(self.source), "--compact"])
+        self.assertEqual(self.tensor(self.target)[1].type_name, "IQ2_S")      # and no graft was done first
+
+    def test_is_compact(self):
+        self.run_graft()
+        self.assertFalse(G.is_compact(self.target))
+        G.compact(self.target, log=self.log.append)
+        self.assertTrue(G.is_compact(self.target))
+
+
+class ShortBody(http.server.BaseHTTPRequestHandler):
+    hits = 0
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        type(self).hits += 1
+        self.send_response(206)
+        self.send_header("Content-Range", "bytes 0-99/1000")
+        self.send_header("Content-Length", "100")
+        self.end_headers()
+        self.wfile.write(b"x" * 40)                                   # the connection closes with 60 bytes missing
+
+
+class Truncated(unittest.TestCase):
+    def test_a_body_cut_short_is_retried_a_bounded_number_of_times_and_then_refused(self):
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ShortBody)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        ShortBody.hits = 0
+        with self.assertRaisesRegex(G.Refused, "cannot read"):
+            G._http_range("http://127.0.0.1:%d/x.gguf" % srv.server_address[1], 0, 100)
+        self.assertEqual(ShortBody.hits, 3)
 
 
 if __name__ == "__main__":

@@ -12,7 +12,8 @@ What it does, in this order:
   3. reads the source's bytes (optionally against --source-sha256) and writes them where the target's tensor was;
   4. writes zeros over the rest of the old slot, then changes the tensor's type in the target's tensor directory.
 The offset of the tensor and of every other tensor stay, so the file is as long as before. The type is changed last: a run
-that stops earlier leaves a file that still reads as the original, and running it again finishes the job. A tensor that is
+that stops earlier leaves the header as it was (and, if it stopped inside the data write, a slot that is half new: nothing
+should read the file then), and running the same command again finishes the job. A tensor that is
 already the source's bytes is reported and left alone. --out writes a copy and leaves the target as it is.
 
 --compact (default off) closes the hole the graft leaves when the new tensor is smaller than the old one: every later tensor moves
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import pathlib
@@ -36,6 +38,7 @@ import shutil
 import struct
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -43,6 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gguf_reader import GGML_TYPES, GGUFFile  # noqa: E402
 
 CHUNK = 8 << 20
+BACKOFF = 1.0                                     # seconds before a range request is tried again (times the attempt number)
 HEADER_TRY = (1 << 20, 8 << 20, 64 << 20)       # how much of a remote file is read to find its tensor directory
 TYPE_IDS = {name: i for i, name in GGML_TYPES.items()}
 
@@ -60,7 +64,7 @@ def _http_range(url: str, start: int, length: int, tries: int = 3, allow_short: 
     whole file from its start: that is refused, not used). A range past the end of the file comes back shorter: that is an
     error unless `allow_short`."""
     last = None
-    for _ in range(tries):
+    for attempt in range(tries):
         req = urllib.request.Request(url, headers={"Range": "bytes=%d-%d" % (start, start + length - 1),
                                                    "User-Agent": "strata-graft-tensor"})
         try:
@@ -75,11 +79,13 @@ def _http_range(url: str, start: int, length: int, tries: int = 3, allow_short: 
                 length = min(length, int(m.group(2)) - start + 1) if allow_short else length
         except Refused:
             raise
-        except (OSError, urllib.error.URLError) as e:
+        except (OSError, urllib.error.URLError, http.client.HTTPException) as e:      # IncompleteRead: a body cut short
             last = e
+            time.sleep(BACKOFF * (attempt + 1))
             continue
         if len(data) != length:
             last = OSError("short read: %d of %d bytes" % (len(data), length))
+            time.sleep(BACKOFF * (attempt + 1))
             continue
         return data
     raise Refused("cannot read %s (%s)" % (url.split("/")[2], last))
@@ -133,6 +139,25 @@ def read_header(src: str) -> GGUFFile:
     raise Refused("the tensor directory of %s could not be read (%s)" % (src, err))
 
 
+def open_target(path) -> GGUFFile:
+    """The parsed header of a target file; anything that is not a readable GGUF v3 file is a refusal, not a traceback."""
+    path = pathlib.Path(path)
+    if not path.is_file():
+        raise Refused("%s is not a file" % path)
+    try:
+        return GGUFFile(path)
+    except (OSError, ValueError) as e:
+        raise Refused("%s is not a whole GGUF file (%s)" % (path.name, e)) from None
+
+
+def check_private(path) -> None:
+    """Refuse a file that is a symlink or has other hard links: writing in place would change the other path too."""
+    path = pathlib.Path(path)
+    if path.is_symlink() or path.stat().st_nlink > 1:
+        raise Refused("%s is a symlink or has other hard links (a Hugging Face cache blob, a shared file): writing in place would "
+                      "change them too; copy it first (cp --reflink=auto SRC DST) and use the copy" % path.name)
+
+
 def find_tensor(g: GGUFFile, name: str, what: str):
     hit = [t for t in g.tensors if t.name == name]
     if len(hit) != 1:
@@ -183,9 +208,9 @@ def graft(target, tensor: str, source: str, source_sha256: str | None = None, ou
     `out`: a path to write a changed copy to; the target is then left as it is."""
     target = pathlib.Path(target)
     source = str(source)
-    tg = GGUFFile(target) if target.is_file() else None
-    if tg is None:
-        raise Refused("%s is not a file" % target)
+    tg = open_target(target)
+    if out is None:
+        check_private(target)
     sg = read_header(source)
     tt, st = find_tensor(tg, tensor, str(target.name)), find_tensor(sg, tensor, "the source")
     if tt.shape != st.shape:
@@ -284,6 +309,7 @@ def compact(target, expect_size: int | None = None, log=print) -> str:
     """Close the holes between tensors in place. Returns "compacted" or "already". Restartable through <target>.compact."""
     target = pathlib.Path(target)
     journal = target.with_name(target.name + ".compact")
+    check_private(target)
     if journal.exists():
         plan = json.loads(journal.read_text())
         size = target.stat().st_size
@@ -291,7 +317,7 @@ def compact(target, expect_size: int | None = None, log=print) -> str:
             raise Refused("%s does not match the journal %s; delete the journal only if you know the file is whole" % (target.name, journal.name))
         log("finishing an earlier compact run (%d of %d tensors moved)" % (plan["done"], len(plan["rows"])))
     else:
-        g = GGUFFile(target)
+        g = open_target(target)
         plan = compact_plan(g, target.stat().st_size)
         if not any(r["old"] != r["new"] for r in plan["rows"]):
             log("%s has no holes between its tensors: nothing to do" % target.name)
@@ -348,11 +374,23 @@ def _save(journal: pathlib.Path, plan: dict) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, journal)
+    fd = os.open(str(journal.parent), os.O_RDONLY)
+    try:
+        os.fsync(fd)                          # the rename itself, so a power cut cannot roll the journal back
+    finally:
+        os.close(fd)
+
+
+def is_compact(target) -> bool:
+    """Has the file no holes between its tensors (the shape --compact leaves)?"""
+    g = open_target(target)
+    plan = compact_plan(g, pathlib.Path(target).stat().st_size)
+    return not any(r["old"] != r["new"] for r in plan["rows"])
 
 
 def grafted(target, tensor: str, type_name: str) -> bool:
     """Does the target's tensor already have this type (the cheap test of an earlier run)?"""
-    t = [x for x in GGUFFile(pathlib.Path(target)).tensors if x.name == tensor]
+    t = [x for x in open_target(target).tensors if x.name == tensor]
     return len(t) == 1 and t[0].type_name == type_name
 
 
@@ -371,7 +409,8 @@ def main(argv=None) -> int:
     if a.compact and a.out:
         ap.error("--compact works in place; copy the file first (cp --reflink)")
     try:
-        if a.tensor:
+        pending = pathlib.Path(a.target).with_name(pathlib.Path(a.target).name + ".compact").exists()
+        if a.tensor and not pending:               # a half-compacted file is only finished, never grafted again
             graft(a.target, a.tensor, a.source, a.source_sha256, a.out)
         if a.compact:
             compact(a.target, a.expect_size)
