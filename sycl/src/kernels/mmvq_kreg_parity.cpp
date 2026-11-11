@@ -11,11 +11,12 @@
 // STRATA_MMVQ_KREG latch is not read). For Q4_K, Q5_K, Q6_K and IQ4_XS (and, dense mode only, Q3_K and IQ4_NL) at 1-8 columns:
 //
 //   1. KREG against a float64 reference that dequantizes the SAME weight blocks (ggml's dequantize_row_* formulas)
-//      and the SAME Q8_1 bytes the kernels read, so only the kernels' FP32 arithmetic is under test. Bound per
-//      output (M3b): |gpu - ref| <= 2 gamma(h) * sum_i (|a_i x_i| + |b_i x_i|), the summation bound of KREG's own
-//      FP32 tree (kreg_rel: depth h = 15 + n_in / 512 at most, gamma(h) = h u / (1 - h u), u = 2^-24; w_i = a_i - b_i,
-//      the scale part and the min term Q4_K / Q5_K subtract in FP32). It grows with the row's tree, not with a fixed
-//      2e-5, so it stays tight enough for check 5 at the 17408-wide rows.
+//      and the SAME Q8_1 bytes the kernels read, so only the kernels' FP32 arithmetic is under test. Bound per output:
+//      |gpu - ref| <= 2e-5 * sum_i |w_i x_i| (a strata run, as it always was); in a dense run (STRATA_PARITY_DENSE=1) the
+//      summation bound of KREG's own FP32 tree (M3b): |gpu - ref| <= 2 gamma(h) * sum_i (|a_i x_i| + |b_i x_i|), kreg_rel:
+//      depth h = 15 + n_in / 512 at most, gamma(h) = h u / (1 - h u), u = 2^-24; w_i = a_i - b_i, the scale part and the min
+//      term Q4_K / Q5_K subtract in FP32. It grows with the row's tree, not with a fixed 2e-5, so it stays tight enough for
+//      check 5 at the 17408-wide rows.
 //   2. the default kernels against the float64 reference with the loose bound |gpu - ref| <= 2e-5 * sum_i |w_i x_i|
 //      (their summation trees differ): a bound the kernels the engine runs today meet.
 //   3. KREG differs from the default kernels in some output of every case with n_in >= 2560 (it sums in another
@@ -450,7 +451,7 @@ int selftest() {
                 for (int j = 0; j < T; ++j)
                     for (int r = 0; r < sh.n_out; ++r) {
                         const size_t i = (size_t) j * sh.n_out + r;
-                        const double bnd = kBound * mag[i] + 1e-30, bk = krel * mag2[i] + 1e-30;
+                        const double bnd = kBound * mag[i] + 1e-30, bk = g_dense ? krel * mag2[i] + 1e-30 : bnd;
                         if (!std::isfinite(yk[i]) || !std::isfinite(yd[i]) || !std::isfinite(y1[i]) || !std::isfinite(yx[i])) { ++nf; continue; }
                         rk = std::max(rk, std::fabs(yk[i] - ref[i]) / bk);
                         rd = std::max(rd, std::fabs(yd[i] - ref[i]) / bnd);
@@ -473,7 +474,7 @@ int selftest() {
                     reference(f.type, w2, sh.n_in, 1, 0, 1, x, TMAX, ref2, m2a, m2b);
                     double seen = 0;
                     for (int j = 0; j < TMAX; ++j)
-                        seen = std::max(seen, std::fabs(yk[(size_t) j * sh.n_out] - ref2[j]) / (krel * mag2[(size_t) j * sh.n_out] + 1e-30));
+                        seen = std::max(seen, std::fabs(yk[(size_t) j * sh.n_out] - ref2[j]) / (g_dense ? krel * mag2[(size_t) j * sh.n_out] + 1e-30 : kBound * mag[(size_t) j * sh.n_out] + 1e-30));
                     std::printf("%-7s %5d x %5d     power: one scale step of row 0 is %.1f x the bound\n", f.name, sh.n_in,
                                 sh.n_out, seen);
                     if (seen <= 1.0) {

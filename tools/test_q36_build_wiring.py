@@ -67,6 +67,26 @@ class BuildScript(unittest.TestCase):
         self.assertIn("-DSTRATA_BUILD_Q36=ON", log)
         self.assertIn("--target strata-q36", log)
 
+    def test_a_battlemage_build_without_the_fetched_projects_stops_before_cmake(self):
+        # (a REPO of its own: the checkout's third_party/ may hold the fetched folders)
+        with tempfile.TemporaryDirectory() as repo:
+            r = self.run_build("strata-q36", Q36="ON", AOT="bmg-g31", REPO=repo)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("get-q36-tla.sh", r.stderr)
+            self.assertFalse(self.log.exists(), "cmake never started")
+            third = Path(repo) / "third_party"
+            (third / "sycl-tla" / "include" / "cutlass").mkdir(parents=True)
+            (third / "vllm-xpu-kernels" / "csrc" / "xpu" / "attn" / "xe_2").mkdir(parents=True)
+            (third / "vllm-xpu-kernels" / "csrc" / "xpu" / "attn" / "xe_2" / "chunk_prefill.hpp").write_text("", encoding="utf-8")
+            r = self.run_build("strata-q36", Q36="ON", AOT="bmg-g31", REPO=repo)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("-DSTRATA_BUILD_Q36=ON", self.log.read_text())
+
+    def test_without_an_aot_target_there_is_nothing_to_fetch(self):
+        with tempfile.TemporaryDirectory() as repo:
+            self.assertEqual(self.run_build("strata-q36", Q36="ON", REPO=repo).returncode, 0)
+            self.assertEqual(self.run_build("strata", AOT="bmg-g31", REPO=repo).returncode, 0)    # Q36 off: not asked for
+
     def test_an_existing_build_folder_takes_the_switch(self):
         self.build.mkdir()
         (self.build / "build.ninja").write_text("", encoding="utf-8")

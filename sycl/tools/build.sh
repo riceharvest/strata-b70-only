@@ -45,6 +45,14 @@ fi
 
 repo=${REPO:-$(git rev-parse --show-toplevel)}
 b=${BUILD_DIR:-$repo/build-sycl}
+# strata-q36's long-prompt attention (an AOT build for Battlemage / Lunar Lake) compiles against two projects fetched into
+# third_party/; say so before cmake is touched, so a build folder is not left configured for a build that cannot start
+if [[ "${Q36:-}" =~ ^(ON|on|1|TRUE|true|YES|yes)$ ]] && [[ "${AOT:-}" =~ ^(bmg|lnl) ]] &&
+   { [ ! -d "$repo/third_party/sycl-tla/include/cutlass" ] || [ ! -f "$repo/third_party/vllm-xpu-kernels/csrc/xpu/attn/xe_2/chunk_prefill.hpp" ]; }; then
+  echo "build.sh: Q36=ON with AOT=${AOT} compiles against third_party/sycl-tla and third_party/vllm-xpu-kernels, which are not there." >&2
+  echo "  Fetch them once (git and a network, about 40 MB), then build again:   bash sycl/tools/get-q36-tla.sh" >&2
+  exit 2
+fi
 [ -f $b/build.ninja ] || cmake -S $repo/sycl -B $b -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
     -DSTRATA_SYCL_AOT="${AOT:-}" -DSTRATA_SYCL_SPIN_MAX="${SPIN_MAX:-}" -DSTRATA_SYCL_I8_ESIMD="${I8_ESIMD:-AUTO}" -DSTRATA_SYCL_IQ_DECODE_FAST="${IQ_DECODE_FAST:-ON}" \
     -DSTRATA_HOST_MARCH="${HOST_MARCH:-}" -DSTRATA_SYCL_PARITY="${PARITY:-OFF}" -DSTRATA_BUILD_DSV41="${DSV41:-OFF}" -DSTRATA_BUILD_Q36="${Q36:-OFF}" 2>&1 | tail -15
