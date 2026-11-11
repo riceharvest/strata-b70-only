@@ -11,6 +11,7 @@
 #                      separated by spaces (default: none)
 #   STRATA_VISION_DIR  a host folder for the picture reader's files (serve/server.py reads it too); mounted at the same path, so the
 #                      embeddings file the server names on the GENI line is visible when /dev/shm has no room (default: none)
+#   STRATA_SYCL_USER   uid:gid the engine runs as in the container (default: the image's root; see below)
 #   STRATA_SYCL_SHM    1 (default): the host's /dev/shm is the container's /dev/shm. Pictures: the server (on the host) writes the
 #                      image embeddings of a request into /dev/shm and names that file on the engine's GENI line, so the engine in
 #                      the container must see the same file. 0: the container keeps a private /dev/shm.
@@ -70,6 +71,10 @@ esac
 # the runtime's own profile (the engine warns, and runs unpinned)
 seccomp=${STRATA_SYCL_SECCOMP-"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/seccomp-io_uring.json"}
 [ -n "$seccomp" ] && [ -f "$seccomp" ] && extra+=(--security-opt "seccomp=$seccomp")
+# STRATA_SYCL_USER=uid:gid (opt-in): the engine runs as that user instead of the image's root.  xe reports the VRAM a process
+# holds only in its /proc/<pid>/fdinfo, which the host user can then read (a VRAM watch needs no root); the render node
+# must be open to that user (renderD* is 0666 on most distributions)
+[ -n "${STRATA_SYCL_USER:-}" ] && extra+=(-u "$STRATA_SYCL_USER" -e HOME=/tmp)
 "${ctr[@]}" rm -f "$name" >/dev/null 2>&1 || true        # a container left behind by a killed server
 exec "${ctr[@]}" run --rm -i --name "$name" --device /dev/dri --oom-score-adj 1000 --stop-timeout 30 --no-healthcheck \
     --ulimit memlock=-1 "${extra[@]}" \
