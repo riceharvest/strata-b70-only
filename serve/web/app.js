@@ -501,7 +501,7 @@ const clock = (t) => new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit",
 const clockShort = (t) => new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
 const dayLabel = (iso) => new Date(`${iso}T12:00:00`).toLocaleDateString([], {month: "short", day: "numeric"});
 const FINISH = {stop: ["st-badge--generating", "Done"], length: ["st-badge--reading", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
-                disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
+                disconnect: ["st-badge--queued", "Closed"], timeout: ["st-badge--queued", "Timeout"], error: ["st-badge--error", "Error"]};
 const COLORS = {decode: "var(--c-decode)", prefill: "var(--c-prefill)", cached: "var(--c-cached)", fresh: "var(--c-fresh)", out: "var(--c-out)"};
 
 // % change of the recent half against the one before it, as a small chip; better = "up" or "down"

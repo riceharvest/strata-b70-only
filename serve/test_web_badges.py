@@ -15,13 +15,13 @@ SERVER = Path(__file__).resolve().parent / "server.py"
 class FinishBadges(unittest.TestCase):
     def test_a_timed_out_request_has_a_badge(self):
         src = APP.read_text(encoding="utf-8")
-        table = src[src.index("const badge = {stop:"):]
+        table = src[src.index("const FINISH = {stop:"):]
         table = table[:table.index("};")]
         self.assertRegex(table, r'timeout: \["st-badge--queued", "Timeout"\]')
 
     def test_every_finish_the_server_stores_has_a_badge(self):
         src = APP.read_text(encoding="utf-8")
-        table = src[src.index("const badge = {stop:"):]
+        table = src[src.index("const FINISH = {stop:"):]
         table = table[:table.index("};")]
         for finish in ("stop", "length", "cancel", "disconnect", "error", "timeout"):
             self.assertRegex(table, rf"\b{finish}:", finish)
