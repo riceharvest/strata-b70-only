@@ -126,6 +126,59 @@ class CMakeFile(unittest.TestCase):
             self.assertTrue((base / rel).is_file(), rel)
 
 
+def without_q36_branches(text: str) -> str:
+    """The text as a compile without STRATA_Q36_BUILD sees it: the `#if defined(STRATA_Q36_BUILD)` branches dropped, `#else` kept."""
+    out, stack = [], []
+    for line in text.split("\n"):
+        m = re.match(r"\s*#\s*(if|else|endif)\b(.*)", line)
+        if m and (m.group(1) != "if" or "STRATA_Q36_BUILD" in m.group(2)):
+            if m.group(1) == "if":
+                stack.append("!" in m.group(2).split("STRATA_Q36_BUILD")[0])
+            elif m.group(1) == "else":
+                stack[-1] = not stack[-1]
+            else:
+                stack.pop()
+            continue
+        if all(stack):
+            out.append(line)
+    return "\n".join(out)
+
+
+class StrataIsKeptAsItWas(unittest.TestCase):
+    """`strata` compiles the same kernel sources and headers as before: the 27B's forms are sources of strata-q36 only, and the
+    few lines of shared headers that know the dense family are behind STRATA_Q36_BUILD, which only strata-q36 defines."""
+
+    def test_the_kernel_files_say_nothing_of_it(self):
+        for rel in ("sycl/src/kernels/cuda/native_mmvq.dp.cpp", "sycl/src/kernels/cuda/dequant_bf16.dp.cpp",
+                    "sycl/include/strata/kernels/native_mmvq.hpp", "include/strata/kernels/dequant_bf16.hpp",
+                    "include/strata/artifact/gguf_reader.hpp", "sycl/src/program/generate.cpp"):
+            text = (ROOT / rel).read_text(encoding="utf-8")
+            for word in ("q36", "STRATA_Q36", "dense_mode", "Qwen35)"):
+                self.assertNotIn(word, text, f"{rel}: {word}")
+
+    def test_the_family_headers_know_the_dense_family_only_behind_the_definition(self):
+        for rel in ("include/strata/artifact/model_family.hpp", "include/strata/core/family_layout.hpp",
+                    "sycl/include/strata/core/family_layout.hpp"):
+            text = (ROOT / rel).read_text(encoding="utf-8")
+            self.assertIn("STRATA_Q36_BUILD", text, rel)
+            self.assertNotRegex(without_q36_branches(text), r"\bQwen35\b(?!Moe)", rel)
+
+    def test_only_strata_q36_defines_it(self):
+        text = CMAKE.read_text(encoding="utf-8")
+        self.assertEqual(len(re.findall(r"STRATA_Q36_BUILD=1", text)), 1)
+        block = q36_block(text)
+        self.assertRegex(block, r"target_compile_definitions\(strata-q36 PRIVATE [^)]*STRATA_Q36_BUILD=1")
+        self.assertIn("src/qwen35/q36_mmvq_dense.dp.cpp", block)
+        self.assertNotIn("q36_mmvq_dense", text.replace(block, ""), "the dense forms are not a source of any other target")
+
+    def test_no_other_build_file_lists_the_dense_source(self):
+        for rel in ("CMakeLists.txt", "sycl/CMakeLists.txt"):
+            text = (ROOT / rel).read_text(encoding="utf-8")
+            if rel == "sycl/CMakeLists.txt":
+                text = text.replace(q36_block(text), "")
+            self.assertNotIn("q36_mmvq_dense", text, rel)
+
+
 class ThirdParty(unittest.TestCase):
     PINS = {"sycl-tla": "87f6850680a580654b9ea2c80dbc01aeb36ad231", "vllm-xpu-kernels": "ddf336d86e3c8602888572a3502f951abd51df12"}
 

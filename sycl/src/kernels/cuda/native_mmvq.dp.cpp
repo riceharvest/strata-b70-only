@@ -2246,10 +2246,6 @@ inline bool kreg_env() {   // latched before graph capture
 }
 int g_kreg_override = -1;   // native_mmvq_set_kreg (tests): -1 = the STRATA_MMVQ_KREG latch
 inline bool kreg_on() { return g_kreg_override >= 0 ? g_kreg_override != 0 : kreg_env(); }
-// native_mmvq_set_dense_mode: strata-q36 turns on the 27B's forms below ("dense mode", after kreg_dispatch); 0 (strata, and the
-// default) leaves every call as it is without it.  Set once at start, before graph capture.
-int g_dense_mode = 0;
-inline bool dense_mode() { return g_dense_mode != 0; }
 
 // STRATA_XE2_KQ (the B70 default, strata::apply_b70_defaults; unset or 0: off, every launch below as before): the
 // decode window's dense kernels for a pack with Q5_K / Q6_K / Q8_0 dense tensors and a Q6_K head (Unsloth UD-IQ1_S).
@@ -2465,78 +2461,6 @@ struct KregIQ4XS {
     }
     static float dot(const W& r, const A& v) { return r.d * v.ds * (float) dp4a4(r.hi, v.u1, dp4a4(r.lo, v.u0, 0)); }
 };
-// IQ4_NL (M2): eight 18-byte blocks as one 256-weight group (144 bytes; a row is n_in / 32 blocks, so a group starts every
-// 144 bytes), lane g = block g: KregIQ4XS's table decode and dot with the block's own fp16 scale.  2-byte aligned qs loads.
-struct IQ4NLGroup { IQ4NLBlock b[8]; };
-static_assert(sizeof(IQ4NLGroup) == 144, "IQ4_NL group");
-struct KregIQ4NL {
-    using Block = IQ4NLGroup;
-    static constexpr int kTableWords = 256;
-    static uint32_t table_entry(int i) { return KregIQ4XS::table_entry(i); }
-    using A = KregIQ4XS::A;
-    using W = KregIQ4XS::W;
-    static A act(const Q81Block* xb, int g) { return KregIQ4XS::act(xb, g); }
-    static W load(const Block* b, int g, const uint32_t* tl) {
-        W r;
-        const IQ4NLBlock& q = b->b[g];
-        const sycl::int4 qv = load16_a2(q.qs);
-        const uint32_t v[4] = {(uint32_t) qv.x(), (uint32_t) qv.y(), (uint32_t) qv.z(), (uint32_t) qv.w()};
-        int lo[4], hi[4];
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const uint32_t P = tl[v[i] & 0xFF] | (tl[(v[i] >> 8) & 0xFF] << 8);
-            const uint32_t Q = tl[(v[i] >> 16) & 0xFF] | (tl[v[i] >> 24] << 8);
-            lo[i] = (int) ((P & 0xFFFFu) | (Q << 16));
-            hi[i] = (int) ((P >> 16) | (Q & 0xFFFF0000u));
-        }
-        r.lo = sycl::int4(lo[0], lo[1], lo[2], lo[3]); r.hi = sycl::int4(hi[0], hi[1], hi[2], hi[3]);
-        r.d = (float) q.d;
-        return r;
-    }
-    static float dot(const W& r, const A& v) { return KregIQ4XS::dot(r, v); }
-};
-// Q3_K (M2): lane g = the 256-block's 32 weights 32 g .. 32 g + 31 (Q8_1 block g): qs half n = g / 4 at shift 2 (g % 4),
-// hmask bit g, scales 2 g and 2 g + 1 (16 weights each).  q = (q2 | h << 2) - 4: the "- 4" as 4 * sum(x) per half block
-// on the activation side (once per column), so a column's dot is integer up to one conversion:
-// d * dx * float(s0 * (dp0 - 4 sum0) + s1 * (dp1 - 4 sum1)).  110-byte blocks: 2-byte aligned loads.
-struct KregQ3K {
-    static constexpr int kTableWords = 0;
-    static uint32_t table_entry(int) { return 0; }
-    using Block = Q3KBlock;
-    struct A { sycl::int4 u0, u1; int c0, c1; float ds; };
-    struct W { sycl::int4 lo, hi; int s0, s1; float d; };
-    static A act(const Q81Block* xb, int g) {
-        const sycl::int4 ones(0x01010101, 0x01010101, 0x01010101, 0x01010101);
-        A a;
-        a.u0 = ld_q8_16(xb + g, 0); a.u1 = ld_q8_16(xb + g, 1); a.ds = (float) xb[g].ds[0];
-        a.c0 = 4 * dp4a4(ones, a.u0, 0); a.c1 = 4 * dp4a4(ones, a.u1, 0);
-        return a;
-    }
-    static W load(const Block* b, int g) {
-        W r;
-        const int n = g >> 2, sh = 2 * (g & 3);
-        const uint8_t* bb = reinterpret_cast<const uint8_t*>(b);
-        const sycl::int4 h0 = load16_a2(bb), h1 = load16_a2(bb + 16);
-        const sycl::int4 q0 = load16_a2(bb + 32 + 32 * n), q1 = load16_a2(bb + 48 + 32 * n);
-        const sycl::int4 sc = load16_a2(bb + 96);   // scales[12], then d
-        auto v = [&](int q, int h) { return (((uint32_t) q >> sh) & 0x03030303u) | ((((uint32_t) h >> g) & 0x01010101u) << 2); };
-        r.lo = sycl::int4((int) v(q0.x(), h0.x()), (int) v(q0.y(), h0.y()), (int) v(q0.z(), h0.z()), (int) v(q0.w(), h0.w()));
-        r.hi = sycl::int4((int) v(q1.x(), h1.x()), (int) v(q1.y(), h1.y()), (int) v(q1.z(), h1.z()), (int) v(q1.w(), h1.w()));
-        const uint32_t sw[3] = {(uint32_t) sc.x(), (uint32_t) sc.y(), (uint32_t) sc.z()};
-        auto byte = [&](int i) { return (sw[i >> 2] >> (8 * (i & 3))) & 0xFFu; };
-        // scale j: low 4 bits sc[j] & 15 (j < 8) or sc[j - 8] >> 4, high 2 bits (sc[8 + j % 4] >> 2 (j / 4)) & 3; minus 32
-        const int j0 = 2 * g, j1 = 2 * g + 1;
-        const uint32_t l0 = g < 4 ? byte(j0) & 15u : byte(j0 - 8) >> 4, l1 = g < 4 ? byte(j1) & 15u : byte(j1 - 8) >> 4;
-        const uint32_t hh0 = (byte(8 + (j0 & 3)) >> (2 * (j0 >> 2))) & 3u, hh1 = (byte(8 + (j1 & 3)) >> (2 * (j1 >> 2))) & 3u;
-        r.s0 = (int) (l0 | hh0 << 4) - 32; r.s1 = (int) (l1 | hh1 << 4) - 32;
-        r.d = (float) sycl::bit_cast<sycl::half>((uint16_t) ((uint32_t) sc.w() & 0xFFFFu));
-        return r;
-    }
-    static float dot(const W& r, const A& a) {
-        const int i0 = dp4a4(r.lo, a.u0, 0) - a.c0, i1 = dp4a4(r.hi, a.u1, 0) - a.c1;
-        return r.d * a.ds * (float) (r.s0 * i0 + r.s1 * i1);
-    }
-};
 template <int R, int NCOLS> constexpr int kreg_p() { return (R * NCOLS + KREG_SG - 1) / KREG_SG * KREG_SG; }
 template <typename F, int NCOLS, int R>
 void native_mmvq_kreg_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
@@ -2650,350 +2574,6 @@ void kreg_dispatch(const void* w, const void* x, float* y, int n_in, int n_out, 
         } else launch_kreg<F, NCOLS, 8, 256>(w, x, y, n_in, n_out, s);
     }
 }
-
-// ===== dense mode (strata-q36: the 27B's KREG forms).  Everything from here to KREG2 below runs only after
-// native_mmvq_set_dense_mode(true); strata never sets it, so its launches are those above.  The forms are the
-// 27B tree's (sweeps on the B70, 2026-11-02 / 11-03): the two-piece (H = 2) and K-split rows for a row wider than
-// 16384, a persistent grid for every format, other tile shapes at 5-8 columns, and KREG for Q3_K and IQ4_NL.
-// H = 2 (M2, rows wider than 16384; STRATA_KREG_H2=0: off): a lane owns two 32-weight pieces of a row, block kb and kb + bpr / 2,
-// so a 17408-wide row takes 272 lanes (17 sub-groups: three groups a core with 128 registers, where 544 lanes left one group and
-// 30 idle threads a core).  The lane adds its two dots (first half, then second) before the butterfly: another summation order
-// than H = 1, the same for every column count (KREG2 then stays off for those rows).  The activation pieces of both halves are
-// in registers at 1-2 columns, reloaded per tile at 3-4.
-template <typename F, int NCOLS, int R, int H = 1, bool AR = (H == 1 || NCOLS <= 2)>
-void native_mmvq_kreg_dense_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
-                             float* __restrict__ y, int n_in, int n_out, float* __restrict__ slm) {
-    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<1>();
-    const sycl::sub_group sg = it.get_sub_group();
-    constexpr int P0 = R * NCOLS, P = kreg_p<R, NCOLS>(), PL = P / KREG_SG;
-    constexpr bool AREG = AR;   // the activation pieces stay in registers across tiles
-    const int lid = int(it.get_local_id(0)), lane = int(sg.get_local_linear_id()), sgi = lid / KREG_SG;
-    const int nsg = int(it.get_local_range(0)) / KREG_SG;
-    const int bpr = n_in / QK, x_stride = n_in / Q8K, bph = bpr / H;
-    const bool live = (lid >> 3) < bph;
-    const int kb = live ? (lid >> 3) : 0, g = lid & 7;
-    typename F::A a[AREG ? H : 1][NCOLS];
-    auto load_act = [&](int hh, typename F::A (&dst)[NCOLS]) {
-#pragma unroll
-        for (int j = 0; j < NCOLS; ++j) {
-            dst[j] = F::act(x + std::size_t(j) * x_stride + (kb + hh * bph) * (QK / Q8K), g);
-            if (!live) dst[j] = typename F::A{};
-        }
-    };
-    if constexpr (AREG) {
-#pragma unroll
-        for (int hh = 0; hh < H; ++hh) load_act(hh, a[hh]);
-    }
-    const uint32_t* tbl = nullptr;
-    if constexpr (F::kTableWords > 0) {   // per-group codebook table after the two reduction buffers
-        uint32_t* tw = reinterpret_cast<uint32_t*>(slm + 2 * nsg * P);
-        for (int i = lid; i < F::kTableWords; i += int(it.get_local_range(0))) tw[i] = F::table_entry(i);
-        it.barrier(sycl::access::fence_space::local_space);
-        tbl = tw;
-    }
-    const int ntiles = (n_out + R - 1) / R;
-    int buf = 0;
-    for (int t = int(it.get_group(0)); t < ntiles; t += int(it.get_group_range(0))) {
-        const int row0 = t * R;
-        const int rlast = n_out - 1 - row0;
-        float v[P];
-        // one half's weights and dots at a time (AREG: unrolled, the halves' activations indexed by a constant; else a rolled
-        // loop, so the compiler does not hoist the second half's loads next to the first's: 3-4 columns spilled that way)
-        auto half = [&](const int hh, const typename F::A* av) {
-            const typename F::Block* wt = w + std::size_t(row0) * bpr + kb + hh * bph;
-            typename F::W wv[R];
-#pragma unroll
-            for (int r = 0; r < R; ++r) {
-                if constexpr (F::kTableWords > 0) wv[r] = F::load(wt + (r < rlast ? r : rlast) * bpr, g, tbl);
-                else wv[r] = F::load(wt + (r < rlast ? r : rlast) * bpr, g);
-            }
-#pragma unroll
-            for (int r = 0; r < R; ++r)
-#pragma unroll
-                for (int j = 0; j < NCOLS; ++j) {
-                    const float d = F::dot(wv[r], av[j]);
-                    if (hh == 0) v[r * NCOLS + j] = d;
-                    else v[r * NCOLS + j] += d;
-                }
-        };
-        if constexpr (AREG) {
-#pragma unroll
-            for (int hh = 0; hh < H; ++hh) half(hh, a[hh]);
-        } else {
-#pragma nounroll
-            for (int hh = 0; hh < H; ++hh) {
-                typename F::A ar[NCOLS];
-                load_act(hh, ar);
-                half(hh, ar);
-            }
-        }
-#pragma unroll
-        for (int k = P0; k < P; ++k) v[k] = 0.0f;
-        kreg_tsum<KREG_SG / 2, P, P>(v, sg, lane);
-        float* b = slm + buf * nsg * P;
-#pragma unroll
-        for (int i = 0; i < PL; ++i) b[sgi * P + lane * PL + i] = v[i];
-        it.barrier(sycl::access::fence_space::local_space);   // SLM-only fence (group_barrier also fences global)
-        for (int k = lid; k < P0; k += int(it.get_local_range(0))) {
-            float s = 0.0f;
-            for (int q = 0; q < nsg; ++q) s += b[q * P + k];
-            const int r = k / NCOLS, j = k % NCOLS;
-            if (row0 + r < n_out) y[std::size_t(j) * n_out + row0 + r] = s;
-        }
-        buf ^= 1;   // the next tile writes the other buffer; this one is rewritten only after the next barrier
-    }
-}
-template <typename F, int NCOLS, int R, int GRF, int H = 1>
-void launch_kreg_dense(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, dpct::queue_ptr s) {
-    const auto* w = static_cast<const typename F::Block*>(weights);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const int L = ((n_in / QK / H) * 8 + KREG_SG - 1) / KREG_SG * KREG_SG;
-    const int nsg = L / KREG_SG;
-    constexpr int P = kreg_p<R, NCOLS>();
-    const int tiles = (n_out + R - 1) / R;
-    const int groups = std::min(tiles, kreg_groups_cap(NCOLS, nsg, GRF, s));   // (a group loops over tiles: the same sums)
-    s->submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> slm(sycl::range<1>(2 * nsg * P + F::kTableWords), h);
-        auto k = [=](sycl::nd_item<1>) [[sycl::reqd_sub_group_size(16)]] {
-            native_mmvq_kreg_dense_kernel<F, NCOLS, R, H, (H == 1 || NCOLS <= 2 || GRF == 256)>(
-                w, x, y, n_in, n_out, slm.get_multi_ptr<sycl::access::decorated::no>().get());
-        };
-        const sycl::nd_range<1> nr(std::size_t(groups) * L, L);
-        if constexpr (GRF == 256)
-            h.parallel_for<dpct_kernel_name<class native_mmvq_kreg_dense256, F, dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<R>,
-                                            dpct_kernel_scalar<H>>>(
-                nr, sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>}, k);
-        else
-            h.parallel_for<dpct_kernel_name<class native_mmvq_kreg_dense, F, dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<R>,
-                                            dpct_kernel_scalar<H>>>(nr, k);
-    });
-}
-// KS (M2, the default for rows wider than 16384 with an even block count; STRATA_KREG_KS=0: off): the row's K split over
-// two work-groups (bench, 17408 x 5120 on the B70: 4 columns Q5_K 183 -> 130 us, Q4_K 152 -> 102, IQ4_XS 157 -> 122,
-// IQ4_NL 155 -> 119, Q6_K 155 -> 144; 1 column Q5_K 139 -> 128, Q4_K 114 -> 94). Group g
-// takes part g % ks (ks parts of bpr / ks blocks each) of tile g / ks, ...; each part's sum is the one-piece arithmetic over
-// its blocks (butterfly, then sub-group order) into a scratch plane, and a second launch adds the planes in part order
-// (((p0 + p1) + p2) + p3).  Another summation order than one piece, the same at every column count.
-// M4 (STRATA_KREG_KS=4, opt-in): ks = 4 where the block count allows it (the 27B's 17408-wide ffn_down: 68 blocks, 136 live
-// lanes of a 144-lane group, 7 groups a core with 128 registers where the 272-lane halves fit 3), so 5-8 columns run in ONE
-// launch pair (R 4 / 256 registers for the K-quants: 8 columns of their activations are 96 registers a lane), every weight
-// read once per window where the halves run 5-8 columns as 4 columns and the rest.  Measured on the B70 (2026-11-03, 27B,
-// MTP 5): the 256-register 5-6 column launches ran 228 us a call against ~126 us for 1-4 columns, little better than the
-// split, and the 4-part sums moved two near-tie top-1 picks of the KL gate (answers 0.9883 -> 0.9824, KL unchanged): the
-// default stays the M2 halves.
-template <typename F, int NCOLS, int R>
-void native_mmvq_kreg_ks_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
-                                float* __restrict__ part, int n_in, int n_out, int ks, float* __restrict__ slm) {
-    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<1>();
-    const sycl::sub_group sg = it.get_sub_group();
-    constexpr int P0 = R * NCOLS, P = kreg_p<R, NCOLS>(), PL = P / KREG_SG;
-    const int lid = int(it.get_local_id(0)), lane = int(sg.get_local_linear_id()), sgi = lid / KREG_SG;
-    const int nsg = int(it.get_local_range(0)) / KREG_SG;
-    const int bpr = n_in / QK, x_stride = n_in / Q8K, bph = bpr / ks;
-    const int hh = int(it.get_group(0)) % ks;
-    const bool live = (lid >> 3) < bph;
-    const int kb = (live ? (lid >> 3) : 0) + hh * bph, g = lid & 7;
-    float* out = part + std::size_t(hh) * NCOLS * n_out;
-    typename F::A a[NCOLS];
-#pragma unroll
-    for (int j = 0; j < NCOLS; ++j) {
-        a[j] = F::act(x + std::size_t(j) * x_stride + kb * (QK / Q8K), g);
-        if (!live) a[j] = typename F::A{};
-    }
-    const uint32_t* tbl = nullptr;
-    if constexpr (F::kTableWords > 0) {
-        uint32_t* tw = reinterpret_cast<uint32_t*>(slm + 2 * nsg * P);
-        for (int i = lid; i < F::kTableWords; i += int(it.get_local_range(0))) tw[i] = F::table_entry(i);
-        it.barrier(sycl::access::fence_space::local_space);
-        tbl = tw;
-    }
-    const int ntiles = (n_out + R - 1) / R;
-    int buf = 0;
-    for (int t = int(it.get_group(0)) / ks; t < ntiles; t += int(it.get_group_range(0)) / ks) {
-        const int row0 = t * R;
-        const typename F::Block* wt = w + std::size_t(row0) * bpr + kb;
-        const int rlast = n_out - 1 - row0;
-        typename F::W wv[R];
-#pragma unroll
-        for (int r = 0; r < R; ++r) {
-            if constexpr (F::kTableWords > 0) wv[r] = F::load(wt + (r < rlast ? r : rlast) * bpr, g, tbl);
-            else wv[r] = F::load(wt + (r < rlast ? r : rlast) * bpr, g);
-        }
-        float v[P];
-#pragma unroll
-        for (int r = 0; r < R; ++r)
-#pragma unroll
-            for (int j = 0; j < NCOLS; ++j) v[r * NCOLS + j] = F::dot(wv[r], a[j]);
-#pragma unroll
-        for (int k = P0; k < P; ++k) v[k] = 0.0f;
-        kreg_tsum<KREG_SG / 2, P, P>(v, sg, lane);
-        float* b = slm + buf * nsg * P;
-#pragma unroll
-        for (int i = 0; i < PL; ++i) b[sgi * P + lane * PL + i] = v[i];
-        it.barrier(sycl::access::fence_space::local_space);
-        for (int k = lid; k < P0; k += int(it.get_local_range(0))) {
-            float s = 0.0f;
-            for (int q = 0; q < nsg; ++q) s += b[q * P + k];
-            const int r = k / NCOLS, j = k % NCOLS;
-            if (row0 + r < n_out) out[std::size_t(j) * n_out + row0 + r] = s;
-        }
-        buf ^= 1;
-    }
-}
-constexpr int kKregKsMax = 4;   // the most parts a row's K is split into
-inline float* kreg_ks_scratch(dpct::queue_ptr s) {   // 4 planes x 8 columns x 65536 rows, made once (before any graph uses it)
-    static float* p = sycl::malloc_device<float>(std::size_t(kKregKsMax) * 8 * 65536, *s);
-    return p;
-}
-/// The K split of a row (0: none): rows wider than 16384 (the default; STRATA_KREG_KS=0: H = 2 / one piece) in 2 parts;
-/// STRATA_KREG_KS=4: in 4 where the row's block count allows it.  It depends on the shape alone, never on the column count,
-/// so a T-column call stays bitwise T one-column calls.
-inline int kreg_ks_n(int n_in, int n_out) {
-    static const int e = [] { const char* v = std::getenv("STRATA_KREG_KS"); return v && v[0] ? std::atoi(v) : -1; }();
-    if (e == 0 || n_in <= 16384 || n_out > 65536 || n_in % QK != 0) return 0;
-    const int bpr = n_in / QK;
-    if (e == 4 && bpr % 4 == 0) return 4;
-    return bpr % 2 == 0 ? 2 : 0;
-}
-inline bool kreg_ks(int n_in, int n_out) { return kreg_ks_n(n_in, n_out) > 0; }
-template <typename F, int NCOLS, int R, int GRF>
-void launch_kreg_ks(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, dpct::queue_ptr s) {
-    const auto* w = static_cast<const typename F::Block*>(weights);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    float* part = kreg_ks_scratch(s);
-    const int ks = kreg_ks_n(n_in, n_out);   // 2 or 4 (the caller checked kreg_ks)
-    const int L = ((n_in / QK / ks) * 8 + KREG_SG - 1) / KREG_SG * KREG_SG;
-    const int nsg = L / KREG_SG;
-    constexpr int P = kreg_p<R, NCOLS>();
-    const int tiles = (n_out + R - 1) / R;
-    const int groups = ks * std::min(tiles, std::max(1, kreg_groups_cap(NCOLS, nsg, GRF, s) / ks));
-    s->submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> slm(sycl::range<1>(2 * nsg * P + F::kTableWords), h);
-        auto k = [=](sycl::nd_item<1>) [[sycl::reqd_sub_group_size(16)]] {
-            native_mmvq_kreg_ks_kernel<F, NCOLS, R>(w, x, part, n_in, n_out, ks,
-                                                     slm.get_multi_ptr<sycl::access::decorated::no>().get());
-        };
-        const sycl::nd_range<1> nr(std::size_t(groups) * L, L);
-        if constexpr (GRF == 256)
-            h.parallel_for<dpct_kernel_name<class native_mmvq_kreg_ks256, F, dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<R>>>(
-                nr, sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>}, k);
-        else
-            h.parallel_for<dpct_kernel_name<class native_mmvq_kreg_ks, F, dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<R>>>(nr, k);
-    });
-    const std::size_t n = std::size_t(NCOLS) * n_out;
-    s->parallel_for<dpct_kernel_name<class native_mmvq_kreg_ks_add, F, dpct_kernel_scalar<NCOLS>>>(
-        sycl::range<1>(n), [=](sycl::id<1> i) {
-            float v = part[i] + part[n + i];   // the planes in part order (ks 2: the M2 sum, bit for bit)
-            for (int q = 2; q < ks; ++q) v += part[std::size_t(q) * n + i];
-            y[i] = v;
-        });
-}
-// Per-(format, columns) tile shape: R rows per tile, GRF mode. R and the GRF mode change no sum (a column's sum depends on
-// neither: see above), so any choice is bitwise the same output.
-//   - the 2026-10-16 sweep on an Arc Pro B70 (Qwen3.8-Flash-Next shapes, n_in 2560 / 6144): kreg_default_rg;
-//   - a 256-register form allows 512 lanes a work-group: a wider row (17408: 544 lanes) takes the 128-register form of
-//     the same R (R 8 -> 4 there); try_kreg runs such rows at 5-8 columns as 4 columns and the rest, and with H = 2
-//     (272 lanes, the default for them) kreg_dispatch picks its own tiles;
-//   - STRATA_KREG_RG="R,G" (bench knob, read once): every call at 2-8 columns takes R in {2,4,8}, G in {128,256} where
-//     that fits the lane rule above.
-struct KregRG { int r, g; };
-// M4: 7-8 columns (an MTP window of 6-7 drafts) at R 4 / 256 registers for the Q4_K-like formats (R 8 there holds 64 sums,
-// 96 weight and 84-96 activation registers a lane: past 256) and Q5_K (R 2 / 128: 84-96 activation registers alone); IQ4_XS
-// at R 2 (R 4 / 128: 63-72 + 36 + 32).  5-6 columns as M2 measured them (2026-11-02, waves 1: Q5_K 5120 x 17408 at 5
-// columns 147 us at R 2 / 128, 146 at R 8 / 256).
-template <typename F, int NCOLS>
-KregRG kreg_default_rg(int n_in) {
-    if constexpr (std::is_same_v<F, KregIQ4XS>) return NCOLS == 1 ? KregRG{8, 128} : NCOLS <= 6 ? KregRG{4, 128} : KregRG{2, 128};
-    else if constexpr (std::is_same_v<F, KregQ6K>) return NCOLS <= 3 ? KregRG{4, 128} : KregRG{2, 128};
-    else {
-        if constexpr (NCOLS == 1) return {4, 128};
-        else if constexpr (NCOLS == 2) return n_in <= 4096 ? KregRG{8, 256} : KregRG{4, 128};
-        else if constexpr (NCOLS <= 4) return {4, 128};
-        else if constexpr (NCOLS >= 7) return {4, 256};
-        else if constexpr (std::is_same_v<F, KregQ5K>) return n_in <= 4096 ? KregRG{8, 256} : KregRG{2, 128};
-        else return {8, 256};
-    }
-}
-inline KregRG kreg_env_rg() {
-    static const KregRG v = [] {
-        KregRG k{0, 0};
-        if (const char* e = std::getenv("STRATA_KREG_RG")) {
-            int r = 0, g = 0;
-            if (std::sscanf(e, "%d,%d", &r, &g) == 2 && (r == 2 || r == 4 || r == 8) && (g == 128 || g == 256)) k = {r, g};
-        }
-        return k;
-    }();
-    return v;
-}
-// M2: rows wider than 16384 in the two-piece (H = 2) form, per format (a format takes one form at every column count).  The
-// default from the 17408 x 5120 bench on the B70 (2026-11-02): Q6_K, IQ4_XS, IQ4_NL and Q3_K two-piece (Q6_K 1 column 165 ->
-// 129 us, 4 columns 204 -> 155; IQ4_XS 1-2 columns 117-145 -> 109); Q4_K / Q5_K one-piece (two-piece: 1-2 columns faster,
-// 3-4 columns slower, Q5_K 4 columns 172 -> 220 us).  STRATA_KREG_H2=1: every format two-piece, 0: none.
-template <typename F>
-inline bool kreg_h2(int n_in) {
-    static const int e = [] { const char* v = std::getenv("STRATA_KREG_H2"); return v ? (v[0] == '1' ? 1 : 0) : -1; }();
-    const bool on = e >= 0 ? e == 1 : !(std::is_same_v<F, KregQ4K> || std::is_same_v<F, KregQ5K>);
-    return on && n_in > 16384 && (n_in / QK) % 2 == 0;
-}
-inline bool kreg_h2g() {   // STRATA_KREG_H2G=1: the two-piece form at 3-4 columns in 256 registers (activations kept), R 4
-    static const bool v = [] { const char* e = std::getenv("STRATA_KREG_H2G"); return e && e[0] == '1'; }();
-    return v;
-}
-// M4: the K-split rows' tiles.  1-4 columns R 4 / 128 registers (M2).  5-8 columns (ks 4, STRATA_KREG_KS=4, only: try_kreg
-// splits ks 2) by the
-// format's register needs per lane (activations a column + weights a row, both x the count, + the sums): Q4_K / Q5_K / Q3_K
-// 11-12 + 11-12 at R 4 / 256 (60-96 + 48 + 32); Q6_K R 2 / 128 as its other 5-8 column rows (10 + 10: 50-80 + 20 + 16; M2's
-// 256-register Q6_K forms ran 1.3-1.4x slower); IQ4_XS / IQ4_NL 9 + 9 at R 4 / 128 to 6 columns (45-54 + 36 + 32), R 2 above.
-template <typename F, int NCOLS>
-constexpr KregRG kreg_ks_rg() {
-    if constexpr (NCOLS <= 4) return {4, 128};
-    else if constexpr (std::is_same_v<F, KregQ6K>) return {2, 128};
-    else if constexpr (std::is_same_v<F, KregIQ4XS> || std::is_same_v<F, KregIQ4NL>) return NCOLS <= 6 ? KregRG{4, 128} : KregRG{2, 128};
-    else return {4, 256};
-}
-template <typename F, int NCOLS>
-void kreg_dispatch_dense(const void* w, const void* x, float* y, int n_in, int n_out, dpct::queue_ptr s) {
-    if (kreg_ks(n_in, n_out)) {
-        constexpr KregRG c = kreg_ks_rg<F, NCOLS>();
-        launch_kreg_ks<F, NCOLS, c.r, c.g>(w, x, y, n_in, n_out, s);
-        return;
-    }
-    if constexpr (NCOLS <= 4) {   // (R 4 at 1-2 columns, 2 at 3-4; STRATA_KREG_H2G=1: 3-4 in 256 registers at R 4)
-        if (kreg_h2<F>(n_in)) {
-            if constexpr (NCOLS >= 3) {
-                if (kreg_h2g()) { launch_kreg_dense<F, NCOLS, 4, 256, 2>(w, x, y, n_in, n_out, s); return; }
-            }
-            launch_kreg_dense<F, NCOLS, NCOLS <= 2 ? 4 : 2, 128, 2>(w, x, y, n_in, n_out, s);
-            return;
-        }
-    } else {                      // 5-8 columns (STRATA_KREG_H2W=0: off): 272 lanes allow the 256-register form; R 2
-        if (kreg_h2<F>(n_in)) { launch_kreg_dense<F, NCOLS, 2, 256, 2>(w, x, y, n_in, n_out, s); return; }
-    }
-    KregRG rg = kreg_default_rg<F, NCOLS>(n_in);
-    if constexpr (NCOLS == 1) {   // one form per format (the 1-column tiles were not re-swept)
-        if (rg.r == 8) launch_kreg_dense<F, 1, 8, 128>(w, x, y, n_in, n_out, s);
-        else launch_kreg_dense<F, 1, 4, 128>(w, x, y, n_in, n_out, s);
-        return;
-    } else {
-        const KregRG ov = kreg_env_rg();
-        if (ov.r > 0) rg = ov;
-        const int L = ((n_in / QK) * 8 + KREG_SG - 1) / KREG_SG * KREG_SG;
-        if (rg.g == 256 && L > 512) rg = {rg.r > 4 ? 4 : rg.r, 128};   // (the 17408-wide ffn_down at 5-8 columns: Q4_K's R 8 / 256)
-        if (rg.g == 128 && rg.r == 8) rg.r = 4;                        // (no 8-row 128-register form)
-        if (rg.g == 256 && rg.r == 2) rg.r = 4;                        // (nor a 2-row 256-register one)
-        if (rg.g == 256) {
-            if (rg.r == 8) launch_kreg_dense<F, NCOLS, 8, 256>(w, x, y, n_in, n_out, s);
-            else launch_kreg_dense<F, NCOLS, 4, 256>(w, x, y, n_in, n_out, s);
-        } else {
-            if (rg.r == 2) launch_kreg_dense<F, NCOLS, 2, 128>(w, x, y, n_in, n_out, s);
-            else launch_kreg_dense<F, NCOLS, 4, 128>(w, x, y, n_in, n_out, s);
-        }
-    }
-}
-// the formats that only dense mode has (their callers check dense_mode() first)
-template <typename F>
-constexpr bool kKregDenseOnly = std::is_same_v<F, KregQ3K> || std::is_same_v<F, KregIQ4NL>;
-// ===== end of dense mode
 // KREG2 (IQ4_XS at 1-4 columns under STRATA_MMVQ_KREG=1, at 5-8 columns when STRATA_KREG2_R names them; STRATA_KREG2=0:
 // off): the KREG IQ4_XS per-output arithmetic
 // (a column's sum is bitwise the KREG one: the 16-lane butterfly and the sub-group-ordered SLM sum do not depend on
@@ -3175,7 +2755,6 @@ bool k2_go(const Kreg2Cfg& c, const void* w, const void* x, float* y, int n_in, 
 inline bool try_kreg2(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, dpct::queue_ptr s) {
     const Kreg2Cfg& c = kreg2_cfg();
     if (!c.on || g_kreg_override == 3) return false;   // native_mmvq_set_kreg(3) (bench): KREG without KREG2
-    if (dense_mode() && (kreg_h2<KregIQ4XS>(n_in) || kreg_ks(n_in, n_out))) return false;   // (the H = 2 / KS rows: KREG at every column count)
     switch (ncols) {
         case 1: return k2_go<1>(c, w, x, y, n_in, n_out, s);
         case 2: return k2_go<2>(c, w, x, y, n_in, n_out, s);
@@ -3198,41 +2777,17 @@ bool try_kreg(const void* weights, const void* x_q8_1, float* y, int n_in, int n
     if (std::is_same_v<F, KregIQ4XS> && (wa & 7u) != 0) return false;
     if ((wa & 1u) != 0 || (reinterpret_cast<uintptr_t>(x_q8_1) & 3u) != 0) return false;
     const auto s = strata::q_of(stream);
-    if (dense_mode()) {
-        // dense mode (strata-q36).  A row wider than 16384 (the 27B's ffn_down, 17408: 544 lanes, so only the 128-register
-        // form) at 5-8 columns: 4 columns, then the rest.  In one launch the activations of 5-8 columns spill (Q4_K 17408 x
-        // 5120: 4 columns 154 us, 6 columns 665 us, 8 columns 4.4 ms, and a lost device after it).  Each launch is bitwise
-        // its one-column calls.  (The two-piece formats take 5-8 columns in one 256-register launch: 17408 x 5120 Q6_K 6
-        // columns 373 -> 315 us, IQ4_XS 309 -> 286; Q4_K / Q5_K, one-piece, keep the split: their 5-8 column launches
-        // spill.  STRATA_KREG_H2W=0: split all.  The K-split rows at 5-8 columns too with the halves: 4 + the rest beat one
-        // 256-register launch of 272 lanes, Q5_K 5 columns 258 against 401 us.  STRATA_KREG_KS=4 runs them in one launch
-        // pair, kreg_dispatch_dense.)
-        static const bool h2w = [] { const char* e = std::getenv("STRATA_KREG_H2W"); return !(e && e[0] == '0'); }();
-        const int ksn = kreg_ks_n(n_in, n_out);
-        if (ncols > 4 && n_in > 16384 && (ksn == 2 || (ksn == 0 && !(h2w && kreg_h2<F>(n_in))))) {
-            try_kreg<F>(weights, x_q8_1, y, n_in, n_out, 4, stream);
-            return try_kreg<F>(weights, static_cast<const Q81Block*>(x_q8_1) + std::size_t(4) * (n_in / Q8K), y + std::size_t(4) * n_out,
-                               n_in, n_out, ncols - 4, stream);
-        }
-    }
     if constexpr (std::is_same_v<F, KregIQ4XS>)
         if (try_kreg2(weights, x_q8_1, y, n_in, n_out, ncols, s)) return true;   // the default; STRATA_KREG2=0: off
-    auto go = [&](auto nc) {
-        constexpr int N = decltype(nc)::value;
-        if constexpr (kKregDenseOnly<F>) kreg_dispatch_dense<F, N>(weights, x_q8_1, y, n_in, n_out, s);   // (reached in dense mode only)
-        else if (dense_mode()) kreg_dispatch_dense<F, N>(weights, x_q8_1, y, n_in, n_out, s);
-        else kreg_dispatch<F, N>(weights, x_q8_1, y, n_in, n_out, s);
-        return true;
-    };
     switch (ncols) {
-        case 1: return go(std::integral_constant<int, 1>());
-        case 2: return go(std::integral_constant<int, 2>());
-        case 3: return go(std::integral_constant<int, 3>());
-        case 4: return go(std::integral_constant<int, 4>());
-        case 5: return go(std::integral_constant<int, 5>());
-        case 6: return go(std::integral_constant<int, 6>());
-        case 7: return go(std::integral_constant<int, 7>());
-        default: return go(std::integral_constant<int, 8>());
+        case 1: kreg_dispatch<F, 1>(weights, x_q8_1, y, n_in, n_out, s); return true;
+        case 2: kreg_dispatch<F, 2>(weights, x_q8_1, y, n_in, n_out, s); return true;
+        case 3: kreg_dispatch<F, 3>(weights, x_q8_1, y, n_in, n_out, s); return true;
+        case 4: kreg_dispatch<F, 4>(weights, x_q8_1, y, n_in, n_out, s); return true;
+        case 5: kreg_dispatch<F, 5>(weights, x_q8_1, y, n_in, n_out, s); return true;
+        case 6: kreg_dispatch<F, 6>(weights, x_q8_1, y, n_in, n_out, s); return true;
+        case 7: kreg_dispatch<F, 7>(weights, x_q8_1, y, n_in, n_out, s); return true;
+        default: kreg_dispatch<F, 8>(weights, x_q8_1, y, n_in, n_out, s); return true;
     }
 }
 
@@ -3296,73 +2851,8 @@ void native_mmvq_wide32_kernel(const typename F::Block* __restrict__ w, const Q8
         if (lane == 0) y[std::size_t(j) * n_out + row] = v;
     }
 }
-// Dense mode: IQ4_NL's codebook through a 256-entry SLM table indexed by a qs byte (KregIQ4XS's TL[b] = code(b & 15) |
-// code(b >> 4) << 16): two lookups and two shifts give four low and four high codes, where iq4_lut4's select chain costs ~10
-// instructions a nibble.  The same integers in the same order: bitwise Wide32IQ4NL.  A kernel of its own, so the Q8_0 launches
-// and Flash-Next's IQ4_NL ones stay as they were.
-__dpct_inline__ void iq4nl_tbl_decode(const sycl::int4 q, const uint32_t* tl, sycl::int4& lo4, sycl::int4& hi4) {
-    const uint32_t v[4] = {(uint32_t) q.x(), (uint32_t) q.y(), (uint32_t) q.z(), (uint32_t) q.w()};
-    int lo[4], hi[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const uint32_t P = tl[v[i] & 0xFF] | (tl[(v[i] >> 8) & 0xFF] << 8);
-        const uint32_t Q = tl[(v[i] >> 16) & 0xFF] | (tl[v[i] >> 24] << 8);
-        lo[i] = (int) ((P & 0xFFFFu) | (Q << 16));
-        hi[i] = (int) ((P >> 16) | (Q & 0xFFFF0000u));
-    }
-    lo4 = sycl::int4(lo[0], lo[1], lo[2], lo[3]); hi4 = sycl::int4(hi[0], hi[1], hi[2], hi[3]);
-}
-template <int NCOLS>
-void native_mmvq_wide32_iq4nl_tbl_kernel(const IQ4NLBlock* __restrict__ w, const Q81Block* __restrict__ x,
-                                         float* __restrict__ y, int n_in, int n_out, uint32_t* __restrict__ tl) {
-    using F = Wide32IQ4NL;
-    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    const int lane = int(item.get_local_id(2)), warp = int(item.get_local_id(1));
-    for (int i = warp * WARP + lane; i < 256; i += WARPS * WARP)   // the table, before any row returns
-        tl[i] = (uint32_t) (uint8_t) kIq4nlTable[i & 15] | ((uint32_t) (uint8_t) kIq4nlTable[i >> 4] << 16);
-    item.barrier(sycl::access::fence_space::local_space);
-    const int row = int(item.get_group(2)) * WARPS + warp;
-    if (row >= n_out) return;
-    constexpr int BPS = WARP / F::LPB;                  // blocks per sub-group step
-    const int blocks_per_row = n_in / 32;
-    const int sub = lane / F::LPB;
-    const IQ4NLBlock* wr = w + std::size_t(row) * blocks_per_row;
-    float acc[NCOLS] = {};
-    for (int kb = sub; kb < blocks_per_row; kb += BPS) {
-        F::W wv;
-        iq4nl_tbl_decode(load16_a2(wr[kb].qs), tl, wv.lo, wv.hi);
-        wv.d = (float) wr[kb].d;
-#pragma unroll
-        for (int j = 0; j < NCOLS; ++j) acc[j] += F::apply(wv, x + std::size_t(j) * blocks_per_row + kb);
-    }
-    auto sg = item.get_sub_group();
-#pragma unroll
-    for (int j = 0; j < NCOLS; ++j) {
-        float v = acc[j];
-#pragma unroll
-        for (int o = WARP / 2; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
-        if (lane == 0) y[std::size_t(j) * n_out + row] = v;
-    }
-}
-template <int NCOLS>
-void launch_wide32_iq4nl_tbl(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, dpct::queue_ptr s) {
-    const auto* w = static_cast<const IQ4NLBlock*>(weights);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-    s->submit([&](sycl::handler& h) {
-        sycl::local_accessor<uint32_t, 1> tl(sycl::range<1>(256), h);
-        h.parallel_for<dpct_kernel_name<class native_mmvq_wide32_iq4nl_tbl, dpct_kernel_scalar<NCOLS>>>(
-            sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
-            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
-                native_mmvq_wide32_iq4nl_tbl_kernel<NCOLS>(w, x, y, n_in, n_out, tl.get_multi_ptr<sycl::access::decorated::no>().get());
-            });
-    });
-}
 template <typename F, int NCOLS>
 void launch_wide32(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, dpct::queue_ptr s) {
-    if constexpr (std::is_same_v<F, Wide32IQ4NL>) {
-        if (dense_mode()) { launch_wide32_iq4nl_tbl<NCOLS>(weights, x_q8_1, y, n_in, n_out, s); return; }
-    }
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
@@ -6142,7 +5632,6 @@ void native_q6_k_unpack(const void* weights) {
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
 void native_mmvq_set_q6k_wide(bool on) { g_q6k_wide = on; }
 void native_mmvq_set_kreg(int on) { g_kreg_override = on; }
-void native_mmvq_set_dense_mode(bool on) { g_dense_mode = on ? 1 : 0; }
 void native_mmvq_set_xe2_kq(int parts) { g_xe2_kq_override = parts < 0 ? -1 : (parts == 1 ? kXe2KqDefault : (parts & kXe2KqAll)); }
 int native_mmvq_xe2_kq_seen() { return g_xe2_kq_seen.exchange(0, std::memory_order_relaxed); }
 void native_q6_k_mmvq_stride224(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
@@ -6541,9 +6030,6 @@ void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
-    // dense mode (strata-q36, the 27B's Q3_K tensors; STRATA_KREG_Q3K=0: off): KREG
-    static const bool kq3 = [] { const char* e = std::getenv("STRATA_KREG_Q3K"); return !(e && e[0] == '0'); }();
-    if (dense_mode() && kq3 && try_kreg<KregQ3K>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }   // STRATA_MMVQ_KREG=1
     STRATA_WAVE_MMVQ(Q3KTraits)
     if (ncols > 1) {
         launch_multi<Q3KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
@@ -7010,9 +6496,6 @@ void native_q8_0_f32(const void* weights, const float* x, void* scratch_q8_1,
 
 void native_iq4_nl_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
-    // dense mode (strata-q36; STRATA_KREG_IQ4NL=0: off): KREG
-    static const bool knl = [] { const char* e = std::getenv("STRATA_KREG_IQ4NL"); return !(e && e[0] == '0'); }();
-    if (dense_mode() && knl && try_kreg<KregIQ4NL>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }   // STRATA_MMVQ_KREG=1
     if (try_wide32<Wide32IQ4NL>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
     small_mmvq<IQ4NLBlock, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
 }

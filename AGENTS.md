@@ -50,8 +50,9 @@ are in docs/B70.md.
 
 - One configuration: the one in docs/B70.md (Flash-Next, `strata`). `strata-q36` (the dense Qwen3.8-27B, docs/Q36.md) is the one
   optional second model; it stays off by default and apart from `strata`. Do not add a third model, another quant, or a second GPU
-  path. A kernel in the shared library that `strata-q36` needs differently goes behind its own switch (`native_mmvq_set_dense_mode`
-  is the example), so `strata` launches what it launched; a change that moves `strata` needs a measurement on `strata`.
+  path. What `strata-q36` needs differently from a shared kernel or header goes into sources of its own (`sycl/src/qwen35`, as
+  `q36_mmvq_dense.dp.cpp` does) or behind `STRATA_Q36_BUILD`, which only the `strata-q36` target defines, so `strata` compiles the
+  same sources as without it; a change that moves `strata` needs a measurement on `strata`.
 - One stream. The served setup is single-stream (`parallel` unset). Two streams were measured on the B70 and did not beat one:
   102-118 tok/s solo against 81-102 together, and a prompt read and a decode take turns. `parallel` stays an opt-in setting;
   work goes into the single stream unless parallel is asked for.

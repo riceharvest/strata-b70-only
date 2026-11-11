@@ -32,6 +32,7 @@
 #include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "q36_mmvq_dense.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -83,6 +84,14 @@ bool requant_q8_0(int type, const void* src, int64_t n_in, int64_t n_out, std::v
 namespace {
 
 namespace K = strata::kernels;
+
+// The 27B's decode forms (q36_mmvq_dense.dp.cpp, built into this binary only) take the dense model's products; every other
+// call, and any that they decline, is the shared native_mmvq's.
+bool g_q36_dense_forms = false;
+inline void q36_mmvq(int type, const void* w, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream) {
+    if (g_q36_dense_forms && strata::q36dense::mmvq(type, w, xq, y, n_in, n_out, ncols, stream)) return;
+    K::native_mmvq(type, w, xq, y, n_in, n_out, ncols, stream);
+}
 #if !defined(STRATA_Q36_PORT)
 namespace MMQ = strata::prefill::mmq;
 #endif
@@ -2897,7 +2906,8 @@ struct Engine {
             }
             // M3a: the prompt's weights dequantized by the wide kernels (8 values a thread, 16-byte stores; bitwise the plain
             // kernel's values): on the B70 the plain kernel's 2-byte stores ran at ~165 GB/s, 62% of a 306-token prompt's GPU
-            // time; the wide ones ~485 GB/s (629 -> 405 ms).  STRATA_DEQUANT_WIDE=0 keeps the plain kernel.
+            // time; the wide ones ~485 GB/s (629 -> 405 ms).  STRATA_DEQUANT_WIDE=0 keeps the plain kernel.  (The library's wide kernels take
+            // Q4_K, Q5_K, Q6_K and IQ4_XS; a Q3_K or IQ4_NL matrix is dequantized by the plain one.)
             {   // (an explicit STRATA_DEQUANT_WIDE=0 stays off: dequant_set_wide would override it)
                 const char* dw = std::getenv("STRATA_DEQUANT_WIDE");
                 if (!(dw != nullptr && dw[0] != '\0' && std::atoi(dw) == 0)) strata::kernels::dequant_set_wide(1);
@@ -3254,7 +3264,7 @@ struct Engine {
             const size_t qb = K::native_q8_1_bytes(w.n_in, 1);
             for (int c0 = 0; c0 < T; c0 += 8) {
                 const int nc = std::min(8, T - c0);
-                K::native_mmvq(w.type, w.d, (const char*) q + (size_t) c0 * qb, vbuf + (size_t) c0 * w.n_out, w.n_in, w.n_out,
+                q36_mmvq(w.type, w.d, (const char*) q + (size_t) c0 * qb, vbuf + (size_t) c0 * w.n_out, w.n_in, w.n_out,
                                nc, st);
             }
             verify_cmp("q8_small", out, vbuf, (size_t) T * w.n_out,
@@ -3520,7 +3530,7 @@ work-group size if needed.
         const size_t qb = K::native_q8_1_bytes(w.n_in, 1);
         for (int c0 = 0; c0 < T; c0 += 8) {
             const int nc = std::min(8, T - c0);
-            K::native_mmvq(w.type, w.d, (const char*) q + (size_t) c0 * qb, out + (size_t) c0 * w.n_out, w.n_in, w.n_out, nc, st);
+            q36_mmvq(w.type, w.d, (const char*) q + (size_t) c0 * qb, out + (size_t) c0 * w.n_out, w.n_in, w.n_out, nc, st);
         }
     }
     void group_old(const Layer& L, const int32_t* slot_of, int T, unsigned long long* o_ptr, int32_t* o_start, int32_t* o_ng,
@@ -3886,7 +3896,7 @@ work-group size if needed.
         const size_t qb = K::native_q8_1_bytes(w.n_in, 1);
         for (int c0 = 0; c0 < T; c0 += maxc) {
             const int nc = std::min(maxc, T - c0);
-            K::native_mmvq(w.type, w.d, (const char*) q + (size_t) c0 * qb, out + (size_t) c0 * w.n_out, w.n_in,
+            q36_mmvq(w.type, w.d, (const char*) q + (size_t) c0 * qb, out + (size_t) c0 * w.n_out, w.n_in,
                            w.n_out, nc, st);
         }
     }
@@ -7573,14 +7583,14 @@ int strata::qwen35::run(int argc, char** argv) {
     }
     if (m.dense) {
         // the KREG decode kernels (STRATA_MMVQ_KREG, docs/INTEL.md): +23% decode on the 27B, KL in line with the default kernels
-        // (the 17408-wide ffn_down: see try_kreg / kreg_h2 in native_mmvq).  STRATA_MMVQ_KREG=0 keeps them off.
+        // (the 17408-wide ffn_down: see try_kreg / kreg_h2 in q36_mmvq_dense.dp.cpp).  STRATA_MMVQ_KREG=0 keeps them off.
 #if !defined(_WIN32)
         setenv("STRATA_MMVQ_KREG", "1", 0);
 #else
         if (std::getenv("STRATA_MMVQ_KREG") == nullptr) _putenv_s("STRATA_MMVQ_KREG", "1");
 #endif
-        // the KREG forms tuned on the 27B's shapes (native_mmvq.dp.cpp "dense mode"); strata, Flash-Next's engine, never sets this
-        strata::kernels::native_mmvq_set_dense_mode(true);
+        // the KREG forms tuned on the 27B's shapes (q36_mmvq_dense.dp.cpp)
+        g_q36_dense_forms = true;
     }
     if (chunk == 0) {
         // auto: the largest chunk (4096 .. 1024) that fits beside every expert in VRAM; 2048 when they will not all fit (a prompt chunk streams every layer's

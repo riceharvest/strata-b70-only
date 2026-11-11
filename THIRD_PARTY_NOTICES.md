@@ -8,6 +8,7 @@ What this repository carries or builds from other projects, and under which lice
 | Project | What | Licence (SPDX) | Where |
 | --- | --- | --- | --- |
 | ggml / llama.cpp, [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | two headers, and the CPU dequantizer the build fetches at the commit pinned in `sycl/CMakeLists.txt` | MIT | [third_party/ggml/LICENSE](third_party/ggml/LICENSE) |
+| ggml / llama.cpp, adapted | `sycl/src/qwen35/q36_mmvq_dense.dp.cpp`: the block types and KREG structs copied from `sycl/src/kernels/cuda/native_mmvq.dp.cpp`, which is adapted from llama.cpp's CUDA kernels; it carries the same notice | MIT | its own header (the ggml authors) |
 | SYCLomatic (dpct) helper headers, [oneapi-src/SYCLomatic](https://github.com/oneapi-src/SYCLomatic) | the CUDA to SYCL helper headers the migrated sources include | Apache-2.0 WITH LLVM-exception | [sycl/include/dpct/LICENSE.TXT](sycl/include/dpct/LICENSE.TXT) |
 | vllm-xpu-kernels, [vllm-project/vllm-xpu-kernels](https://github.com/vllm-project/vllm-xpu-kernels) | `sycl/src/qwen35/merge_attn_states.hpp`: a **modified** copy of one file; `sycl/third_party/q36-tla/vllm-fmha_utils-no-torch.patch`: a patch to another (both for `strata-q36`, see below) | Apache-2.0 | [third_party/licenses/vllm-xpu-kernels-LICENSE](third_party/licenses/vllm-xpu-kernels-LICENSE) |
 

@@ -650,11 +650,15 @@ if(STRATA_BUILD_Q36)
   if(NOT STRATA_NATIVE_EXPERTS)
     message(FATAL_ERROR "strata-q36 needs STRATA_NATIVE_EXPERTS=ON (ggml's CPU dequantizer for q36_requant.cpp)")
   endif()
+  # STRATA_Q36_BUILD is set on this target only: the few lines of shared headers that know the dense family
+  # (include/strata/artifact/model_family.hpp, include/strata/core/family_layout.hpp and its sycl/ copy) sit behind it, so every
+  # other target compiles them as before.  The 27B's decode forms are q36_mmvq_dense.dp.cpp, a source of this target only.
   add_executable(strata-q36
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_engine.dp.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense.dp.cpp
     ${STRATA_ROOT}/src/qwen35/q36_main.cpp
     ${STRATA_ROOT}/src/qwen35/q36_requant.cpp)
-  target_compile_definitions(strata-q36 PRIVATE STRATA_Q36_PORT=1)
+  target_compile_definitions(strata-q36 PRIVATE STRATA_Q36_PORT=1 STRATA_Q36_BUILD=1)
   target_include_directories(strata-q36 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35 ${STRATA_ROOT}/third_party/ggml)
   target_link_libraries(strata-q36 PRIVATE strata_prefill strata_engine strata_kernels strata_kernels_cpu Threads::Threads)
   # LP3: the 8-bit cache's prompt attention on vllm-xpu-kernels' Xe2 chunk_prefill (on sycl-tla), a shared library of its own
@@ -696,5 +700,13 @@ if(STRATA_BUILD_Q36)
     # $ORIGIN, not the build tree's absolute path: the serve wrapper mounts the repo at /work/<repo name>.
     set_target_properties(strata-q36 PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
     target_compile_definitions(strata-q36 PRIVATE STRATA_Q36_TLA=1)
+  endif()
+  # the 27B's decode forms against a float64 reference and against native_mmvq on the card (PARITY=ON; docs/Q36.md)
+  if(STRATA_SYCL_PARITY)
+    add_executable(q36_mmvq_dense_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense_parity.cpp
+                   ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense.dp.cpp)
+    target_include_directories(q36_mmvq_dense_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
+    target_link_libraries(q36_mmvq_dense_parity PRIVATE strata_kernels)
+    add_test(NAME q36_mmvq_dense_parity COMMAND q36_mmvq_dense_parity --selftest)
   endif()
 endif()

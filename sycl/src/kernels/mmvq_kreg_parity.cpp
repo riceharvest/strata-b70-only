@@ -2,31 +2,26 @@
 // reference, against the default kernels and against themselves one column at a time.
 //
 //     mmvq_kreg_parity [--selftest]                      the checks below (ctest runs it with --selftest)
-//     STRATA_PARITY_DENSE=1 mmvq_kreg_parity [--selftest]   the dense engine's forms (see below)
 //     mmvq_kreg_parity --bench [types] [ncols] [shape]   us per call, default kernels against KREG
 //                                                        (types=12,13,14,23 ncols=1,2,3,4,6 shape=all|qkv|...|head)
 //                                                        STRATA_KREG_BENCH_STRIP=1|2|3: IQ4_XS with work taken out (kst:: below)
 //
 // Everything goes through the public native_mmvq; native_mmvq_set_kreg switches the KREG kernels on and off (the
-// STRATA_MMVQ_KREG latch is not read). For Q4_K, Q5_K, Q6_K and IQ4_XS (and, dense mode only, Q3_K and IQ4_NL) at 1-8 columns:
+// STRATA_MMVQ_KREG latch is not read). For Q4_K, Q5_K, Q6_K and IQ4_XS at 1-8 columns:
 //
 //   1. KREG against a float64 reference that dequantizes the SAME weight blocks (ggml's dequantize_row_* formulas)
-//      and the SAME Q8_1 bytes the kernels read, so only the kernels' FP32 arithmetic is under test. Bound per output:
-//      |gpu - ref| <= 2e-5 * sum_i |w_i x_i| (a strata run, as it always was); in a dense run (STRATA_PARITY_DENSE=1) the
-//      summation bound of KREG's own FP32 tree (M3b): |gpu - ref| <= 2 gamma(h) * sum_i (|a_i x_i| + |b_i x_i|), kreg_rel:
-//      depth h = 15 + n_in / 512 at most, gamma(h) = h u / (1 - h u), u = 2^-24; w_i = a_i - b_i, the scale part and the min
-//      term Q4_K / Q5_K subtract in FP32. It grows with the row's tree, not with a fixed 2e-5, so it stays tight enough for
-//      check 5 at the 17408-wide rows.
-//   2. the default kernels against the float64 reference with the loose bound |gpu - ref| <= 2e-5 * sum_i |w_i x_i|
-//      (their summation trees differ): a bound the kernels the engine runs today meet.
+//      and the SAME Q8_1 bytes the kernels read, so only the kernels' FP32 arithmetic is under test. Bound per
+//      output: |gpu - ref| <= 2e-5 * sum_i |w_i x_i| (an FP32 chain of ~25 roundings stays under 2e-6 of that sum).
+//   2. the default kernels against the same reference and the same bound: the bound is one the kernels the engine
+//      runs today meet.
 //   3. KREG differs from the default kernels in some output of every case with n_in >= 2560 (it sums in another
 //      order). If nothing differs, the call never reached KREG (a fallback) and checks 1 and 4 tested the default
 //      kernels instead.
 //   4. a T-column KREG call bitwise equal to T one-column KREG calls: native_mmvq_set_multi_exact's contract ("every
 //      column bitwise equal to a single-column call"), which the verify window's bit-exactness rests on.
 //   5. power: at 8 columns, row 0 of the KREG output against a reference with the scale of sub-block 0 of row 0's
-//      first block one step off must fail check 1's bound in some column, at every width. A kernel that decodes one
-//      sub-block scale wrong would pass a bound that cannot see this.
+//      first block one step off must fail the bound in some column. A kernel that decodes one sub-block scale wrong
+//      would pass a bound that cannot see this.
 //   6. STRATA_XE2_KQ (native_mmvq_set_xe2_kq): the KREG call again with STRATA_XE2_KQ=1, bitwise the KREG output (the
 //      persistent grid and the 256-register Q5_K tiles change no sum). Over the run some launch must have taken the
 //      grid and some the tile (native_mmvq_xe2_kq_seen), or the check has compared KREG with itself.
@@ -34,11 +29,6 @@
 //      native_mmvq calls.
 //   8. STRATA_XE2_KQ part 8 (opt-in, not in 1): a planar Q6_K matrix (native_q6_k_planar_adopt) at 5-8 columns, the
 //      launch with the part on (256 registers from 6 columns) bitwise the launch with it off.
-//
-// STRATA_PARITY_DENSE=1 (selftest and --bench): native_mmvq_set_dense_mode(true), the forms strata-q36 runs the 27B with (the
-// two-piece and K-split rows of 17408, Q3_K and IQ4_NL through KREG, other tiles at 5-8 columns).  Those formats and shapes
-// are only run then (a dense run: checks 1 to 5; 6 to 8 are strata's and are not run again).  Without it every check is
-// the one strata's own launches face.
 //
 // THE DATA. Random weight bytes, except each block's fp16 scales (d, and dmin for Q4_K/Q5_K), which are normal fp16
 // values in +-[2^-10, 2^-5) as in mmvq_multi_parity, so every output is finite and a non-finite one fails. Random
@@ -73,17 +63,14 @@ struct Format {
     int type;           // GGML type id
     const char* name;
     int block_bytes;    // per 256 weights
-    int scale_at[8];    // byte offsets of the block's fp16 scales; -1 = none
+    int scale_at[2];    // byte offsets of the block's fp16 scales; -1 = none
     int sub0_scale_at;  // byte whose bit 0 is the low bit of sub-block 0's scale (check 5)
-    bool dense_only = false;   // KREG takes it in dense mode only (STRATA_PARITY_DENSE=1)
 };
 const Format FORMATS[] = {
-    {12, "Q4_K", 144, {0, 2, -1, -1, -1, -1, -1, -1}, 4},     // half2 dm, scales[12] at 4 (j < 4: scales[j] & 63), qs[128]
-    {13, "Q5_K", 176, {0, 2, -1, -1, -1, -1, -1, -1}, 4},     // half2 dm, scales[12] at 4, qh[32], qs[128]
-    {14, "Q6_K", 210, {208, -1, -1, -1, -1, -1, -1, -1}, 192},// ql[128], qh[64], int8 scales[16] at 192, half d at 208
-    {23, "IQ4_XS", 136, {0, -1, -1, -1, -1, -1, -1, -1}, 4},  // half d, u16 scales_h, scales_l[4] at 4, qs[128]
-    {11, "Q3_K", 110, {108, -1, -1, -1, -1, -1, -1, -1}, 96, true},   // hmask[32], qs[64], scales[12] at 96 (6-bit, packed), half d at 108
-    {20, "IQ4_NL", 144, {0, 18, 36, 54, 72, 90, 108, 126}, 1, true},   // 8 x (half d, qs[16]) per 256 weights; check 5: d's high byte
+    {12, "Q4_K", 144, {0, 2}, 4},     // half2 dm, scales[12] at 4 (j < 4: scales[j] & 63), qs[128]
+    {13, "Q5_K", 176, {0, 2}, 4},     // half2 dm, scales[12] at 4, qh[32], qs[128]
+    {14, "Q6_K", 210, {208, -1}, 192},// ql[128], qh[64], int8 scales[16] at 192, half d at 208
+    {23, "IQ4_XS", 136, {0, -1}, 4},  // half d, u16 scales_h, scales_l[4] at 4, qs[128]
 };
 const Format* format_of(int t) {
     for (const Format& f : FORMATS) if (f.type == t) return &f;
@@ -105,46 +92,9 @@ void k4_scale_min(const uint8_t* q, int j, int& d, int& m) {   // ggml get_scale
     else { d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
 }
 
-// one 256-weight block -> 256 doubles, ggml's dequantize_row_q4_K / q5_K / q6_K / iq4_xs; `ymin` (if given): each
-// weight's min term (dmin * m, which Q4_K / Q5_K subtract: y = scale part - ymin), 0 for the other formats
-void dequant_block(int t, const uint8_t* b, double* y, double* ymin = nullptr) {
-    if (ymin) std::fill(ymin, ymin + 256, 0.0);
-    if (t == 20) {   // ggml dequantize_row_iq4_nl, 8 blocks
-        for (int ib = 0; ib < 8; ++ib) {
-            const uint8_t* q = b + 18 * ib;
-            const double d = h2f(q);
-            for (int j = 0; j < 16; ++j) {
-                y[32 * ib + j] = d * kIq4nl[q[2 + j] & 0xF];
-                y[32 * ib + j + 16] = d * kIq4nl[q[2 + j] >> 4];
-            }
-        }
-    } else if (t == 11) {   // ggml dequantize_row_q3_K
-        const double d = h2f(b + 108);
-        const uint8_t* hm = b;
-        const uint8_t* q = b + 32;
-        uint32_t aux[4];
-        std::memcpy(aux, b + 96, 12);
-        const uint32_t kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f, tmp = aux[2];
-        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
-        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
-        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-        const int8_t* sc = reinterpret_cast<const int8_t*>(aux);
-        int is = 0, o = 0;
-        uint8_t m = 1;
-        for (int n = 0; n < 256; n += 128) {
-            int shift = 0;
-            for (int j = 0; j < 4; ++j) {
-                double dl = d * (sc[is++] - 32);
-                for (int l = 0; l < 16; ++l) y[o++] = dl * ((int8_t) ((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
-                dl = d * (sc[is++] - 32);
-                for (int l = 0; l < 16; ++l) y[o++] = dl * ((int8_t) ((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
-                shift += 2;
-                m <<= 1;
-            }
-            q += 32;
-        }
-    } else if (t == 12 || t == 13) {
+// one 256-weight block -> 256 doubles, ggml's dequantize_row_q4_K / q5_K / q6_K / iq4_xs
+void dequant_block(int t, const uint8_t* b, double* y) {
+    if (t == 12 || t == 13) {
         const double d = h2f(b), dmin = h2f(b + 2);
         const uint8_t* sc = b + 4;
         const uint8_t* qh = b + 16;
@@ -160,7 +110,6 @@ void dequant_block(int t, const uint8_t* b, double* y, double* ymin = nullptr) {
                 }
                 y[64 * is + l] = d * s1 * lo - dmin * m1;
                 y[64 * is + 32 + l] = d * s2 * hi - dmin * m2;
-                if (ymin) { ymin[64 * is + l] = dmin * m1; ymin[64 * is + 32 + l] = dmin * m2; }
             }
         }
     } else if (t == 14) {
@@ -207,60 +156,36 @@ void dequant_q8_1(const uint8_t* xq, int n_in, int T, std::vector<double>& x) {
         }
 }
 
-// rows [r0, r1): ref[j * n_out + r], the loose bound's sum of |w_i x_i| (mag) and KREG's bound's sum of
-// |a_i x_i| + |b_i x_i| (mag2: w_i = a_i - b_i, b_i the min term)
+// rows [r0, r1): ref[j * n_out + r] and the bound's sum of |w_i x_i|
 void reference(int t, const std::vector<uint8_t>& w, int n_in, int n_out, int r0, int r1, const std::vector<double>& x,
-               int T, std::vector<double>& ref, std::vector<double>& mag, std::vector<double>& mag2) {
+               int T, std::vector<double>& ref, std::vector<double>& mag) {
     const int bpr = n_in / 256;
     const int bb = format_of(t)->block_bytes;
-    std::vector<double> row((size_t) n_in), rmin((size_t) n_in);
+    std::vector<double> row((size_t) n_in);
     ref.assign((size_t) T * n_out, 0.0);
     mag.assign((size_t) T * n_out, 0.0);
-    mag2.assign((size_t) T * n_out, 0.0);
     for (int r = r0; r < r1; ++r) {
-        for (int b = 0; b < bpr; ++b)
-            dequant_block(t, &w[((size_t) r * bpr + b) * bb], &row[(size_t) 256 * b], &rmin[(size_t) 256 * b]);
+        for (int b = 0; b < bpr; ++b) dequant_block(t, &w[((size_t) r * bpr + b) * bb], &row[(size_t) 256 * b]);
         for (int j = 0; j < T; ++j) {
             const double* xj = &x[(size_t) j * n_in];
-            double s = 0, m = 0, m2 = 0;
-            for (int i = 0; i < n_in; ++i) {
-                s += row[i] * xj[i];
-                m += std::fabs(row[i] * xj[i]);
-                m2 += std::fabs((row[i] + rmin[i]) * xj[i]) + std::fabs(rmin[i] * xj[i]);
-            }
+            double s = 0, m = 0;
+            for (int i = 0; i < n_in; ++i) { s += row[i] * xj[i]; m += std::fabs(row[i] * xj[i]); }
             ref[(size_t) j * n_out + r] = s;
             mag[(size_t) j * n_out + r] = m;
-            mag2[(size_t) j * n_out + r] = m2;
         }
     }
 }
 
-constexpr double kBound = 2e-5;   // the default kernels' (check 2)
+constexpr double kBound = 2e-5;
 
-// KREG's bound (checks 1 and 5) relative to mag2, by its FP32 summation tree at width n_in: a lane's 32-weight dot sums
-// integers exactly and then scales and adds them in at most 8 roundings; the row's second piece (H = 2) adds 2, the
-// 16-lane butterfly 4, the sub-groups' SLM sum one after another at most n_in / 512 (one-piece: 34 sub-groups at 17408),
-// the K split's parts (KS) 1.  (M4, STRATA_KREG_KS=4: KS in 4 parts at 17408 - 9 sub-groups a part, then 3 plane adds:
-// 8 + 4 + 9 + 3 = 24, inside the one-piece depth this bound already allows.)  A summation tree of depth h errs by at most gamma(h) = h u / (1 - h u) times the sum of
-// the magnitudes it adds (Higham, Accuracy and Stability of Numerical Algorithms, 4.2); checked against twice that.
-double kreg_rel(int n_in) {
-    const int h = 8 + 2 + 4 + (n_in + 511) / 512 + 1;
-    const double u = std::ldexp(1.0, -24);
-    return 2.0 * h * u / (1.0 - h * u);
-}
-
-struct Shape { int n_in, n_out; bool dense_only = false; };
-bool g_dense = false;   // STRATA_PARITY_DENSE=1
+struct Shape { int n_in, n_out; };
 // n_in <= 4096 and > 4096 take different tiles; 768 and 256 leave lanes of the last sub-group idle; n_out 1000, 520,
 // 300, 77 and 3 end in a partial tile.
 // 2560 x 4099: more tiles than the persistent KREG2 grid (its default engages at 2-4 columns there, KREG at 1 column:
 // check 4 then compares the two kernels bit for bit), and a partial last tile.
 // 6144 x 2563: more tiles than a wave of the card holds 12-sub-group work-groups (check 6: the persistent grid at
 // 3-8 columns), a partial last tile, and Q5_K rows wider than 4096 (check 6: the 256-register tile at 5-8 columns).
-// 5120 x 600 and 17408 x 300: the Qwen3.8-27B's widths (dense runs only for 17408: 544 lanes, past a 256-register group; with
-// STRATA_KREG_KS=4 its K in 4 parts and 5-8 columns in one launch pair).
-const Shape SHAPES[] = {{2560, 1000}, {6144, 520}, {768, 300}, {256, 77}, {2560, 3}, {2560, 4099}, {6144, 2563},
-                        {5120, 600}, {17408, 300, true}};
+const Shape SHAPES[] = {{2560, 1000}, {6144, 520}, {768, 300}, {256, 77}, {2560, 3}, {2560, 4099}, {6144, 2563}};
 
 struct Dev {
     sycl::queue& q;
@@ -407,7 +332,6 @@ int selftest() {
     int xe2_seen = 0;   // check 6: the STRATA_XE2_KQ parts some launch took
     for (const Format& f : FORMATS) {
         for (const Shape& sh : SHAPES) {
-            if (!g_dense && (f.dense_only || sh.dense_only)) continue;
             const size_t wbytes = k::native_mmvq_weight_bytes(f.type, sh.n_in, sh.n_out);
             const size_t nblk = wbytes / f.block_bytes;
             std::mt19937 rng(777u + 31u * (unsigned) f.type + (unsigned) sh.n_in + 7u * (unsigned) sh.n_out);
@@ -433,10 +357,9 @@ int selftest() {
             q.wait_and_throw();
             std::vector<uint8_t> xq(k::native_q8_1_bytes(sh.n_in, TMAX));
             dev.get(xq.data(), dxq, xq.size());
-            std::vector<double> x, ref, mag, mag2;
+            std::vector<double> x, ref, mag;
             dequant_q8_1(xq.data(), sh.n_in, TMAX, x);
-            reference(f.type, w, sh.n_in, sh.n_out, 0, sh.n_out, x, TMAX, ref, mag, mag2);   // T columns = the first T of these
-            const double krel = kreg_rel(sh.n_in);
+            reference(f.type, w, sh.n_in, sh.n_out, 0, sh.n_out, x, TMAX, ref, mag);   // T columns = the first T of these
 
             long long case_diff = 0;
             for (int T = 1; T <= TMAX; ++T) {
@@ -451,9 +374,9 @@ int selftest() {
                 for (int j = 0; j < T; ++j)
                     for (int r = 0; r < sh.n_out; ++r) {
                         const size_t i = (size_t) j * sh.n_out + r;
-                        const double bnd = kBound * mag[i] + 1e-30, bk = g_dense ? krel * mag2[i] + 1e-30 : bnd;
+                        const double bnd = kBound * mag[i] + 1e-30;
                         if (!std::isfinite(yk[i]) || !std::isfinite(yd[i]) || !std::isfinite(y1[i]) || !std::isfinite(yx[i])) { ++nf; continue; }
-                        rk = std::max(rk, std::fabs(yk[i] - ref[i]) / bk);
+                        rk = std::max(rk, std::fabs(yk[i] - ref[i]) / bnd);
                         rd = std::max(rd, std::fabs(yd[i] - ref[i]) / bnd);
                         uint32_t a, b, c, e;
                         std::memcpy(&a, &yk[i], 4); std::memcpy(&b, &yd[i], 4); std::memcpy(&c, &y1[i], 4);
@@ -467,16 +390,14 @@ int selftest() {
                 std::printf("%-7s %5d x %5d %2d  %-11.3f %-11.3f %9lld %9lld %9lld %9lld %s\n", f.name, sh.n_in, sh.n_out, T,
                             rk, rd, kd, md, xd, nf, ok ? "ok" : "FAIL");
                 if (!ok) ++bad;
-                if (T == TMAX) {   // 5. power: row 0 against a reference with sub-block 0's scale one step off, check 1's bound
+                if (T == TMAX) {   // 5. power: row 0 against a reference with sub-block 0's scale one step off
                     std::vector<uint8_t> w2(w.begin(), w.begin() + wbytes / sh.n_out);
                     w2[f.sub0_scale_at] ^= 1;
-                    std::vector<double> ref2, m2a, m2b;
-                    reference(f.type, w2, sh.n_in, 1, 0, 1, x, TMAX, ref2, m2a, m2b);
+                    std::vector<double> ref2, mag2;
+                    reference(f.type, w2, sh.n_in, 1, 0, 1, x, TMAX, ref2, mag2);
                     double seen = 0;
                     for (int j = 0; j < TMAX; ++j)
-                        seen = std::max(seen, std::fabs(yk[(size_t) j * sh.n_out] - ref2[j]) / (g_dense ? krel * mag2[(size_t) j * sh.n_out] + 1e-30 : kBound * mag[(size_t) j * sh.n_out] + 1e-30));
-                    std::printf("%-7s %5d x %5d     power: one scale step of row 0 is %.1f x the bound\n", f.name, sh.n_in,
-                                sh.n_out, seen);
+                        seen = std::max(seen, std::fabs(yk[(size_t) j * sh.n_out] - ref2[j]) / (kBound * mag[(size_t) j * sh.n_out] + 1e-30));
                     if (seen <= 1.0) {
                         std::printf("%-7s %5d x %5d     no power: one scale step of row 0 stays inside the bound (%.3f)\n",
                                     f.name, sh.n_in, sh.n_out, seen);
@@ -494,18 +415,16 @@ int selftest() {
     }
     k::native_mmvq_set_kreg(-1);
     k::native_mmvq_set_xe2_kq(-1);
-    if (!g_dense && (xe2_seen & 2) == 0) {
+    if ((xe2_seen & 2) == 0) {
         std::printf("STRATA_XE2_KQ: no KREG launch took the persistent grid: check 6 compared KREG with itself\n");
         ++bad;
     }
-    if (!g_dense && (xe2_seen & 4) == 0) {
+    if ((xe2_seen & 4) == 0) {
         std::printf("STRATA_XE2_KQ: no Q5_K launch took the 256-register tile: check 6 compared KREG with itself\n");
         ++bad;
     }
-    if (!g_dense) {   // (strata's checks; a dense run does not touch them)
-        bad += pair_selftest(q);
-        bad += planar_selftest();
-    }
+    bad += pair_selftest(q);
+    bad += planar_selftest();
     std::printf("\nmmvq_kreg_parity: %d failures\n", bad);
     return bad;
 }
@@ -851,22 +770,20 @@ int bench(const char* types_s, const char* ncols_s, const std::string& ssel) {
     const size_t POOL = (size_t) 640 << 20;
     sycl::queue q(sycl::gpu_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()});
     struct BShape { int n_in, n_out; const char* name; };
-    // Qwen3.8-Flash-Next decode shapes; the head is 2560 x 248320.  27B: Qwen3.8-27B's (5120 wide, FFN 17408, head 5120 x 248320)
+    // Qwen3.8-Flash-Next decode shapes; the head is 2560 x 248320
     const BShape shapes[] = {{2560, 10240, "qkv"}, {2560, 6144, "gate"}, {6144, 2560, "out"}, {2560, 12288, "attn_q"},
-                             {2560, 512, "kv"}, {2560, 640, "sh_gu"}, {2560, 248320, "head"},
-                             {5120, 10240, "27qkv"}, {5120, 6144, "27gate"}, {6144, 5120, "27out"}, {5120, 12288, "27q"},
-                             {5120, 17408, "27gu"}, {17408, 5120, "27down"}, {5120, 248320, "27head"}};
+                             {2560, 512, "kv"}, {2560, 640, "sh_gu"}, {2560, 248320, "head"}};
     uint8_t* dpool = (uint8_t*) sycl::malloc_device(POOL + 4096, q);
     std::vector<uint8_t> hpool(POOL);
     const int maxc = 8, maxout = 248320;
     float* y = sycl::malloc_device<float>((size_t) maxc * maxout, q);
-    std::vector<float> hx((size_t) maxc * 17408);
+    std::vector<float> hx((size_t) maxc * 6144);
     std::mt19937 rng(4242);
     std::normal_distribution<float> nd(0.f, 1.f);
     for (auto& v : hx) v = nd(rng);
     float* dx = sycl::malloc_device<float>(hx.size(), q);
     q.memcpy(dx, hx.data(), hx.size() * 4).wait();
-    void* xq = sycl::malloc_device(k::native_q8_1_bytes(17408, maxc) + 256, q);
+    void* xq = sycl::malloc_device(k::native_q8_1_bytes(6144, maxc) + 256, q);
     std::printf("mmvq_kreg_parity --bench on %s: us per call (median), GB/s of weight bytes\n",
                 q.get_device().get_info<sycl::info::device::name>().c_str());
     const int cores = std::max(1, int(q.get_device().get_info<sycl::info::device::max_compute_units>()) / 8);   // k2_go's count
@@ -883,13 +800,12 @@ int bench(const char* types_s, const char* ncols_s, const std::string& ssel) {
     }
     for (const int t : types) {
         const Format* f = format_of(t);
-        if (!f) { std::printf("type %d: not a KREG format (11, 12, 13, 14, 20, 23)\n", t); continue; }
-        if (f->dense_only && !g_dense) { std::printf("type %d (%s): dense mode only (STRATA_PARITY_DENSE=1)\n", t, f->name); continue; }
+        if (!f) { std::printf("type %d: not a KREG format (12, 13, 14, 23)\n", t); continue; }
         if (strip != 0 && t != 23) { std::printf("type %d: STRIP=%d skipped (IQ4_XS only)\n", t, strip); continue; }
         fill_pool(*f, hpool);
         q.memcpy(dpool, hpool.data(), POOL).wait();
         for (const BShape& sh : shapes) {
-            if (ssel == "27" ? sh.name[0] != '2' || sh.name[1] != '7' : (ssel != "all" && ssel != sh.name)) continue;
+            if (ssel != "all" && ssel != sh.name) continue;
             const size_t wb = k::native_mmvq_weight_bytes(t, sh.n_in, sh.n_out);
             const size_t slot = (wb + 255) & ~(size_t) 255;
             const int ndist = (int) std::max<size_t>(1, std::min<size_t>(128, POOL / slot)), nmat = std::max(ndist, 16);
@@ -923,13 +839,6 @@ int bench(const char* types_s, const char* ncols_s, const std::string& ssel) {
                     std::printf("%-6s %-6s %5d x %6d nc %d  default %8s us %5s GB/s  kreg %8.2f us %5.1f GB/s  x%s  strip %d %s R%d groups %d wbytes %zu\n",
                                 f->name, sh.name, sh.n_in, sh.n_out, nc, "-", "-", us1, wb / us1 / 1e3, "-", strip,
                                 pl.k2 ? "kreg2" : "kreg", pl.R, pl.groups, wb);
-                    std::fflush(stdout);
-                    continue;
-                }
-                if (std::getenv("STRATA_BENCH_KREG_ONLY")) {   // KREG alone: us, GB/s, and us per column
-                    const double u = timed(1);
-                    std::printf("%-6s %-6s %5d x %6d nc %d  kreg %8.2f us %5.1f GB/s  %7.2f us/col\n", f->name, sh.name,
-                                sh.n_in, sh.n_out, nc, u, wb / u / 1e3, u / nc);
                     std::fflush(stdout);
                     continue;
                 }
@@ -969,10 +878,6 @@ int floor_bench() {
 
 int main(int argc, char** argv) try {
     bool selftest_flag = false;
-    if (const char* d = std::getenv("STRATA_PARITY_DENSE"); d && d[0] == '1') {   // strata-q36's forms (see the top)
-        g_dense = true;
-        k::native_mmvq_set_dense_mode(true);
-    }
     if (argc > 1 && std::string(argv[1]) == "--floor") return floor_bench();
     if (argc > 1 && std::string(argv[1]) == "--bench")
         return bench(argc > 2 ? argv[2] : "12,13,14,23", argc > 3 ? argv[3] : "1,2,3,4,6", argc > 4 ? argv[4] : "all");
