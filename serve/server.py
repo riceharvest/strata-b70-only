@@ -214,6 +214,12 @@ VISION_START = "<|vision_start|>"
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
 # sets it; 0 turns it off.
 REPEAT_STOP_TOKENS = 256
+# Opt-in ("repeat_cycle_tokens", 0 = off, else at least REPEAT_CYCLE_MIN): the same guard for a short cycle.  A reply
+# whose last N tokens repeat with a period of 2 to 4 tokens (a b a b ..., a b c a b c ...) is ended as "length", like
+# a run of one token.  One token (period 1) is the job of repeat_stop_tokens.  Nothing is exempt: a cycle that long is
+# rare in honest text, but a ruler made of two alternating tokens could reach it, so N has a floor.
+REPEAT_CYCLE_MIN = 64
+REPEAT_CYCLE_MAX_PERIOD = 4
 ANSWER_ROOM_MIN_CAP = 1024    # 0.1.45: from this max_tokens on, thinking without a budget is closed early enough to leave room to answer
 DS41_DEFAULT_BUDGET = 32768   # DeepSeek-V4.1 only: the thinking budget when neither the request nor the config names one
 DS41_SMALL_CAP_MIN = 48       # DeepSeek-V4.1 only: from this max_tokens up to ANSWER_ROOM_MIN_CAP, thinking is capped at half of it
@@ -297,6 +303,18 @@ RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean s
 # server (the engine's main thread waits, untimed, for its next command): the engine is ended and the request fails;
 # the next request starts it again.  The config's "engine_silence_s" sets it (0: wait forever, as before).
 ENGINE_SILENCE_S = 300.0
+SLOT_QUIET_S = 600.0     # a slot whose consumer left: BDONE is waited for while the engine says nothing for this long
+# #4271: a streaming client that stops reading (a hung process, a network that dropped) leaves the thread that writes to
+# it blocked once the socket buffers are full - and that thread holds the engine's turn.  A write that makes no progress
+# for this long ends the request as a disconnect (the engine is stopped, the turn given back).  0: no limit, as before.
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.environ.get(name, "") or default))
+    except ValueError:
+        return default
+
+
+STREAM_WRITE_TIMEOUT_S = _env_seconds("STRATA_STREAM_WRITE_TIMEOUT_S", 60.0)   # the config's "stream_write_timeout_s" sets it
 # Disk sessions: the longest allowance an engine may announce (`SWAIT <phase> <s>`) for one step that blocks in a
 # single call (a file flush, the host->device transfer); the engine's own bound is the same (session_phase_limit_s).
 SESSION_WAIT_MAX_S = 3600
@@ -1140,6 +1158,7 @@ class StrataEngine:
             if log:
                 self.log.close()
             raise
+        proc = self.proc                                 # THIS start's process: a close() from another thread may set self.proc to None meanwhile (#4792)
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
         ready_q: queue.Queue = queue.Queue()
@@ -1170,21 +1189,21 @@ class StrataEngine:
         if self.max_context <= 0:
             if timed_out:                               # still loading, or hung: end it, so the turn is not held for good
                 try:
-                    self.proc.kill()
+                    proc.kill()
                 except OSError:
                     pass
             try:                                        # its pipes and our handle on its log (the log stays)
-                self.proc.wait(timeout=5)
-                self.proc.stdin.close()
-                self.proc.stdout.close()
+                proc.wait(timeout=5)
+                proc.stdin.close()
+                proc.stdout.close()
                 if log:
                     self.log.close()
             except (OSError, subprocess.TimeoutExpired):
                 pass
             if not timed_out and _attempt < START_RETRIES and \
-                    transient_start_failure(log, log_start, time.monotonic() - spawned_at, self.proc.returncode):
+                    transient_start_failure(log, log_start, time.monotonic() - spawned_at, proc.returncode):
                 wait_s = 2.0 * (2 ** _attempt)              # 2, 4, 8 s: the previous process's GPU queues go away
-                exit_words = engine_exit_words(self.proc.returncode)
+                exit_words = engine_exit_words(proc.returncode)
                 if start_log_marks(log, log_start):         # the runtime said so itself (hsa_exception ...)
                     print(f"[strata] the engine stopped while the GPU runtime was starting (most often right after "
                           f"another engine exited, whose GPU queues were still being released"
@@ -1202,7 +1221,7 @@ class StrataEngine:
                    "the engine exited before it was ready")
             # EngineDied, not bare RuntimeError: a request waiting on this load must end with a 503
             # through the request path's handler - a RuntimeError there left the turn with no answer (#1527)
-            note = "" if timed_out else start_exit_note(self.proc.returncode, exe)
+            note = "" if timed_out else start_exit_note(proc.returncode, exe)
             tail = start_log_tail(log, log_start)
             lines = [x for x in tail.split("\n")[2:] if x.strip()]
             if tail and lines and all(x.strip().startswith("[strata]") for x in lines):
@@ -1668,7 +1687,10 @@ class StrataEngine:
         request does not read this one's leftovers.  Returns that line (None: the engine ended or never answered).
         `born`: the engine process (self.gen) the request started on; once that one is gone there is nothing to
         drain - its end line was read already (by the request's own EngineDied), and waiting for another one held
-        a request that had failed for the whole 300 s (#1012), or read the lines of the engine that replaced it."""
+        a request that had failed for the whole 300 s (#1012), or read the lines of the engine that replaced it.
+        `timeout` is a no-progress limit: it counts from the last line the engine wrote, so an engine that was told to
+        stop and still talks (a read or a decode that ends at its next chunk) is not given up on; only one that says
+        nothing for that long is."""
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             if born is not None and (self.gen != born or not self.alive()):
@@ -1679,6 +1701,7 @@ class StrataEngine:
                 continue
             if line is None:
                 return None
+            end = time.monotonic() + timeout                 # any line is progress
             if line.startswith("DONE"):
                 self._parse_done(line)
             if line.startswith(until) or line.startswith("ERR"):
@@ -1725,7 +1748,7 @@ class StrataEngine:
         releasing.add(slot)
 
         def wait():
-            end = time.monotonic() + 600.0
+            end = time.monotonic() + SLOT_QUIET_S           # no-progress limit: every line of the slot starts it again
             tail = list(stream or [])
             while time.monotonic() < end:
                 try:
@@ -1735,6 +1758,7 @@ class StrataEngine:
                 if line is None:
                     tail = []
                     break
+                end = time.monotonic() + SLOT_QUIET_S
                 if line.startswith("BT "):
                     try:
                         tail.append(int(line.split()[2]))
@@ -2458,11 +2482,15 @@ class StrataEngine:
                     raise ValueError(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
-                if self.can_stop:
+                # the engine can be ended or restarted on another thread meanwhile: close() closes stdin (a write then
+                # raises ValueError) before it clears `proc` (None then): the STOP has nobody to reach, and the
+                # request's own outcome must not be replaced by that error
+                proc = self.proc
+                if self.can_stop and proc is not None:
                     try:
-                        self.proc.stdin.write("STOP\n")
-                        self.proc.stdin.flush()
-                    except OSError:
+                        proc.stdin.write("STOP\n")
+                        proc.stdin.flush()
+                    except (OSError, ValueError):
                         pass
                 # #481: never an untimed wait here - it holds the request FIFO, and an engine that lost step never
                 # answers.  An engine that honours STOP gets the current allowance in all (a STOP during a prompt
@@ -3794,6 +3822,7 @@ class Service:
         self.reasoning_budget_configured = False         # the config named reasoning_budget_tokens (0 included): no family default
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
+        self.repeat_cycle_tokens = 0                     # opt-in: a cycle of 2-4 tokens over the last N tokens ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
@@ -4589,6 +4618,8 @@ class Service:
             ("strata:drafts_accepted_total", "counter", "Speculative draft tokens accepted", t["drafts_accepted"]),
             ("strata:tool_calls_unread_total", "counter", "<tool_call> blocks returned as text (an undeclared name or a form the template does not use)",
              t.get("tool_calls_unread", 0)),
+            ("strata:repeat_stops_total", "counter", "Replies ended because the model repeated one token or a short cycle (repeat_stop_tokens, repeat_cycle_tokens)",
+             t.get("repeat_stops", 0)),
             ("strata:tool_args_repaired_total", "counter", "Tool call arguments (a JSON array or object) that were damaged and read as written",
              t.get("tool_args_repaired", 0)),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
@@ -4723,6 +4754,11 @@ class Service:
                     print(f"[strata] a picture a tool returned was left out of the prompt: {why}", flush=True)
                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
         return fetched
+
+    def _count(self, name: str) -> None:
+        """Adds one to a counter of /metrics `totals`."""
+        with self.status_lock:
+            self.totals[name] = self.totals.get(name, 0) + 1
 
     def forget_prompt(self, ids):
         if self.prompts is not None:
@@ -5096,6 +5132,9 @@ class Service:
                                  declared_only=declared_only)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
+        cyc_hist = []                                   # repeat_cycle_tokens: the last few tokens
+        cyc_run = [0] * (REPEAT_CYCLE_MAX_PERIOD + 1)   # cyc_run[p]: how many tokens in a row equal the one p before
+        cycle = 0                                       # the period that ended the reply (0: none)
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
@@ -5306,6 +5345,18 @@ class Service:
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
+                                if self.repeat_cycle_tokens:
+                                    cyc_hist.append(t)
+                                    del cyc_hist[:-(REPEAT_CYCLE_MAX_PERIOD + 1)]
+                                    for p in range(2, REPEAT_CYCLE_MAX_PERIOD + 1):
+                                        same = len(cyc_hist) > p and cyc_hist[-1] == cyc_hist[-1 - p]
+                                        cyc_run[p] = cyc_run[p] + 1 if same else 0
+                                        # p tokens plus a run of N - p equal to the one p before: a window of N tokens
+                                        if cyc_run[p] >= self.repeat_cycle_tokens - p and len(set(cyc_hist[-p:])) > 1:
+                                            cycle = p
+                                            break
+                                    if cycle:
+                                        break
                                 piece = detok.push(t)
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
@@ -5481,7 +5532,13 @@ class Service:
                         print(f"[strata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
                               f"{n} tokens: ended as \"length\" (reasoning_loop_recovery: \"stop\" in "
                               "strata-<model>.json; remove it to turn this off)", flush=True)
+                    elif cycle:
+                        self._count("repeat_stops")
+                        print(f"[strata] the reply repeated a cycle of {cycle} tokens over the last "
+                              f"{self.repeat_cycle_tokens} tokens: ended as \"length\" (repeat_cycle_tokens in "
+                              "strata-<model>.json; 0 turns this off)", flush=True)
                     elif repeated:
+                        self._count("repeat_stops")
                         print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
                               "strata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
@@ -7237,6 +7294,8 @@ def make_handler(svc: Service):
                     self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
+                elif path == "/tokenize":
+                    self._tokenize(req)
                 elif path == "/v1/images/generations":
                     self._images(req)
                 else:
@@ -7507,6 +7566,11 @@ def make_handler(svc: Service):
             self.send_header("X-Accel-Buffering", "no")   # nginx and similar proxies pass each event at once
             self._cors()
             self.end_headers()
+            if STREAM_WRITE_TIMEOUT_S > 0:
+                try:
+                    self.connection.settimeout(STREAM_WRITE_TIMEOUT_S)     # (#4271) a stuck write ends as OSError: disconnected
+                except OSError:
+                    pass
 
         def _capture(self, items, api):
             """Retain bounded input/output for the monitor without changing the API response (the items as they
@@ -7818,6 +7882,23 @@ def make_handler(svc: Service):
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False))})
+
+        def _tokenize(self, req):
+            """POST /tokenize: the prompt a /v1/chat/completions request with this body would read, rendered and
+            tokenized; the model does not run.  {"count": N}, and {"tokens": [ids]} too when the body has "ids": true (the shape
+            llama.cpp and vLLM use for the list)."""
+            req = svc.with_shared(req, "openai")
+            messages, tools, kw = openai_to_messages(req)
+            require_messages(messages)
+            if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the request itself: no tools are offered
+                tools = None
+            if "ids" in req and not isinstance(req["ids"], bool):
+                raise ValueError('ids: true or false')
+            ids = svc.encode_prompt(messages, tools, kw, store=False)
+            body = {"count": len(ids)}
+            if req.get("ids"):
+                body["tokens"] = list(ids)
+            self._json(200, body)
 
         def _anthropic(self, req):
             svc.load()
@@ -8593,7 +8674,7 @@ def tool_call_recovery_setting(cfg: dict) -> bool:
 # it on the Settings page) and the constant it replaces: a name is a global of this module, "Class.name" an attribute of that
 # class.  A key the config leaves out keeps the constant's value.  SESSION_WAIT_MAX_S is not here: it must match the engine's own
 # bound (session_phase_limit_s), and a lower value would end the engine at an SWAIT it announced in good order.
-# repeat_stop_tokens is read in main() (it is a Service attribute).
+# repeat_stop_tokens and repeat_cycle_tokens are read in main() (it is a Service attribute).
 SERVER_NUMBERS = {
     "loop_check_every": "LOOP_CHECK_EVERY", "loop_coverage": "LOOP_COVERAGE", "loop_history_words": "LOOP_HISTORY_WORDS",
     "loop_tail_chars": "LOOP_TAIL_CHARS", "loop_tail_period": "LOOP_TAIL_PERIOD",
@@ -8601,7 +8682,7 @@ SERVER_NUMBERS = {
     "yields_max": "StrataEngine.YIELDS_MAX", "admit_short_first": "ADMIT_SHORT_FIRST",
     "unload_wait_s": "Service.UNLOAD_WAIT_S", "restart_retry_s": "StrataEngine.RESTART_RETRY_S",
     "queue_beat_s": "QUEUE_BEAT_S", "keepalive_s": "KEEPALIVE_S",
-    "stream_linger_s": "stream_order.LINGER_S",
+    "stream_linger_s": "stream_order.LINGER_S", "stream_write_timeout_s": "STREAM_WRITE_TIMEOUT_S",
     "monitor_requests": "METRICS_REQUESTS", "api_monitor_requests": "API_MONITOR_REQUESTS",
 }
 
@@ -8889,6 +8970,13 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
         print(f"[strata] from the config: tool_name_repair {cfg['tool_name_repair']}", flush=True)
+    for key, attr in (("tool_arg_coercion", "TOOL_ARG_COERCION"), ("tool_skipped_closer", "TOOL_SKIPPED_CLOSER")):
+        if (cfg or {}).get(key) is not None:           # tool-call parser switches (serve/frontend.py)
+            if not isinstance(cfg[key], bool):
+                raise SystemExit(f"[strata] config \"{key}\" must be true or false, not {cfg[key]!r}")
+            import serve.frontend as _fe_flags
+            setattr(_fe_flags, attr, cfg[key])
+            print(f"[strata] from the config: {key} {'on' if cfg[key] else 'off'}", flush=True)
     lazy = False
     gpu_locks = None
     if a.engine == "strata":
@@ -9137,6 +9225,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
+    rc = cfg.get("repeat_cycle_tokens", 0)               # opt-in: a cycle of 2-4 tokens; 0 = off
+    if isinstance(rc, bool) or not isinstance(rc, int) or (rc != 0 and rc < REPEAT_CYCLE_MIN):
+        raise SystemExit(f"[strata] config \"repeat_cycle_tokens\" must be 0 (off) or a whole number >= "
+                         f"{REPEAT_CYCLE_MIN}, not {rc!r}")
+    svc.repeat_cycle_tokens = rc
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         svc.reasoning_budget_configured = True

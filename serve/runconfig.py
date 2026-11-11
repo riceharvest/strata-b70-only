@@ -249,6 +249,25 @@ EDITABLE = [
      "End a reply that repeats one token this many times in a row (default 256; 0 = never): a model in a loop, or a broken "
      "state that answers one token forever. The reply ends as \"length\". Lower: loops end sooner and a long honest run of "
      "one token (a line of dashes) may be cut. Empty: 256"),
+    ("repeat_cycle_tokens", ("int", 0, None),
+     "Off by default (0). End a reply whose last N tokens are a cycle of 2 to 4 tokens (a b a b ..., a b c a b c ...); N is at "
+     "least 64. The reply ends as \"length\" with a note in the log, and /metrics counts it. Cost: a few comparisons a "
+     "token, and an honest text made of one short pattern that long (a ruler of two alternating marks, or 16 equal 4-token "
+     "entries in a data table such as zero-filled initialisers) is cut: use 128 or more for code. A single "
+     "repeated token is repeat_stop_tokens' job. Empty: off"),
+    ("tool_arg_coercion", "bool",
+     "On by default. A tool argument is read by the schema the request declares: a boolean the model wrote as True or False "
+     "(or quoted) is true or false, and a quoted number for an integer or number parameter is a number, but only a finite one "
+     "that reads back as written (nan, inf, 1e999 stay text). A parameter whose schema allows a string (type string, a type "
+     "list or anyOf/oneOf with a string, an enum of strings) keeps the text the model wrote, so \"123\" stays \"123\"; a "
+     "parameter with no schema at all is read as JSON when it parses, as before. Off: the old reading everywhere (text such "
+     "as True stays a string, and a string among several types may become a number). Empty: on"),
+    ("tool_skipped_closer", "bool",
+     "Off by default. On: when the model writes a nested <parameter=X>...</parameter> at the start of a line inside a value, "
+     "X being a declared parameter of the tool that is not given yet, and leaves out the value's own </parameter>, the value "
+     "keeps the nested pair and ends before </function>, instead of being cut after the nested close. Still misreads a value "
+     "that itself contains such a line-start opener of a declared sibling plus several more closing tags "
+     "(</parameter>, </function>, </tool_call>) in odd order: streaming and non-streaming can then disagree. Empty: off"),
     ("tool_name_repair", ("enum", ["prefix"]),
      "What to do when the model calls a tool the request did not declare. Empty: the call goes back as text (and "
      "strata_rejected_tool_calls names it). prefix: read it as the one declared tool whose name it extends, or that "
@@ -306,6 +325,11 @@ EDITABLE = [
     ("keepalive_s", ("num", 1, 600),
      "A stream that has gone quiet (the server holds back a tool call's arguments until they are whole) sends a ping at least "
      "this often, in seconds (default 10). The same trade as the number above. Empty: 10"),
+    ("stream_write_timeout_s", ("num", 0, 86400),
+     "A streaming reply whose client does not take one event for this long, in seconds (default 60; 0 = wait for ever), is ended "
+     "as if the client had left: the engine stops and the next request gets its turn. Cost: a client that stops reading for that "
+     "long (a hung program, a very slow link, one huge event such as a big tool argument sent whole) loses its request. "
+     "Empty: 60"),
     ("monitor_requests", ("int", 1, 500),
      "How many of the last finished requests the Monitor lists (default 12). The server keeps up to 500 in memory for the full "
      "list. More: a longer table and a bigger answer every time the page refreshes. Empty: 12"),
@@ -343,13 +367,13 @@ GROUPS = {
                  "conversation_cache_park_ssd_deepest_checkpoint", "conversation_cache_spill_probe_mib",
                  "conversation_cache_spill_probe_s", "conversation_cache_spill_min_tokens", "conversation_cache_spill_mbps",
                  "conversation_cache_spill_prefill_us", "conversation_cache_spill_verify"),
-    "Thinking and answers": ("tool_name_repair", "sampling.temperature", "sampling.top_p", "sampling.top_k", "sampling.min_p",
+    "Thinking and answers": ("tool_name_repair", "tool_arg_coercion", "tool_skipped_closer", "sampling.temperature", "sampling.top_p", "sampling.top_k", "sampling.min_p",
                              "reasoning_budget_tokens", "fit_max_tokens", "anthropic_thinking", "effort_position",
                              "answer_room", "answer_room_min_cap", "answer_reserve_min", "repeat_stop_tokens",
-                             "reasoning_loop_recovery", "loop_check_every", "loop_coverage", "loop_history_words",
+                             "repeat_cycle_tokens", "reasoning_loop_recovery", "loop_check_every", "loop_coverage", "loop_history_words",
                              "loop_tail_chars", "loop_tail_period"),
     "Server": ("stream_linger_s", "aliases", "idle_unload_s", "engine_silence_s", "open_browser", "unload_wait_s", "restart_retry_s",
-               "queue_beat_s", "keepalive_s"),
+               "queue_beat_s", "keepalive_s", "stream_write_timeout_s"),
     "Monitor": ("api_monitor", "api_monitor_requests", "monitor_requests"),
 }
 GROUP_OF = {key: name for name, keys in GROUPS.items() for key in keys}
@@ -488,7 +512,10 @@ def check(key: str, v, cfg: dict):
     if k == "arg":
         return _number(key, v, whole=True, lo=kind[2] if len(kind) > 2 else 0, hi=kind[3] if len(kind) > 3 else None)
     if k == "int":
-        return _number(key, v, whole=True, lo=kind[1], hi=kind[2])
+        n = _number(key, v, whole=True, lo=kind[1], hi=kind[2])
+        if key == "repeat_cycle_tokens" and n is not None and 0 < n < 64:    # the server refuses it at start
+            raise ValueError(f"{key}: 0 (off) or at least 64, not {n}")
+        return n
     if k == "num":
         return float(_number(key, v, lo=kind[1], hi=kind[2], lo_open=len(kind) > 3 and bool(kind[3])))
     if k == "argnum":
