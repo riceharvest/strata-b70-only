@@ -255,10 +255,12 @@ EDITABLE = [
      "token, and an honest text made of one short pattern that long (a ruler of two alternating marks) is cut. A single "
      "repeated token is repeat_stop_tokens' job. Empty: off"),
     ("tool_arg_coercion", "bool",
-     "On by default. A tool argument is read by the type the request's schema declares, so a boolean the model wrote as "
-     "True or False is true or false, and a quoted number for an integer or number parameter is a number. A parameter typed "
-     "string (or string among several types) is never changed. Off: the text goes through as written, so a client may get "
-     "the string \"True\" for a boolean parameter. Empty: on"),
+     "On by default. A tool argument is read by the schema the request declares: a boolean the model wrote as True or False "
+     "(or quoted) is true or false, and a quoted number for an integer or number parameter is a number, but only a finite one "
+     "that reads back as written (nan, inf, 1e999 stay text). A parameter whose schema allows a string (type string, a type "
+     "list or anyOf/oneOf with a string, an enum of strings) keeps the text the model wrote, so \"123\" stays \"123\"; a "
+     "parameter with no schema at all is read as JSON when it parses, as before. Off: the old reading everywhere (text such "
+     "as True stays a string, and a string among several types may become a number). Empty: on"),
     ("tool_skipped_closer", "bool",
      "Off by default. On: when the model writes a nested <parameter=X>...</parameter> at the start of a line inside a value, "
      "X being a declared parameter of the tool that is not given yet, and leaves out the value's own </parameter>, the value "

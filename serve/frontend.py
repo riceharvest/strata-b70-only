@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import math
 import re
 import threading
 import uuid
@@ -1250,16 +1251,77 @@ def lenient_json(text: str):
     return v
 
 
+_INT_TEXT = re.compile(r"[+-]?\d+")
+_NUM_TEXT = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
+
+
+def _schema_kinds(schema) -> tuple[set, bool]:
+    """A parameter's declared schema -> (the JSON types it allows, whether a string is allowed).  `schema` is the property
+    object ({"type": ..., "anyOf": [...], "enum": [...]}) or just its `type` (a word or a list).  A schema with no type, no
+    anyOf/oneOf and no enum says nothing: no types, no string."""
+    if isinstance(schema, str):
+        return {schema}, schema == "string"
+    if isinstance(schema, list):
+        return {k for k in schema if isinstance(k, str)}, "string" in schema
+    if not isinstance(schema, dict):
+        return set(), False
+    kinds, text = set(), False
+    t = schema.get("type")
+    if isinstance(t, str):
+        kinds.add(t)
+    elif isinstance(t, list):
+        kinds.update(k for k in t if isinstance(k, str))
+    for branch in (schema.get("anyOf") or []) + (schema.get("oneOf") or []):
+        k, st = _schema_kinds(branch)
+        kinds |= k
+        text = text or st
+    enum = schema.get("enum")
+    if isinstance(enum, list) and any(isinstance(x, str) for x in enum):
+        text = True
+    return kinds, text or "string" in kinds
+
+
+def schema_is_string(schema) -> bool:
+    """The text of a parameter is the value: the schema allows a string (type string, a type list or anyOf/oneOf with a
+    string, or an enum of strings).  Without tool_arg_coercion only the exact type "string" counts, as before."""
+    if not TOOL_ARG_COERCION:
+        return (schema.get("type") if isinstance(schema, dict) else schema) == "string"
+    return _schema_kinds(schema)[1]
+
+
+def _number_of(text: str, kinds: set):
+    """A quoted number for an integer or number parameter -> the number, or None when it is not one that is finite and
+    reads back as written (nan, inf, 1e999, 1_000, a fraction for an integer)."""
+    t = text.strip()
+    if "integer" in kinds and _INT_TEXT.fullmatch(t):
+        return int(t)
+    if "number" in kinds and _INT_TEXT.fullmatch(t):
+        return int(t)                                  # exact: no float rounding of a long digit string
+    if "number" in kinds and _NUM_TEXT.fullmatch(t):
+        n = float(t)
+        return n if math.isfinite(n) else None
+    if "integer" in kinds and _NUM_TEXT.fullmatch(t):
+        n = float(t)
+        return int(n) if math.isfinite(n) and n == int(n) and abs(n) < 2 ** 53 else None
+    return None
+
+
 def coerce_value(value: str, declared, notes: list | None = None):
     """A non-string parameter's text -> its value by the tool's declared type: JSON when it parses; else an array or an
     object read with lenient_json (a note says so in `notes`); else the text itself, as before.  An array or object that
-    arrived as a JSON string of itself is decoded once more."""
+    arrived as a JSON string of itself is decoded once more.  `declared`: the parameter's schema object, or its type.
+    With TOOL_ARG_COERCION a schema that allows a string keeps the text as written, `True`/`False` and quoted numbers
+    follow the type, and only a finite number that reads back as written is made (else the text stays)."""
+    if not TOOL_ARG_COERCION and isinstance(declared, dict):
+        declared = declared.get("type")                # the old reading: the declared type word only
     if declared == "string":
         return value
+    kinds, _ = _schema_kinds(declared)
     if TOOL_ARG_COERCION:
-        kinds = declared if isinstance(declared, list) else [declared]
-        if "boolean" in kinds and "string" not in kinds:
-            word = value.strip().lower()
+        if schema_is_string(declared):
+            return value
+        if "boolean" in kinds:
+            word = value.strip().strip('"').lower()
             if word in ("true", "false"):
                 return word == "true"
     try:
@@ -1274,13 +1336,14 @@ def coerce_value(value: str, declared, notes: list | None = None):
         if notes is not None:
             notes.append("a damaged JSON " + ("array" if isinstance(v, list) else "object") + " argument was read as written")
         return v
-    if TOOL_ARG_COERCION and isinstance(v, str) and declared in ("integer", "number"):
-        try:                                           # a number the model quoted: "450" for an integer parameter
-            n = float(v) if declared == "number" or not v.strip().lstrip("+-").isdigit() else int(v)
-        except ValueError:
-            return v
-        return int(n) if declared == "integer" and n == int(n) else n
-    if isinstance(v, str) and declared in ("array", "object") and v.lstrip().startswith(("[", "{")):
+    if TOOL_ARG_COERCION:
+        if isinstance(v, float) and not math.isfinite(v):
+            return value                               # a bare NaN / Infinity is not JSON the client can read
+        if isinstance(v, str) and kinds & {"integer", "number"}:
+            n = _number_of(v, kinds)                   # a number the model quoted: "450" for an integer parameter
+            return v if n is None else n
+    if (isinstance(v, str) and (kinds & {"array", "object"} if TOOL_ARG_COERCION else declared in ("array", "object"))
+            and v.lstrip().startswith(("[", "{"))):
         try:
             return json.loads(v)
         except ValueError:
@@ -1311,7 +1374,7 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
             value = value[1:]
         if value.endswith("\n"):
             value = value[:-1]
-        args[pname] = coerce_value(value, (props.get(pname) or {}).get("type"), notes)
+        args[pname] = coerce_value(value, props.get(pname) or {} if TOOL_ARG_COERCION else (props.get(pname) or {}).get("type"), notes)
     return ToolCall(name=name, arguments=args)
 
 
@@ -1670,7 +1733,7 @@ class OutputParser:
                     return out
                 self.scall = ToolCall(name=name, arguments={})
                 props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
-                self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
+                self.sdeclared = {k: (v or {}) for k, v in props.items()}   # the parameters' schema objects
                 out.append(Event("tool_start", call=self.scall))
                 args("{")
                 self.sp += b + 1
@@ -1688,7 +1751,7 @@ class OutputParser:
                     self.sp += b + 1
                     self.spname = pname.strip()
                     self.sgiven.add(self.spname)
-                    if self.sdeclared.get(pname) == "string":
+                    if schema_is_string(self.sdeclared.get(pname)):
                         args('"')
                         self.ss, self.sval_started = "str", False
                     else:

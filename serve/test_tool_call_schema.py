@@ -86,6 +86,53 @@ class Coercion(unittest.TestCase):
                              [{"number": 450, "formatted": "True"}])
 
 
+class CoercionLimits(unittest.TestCase):
+    """The reviewer's S1 (non-finite numbers) and S2 (a schema that allows a string keeps the string)."""
+
+    def test_non_finite_and_odd_numbers_stay_text(self):
+        with Setting(TOOL_ARG_COERCION=True):
+            for text in ('"inf"', '"1e999"', '"nan"', '"-Infinity"', 'NaN', '"1_000"'):
+                for kind in ("integer", "number"):
+                    got = frontend.coerce_value(text, {"type": kind})
+                    self.assertIn(got, (text, text.strip('"')), (text, kind))
+                    self.assertIsInstance(got, str)
+            self.assertEqual(frontend.coerce_value('"2.5"', {"type": "integer"}), '2.5')    # not an integer: text
+            self.assertEqual(frontend.coerce_value('"9007199254740993"', {"type": "number"}), 9007199254740993)
+            self.assertEqual(frontend.coerce_value('"3.0"', {"type": "integer"}), 3)
+
+    def test_a_call_with_them_neither_raises_nor_writes_bare_nan(self):
+        tool = {"name": "t", "parameters": {"properties": {"n": {"type": "integer"}, "x": {"type": "number"}}}}
+        for text in ('"inf"', '"1e999"', '"nan"'):
+            body = f"<function=t>\n<parameter=n>\n{text}\n</parameter>\n<parameter=x>\n{text}\n</parameter>\n</function>"
+            for step in (1, 1000):
+                calls = stream(f"<tool_call>\n{body}\n</tool_call>", [tool], step)
+                self.assertEqual(len(calls), 1, (text, step))
+                self.assertIsInstance(calls[0]["n"], str)
+                self.assertIsInstance(calls[0]["x"], str)
+
+    def test_a_schema_that_allows_a_string_keeps_it(self):
+        with Setting(TOOL_ARG_COERCION=True):
+            for schema in ({"type": ["string", "null"]}, {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                           {"enum": ["true", "123"]}, {"oneOf": [{"type": "integer"}, {"type": "string"}]}):
+                for text in ("123", "true", "null"):
+                    self.assertEqual(frontend.coerce_value(text, schema), text, (schema, text))
+            self.assertEqual(frontend.coerce_value("123", {"anyOf": [{"type": "integer"}, {"type": "null"}]}), 123)
+            self.assertEqual(frontend.coerce_value("true", {"anyOf": [{"type": "boolean"}, {"type": "null"}]}), True)
+            self.assertEqual(frontend.coerce_value('"true"', {"type": "boolean"}), True)
+            self.assertEqual(frontend.coerce_value("123", None), 123)       # no schema at all: as before
+
+    def test_off_is_the_old_reading_everywhere(self):
+        with Setting(TOOL_ARG_COERCION=False):
+            self.assertEqual(frontend.coerce_value("123", {"type": ["string", "null"]}), 123)
+            self.assertEqual(frontend.coerce_value("123", {"type": "string"}), "123")
+            self.assertEqual(frontend.coerce_value("True", {"type": "boolean"}), "True")
+
+    def test_string_streams_as_string_when_the_schema_allows_it(self):
+        tool = {"name": "t", "parameters": {"properties": {"v": {"anyOf": [{"type": "string"}, {"type": "null"}]}}}}
+        body = "<tool_call>\n<function=t>\n<parameter=v>\n123\n</parameter>\n</function>\n</tool_call>"
+        self.assertEqual(stream(body, [tool], 3), [{"v": "123"}])
+
+
 class SkippedCloser(unittest.TestCase):
     SKIPPED = ("<function=edit_file>\n<parameter=path>\ndocs/tools.md\n</parameter>\n<parameter=new_string>\n"
                "<parameter=limit>25</parameter>\n</function>")
