@@ -17,8 +17,10 @@ import re
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
-from serve.server import StrataEngine, default_model_name, engine_args, model_card_sampling
+import serve.server as server
+from serve.server import (StrataEngine, default_model_name, engine_args, model_card_sampling, resolve_sampling)
 
 CONFIGS = sorted((Path(__file__).resolve().parents[1] / "tools" / "qwen35").glob("serve-27b*.json"))
 
@@ -94,6 +96,59 @@ class Sampling(unittest.TestCase):
             with self.subTest(sampling):
                 for word in keys.split():
                     self.assertRegex(word, r"^[a-z_]+=\S+$", f"{word!r} in {keys!r}")
+
+
+class GreedyKeepsDrafting(unittest.TestCase):
+    """strata-q36 drafts only for a greedy request with no penalty.  The instruct set (thinking off) carries presence_penalty
+    1.5: a request that asked for temperature 0 got `penalty_present=1.5` on its GEN line, the engine then read the logits on
+    the host one token at a time and offered no draft (a 118K prompt answered at 21.5 tok/s, "drafts accepted 0 of 0")."""
+
+    def keys(self, arch, thinking, request, block=None, shared=None):
+        return StrataEngine.sampling_keys(resolve_sampling(arch, thinking, block or {}, shared or {}, request))
+
+    def test_temperature_0_with_thinking_off_has_no_penalty_word(self):
+        keys = self.keys("qwen35", False, {"temperature": 0})
+        self.assertEqual(keys, " top_p=0.8 top_k=20")
+        self.assertNotIn("penalty", keys)
+
+    def test_the_old_behaviour_is_one_switch_away(self):
+        with mock.patch.object(server, "CARD_PENALTY_AT_GREEDY", True):
+            keys = self.keys("qwen35", False, {"temperature": 0})
+        self.assertEqual(keys, " top_p=0.8 top_k=20 penalty_present=1.5 penalty_last_n=64")
+
+    def test_thinking_on_is_as_before(self):
+        self.assertEqual(self.keys("qwen35", True, {"temperature": 0}), " top_p=0.95 top_k=20")
+
+    def test_a_sampled_request_keeps_the_card_penalty(self):
+        # no temperature in the request: the card's 0.7 (thinking off) is a sampled request, which never drafts anyway
+        keys = self.keys("qwen35", False, {})
+        self.assertIn("temperature=0.7", keys)
+        self.assertIn("penalty_present=1.5", keys)
+        self.assertIn("penalty_present=1.5", self.keys("qwen35", False, {"temperature": 0.3}))
+
+    def test_a_penalty_somebody_named_stays(self):
+        self.assertIn("penalty_present=0.5", self.keys("qwen35", False, {"temperature": 0, "presence_penalty": 0.5}))
+        self.assertIn("penalty_present=2.0", self.keys("qwen35", False, {"temperature": 0}, block={"presence_penalty": 2.0}))
+        self.assertIn("penalty_freq=0.3", self.keys("qwen35", False, {"temperature": 0}, shared={"frequency_penalty": 0.3}))
+        self.assertIn("penalty_repeat=1.1", self.keys("qwen35", False, {"temperature": 0, "repetition_penalty": 1.1}))
+        # an explicit 0 is a named value too: no penalty either way
+        self.assertNotIn("penalty", self.keys("qwen35", False, {"temperature": 0, "presence_penalty": 0}))
+
+    def test_a_config_that_asks_for_temperature_0_is_greedy_too(self):
+        self.assertNotIn("penalty", self.keys("qwen35", False, {}, block={"temperature": 0}))
+        self.assertNotIn("penalty", self.keys("qwen35", False, {}, shared={"temperature": 0.0}))
+
+    def test_other_families_are_not_changed(self):
+        for arch in ("qwen4exp", "qwen35moe"):
+            self.assertIn("penalty_present=1.5", self.keys(arch, False, {"temperature": 0}), arch)
+
+    def test_the_merge_is_otherwise_the_old_one(self):
+        self.assertEqual(resolve_sampling("qwen35", False, {}, {}, {"temperature": 0, "top_p": 0.5, "seed": 3}),
+                         {"temperature": 0, "top_p": 0.5, "top_k": 20, "seed": 3})
+        req = {"temperature": 0.2}
+        self.assertIs(resolve_sampling(None, True, {}, {}, req), req)      # no family, no config: the request as it came
+        self.assertIsNone(resolve_sampling(None, True, {}, {}, None))
+        self.assertEqual(resolve_sampling("qwen35", True, {}, {}, {"top_p": None})["top_p"], 0.95)   # a null field is not named
 
 
 class Done(unittest.TestCase):
