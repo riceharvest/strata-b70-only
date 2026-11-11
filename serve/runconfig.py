@@ -252,7 +252,8 @@ EDITABLE = [
     ("repeat_cycle_tokens", ("int", 0, None),
      "Off by default (0). End a reply whose last N tokens are a cycle of 2 to 4 tokens (a b a b ..., a b c a b c ...); N is at "
      "least 64. The reply ends as \"length\" with a note in the log, and /metrics counts it. Cost: a few comparisons a "
-     "token, and an honest text made of one short pattern that long (a ruler of two alternating marks) is cut. A single "
+     "token, and an honest text made of one short pattern that long (a ruler of two alternating marks, or 16 equal 4-token "
+     "entries in a data table such as zero-filled initialisers) is cut: use 128 or more for code. A single "
      "repeated token is repeat_stop_tokens' job. Empty: off"),
     ("tool_arg_coercion", "bool",
      "On by default. A tool argument is read by the schema the request declares: a boolean the model wrote as True or False "

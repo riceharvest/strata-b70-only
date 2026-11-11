@@ -104,16 +104,16 @@ class MaxTokens(unittest.TestCase):
         msgs = [{"role": "user", "content": "how many tokens is this?"}]
         s, b = self.post("/tokenize", {"model": "m", "messages": msgs})
         self.assertEqual(s, 200)
-        self.assertEqual(list(b), ["tokens"])
+        self.assertEqual(list(b), ["count"])
         s2, _, n_in, _ = self.call("openai", "how many tokens is this?", max_tokens=8)
-        self.assertEqual((s2, b["tokens"]), (200, n_in))
+        self.assertEqual((s2, b["count"]), (200, n_in))
         s, b2 = self.post("/tokenize", {"model": "m", "messages": msgs, "ids": True})
-        self.assertEqual((s, len(b2["ids"]), b2["tokens"]), (200, b["tokens"], b["tokens"]))
+        self.assertEqual((s, len(b2["tokens"]), b2["count"]), (200, b["count"], b["count"]))
         tool = {"type": "function", "function": {"name": "f", "description": "d", "parameters": {"type": "object"}}}
         s, b3 = self.post("/tokenize", {"model": "m", "messages": msgs, "tools": [tool]})
-        self.assertGreater(b3["tokens"], b["tokens"])               # the tool list is part of the prompt
+        self.assertGreater(b3["count"], b["count"])               # the tool list is part of the prompt
         s, b4 = self.post("/tokenize", {"model": "m", "messages": msgs, "tools": [tool], "tool_choice": "none"})
-        self.assertEqual(b4["tokens"], b["tokens"])
+        self.assertEqual(b4["count"], b["count"])
         self.assertEqual(self.post("/tokenize", {"model": "m", "messages": []})[0], 400)
         self.assertEqual(self.post("/tokenize", {"model": "m", "messages": msgs, "ids": "yes"})[0], 400)
 

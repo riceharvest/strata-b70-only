@@ -7873,7 +7873,8 @@ def make_handler(svc: Service):
 
         def _tokenize(self, req):
             """POST /tokenize: the prompt a /v1/chat/completions request with this body would read, rendered and
-            tokenized; the model does not run.  {"tokens": N}, and {"ids": [...]} too when the body has "ids": true."""
+            tokenized; the model does not run.  {"count": N}, and {"tokens": [ids]} too when the body has "ids": true (the shape
+            llama.cpp and vLLM use for the list)."""
             req = svc.with_shared(req, "openai")
             messages, tools, kw = openai_to_messages(req)
             require_messages(messages)
@@ -7882,9 +7883,9 @@ def make_handler(svc: Service):
             if "ids" in req and not isinstance(req["ids"], bool):
                 raise ValueError('ids: true or false')
             ids = svc.encode_prompt(messages, tools, kw, store=False)
-            body = {"tokens": len(ids)}
+            body = {"count": len(ids)}
             if req.get("ids"):
-                body["ids"] = list(ids)
+                body["tokens"] = list(ids)
             self._json(200, body)
 
         def _anthropic(self, req):
