@@ -2305,6 +2305,40 @@ class RepeatStop(unittest.TestCase):
         self.assertEqual(done["finish"], "stop")
 
 
+class RepeatStopChannels(unittest.TestCase):
+    """repeat_stop_tokens counts every token the engine yields, so the channel does not matter: inside the thinking, and
+    in a burst of tokens (a drafted step hands several at once; the engine's generator still yields them one by one)."""
+
+    def run_reply(self, script, thinking):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            done = [x for kind, x in svc.run(tok.encode("hi"), thinking, None, 3000, {}, threading.Event())
+                    if kind == "done"][0]
+        return done, out.getvalue(), svc
+
+    def test_inside_the_thinking(self):
+        done, log, svc = self.run_reply("let me think " + "!" * 1000, True)
+        self.assertEqual(done["finish"], "length")
+        self.assertIn("repeated one token ('!') 256 times", log)
+        self.assertEqual(svc.totals["repeat_stops"], 1)
+
+    def test_in_bursts_of_tokens(self):
+        class Burst(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                toks = list(super().generate(ids, max_new, sampling, cancel, embeddings))
+                for i in range(0, len(toks), 6):
+                    yield from toks[i:i + 6]
+
+        tok = ByteTokenizer()
+        svc = Service(Burst(tok, "ok " + "!" * 1000, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            done = [x for kind, x in svc.run(tok.encode("hi"), False, None, 3000, {}, threading.Event())
+                    if kind == "done"][0]
+        self.assertEqual((done["finish"], done["completion_tokens"]), ("length", 3 + 256))
+
+
 class RepeatCycle(unittest.TestCase):
     """repeat_cycle_tokens (opt-in): a cycle of 2-4 tokens over the last N tokens ends the reply as "length"."""
 
