@@ -45,21 +45,23 @@ Qwen3.8-Flash-Next UD-IQ1_S (the served recipe setup writes) on one Arc Pro B70,
 | 118K (118,227 tokens) | 3,475 / 3,356 | 85.6 / 86.5 |
 | 250K (249,650 tokens) | 3,325 / 3,329 | 84.7 / 87.5 |
 
-Short cold prompts (one user message, nothing cached, same start), prompt read time and time to the first token:
+Short cold prompts (one user message, nothing cached, same settings, the median of three), prompt read time and time to
+the first token:
 
 | Prompt | Read (tok/s) | First token |
 | --- | ---: | ---: |
-| 135 tokens | 313 ms (431) | 355 ms |
-| 393 tokens | 427 ms (921) | 468 ms |
-| 1,178 tokens | 637 ms (1,848) | 691 ms |
-| 5,382 tokens | 1,841 ms (2,923) | 1,963 ms |
+| 139 tokens | 320 ms (435) | 356 ms |
+| 384 tokens | 377 ms (1,018) | 412 ms |
+| 1,378 tokens | 673 ms (2,047) | 726 ms |
+| 5,303 tokens | 1,863 ms (2,846) | 1,967 ms |
 
 A short prompt cannot reach the long prompts' speed: about a third of the experts live in RAM, and a few hundred tokens
 already route to most of them, so every read has to bring most of those across PCIe whatever its length.
 
-The two [localmaxxing](https://localmaxxing.com) prompts in the same start (greedy, 512 tokens, one measured run each
-after a warm-up): reasoning-v1 121.8 tok/s (345-token prompt read in 371 ms, first token 412 ms), code-v1 103.7 tok/s
-(280 tokens in 369 ms, first token 415 ms).
+The two [localmaxxing](https://localmaxxing.com) prompts (greedy, 512 tokens, the same text three times after a
+warm-up): reasoning-v1 129.6 / 130.2 / 131.2 tok/s, code-v1 106.6 / 108.2 / 109.4 tok/s. With 700 MiB of VRAM kept free
+on a card that drives no desktop: 129-134 and 105-110 tok/s. A single run with another closing line in the prompt reads
+up to 10% lower or higher, because the text the model writes changes with it.
 
 Does the tuning change what the model says? Measured 2026-11-11: the served kernels against their exact alternatives give
 the same top token in 36 of 36 prompt reads and in 99.1% of 2,867 decoded positions, and llama.cpp on the CPU scores the
