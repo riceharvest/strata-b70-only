@@ -858,10 +858,11 @@ _LOOSE_PART = re.compile(r"<\s*(?:function[ \t]*[=:]?\s*|=\s*)?[A-Za-z0-9_.\-]*\
 _QUOTED_OPEN = re.compile(r"<function=[^<>\s]+>\s*(?:<parameter=|</function>)")
 
 
-# Opt-in, set once at start from the run config ("tool_skipped_closer"): a `</parameter>` that closes a nested
-# `<parameter=X>` opener inside a value is value text, and a value whose own closer the model left out ends before the
-# call's `</function>` (upstream issue 5756).  Off: the first close with a valid follower ends the value, as before.
-TOOL_SKIPPED_CLOSER = False
+# On by default, set once at start from the run config ("tool_skipped_closer": false turns it off): a `</parameter>`
+# that closes a nested `<parameter=X>` opener inside a value is value text, and a value whose own closer the model left
+# out ends before the call's `</function>` (upstream issue 5756).  Off: the first close with a valid follower ends the
+# value, as before.
+TOOL_SKIPPED_CLOSER = True
 # On by default ("tool_arg_coercion": false turns it off): a parameter's text is read by the declared JSON schema type
 # even when the model wrote it as Python (`True`, `False`) or as a quoted number (upstream issue 5743).  Off: the text
 # goes through as written.
@@ -921,7 +922,10 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
     at = text.find(PARAM_END)
     skipped = -1                                      # the first nested close followed by the call's end
     while at >= 0:
-        if TOOL_SKIPPED_CLOSER and len(_NESTED_OPEN.findall(text, 0, at)) > text.count(PARAM_END, 0, at):
+        # (a value that quotes a whole call - a `<function=` before this close - is left to the #4078 rule below: its
+        # nested pair is part of the quoted call, which has its own `</function>`)
+        if (TOOL_SKIPPED_CLOSER and "<function=" not in text[:at]
+                and len(_NESTED_OPEN.findall(text, 0, at)) > text.count(PARAM_END, 0, at)):
             after = text[at + len(PARAM_END):].lstrip()
             if skipped < 0 and after.startswith((FUNC_END, CALL_END)):
                 skipped = at + len(PARAM_END)
