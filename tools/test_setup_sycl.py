@@ -624,6 +624,37 @@ class ServedRecipe(unittest.TestCase):
         self.assertEqual(out["args_written"], out["args"])
         self.assertEqual(user_args.capture(out, setup.SETUP_CHOICE_FLAGS), ["--vram-reserve-mib", "700"])
 
+    def test_an_env_entry_the_person_set_survives_a_rerun_and_a_recipe_one_does_not_stay_without_the_recipe(self):
+        old = {"STRATA_KREG2_R": "1", "STRATA_MY_SWITCH": "x", "STRATA_SPEC_PROBE_MIN": "1", "STRATA_SYCL_BIN": "stale",
+               "IGC_EnableDPEmulation": "1", "STRATA_ROUTE_TAIL_SKIP": "0"}
+        cfg = self.cfg(env=old, model_name="qwen3.8-flash-next-unsloth-ud-iq1_s")
+        out, _ = self.make(cfg=cfg)
+        self.assertEqual(out["env"]["STRATA_KREG2_R"], "1")                       # the person's value beats the recipe's
+        self.assertEqual(out["env"]["STRATA_MY_SWITCH"], "x")
+        self.assertEqual(out["env"]["STRATA_SPEC_PROBE_MIN"], "1")
+        self.assertNotIn("STRATA_SYCL_BIN", out["env"])                           # what setup writes itself is regenerated
+        self.assertNotIn("IGC_EnableDPEmulation", out["env"])
+        self.assertNotIn("STRATA_ROUTE_TAIL_SKIP", out["env"])                    # setup's own entry of an Unsloth config
+        off, _ = self.make(served=False, cfg=self.cfg(env={**self.si.SERVED_ENV, "STRATA_MY_SWITCH": "x"}))
+        self.assertEqual(off["env"], {"STRATA_MY_SWITCH": "x"})                   # the recipe's values of an earlier run are gone
+        gone, _ = self.make(served=False, cfg=self.cfg(env=dict(self.si.SERVED_ENV)))
+        self.assertIsNone(gone.get("env"))
+
+    def test_the_recipe_is_for_exactly_one_b70(self):
+        si = self.si
+        b70 = {"devid": "e223"}
+        self.assertTrue(si.served_applies([b70], "e223", True))
+        self.assertFalse(si.served_applies([b70, b70], "e223", True))             # a layer split keeps its two-card --spec 2 rule
+        self.assertFalse(si.served_applies([{"devid": "e221"}], "e221", True))
+        self.assertFalse(si.served_applies([b70], "e223", False))
+
+    def test_the_model_and_vision_options_in_the_equals_form_are_seen(self):
+        si = self.si
+        b70 = [{"devid": "e223", "vram_gb": 32.0, "driver": "xe"}]
+        with mock.patch.object(setup, "tier_pick", setup.tier_pick), mock.patch.object(setup, "RECOMMENDED_SIZES", dict(setup.RECOMMENDED_SIZES)):
+            self.assertEqual(si.prefer_served(b70, 62.0, ["--model=UD-IQ1_S"]), ["--model=UD-IQ1_S", "--vision", "no"])
+            self.assertEqual(si.prefer_served(b70, 62.0, ["--model", "UD-IQ1_S", "--vision=yes"]), ["--model", "UD-IQ1_S", "--vision=yes"])
+
     def test_the_off_switch_is_taken_out_before_setup_sees_it(self):
         src = (ROOT / "sycl" / "setup_intel.py").read_text(encoding="utf-8")
         self.assertIn("NO_RECIPE_FLAG not in argv", src)
