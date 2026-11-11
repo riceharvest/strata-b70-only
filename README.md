@@ -123,7 +123,8 @@ PCIe 4.0 x16 slot. Treat them as a floor; on a newer platform expect more, but n
        ./setup.sh --backend sycl --family unsloth --model UD-IQ1_S --context 262144 --vision no
 
    On one B70 with 64 GB of RAM, a first `./setup.sh --backend sycl` with no `--family` or `--model` preselects the same
-   model and context in its menu (`--yes` takes them).
+   model and context in its menu (`--yes` takes them). That run keeps pictures on, which the served setup does not
+   have: use the command above for the served one.
    Setup downloads Unsloth's UD-IQ1_S files at a pinned revision, checks them against pinned sizes and SHA-256 sums, and
    takes one tensor (layer 18's gate experts) from the UD-IQ1_M file of the same repository into shard 2, about 216 MB read
    (the file as published cannot be packed: `docs/QUANTS.md` says why; nothing is quantized again). It then builds the pack,
