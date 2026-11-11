@@ -862,9 +862,10 @@ _QUOTED_OPEN = re.compile(r"<function=[^<>\s]+>\s*(?:<parameter=|</function>)")
 # `<parameter=X>` opener inside a value is value text, and a value whose own closer the model left out ends before the
 # call's `</function>` (upstream issue 5756).  Off: the first close with a valid follower ends the value, as before.
 TOOL_SKIPPED_CLOSER = False
-# Opt-in ("tool_arg_coercion"): a parameter's text is read by the declared JSON schema type even when the model wrote it
-# as Python (`True`, `False`) or as a quoted number (upstream issue 5743).  Off: the text goes through as written.
-TOOL_ARG_COERCION = False
+# On by default ("tool_arg_coercion": false turns it off): a parameter's text is read by the declared JSON schema type
+# even when the model wrote it as Python (`True`, `False`) or as a quoted number (upstream issue 5743).  Off: the text
+# goes through as written.
+TOOL_ARG_COERCION = True
 _NESTED_OPEN = re.compile(r"<parameter=[^<>\s]+>")
 
 

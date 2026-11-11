@@ -1,8 +1,9 @@
 """Tool-call arguments that follow the declared schema, and a value whose own </parameter> the model skipped.
 
 Upstream issues 5743 (a boolean written True/False came back as a string) and 5756 (a nested <parameter=..> pair
-ended the value early when the model left out the value's own closer).  Both fixes are opt-in settings
-(tool_arg_coercion, tool_skipped_closer); off, the parser behaves as before.
+ended the value early when the model left out the value's own closer).  Both fixes are settings:
+tool_arg_coercion (on by default) and tool_skipped_closer (off by default: with it on, a value that quotes a whole
+call is read wrongly in the corpus's nested-call specimen); with one off, the parser behaves as before.
 
     python -m unittest serve.test_tool_call_schema -v
 """
@@ -54,7 +55,12 @@ class Coercion(unittest.TestCase):
             "<parameter=formatted>\nTrue\n</parameter>\n</function>")
 
     def test_off_keeps_the_text(self):
-        self.assertEqual(call(self.BODY, BOOL_TOOL), {"number": 450, "formatted": "True"})
+        with Setting(TOOL_ARG_COERCION=False):
+            self.assertEqual(call(self.BODY, BOOL_TOOL), {"number": 450, "formatted": "True"})
+
+    def test_on_is_the_default(self):
+        self.assertTrue(frontend.TOOL_ARG_COERCION)
+        self.assertEqual(call(self.BODY, BOOL_TOOL), {"number": 450, "formatted": True})
 
     def test_on_follows_the_declared_type(self):
         with Setting(TOOL_ARG_COERCION=True):
@@ -76,8 +82,9 @@ class Coercion(unittest.TestCase):
         with Setting(TOOL_ARG_COERCION=True):
             self.assertEqual(stream(f"<tool_call>\n{self.BODY}\n</tool_call>", [BOOL_TOOL]),
                              [{"number": 450, "formatted": True}])
-        self.assertEqual(stream(f"<tool_call>\n{self.BODY}\n</tool_call>", [BOOL_TOOL]),
-                         [{"number": 450, "formatted": "True"}])
+        with Setting(TOOL_ARG_COERCION=False):
+            self.assertEqual(stream(f"<tool_call>\n{self.BODY}\n</tool_call>", [BOOL_TOOL]),
+                             [{"number": 450, "formatted": "True"}])
 
 
 class SkippedCloser(unittest.TestCase):
