@@ -9,8 +9,8 @@
 //   esimd_f16_parity [mean_rows=320] [experts=16] [reps=10] [seed=1] [gate_up_type=22 down_type=42 | all]
 //   all: every format pair below, then one table (the sweep: no model file is needed, the experts are random blocks with sane scales;
 //        random, because Xe2 compresses memory and a constant fill would stream faster than real weights).
-//   types: gate/up 12 Q4_K, 13 Q5_K, 14 Q6_K, 8 Q8_0, 21 IQ3_S, 18 IQ3_XXS, 17 IQ2_XS, 23 IQ4_XS, 2 Q4_0, 3 Q4_1, 6 Q5_0, 22 IQ2_S,
-//          16 IQ2_XXS; down 20 IQ4_NL, 7 Q5_1, 8 Q8_0, 2 Q4_0, 3 Q4_1, 6 Q5_0, 42 Q2_0.
+//   types: gate/up 12 Q4_K, 13 Q5_K, 14 Q6_K, 8 Q8_0, 21 IQ3_S, 18 IQ3_XXS, 17 IQ2_XS, 23 IQ4_XS, 29 IQ1_M, 42 Q2_0, 2 Q4_0, 3 Q4_1,
+//          6 Q5_0, 22 IQ2_S, 16 IQ2_XXS; down 20 IQ4_NL, 7 Q5_1, 8 Q8_0, 2 Q4_0, 3 Q4_1, 6 Q5_0, 42 Q2_0.
 //   BENCH_NOREF=1: no FP64 reference (timing sweeps).
 //   Row counts: gamma-distributed (a few large experts, many small), three edge counts (1, 33, 65), scaled to the mean.
 // Exit status 1 when (c) is off by more than 1e-5 rms, (b) is more than 1.25x the FP16 chain's own error, or (d) differs.
@@ -56,6 +56,7 @@ static int block_bytes(int t) {
         case 21: return 110;
         case 22: return 82;
         case 23: return 136;
+        case 29: return 56;
         default: return 18;   // 42 Q2_0
     }
 }
@@ -83,6 +84,7 @@ static const char* type_name(int t) {
         case 21: return "IQ3_S";
         case 22: return "IQ2_S";
         case 23: return "IQ4_XS";
+        case 29: return "IQ1_M";
         case 42: return "Q2_0";
         default: return "?";
     }
@@ -103,6 +105,14 @@ static void sane_block(int t, uint8_t* blk, std::mt19937& rng) {
         case 3: case 7: put(0, 0.0004f + 0.00002f * j1); put(2, -0.004f - 0.0002f * j2); break;          // d, m
         case 8: case 20: put(0, 0.0001f + 0.000004f * j1); break;                                        // codes up to 127
         case 23: put(0, 0.00008f + 0.000001f * j1); break;                                               // codes up to 127 x 31
+        case 29: {   // IQ1_M has no d field: the FP16 scale is the top nibbles of the four 16-bit scale words
+            const uint16_t h = f2h(0.004f + 0.0002f * j1);
+            uint16_t sc[4];
+            std::memcpy(sc, blk + 48, 8);
+            for (int k = 0; k < 4; ++k) sc[k] = (uint16_t) ((sc[k] & 0x0fff) | (((h >> (4 * k)) & 0xf) << 12));
+            std::memcpy(blk + 48, sc, 8);
+            break;
+        }
         default: put(0, 0.0004f + 0.00002f * j1); break;
     }
 }
@@ -175,6 +185,24 @@ static void dec_row(int t, const uint8_t* row, int K, double* out) {
                     }
                 }
             }
+        } else if (t == 29) {   // IQ1_M: qs[32], qh[16], scales[8] (4 x 16 bits: 3-bit scales, the top nibbles the FP16 d)
+            const uint8_t *qs = blk, *qh = blk + 32;
+            uint16_t sc[4];
+            std::memcpy(sc, blk + 48, 8);
+            const uint16_t fb = (uint16_t) ((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+            const double d0 = h2f(fb);
+            for (int ib = 0; ib < 8; ++ib)
+                for (int l = 0; l < 4; ++l) {
+                    const int ib16 = 2 * ib + l / 2;
+                    const double dd = d0 * (2 * ((sc[ib16 / 4] >> (3 * (ib16 % 4))) & 7) + 1);
+                    const int qhb = qh[2 * ib + l / 2] >> (4 * (l % 2));
+                    const double delta = (qhb & 8) ? -1.125 : -0.875;
+                    const uint32_t g = iq1s_grid_gpu[qs[4 * ib + l] | ((qhb & 7) << 8)];
+                    for (int j = 0; j < 8; ++j) {
+                        const int qv = j < 4 ? (g >> (8 * j)) & 0xf : (g >> (8 * (j - 4) + 4)) & 0xf;
+                        o[ib * 32 + 8 * l + j] = dd * (qv + delta);
+                    }
+                }
         } else if (t == 23) {   // IQ4_XS: d, scales_h, scales_l[4], qs[128]
             uint16_t sh; std::memcpy(&sh, blk + 2, 2);
             const uint8_t *sl = blk + 4, *qs = blk + 8;
@@ -472,8 +500,13 @@ int main(int argc, char** argv) {
     sycl::queue* q = &dpct::get_in_order_queue();
     std::vector<std::pair<int, int>> cases = {{22, 42}, {16, 42}};
     const bool all = argc > 5 && std::strcmp(argv[5], "all") == 0;
-    if (all)   // the pairs of Unsloth's files first (UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL, Q8_0, UD-IQ4_XS), then every other format once
-        cases = {{12, 7}, {13, 8}, {14, 8}, {8, 8}, {21, 20}, {23, 20}, {18, 42}, {17, 42}, {21, 42}, {22, 20}, {2, 2}, {3, 3}, {6, 6}, {22, 42}, {16, 42}};
+    if (all)   // every gate/up and down pair a layer has in Unsloth's files of the model (12 of them, two revisions) and in the GSQ-RCO
+               // packs (tools/quant_formats.py --hf, from the headers), then the two formats of launch_x no file has (Q4_0, Q4_1)
+        cases = {{16, 42}, {22, 42}, {17, 42}, {16, 20}, {22, 20}, {17, 20}, {22, 6},      // IQ2_XXS / IQ2_S / IQ2_XS with Q2_0, IQ4_NL, Q5_0
+                 {18, 42}, {18, 20}, {18, 6}, {23, 20}, {23, 6}, {23, 8},                  // IQ3_XXS, IQ4_XS
+                 {21, 42}, {21, 20}, {21, 8}, {29, 42}, {42, 42},                          // IQ3_S, IQ1_M, Q2_0 (the earlier packs)
+                 {12, 7}, {12, 8}, {13, 8}, {14, 8}, {8, 8},                               // the K-quants and Q8_0
+                 {2, 2}, {3, 3}};
     else if (argc > 6) cases = {{std::atoi(argv[5]), std::atoi(argv[6])}};
     if (!i8::f16_handles(22, 42, 640, 2560, q)) { std::printf("esimd_f16_parity: SKIP (no ESIMD DPAS device)\n"); return 0; }
     dpct::blas::descriptor_ptr hd = new dpct::blas::descriptor();
