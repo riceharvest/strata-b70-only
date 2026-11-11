@@ -1374,10 +1374,10 @@ class OutputParser:
         anywhere outside code (a fence, inline code, an indented block)."""
         if self.state == "reasoning":
             return self._ok_at(p)
-        snap = (self.fence, self.line, self.ticks)
+        snap = self._snap()
         self._track(self.buf[:p])
         ok = not self._in_code()
-        self.fence, self.line, self.ticks = snap
+        self._restore(snap)
         return ok
 
     def _callable(self, name: str) -> bool:

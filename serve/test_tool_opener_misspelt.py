@@ -86,8 +86,9 @@ class Misspelt(unittest.TestCase):
         self.assertEqual(calls(evs), [])
         self.assertEqual(text(evs), t)
 
-    # (upstream also has a test that an indented code block stays text; the fork's tracker does not know indented
-    # blocks yet - that is upstream 209dcadb - so a misspelt opener there is read as a call, like a real one is.)
+    def test_indented_code_stays_text(self):
+        t = "Example:\n\n    <toolcall>\n    " + BODY.replace("\n", "\n    ") + "</tool_call>\n"
+        self.assertEqual(calls(run(t)), [])
 
     def test_no_tools_declared(self):
         t = "<toolcall>\n" + BODY + "</tool_call>"
