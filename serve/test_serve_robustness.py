@@ -55,7 +55,6 @@ class StalledClient(unittest.TestCase):
         import json
         import socket
         import time
-        import urllib.request
         import serve.server as server
         from serve.frontend import ChatTemplate
         from serve.server import ByteTokenizer, MockEngine, Service, serve

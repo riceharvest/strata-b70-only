@@ -307,7 +307,14 @@ SLOT_QUIET_S = 600.0     # a slot whose consumer left: BDONE is waited for while
 # #4271: a streaming client that stops reading (a hung process, a network that dropped) leaves the thread that writes to
 # it blocked once the socket buffers are full - and that thread holds the engine's turn.  A write that makes no progress
 # for this long ends the request as a disconnect (the engine is stopped, the turn given back).  0: no limit, as before.
-STREAM_WRITE_TIMEOUT_S = float(os.environ.get("STRATA_STREAM_WRITE_TIMEOUT_S", "60") or 0)
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        return max(0.0, float(os.environ.get(name, "") or default))
+    except ValueError:
+        return default
+
+
+STREAM_WRITE_TIMEOUT_S = _env_seconds("STRATA_STREAM_WRITE_TIMEOUT_S", 60.0)   # the config's "stream_write_timeout_s" sets it
 # Disk sessions: the longest allowance an engine may announce (`SWAIT <phase> <s>`) for one step that blocks in a
 # single call (a file flush, the host->device transfer); the engine's own bound is the same (session_phase_limit_s).
 SESSION_WAIT_MAX_S = 3600
@@ -8662,7 +8669,7 @@ SERVER_NUMBERS = {
     "yields_max": "StrataEngine.YIELDS_MAX", "admit_short_first": "ADMIT_SHORT_FIRST",
     "unload_wait_s": "Service.UNLOAD_WAIT_S", "restart_retry_s": "StrataEngine.RESTART_RETRY_S",
     "queue_beat_s": "QUEUE_BEAT_S", "keepalive_s": "KEEPALIVE_S",
-    "stream_linger_s": "stream_order.LINGER_S",
+    "stream_linger_s": "stream_order.LINGER_S", "stream_write_timeout_s": "STREAM_WRITE_TIMEOUT_S",
     "monitor_requests": "METRICS_REQUESTS", "api_monitor_requests": "API_MONITOR_REQUESTS",
 }
 

@@ -324,6 +324,11 @@ EDITABLE = [
     ("keepalive_s", ("num", 1, 600),
      "A stream that has gone quiet (the server holds back a tool call's arguments until they are whole) sends a ping at least "
      "this often, in seconds (default 10). The same trade as the number above. Empty: 10"),
+    ("stream_write_timeout_s", ("num", 0, 86400),
+     "A streaming reply whose client does not take one event for this long, in seconds (default 60; 0 = wait for ever), is ended "
+     "as if the client had left: the engine stops and the next request gets its turn. Cost: a client that stops reading for that "
+     "long (a hung program, a very slow link, one huge event such as a big tool argument sent whole) loses its request. "
+     "Empty: 60"),
     ("monitor_requests", ("int", 1, 500),
      "How many of the last finished requests the Monitor lists (default 12). The server keeps up to 500 in memory for the full "
      "list. More: a longer table and a bigger answer every time the page refreshes. Empty: 12"),
@@ -367,7 +372,7 @@ GROUPS = {
                              "repeat_cycle_tokens", "reasoning_loop_recovery", "loop_check_every", "loop_coverage", "loop_history_words",
                              "loop_tail_chars", "loop_tail_period"),
     "Server": ("stream_linger_s", "aliases", "idle_unload_s", "engine_silence_s", "open_browser", "unload_wait_s", "restart_retry_s",
-               "queue_beat_s", "keepalive_s"),
+               "queue_beat_s", "keepalive_s", "stream_write_timeout_s"),
     "Monitor": ("api_monitor", "api_monitor_requests", "monitor_requests"),
 }
 GROUP_OF = {key: name for name, keys in GROUPS.items() for key in keys}

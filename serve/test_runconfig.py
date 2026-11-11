@@ -128,6 +128,14 @@ class Apply(unittest.TestCase):
         new, _ = runconfig.apply({"sampling": {"top_k": 20}}, {"sampling.top_k": None})
         self.assertNotIn("sampling", new)                                 # an empty block goes
 
+    def test_stream_write_timeout_is_a_setting(self):
+        cfg, _ = runconfig.apply(CFG, {"stream_write_timeout_s": 0})
+        self.assertEqual(cfg["stream_write_timeout_s"], 0)
+        self.assertEqual(server.server_numbers(cfg)["STREAM_WRITE_TIMEOUT_S"], 0)
+        self.assertEqual(server.server_numbers(CFG)["STREAM_WRITE_TIMEOUT_S"], server.STREAM_WRITE_TIMEOUT_S)
+        with self.assertRaises(ValueError):
+            runconfig.apply(CFG, {"stream_write_timeout_s": -1})
+
     def test_repeat_cycle_tokens_is_off_or_at_least_64(self):
         cfg, _ = runconfig.apply(CFG, {"repeat_cycle_tokens": 64})
         self.assertEqual(cfg["repeat_cycle_tokens"], 64)
@@ -431,7 +439,7 @@ class ServerNumbers(unittest.TestCase):
         cfg = {"loop_check_every": 256, "loop_coverage": 0.5, "loop_history_words": 20000, "loop_tail_chars": 4096,
                "loop_tail_period": 128, "answer_room_min_cap": 2048, "answer_reserve_min": 800, "yields_max": 4,
                "admit_short_first": 8192, "unload_wait_s": 60, "restart_retry_s": 5, "queue_beat_s": 2.5, "keepalive_s": 3,
-               "stream_linger_s": 1.5, "monitor_requests": 30, "api_monitor_requests": 250}
+               "stream_linger_s": 1.5, "stream_write_timeout_s": 7, "monitor_requests": 30, "api_monitor_requests": 250}
         self.assertEqual(server.apply_server_numbers(cfg), list(cfg))
         got = {k: getattr(*server._number_home(w)) for k, w in server.SERVER_NUMBERS.items()}
         self.assertEqual(got, {k: (float(v) if isinstance(self.before[server.SERVER_NUMBERS[k]], float) else v)
