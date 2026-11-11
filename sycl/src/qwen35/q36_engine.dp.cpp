@@ -1435,14 +1435,18 @@ auto &bv =
 constexpr int kArgBlocks = 128;   // (the row stride of k_argmax's partials)
 
 // ------------------------------------------------------------------------------------------------ drafting beyond greedy
-// A greedy request with a penalty drafts too: the verify window returns each row's M highest raw logits (q36_sampling.hpp)
-// and the host picks the row's token as the plain sampler would (the penalized argmax), then compares it with the draft.
-// The switch is read once; 0 gives those requests the plain decode.
+// A greedy request with a penalty and a sampled request (a temperature above 0) draft too: the verify window returns each
+// row's M highest raw logits (q36_sampling.hpp) and the host picks the row's token as the plain sampler would, then
+// compares it with the draft.  Both switches are read once; 0 gives that class of requests the plain decode.
 using strata::qwen35::kSpecRowWords;
 using strata::qwen35::kSpecTopM;
 using strata::qwen35::kSpecChunk;
 bool q36_spec_pen_on() {   // STRATA_Q36_SPEC_PEN: a greedy request with a penalty drafts
     static const bool on = [] { const char* e = std::getenv("STRATA_Q36_SPEC_PEN"); return !(e && e[0] == '0'); }();
+    return on;
+}
+bool q36_spec_sample_on() {   // STRATA_Q36_SPEC_SAMPLE: a request with a temperature above 0 drafts
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_SPEC_SAMPLE"); return !(e && e[0] == '0'); }();
     return on;
 }
 bool q36_spec_check_on() {   // STRATA_Q36_SPEC_CHECK=1: compare each window's rows with the host's top M (a debug aid)
@@ -2533,7 +2537,7 @@ struct Engine {
     void *q8, *xq, *escr;
     int32_t *ids, *grp_start, *n_groups, *ent_dst, *ent_tok, *tok, *pos0, *pick;
     int32_t* hpin = nullptr;   // pinned staging: [0] decode token, [1] position, [2..9] picks, [10] max rows, [16..] tokens
-    // drafting beyond greedy (STRATA_Q36_SPEC_PEN): a verify window's rows as their M highest raw logits
+    // drafting beyond greedy (STRATA_Q36_SPEC_PEN / _SAMPLE): a verify window's rows as their M highest raw logits
     uint64_t* sp_cand = nullptr;   // [kVerify][sp_nch][kSpecTopM]: each 4,096-logit chunk's best keys (first stage)
     int32_t* sp_rows = nullptr;    // [kVerify][kSpecRowWords]: a row's ids, then its logits' bits (second stage)
     int32_t* sp_m = nullptr;       // [1] the candidates a row returns, set before each window (the kernels read it)
@@ -2958,7 +2962,7 @@ struct Engine {
         pick = dalloc_t<int32_t>(kVerify);
         amv = dalloc((size_t) kArgBlocks * kVerify);
         ami = dalloc_t<int32_t>((size_t) kArgBlocks * kVerify);
-        if (q36_spec_pen_on()) {   // (about 0.5 MB of the card and 8 KB of pinned memory)
+        if (q36_spec_pen_on() || q36_spec_sample_on()) {   // (about 0.5 MB of the card and 8 KB of pinned memory)
             sp_nch = (int) ((g.n_vocab + kSpecChunk - 1) / kSpecChunk);
             if (sp_nch >= 1 && sp_nch <= kThreads) {   // (the second stage gives each chunk a work-item)
                 sp_cand = dalloc_t<uint64_t>((size_t) kVerify * (size_t) sp_nch * kSpecTopM);
@@ -6213,7 +6217,7 @@ work-group size if needed.
     /// advanced there), each pick written into the verify window's token row, then the verify window.  Graph C (per kept count):
     /// the commit and hlast.  The same kernels on the same rows as the eager form, so the same picks.
     bool spec_graphs() const { return use_graph && mtp_graph && n_sess == 1 && !main_hybrid; }
-    /// Whether a window may return its rows' top candidates for the host to draw (STRATA_Q36_SPEC_PEN): the
+    /// Whether a window may return its rows' top candidates for the host to draw (STRATA_Q36_SPEC_PEN / _SAMPLE): the
     /// graph form of the verify window only (one session, no hybrid experts, a window that fits kGemmT rows).
     bool sp_window_ok() const { return sp_cand != nullptr && mtp_d >= 1 && mtp_d + 1 <= kGemmT && spec_graphs(); }
     /// The M highest raw logits of each of the first T rows of `logits` (M = *sp_m, at most kSpecTopM), ranked by (logit, then
@@ -6556,8 +6560,8 @@ work-group size if needed.
                     fix.assign((size_t) f, filler);
                     spec_step(filler, fix, mtp_d, drafts, picks);
                 }
-                // the graph variant that returns the rows' top candidates (the same T0 and D keys): a request with a penalty
-                // would else make each of them on first use
+                // the graph variant that returns the rows' top candidates (the same T0 and D keys): a request with a penalty or a
+                // temperature above 0 would else make each of them on first use
                 if (sp_window_ok() && pos + (int64_t) (mtp_d + 1) * (mtp_d + 2) < ctx) {
                     strata::qwen35::Sampling ws;
                     ws.temperature = 1.f;
@@ -7436,15 +7440,15 @@ struct Serve {
         long long produced = 0, offered = 0, accepted = 0;
         const char* finish = "length";
         // greedy requests alone with the MTP block: speculative steps of mtp_d drafts (verified, so the text is the greedy
-        // text); requests beside others, one token at a time.  A greedy request with a penalty (the device argmax cannot serve
-        // it) drafts when the window can hand its rows' top candidates to the host (E.sp_window_ok(): graphs, one session) and
-        // q36_sampling.hpp's spec_plan() takes it: the host then picks each row's penalized argmax as the plain sampler would and
-        // keeps a draft when it equals the pick, so the text is the plain path's.  Sampled requests: the plain path (for now).
-        // STRATA_Q36_SPEC_PEN=0: a request with a penalty takes the plain path.
+        // text); requests beside others, one token at a time.  A request that the device argmax cannot serve (a penalty, a
+        // temperature above 0) drafts when the window can hand its rows' top candidates to the host (E.sp_window_ok(): graphs,
+        // one session) and q36_sampling.hpp's spec_plan() takes it: the host then draws each row as the plain sampler would
+        // (the same draw of the same stream) and keeps a draft when it equals the draw, so the text is the plain path's.
+        // STRATA_Q36_SPEC_PEN=0 / STRATA_Q36_SPEC_SAMPLE=0: those requests take the plain path.
         strata::qwen35::SpecPlan plan;
         if (E.mtp_d > 0 && smp.needs_logits() && !adm && E.sp_window_ok()) {
             plan = strata::qwen35::spec_plan(smp, (int) E.m->g.n_vocab);
-            if (plan.ok && (plan.sampled || !q36_spec_pen_on())) plan.ok = false;
+            if (plan.ok && !(plan.sampled ? q36_spec_sample_on() : q36_spec_pen_on())) plan.ok = false;
         }
         const bool spec = E.mtp_d > 0 && !adm && (!smp.needs_logits() || plan.ok);
         const Engine::SpecSel sel{&smp, plan.kk, plan.M, &hist, &rng};
