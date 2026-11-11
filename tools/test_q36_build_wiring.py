@@ -127,19 +127,27 @@ class CMakeFile(unittest.TestCase):
 
 
 def without_q36_branches(text: str) -> str:
-    """The text as a compile without STRATA_Q36_BUILD sees it: the `#if defined(STRATA_Q36_BUILD)` branches dropped, `#else` kept."""
+    """The text as a compile without STRATA_Q36_BUILD sees it: its `#if defined(...)` branches dropped, `#else` kept (other
+    conditionals stay and are tracked, so their `#endif` is not taken for ours)."""
     out, stack = [], []
     for line in text.split("\n"):
-        m = re.match(r"\s*#\s*(if|else|endif)\b(.*)", line)
-        if m and (m.group(1) != "if" or "STRATA_Q36_BUILD" in m.group(2)):
-            if m.group(1) == "if":
-                stack.append("!" in m.group(2).split("STRATA_Q36_BUILD")[0])
-            elif m.group(1) == "else":
-                stack[-1] = not stack[-1]
-            else:
+        m = re.match(r"\s*#\s*(ifdef|ifndef|if|elif|else|endif)\b(.*)", line)
+        if m:
+            kind, rest = m.group(1), m.group(2)
+            if kind in ("if", "ifdef", "ifndef"):
+                if "STRATA_Q36_BUILD" in rest:
+                    stack.append(kind == "ifndef" or "!" in rest.split("STRATA_Q36_BUILD")[0])
+                    continue
+                stack.append(None)
+            elif stack and stack[-1] is not None:
+                if kind == "else":
+                    stack[-1] = not stack[-1]
+                elif kind == "endif":
+                    stack.pop()
+                continue
+            elif kind == "endif" and stack:
                 stack.pop()
-            continue
-        if all(stack):
+        if all(x for x in stack if x is not None):
             out.append(line)
     return "\n".join(out)
 
@@ -151,14 +159,14 @@ class StrataIsKeptAsItWas(unittest.TestCase):
     def test_the_kernel_files_say_nothing_of_it(self):
         for rel in ("sycl/src/kernels/cuda/native_mmvq.dp.cpp", "sycl/src/kernels/cuda/dequant_bf16.dp.cpp",
                     "sycl/include/strata/kernels/native_mmvq.hpp", "include/strata/kernels/dequant_bf16.hpp",
-                    "include/strata/artifact/gguf_reader.hpp", "sycl/src/program/generate.cpp"):
+                    "sycl/src/program/generate.cpp"):
             text = (ROOT / rel).read_text(encoding="utf-8")
             for word in ("q36", "STRATA_Q36", "dense_mode", "Qwen35)"):
                 self.assertNotIn(word, text, f"{rel}: {word}")
 
     def test_the_family_headers_know_the_dense_family_only_behind_the_definition(self):
-        for rel in ("include/strata/artifact/model_family.hpp", "include/strata/core/family_layout.hpp",
-                    "sycl/include/strata/core/family_layout.hpp"):
+        for rel in ("include/strata/artifact/model_family.hpp", "include/strata/artifact/gguf_reader.hpp",
+                    "include/strata/core/family_layout.hpp", "sycl/include/strata/core/family_layout.hpp"):
             text = (ROOT / rel).read_text(encoding="utf-8")
             self.assertIn("STRATA_Q36_BUILD", text, rel)
             self.assertNotRegex(without_q36_branches(text), r"\bQwen35\b(?!Moe)", rel)

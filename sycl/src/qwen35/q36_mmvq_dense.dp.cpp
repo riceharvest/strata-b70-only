@@ -33,6 +33,7 @@
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
+#include "strata/sycl_math.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "q36_mmvq_dense.hpp"
 

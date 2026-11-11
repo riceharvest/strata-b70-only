@@ -34,19 +34,27 @@ def git(*args: str) -> str:
 
 
 def resolve(text: str) -> str:
-    """The text as a compile without STRATA_Q36_BUILD sees it."""
-    out, stack = [], []
+    """The text as a compile without STRATA_Q36_BUILD sees it: its `#if defined(...)` branches dropped, `#else` kept.  Other
+    conditionals stay as they are (and are tracked, so their `#endif` is not taken for ours)."""
+    out, stack = [], []   # an entry per open conditional: None (not ours), or whether the branch we are in is kept
     for line in text.split("\n"):
-        m = re.match(r"\s*#\s*(if|else|endif)\b(.*)", line)
-        if m and (m.group(1) != "if" or "STRATA_Q36_BUILD" in m.group(2)):
-            if m.group(1) == "if":
-                stack.append("!" in m.group(2).split("STRATA_Q36_BUILD")[0])   # defined(X) is false: only `!defined` keeps its branch
-            elif m.group(1) == "else":
-                stack[-1] = not stack[-1]
-            else:
+        m = re.match(r"\s*#\s*(ifdef|ifndef|if|elif|else|endif)\b(.*)", line)
+        if m:
+            kind, rest = m.group(1), m.group(2)
+            if kind in ("if", "ifdef", "ifndef"):
+                if "STRATA_Q36_BUILD" in rest:
+                    stack.append(kind == "ifndef" or "!" in rest.split("STRATA_Q36_BUILD")[0])   # defined(X) is false here
+                    continue
+                stack.append(None)
+            elif stack and stack[-1] is not None:
+                if kind == "else":
+                    stack[-1] = not stack[-1]
+                elif kind == "endif":
+                    stack.pop()
+                continue
+            elif kind == "endif" and stack:
                 stack.pop()
-            continue
-        if all(stack):
+        if all(x for x in stack if x is not None):
             out.append(line)
     return "\n".join(out)
 
