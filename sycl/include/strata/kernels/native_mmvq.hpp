@@ -33,6 +33,11 @@ std::size_t native_q8_1_bytes(int n_in, int ncols = 1);
 void native_mmvq_set_multi_exact(bool exact);
 void native_mmvq_set_q6k_wide(bool on);   // SYCL port: the 16-byte-load Q6_K kernel (default on)
 void native_mmvq_set_kreg(int on);   // SYCL port: the KREG kernels on (1) / off (0) / as STRATA_MMVQ_KREG (-1, default); 3: on without KREG2
+// SYCL port, strata-q36 (the dense Qwen3.8-27B) only: the KREG forms tuned on that model's shapes (two-piece and K-split rows wider
+// than 16384, a persistent grid for every format, other tiles at 5-8 columns, KREG for Q3_K and IQ4_NL, an SLM codebook table
+// for the wide IQ4_NL kernel).  Off by default: strata never calls this, and its launches are the same with the code present.
+// Set once at start, before graph capture.
+void native_mmvq_set_dense_mode(bool on);
 // SYCL port, STRATA_XE2_KQ (the B70 default; unset or 0: off): the decode window's Q5_K / Q6_K / Q8_0 dense launches,
 // every output bitwise what it is with the switch off. Parts (1 = 2 + 4 + 16, else their sum; 30 = all four): 2 KREG
 // Q5_K / Q6_K on a persistent grid at 3-8 columns, 4 KREG Q5_K rows wider than 4096 at 5-8 columns in 256 registers,

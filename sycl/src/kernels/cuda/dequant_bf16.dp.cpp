@@ -234,7 +234,9 @@ __dpct_inline__ void dequant_kernel(const uint8_t *__restrict__ blocks,
 // one 16-byte store (two for FP32), so a warp writes 512 consecutive bytes.  The arithmetic per value is group32's -
 // the same expression on the same operands - so the output is bitwise the same (dequant_wide_parity).  On the P40:
 // Q6_K 7.2 -> 0.33 ms (227 GB/s), Q4_K 1.67 -> 0.32 ms, Q5_K 1.24 -> 0.33 ms, IQ4_XS 1.21 -> 0.34 ms for that shape.
-// Q4_K, Q5_K, Q6_K and IQ4_XS.  On by default on compute capability 6.1, where it was measured;
+// Q4_K, Q5_K, Q6_K and IQ4_XS; with dequant_set_wide(1) (strata-q36) also Q3_K and IQ4_NL (the B70's 27B, group32's expressions
+// in the same order).  On by default on compute capability 6.1, where it was measured, and from strata-q36 on the B70
+// (306-token prompt 629 -> 405 ms, the plain kernel's 32 two-byte stores per thread ran at ~165 GB/s there);
 // STRATA_DEQUANT_WIDE=0 / =1 turns it off / on for every card.
 __dpct_inline__ uint64_t
 ld8(const uint8_t *p) { // 8 bytes at a 2-byte aligned address
@@ -307,6 +309,38 @@ __dpct_inline__ void wide8(const uint8_t *row_blocks, int gi_in_row, int piece,
             const int lb = (int) (qs >> (8 * k)) & 0xFF;
             put(v, k, dl * (float) kv_iq4nl[piece >= 2 ? (lb >> 4) : (lb & 0xf)]);
         }
+    } else if constexpr (TYPE == 20) {                             // IQ4_NL: d qs[16] (blocks of 32)
+        const uint8_t* b = row_blocks + (size_t) gi_in_row * 18;
+        const float d = h2f(b);
+        const uint64_t qs = ld8(b + 2 + 8 * (piece & 1));   // pieces 0, 1: the low nibbles; 2, 3: the high ones
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int lb = (int) (qs >> (8 * k)) & 0xFF;
+            put(v, k, d * (float) kv_iq4nl[piece >= 2 ? (lb >> 4) : (lb & 0xf)]);
+        }
+    } else if constexpr (TYPE == 11) {                             // Q3_K: hmask[32] qs[64] scales[12] d
+        const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 110;
+        const int gi = gi_in_row % 8, n = gi / 4, jj = gi % 4;
+        const uint8_t* sc = b + 96;
+        const float d_all = h2f(b + 108);
+        uint32_t aux[4];
+        memcpy(aux, sc, 12);
+        const uint32_t kmask1 = 0x03030303u, kmask2 = 0x0f0f0f0fu, tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        const int8_t* scales = reinterpret_cast<const int8_t*>(aux);
+        const int shift = 2 * jj;
+        const uint8_t m = (uint8_t) (1u << (n * 4 + jj));
+        const int is = n * 8 + jj * 2 + (l0 >= 16 ? 1 : 0);
+        const float dl = d_all * (float) (scales[is] - 32);
+        const uint64_t q = ld8(b + 32 + n * 32 + l0), hm = ld8(b + l0);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int qb = (int) (q >> (8 * k)) & 0xFF, hb = (int) (hm >> (8 * k)) & 0xFF;
+            put(v, k, dl * (float) ((int) ((qb >> shift) & 3) - ((hb & m) ? 0 : 4)));
+        }
     }
 }
 template <int TYPE, typename T>
@@ -329,8 +363,12 @@ __dpct_inline__ void dequant_wide_kernel(const uint8_t *__restrict__ blocks,
     for (int k = 0; k < (int)(8 * sizeof(T) / 16); ++k)
         o[k] = ((const sycl::uint4 *)v)[k];
 }
-bool wide_type(int type) { return type == 12 || type == 13 || type == 14 || type == 23; }
-int g_dequant_wide = -1;   // dequant_set_wide (the parity test); -1 = STRATA_DEQUANT_WIDE, else the card's default
+int g_dequant_wide = -1;   // dequant_set_wide (the parity test, strata-q36); -1 = STRATA_DEQUANT_WIDE, else the card's default
+// Q3_K (11) and IQ4_NL (20) only where dequant_set_wide(1) was called (strata-q36): STRATA_DEQUANT_WIDE=1 in strata keeps its four
+// formats, as before.
+bool wide_type(int type) {
+    return type == 12 || type == 13 || type == 14 || type == 23 || ((type == 11 || type == 20) && g_dequant_wide == 1);
+}
 bool dequant_wide_on() {
     static const int env = [] { const char* v = std::getenv("STRATA_DEQUANT_WIDE"); return v != nullptr && v[0] != '\0' ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
     if (g_dequant_wide >= 0) return g_dequant_wide != 0;
@@ -498,9 +536,11 @@ void launch(int type, const void *blocks, int64_t row0, int64_t rows,
         });                                                                    \
     } break
         switch (type) {
+        case 11: STRATA_DQW(11);
         case 12: STRATA_DQW(12);
         case 13: STRATA_DQW(13);
         case 14: STRATA_DQW(14);
+        case 20: STRATA_DQW(20);
         case 23: STRATA_DQW(23);
         }
 #undef STRATA_DQW
