@@ -976,7 +976,10 @@ class FlagsCommand(unittest.TestCase):
         self.assertEqual(store.list_presets(), [])
 
     def test_the_access_help_names_the_flags_for_showing_and_setting_a_key(self):             # #3713 #3951
-        from strata_cli.launch import screens
+        try:
+            from strata_cli.launch import screens
+        except ModuleNotFoundError as e:                 # the screens need textual, which setup installs but a bare checkout lacks
+            self.skipTest(str(e))
         self.assertIn("strata launch --show-key", screens.AccessScreen.help_text)
         self.assertIn("--api-key YOUR-KEY", screens.AccessScreen.help_text)
 
