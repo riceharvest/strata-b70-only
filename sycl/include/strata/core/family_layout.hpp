@@ -63,7 +63,14 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
     num("ssm.inner_size", g.ssm_value_dim);
     num("full_attention_interval", g.qsa_interval);
     g.head_dim = key_length;
-    if (family == strata::ModelFamily::Qwen35Moe) {
+    const bool dense = family == strata::ModelFamily::Qwen35;   // Qwen3.8-27B: a dense SwiGLU FFN, no experts
+    if (dense) {
+        g.n_expert = 0;
+        g.n_expert_used = top_k = 0;
+        g.n_ff_shexp = 0;
+        num("feed_forward_length", g.n_ff);
+    }
+    if (family == strata::ModelFamily::Qwen35Moe || dense) {
         num("nextn_predict_layers", g.n_mtp_layers);
         g.hc = g.hc_lr = 0;                 // a plain pre-norm residual
         g.idx_q_heads = g.idx_key_dim = 0;  // dense attention, no sparse indexer
@@ -84,8 +91,8 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
         err = buf;
         return false;
     };
-    if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_head <= 0 || g.n_head_kv <= 0 || g.head_dim <= 0 || g.n_expert <= 0 ||
-        top_k <= 0 || top_k > g.n_expert || g.n_ff <= 0 || g.ssm_state_size <= 0 || g.ssm_k_heads <= 0 ||
+    if (g.n_layers <= 0 || g.n_embd <= 0 || g.n_head <= 0 || g.n_head_kv <= 0 || g.head_dim <= 0 ||
+        (!dense && (g.n_expert <= 0 || top_k <= 0 || top_k > g.n_expert)) || g.n_ff <= 0 || g.ssm_state_size <= 0 || g.ssm_k_heads <= 0 ||
         g.ssm_v_heads <= 0 || g.ssm_d_conv <= 0 || g.qsa_interval < 2)
         return bad("a geometry key is zero or out of range");
     if (value_length >= 0 && value_length != key_length) return bad("attention.key_length != attention.value_length");
@@ -159,6 +166,11 @@ inline std::vector<TensorWant> layer_tensors(const ModelGeometry& g, int64_t lay
     const int64_t N = g.n_embd, NE = g.n_expert, FF = g.n_ff, FS = g.n_ff_shexp;
     std::vector<TensorWant> t;
     auto add = [&](const char* s, std::vector<int64_t> shape) { t.push_back({s, std::move(shape)}); };
+    if (g.family == strata::ModelFamily::Qwen35) {   // the dense SwiGLU FFN, every layer (the MTP block's too)
+        add("ffn_gate.weight", {N, FF});
+        add("ffn_up.weight", {N, FF});
+        add("ffn_down.weight", {FF, N});
+    } else {
     // MoE, every layer (the MTP block's too)
     add("ffn_gate_inp.weight", {N, NE});
     add("ffn_gate_inp_shexp.weight", {N});
@@ -168,6 +180,7 @@ inline std::vector<TensorWant> layer_tensors(const ModelGeometry& g, int64_t lay
     add("ffn_gate_exps.weight", {N, FF, NE});
     add("ffn_up_exps.weight", {N, FF, NE});
     add("ffn_down_exps.weight", {FF, N, NE});
+    }
     if (g.has_hyper_connections()) {
         // gated residual (Flash-Next): `gr_read` transposes, so the file's orientation is [hc_dim, hc_lr] / [hc_lr, hc_dim]
         const int64_t H = g.hc_dim();
@@ -180,7 +193,7 @@ inline std::vector<TensorWant> layer_tensors(const ModelGeometry& g, int64_t lay
         add("hc_ffn_inject.weight", {H, g.hc});
         add("hc_ffn_norm.weight", {H});
     } else {
-        // plain pre-norm residual (qwen35moe): x += mixer(rms(x)); x += moe(rms(x))
+        // plain pre-norm residual (qwen35moe, qwen35): x += mixer(rms(x)); x += ffn(rms(x))
         add("attn_norm.weight", {N});
         add("post_attention_norm.weight", {N});
     }
@@ -237,7 +250,9 @@ inline std::vector<TensorWant> global_tensors(const ModelGeometry& g) {
 }
 
 /// Whether the family's table names every blk.* tensor its files carry (then an unnamed one is an error).
-inline bool layout_table_complete(const ModelGeometry& g) { return g.family == strata::ModelFamily::Qwen35Moe; }
+inline bool layout_table_complete(const ModelGeometry& g) {
+    return g.family == strata::ModelFamily::Qwen35Moe || g.family == strata::ModelFamily::Qwen35;
+}
 
 /// Checks the model `m` (all shards) against the layout table of `g`.  `checked` counts the tensors found.
 inline bool check_gguf_layout(const strata::GgufModel& m, const ModelGeometry& g, std::string& err,
