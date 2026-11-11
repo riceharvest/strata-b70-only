@@ -372,6 +372,7 @@ class ServedModel(unittest.TestCase):
         g = setup.MODELS["UD-IQ1_S"]["graft"]
         fam = setup.FAMILIES["unsloth"]
         self.assertEqual(g["result"][0], setup.REPO_PINS["unsloth/Qwen3.8-Flash-Next-GGUF"][g["shard"]][0])
+        self.assertEqual(g["compacted_size"], g["result"][0] - 52428800)      # the old IQ2_S slot minus the IQ2_XXS tensor
         self.assertNotEqual(g["result"][1], setup.REPO_PINS["unsloth/Qwen3.8-Flash-Next-GGUF"][g["shard"]][1])
         self.assertEqual(setup.shard_pin("UD-IQ1_S", fam, Path("/x") / g["shard"]), tuple(g["result"]))
         other = setup.model_file(fam, "UD-IQ1_S", 3)

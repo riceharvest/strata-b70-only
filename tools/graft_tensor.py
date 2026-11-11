@@ -15,12 +15,20 @@ The offset of the tensor and of every other tensor stay, so the file is as long 
 that stops earlier leaves a file that still reads as the original, and running it again finishes the job. A tensor that is
 already the source's bytes is reported and left alone. --out writes a copy and leaves the target as it is.
 
+--compact (default off) closes the hole the graft leaves when the new tensor is smaller than the old one: every later tensor moves
+down to its aligned contiguous offset, the directory offsets are rewritten and the file is cut. Strata follows the directory's
+offsets and does not need it; llama.cpp refuses a file whose tensors are not contiguous. It changes the file's hash and size, and is
+restartable: a journal file (<target>.compact) records the plan and the copy's progress (fsynced after each chunk); a run that
+stops is finished by running the same command again. The file is not readable by anything until it is finished. It works in place
+only (a copy would need the space twice); use `cp --reflink` first if you want to keep the original.
+
 Exit status: 0 done or already done, 1 refused or failed (the target is not changed by a refusal).
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import pathlib
 import re
@@ -248,6 +256,100 @@ def graft(target, tensor: str, source: str, source_sha256: str | None = None, ou
     return "grafted"
 
 
+def _align(n: int, a: int) -> int:
+    return (n + a - 1) // a * a
+
+
+def compact_plan(g: GGUFFile, file_size: int) -> dict:
+    """The tensors in file order with their new offsets (each at the aligned end of the one before), the header position of each
+    offset field, and the file's new size (trailing padding after the last tensor is kept)."""
+    order = sorted(g.tensors, key=lambda t: t.offset)
+    rows, cursor, old_end = [], 0, 0
+    for t in order:
+        n = t.expected_bytes()
+        if n is None:
+            raise Refused("%s is %s, whose size is not known here" % (t.name, t.type_name))
+        new = _align(cursor, g.alignment)
+        if t.offset < new:
+            raise Refused("%s overlaps the tensor before it" % t.name)
+        rows.append({"name": t.name, "old": t.offset, "new": new, "size": n})
+        cursor = new + n
+        old_end = max(old_end, t.offset + n)
+    if g.data_start + old_end > file_size:
+        raise Refused("the file ends before its last tensor does")
+    return {"rows": rows, "size_before": file_size, "size_after": file_size - (old_end - cursor), "data_start": g.data_start}
+
+
+def compact(target, expect_size: int | None = None, log=print) -> str:
+    """Close the holes between tensors in place. Returns "compacted" or "already". Restartable through <target>.compact."""
+    target = pathlib.Path(target)
+    journal = target.with_name(target.name + ".compact")
+    if journal.exists():
+        plan = json.loads(journal.read_text())
+        size = target.stat().st_size
+        if size not in (plan["size_before"], plan["size_after"]) and not plan["size_after"] < size < plan["size_before"]:
+            raise Refused("%s does not match the journal %s; delete the journal only if you know the file is whole" % (target.name, journal.name))
+        log("finishing an earlier compact run (%d of %d tensors moved)" % (plan["done"], len(plan["rows"])))
+    else:
+        g = GGUFFile(target)
+        plan = compact_plan(g, target.stat().st_size)
+        if not any(r["old"] != r["new"] for r in plan["rows"]):
+            log("%s has no holes between its tensors: nothing to do" % target.name)
+            return "already"
+        if expect_size is not None and plan["size_after"] != expect_size:
+            raise Refused("the compacted file would be %d bytes, not the expected %d" % (plan["size_after"], expect_size))
+        for r, t in zip(plan["rows"], sorted(g.tensors, key=lambda t: t.offset)):
+            r["pos"] = type_field(target, g, t) + 4          # the offset field follows the 4-byte type
+        plan.update(done=0, chunk=0, phase="data")
+        _save(journal, plan)
+    ds = plan["data_start"]
+    rows = plan["rows"]
+    moved = sum(r["size"] for r in rows if r["old"] != r["new"])
+    if plan["phase"] == "data":
+        with open(target, "r+b") as f:
+            for i in range(plan["done"], len(rows)):
+                r = rows[i]
+                if r["old"] == r["new"]:
+                    plan["done"], plan["chunk"] = i + 1, 0
+                    continue
+                done = plan["chunk"] if i == plan["done"] else 0
+                while done < r["size"]:
+                    # a chunk no longer than the distance moved never overwrites its own source, so a chunk written but not
+                    # yet journaled is simply copied again
+                    n = min(CHUNK, r["old"] - r["new"], r["size"] - done)
+                    f.seek(ds + r["old"] + done)
+                    b = f.read(n)
+                    f.seek(ds + r["new"] + done)
+                    f.write(b)
+                    f.flush()
+                    os.fsync(f.fileno())
+                    done += n
+                    plan["done"], plan["chunk"] = i, done          # a chunk ahead of this one is never touched by the write
+                    _save(journal, plan)
+                plan["done"], plan["chunk"] = i + 1, 0
+            plan["phase"] = "header"
+            _save(journal, plan)
+    with open(target, "r+b") as f:
+        for r in rows:
+            f.seek(r["pos"])
+            f.write(struct.pack("<Q", r["new"]))
+        f.truncate(plan["size_after"])
+        f.flush()
+        os.fsync(f.fileno())
+    journal.unlink()
+    log("%d tensors moved (%d bytes), the file is %d bytes now" % (sum(r["old"] != r["new"] for r in rows), moved, plan["size_after"]))
+    return "compacted"
+
+
+def _save(journal: pathlib.Path, plan: dict) -> None:
+    tmp = journal.with_name(journal.name + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(plan, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, journal)
+
+
 def grafted(target, tensor: str, type_name: str) -> bool:
     """Does the target's tensor already have this type (the cheap test of an earlier run)?"""
     t = [x for x in GGUFFile(pathlib.Path(target)).tensors if x.name == tensor]
@@ -257,13 +359,22 @@ def grafted(target, tensor: str, type_name: str) -> bool:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--target", required=True, help="the GGUF file to change (one shard)")
-    ap.add_argument("--tensor", required=True, help="the tensor's name, e.g. blk.18.ffn_gate_exps.weight")
-    ap.add_argument("--source", required=True, help="the GGUF file (or https URL) that holds the tensor to take")
+    ap.add_argument("--tensor", help="the tensor's name, e.g. blk.18.ffn_gate_exps.weight")
+    ap.add_argument("--source", help="the GGUF file (or https URL) that holds the tensor to take")
+    ap.add_argument("--compact", action="store_true", help="afterwards (or alone, without --tensor) close the holes between tensors, in place")
+    ap.add_argument("--expect-size", type=int, help="with --compact: the file size the result must have")
     ap.add_argument("--source-sha256", help="the SHA-256 the source tensor's bytes must have")
     ap.add_argument("--out", help="write a changed copy here and leave --target as it is")
     a = ap.parse_args(argv)
+    if bool(a.tensor) != bool(a.source) or not (a.tensor or a.compact):
+        ap.error("give --tensor and --source (a graft), or --compact alone, or both")
+    if a.compact and a.out:
+        ap.error("--compact works in place; copy the file first (cp --reflink)")
     try:
-        graft(a.target, a.tensor, a.source, a.source_sha256, a.out)
+        if a.tensor:
+            graft(a.target, a.tensor, a.source, a.source_sha256, a.out)
+        if a.compact:
+            compact(a.target, a.expect_size)
     except Refused as e:
         print("graft_tensor: refused: %s" % e, file=sys.stderr)
         return 1

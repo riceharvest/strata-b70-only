@@ -48,8 +48,8 @@ def gguf(tensors, align=ALIGN) -> bytes:
 SHAPE = [256, 1, 2]
 OLD = blob(2 * 82, 1)
 NEW = blob(2 * 66, 2)
-BEFORE = blob(128, 3)
-AFTER = blob(96, 4)
+BEFORE = blob(512, 3)
+AFTER = blob(132, 4)
 
 
 def target_bytes():
@@ -102,7 +102,7 @@ class InPlace(Files):
         self.assertEqual(self.data(self.target), NEW)
         old_slot = (len(OLD) + ALIGN - 1) // ALIGN * ALIGN
         self.assertEqual(self.data(self.target, n=old_slot)[len(NEW):], bytes(old_slot - len(NEW)))   # the rest is zeros
-        self.assertEqual(self.data(self.target, "token_embd.weight", 128), BEFORE)
+        self.assertEqual(self.data(self.target, "token_embd.weight", 512), BEFORE)
         self.assertEqual(self.data(self.target, "blk.1.ffn_up_exps.weight"), AFTER)
         changed = [i for i in range(len(before)) if before[i] != after[i]]
         head_changed = [i for i in changed if i < g.data_start]
@@ -233,6 +233,83 @@ class Command(Files):
         self.assertEqual(G.main(args), 0)
         self.assertEqual(G.main(args), 0)                              # already done
         self.assertEqual(G.main(["--target", str(self.target), "--tensor", "nope", "--source", str(self.source)]), 1)
+
+
+class Compact(Files):
+    """--compact: the hole a smaller tensor leaves is closed, every later tensor moves down, offsets stay contiguous."""
+
+    def grafted(self):
+        self.run_graft()
+        return self.target
+
+    def contiguous(self, path):
+        g = GGUFFile(path)
+        end = 0
+        for t in sorted(g.tensors, key=lambda x: x.offset):
+            self.assertEqual(t.offset, (end + g.alignment - 1) // g.alignment * g.alignment, t.name)
+            end = t.offset + t.expected_bytes()
+        # the file ends with the last tensor, or with the padding the original had after it (less than one alignment)
+        self.assertTrue(g.data_start + end <= Path(path).stat().st_size < g.data_start + end + g.alignment)
+
+    def test_the_hole_is_closed_and_the_data_follows(self):
+        self.grafted()
+        before = {t.name: self.data(self.target, t.name) for t in GGUFFile(self.target).tensors}
+        size = self.target.stat().st_size
+        self.assertEqual(G.compact(self.target, log=self.log.append), "compacted")
+        self.contiguous(self.target)
+        self.assertLess(self.target.stat().st_size, size)
+        for name, d in before.items():
+            self.assertEqual(self.data(self.target, name), d, name)
+        self.assertFalse(self.target.with_name("target.gguf.compact").exists())
+        self.assertEqual(G.compact(self.target, log=self.log.append), "already")
+
+    def test_the_file_is_not_touched_by_default(self):
+        self.grafted()
+        self.assertRaises(AssertionError, self.contiguous, self.target)    # the hole is still there without --compact
+
+    def test_wrong_expected_size_is_refused_and_changes_nothing(self):
+        self.grafted()
+        raw = self.target.read_bytes()
+        with self.assertRaisesRegex(G.Refused, "expected"):
+            G.compact(self.target, expect_size=1)
+        self.assertEqual(self.target.read_bytes(), raw)
+        self.assertFalse(self.target.with_name("target.gguf.compact").exists())
+
+    def test_a_run_stopped_in_the_middle_is_finished_by_the_next(self):
+        self.grafted()
+        before = {t.name: self.data(self.target, t.name) for t in GGUFFile(self.target).tensors}
+        real = G._save
+        calls = []
+
+        def crash(journal, plan):
+            real(journal, plan)
+            calls.append(1)
+            if len(calls) == 3:
+                raise KeyboardInterrupt
+
+        old_chunk = G.CHUNK
+        G.CHUNK = 16                                    # many small chunks, so it stops inside a tensor
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                G_save = G._save
+                G._save = crash
+                try:
+                    G.compact(self.target, log=self.log.append)
+                finally:
+                    G._save = G_save
+            self.assertTrue(self.target.with_name("target.gguf.compact").exists())
+            self.assertEqual(G.compact(self.target, log=self.log.append), "compacted")
+        finally:
+            G.CHUNK = old_chunk
+        self.contiguous(self.target)
+        for name, d in before.items():
+            self.assertEqual(self.data(self.target, name), d, name)
+
+    def test_cli_compact_after_the_graft(self):
+        args = ["--target", str(self.target), "--tensor", NAME, "--source", str(self.source), "--compact"]
+        self.assertEqual(G.main(args), 0)
+        self.contiguous(self.target)
+        self.assertEqual(G.main(["--target", str(self.target), "--compact"]), 0)
 
 
 if __name__ == "__main__":

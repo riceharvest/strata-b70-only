@@ -321,6 +321,7 @@ UNSLOTH_IQ1_S_GRAFT = {
     "source_file": "Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf",
     "source_sha256": "38818a36ffd7c9f70921d148d67e94fe7a73cac8bd74de68ba7d34a7270c1640",   # of the tensor's 216,268,800 bytes
     "result": (37568095648, "7ebee4c9cf63f36319574b0e7a90be7d4fb8a1e0f534db4ba3644f2d6aa191b8"),
+    "compacted_size": 37515666848,                      # shard 2 after `tools/graft_tensor.py --compact` (753 tensors move down; llama.cpp needs it, Strata does not)
 }
 MODELS = {
     # the original model only for now: Swift 1.5's Q2_0 files split one layer's experts across the two shards, which
