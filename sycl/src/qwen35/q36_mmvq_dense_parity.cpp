@@ -411,7 +411,6 @@ double time_graph(sycl::queue& q, int nmat, const std::function<void(int)>& laun
 
 int bench(const char* types_s, const char* ncols_s, const std::string& ssel) {
     const std::vector<int> types = parse_list(types_s), ncl = parse_list(ncols_s);
-    const size_t POOL = (size_t) 640 << 20;
     sycl::queue q(sycl::gpu_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()});
     struct BShape { int n_in, n_out; const char* name; };
     // Qwen3.8-Flash-Next decode shapes; the head is 2560 x 248320.  27B: Qwen3.8-27B's (5120 wide, FFN 17408, head 5120 x 248320)
@@ -419,17 +418,39 @@ int bench(const char* types_s, const char* ncols_s, const std::string& ssel) {
                              {2560, 512, "kv"}, {2560, 640, "sh_gu"}, {2560, 248320, "head"},
                              {5120, 10240, "27qkv"}, {5120, 6144, "27gate"}, {6144, 5120, "27out"}, {5120, 12288, "27q"},
                              {5120, 17408, "27gu"}, {17408, 5120, "27down"}, {5120, 248320, "27head"}};
-    uint8_t* dpool = (uint8_t*) sycl::malloc_device(POOL + 4096, q);
-    std::vector<uint8_t> hpool(POOL);
+    const auto selected = [&](const BShape& sh) {
+        return ssel == "27" ? sh.name[0] == '2' && sh.name[1] == '7' : (ssel == "all" || ssel == sh.name);
+    };
+    // THE POOL.  Every weight matrix of a launch must lie inside it: a read past the end of the allocation is a device page
+    // fault, and on the xe driver that ends in "exec queue reset" and UR_RESULT_ERROR_DEVICE_LOST.  (2026-11-11: the pool was
+    // a fixed 640 MiB; the 27head shape, 5120 x 248320, is 715 MB in Q4_K, 874 MB in Q5_K, 1043 MB in Q6_K, 675 MB in IQ4_XS,
+    // one copy of it read past the end by 42 MiB (Q4_K) to 372 MB (Q6_K), and the card was lost on the first row after 27down.)  So the pool is
+    // the largest selected matrix when that is above 640 MiB, and a launch whose matrix does not fit is skipped with a message.
+    size_t pool = (size_t) 640 << 20;
+    for (const int t : types) {
+        if (!format_of(t)) continue;
+        for (const BShape& sh : shapes)
+            if (selected(sh)) pool = std::max(pool, (size_t) k::native_mmvq_weight_bytes(t, sh.n_in, sh.n_out));
+    }
+    const size_t max_alloc = (size_t) q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
+    if (pool + 4096 > max_alloc) pool = (max_alloc > 4096 ? max_alloc - 4096 : 0) & ~(size_t) 255;
+    const size_t POOL = pool;
     const int maxc = 8, maxout = 248320;
+    const size_t xq_bytes = k::native_q8_1_bytes(17408, maxc) + 256;
+    uint8_t* dpool = (uint8_t*) sycl::malloc_device(POOL + 4096, q);
     float* y = sycl::malloc_device<float>((size_t) maxc * maxout, q);
     std::vector<float> hx((size_t) maxc * 17408);
+    float* dx = sycl::malloc_device<float>(hx.size(), q);
+    void* xq = sycl::malloc_device(xq_bytes, q);
+    if (!dpool || !y || !dx || !xq) {
+        std::printf("bench: could not allocate the buffers (weight pool %.0f MiB): stopping before any launch\n", POOL / 1048576.0);
+        return 1;
+    }
+    std::vector<uint8_t> hpool(POOL);
     std::mt19937 rng(4242);
     std::normal_distribution<float> nd(0.f, 1.f);
     for (auto& v : hx) v = nd(rng);
-    float* dx = sycl::malloc_device<float>(hx.size(), q);
     q.memcpy(dx, hx.data(), hx.size() * 4).wait();
-    void* xq = sycl::malloc_device(k::native_q8_1_bytes(17408, maxc) + 256, q);
     std::printf("q36_mmvq_dense_parity --bench on %s: us per call (median), GB/s of weight bytes\n",
                 q.get_device().get_info<sycl::info::device::name>().c_str());
     for (const int t : types) {
@@ -438,12 +459,23 @@ int bench(const char* types_s, const char* ncols_s, const std::string& ssel) {
         fill_pool(*f, hpool);
         q.memcpy(dpool, hpool.data(), POOL).wait();
         for (const BShape& sh : shapes) {
-            if (ssel == "27" ? sh.name[0] != '2' || sh.name[1] != '7' : (ssel != "all" && ssel != sh.name)) continue;
+            if (!selected(sh)) continue;
             const size_t wb = k::native_mmvq_weight_bytes(t, sh.n_in, sh.n_out);
             const size_t slot = (wb + 255) & ~(size_t) 255;
+            if (wb > POOL) {   // (a launch here would read past the pool: see the note above)
+                std::printf("%-6s %-6s %5d x %6d: skipped, the weights (%.0f MiB) do not fit the pool (%.0f MiB)\n", f->name, sh.name,
+                            sh.n_in, sh.n_out, wb / 1048576.0, POOL / 1048576.0);
+                continue;
+            }
             const int ndist = (int) std::max<size_t>(1, std::min<size_t>(128, POOL / slot)), nmat = std::max(ndist, 16);
             for (const int nc : ncl) {
                 if (nc < 1 || nc > maxc) continue;
+                if ((size_t) nc * sh.n_in > hx.size() || (size_t) nc * sh.n_out > (size_t) maxc * maxout ||
+                    k::native_q8_1_bytes(sh.n_in, nc) > xq_bytes) {
+                    std::printf("%-6s %-6s %5d x %6d nc %d: skipped, an activation or output buffer is too small\n", f->name, sh.name,
+                                sh.n_in, sh.n_out, nc);
+                    continue;
+                }
                 k::native_quantize_q8_1(dx, xq, sh.n_in, nc, &q);
                 q.wait();
                 auto timed = [&](int mode) {
