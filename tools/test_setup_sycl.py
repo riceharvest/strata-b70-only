@@ -339,7 +339,7 @@ class ToSycl(unittest.TestCase):
             m.install_shared_embeddings()
             m.S.combined_embeddings_path(Path("/tmp/x"), 10)
             m.S.combined_embeddings_path(Path("/tmp/x"), 10)
-        self.assertEqual(out.getvalue().count("/dev/shm has no room"), 1)
+        self.assertEqual(out.getvalue().count("is not where the engine's container can read it"), 1)
 
 
 def load_setup_intel():
