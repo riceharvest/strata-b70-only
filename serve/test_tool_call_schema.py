@@ -19,7 +19,7 @@ BOOL_TOOL = {"name": "get_prime_factors", "parameters": {"properties": {
     "number": {"type": "integer"}, "formatted": {"type": "boolean"}, "ratio": {"type": "number"},
     "maybe": {"type": ["boolean", "null"]}, "label": {"type": "string"}}}}
 EDIT_TOOL = {"name": "edit_file", "parameters": {"properties": {
-    "path": {"type": "string"}, "new_string": {"type": "string"}}}}
+    "path": {"type": "string"}, "new_string": {"type": "string"}, "limit": {"type": "integer"}}}}
 
 
 def call(body, tool):
@@ -120,6 +120,28 @@ class SkippedCloser(unittest.TestCase):
         plain = "<function=edit_file>\n<parameter=path>\na\n</parameter>\n<parameter=new_string>\nhi\n</parameter>\n</function>"
         with Setting(TOOL_SKIPPED_CLOSER=True):
             self.assertEqual(call(plain, EDIT_TOOL), {"path": "a", "new_string": "hi"})
+
+    def test_on_a_value_that_mentions_an_opener_is_not_corrupted(self):
+        # reviewer's B1 (a): with the rule on, a value that mentions <parameter=x> once got a stray closer appended
+        body = ("<function=edit_file>\n<parameter=path>\na\n</parameter>\n<parameter=new_string>\n"
+                "see <parameter=x> here\n</parameter>\n</function>")
+        with Setting(TOOL_SKIPPED_CLOSER=True):
+            self.assertEqual(call(body, EDIT_TOOL)["new_string"], "see <parameter=x> here")
+
+    def test_on_the_reviewers_inputs(self):
+        # (b) the value mentions an opener and the model also left out </function>
+        head = "<function=edit_file>\n<parameter=path>\na\n</parameter>\n<parameter=new_string>\nsee <parameter=x> here\n</parameter>\n"
+        with Setting(TOOL_SKIPPED_CLOSER=True):
+            for text in (f"<tool_call>\n{head}</tool_call>", f"<tool_call>\n{head}</function>\n</tool_call>"):
+                for step in (1, 5, 1000):
+                    self.assertEqual(stream(text, [EDIT_TOOL], step),
+                                     [{"path": "a", "new_string": "see <parameter=x> here"}], (text, step))
+            # a declared sibling opened mid-line is prose, not a skipped closer
+            prose = "<function=edit_file>\n<parameter=new_string>\nuse <parameter=limit> to cap\n</parameter>\n</function>"
+            self.assertEqual(call(prose, EDIT_TOOL), {"new_string": "use <parameter=limit> to cap"})
+            # a nested pair with no closer anywhere after it ends where it did before the rule
+            pair = "<function=edit_file>\n<parameter=new_string>\n<parameter=limit>1</parameter>\n</tool_call>"
+            self.assertEqual(call(pair, EDIT_TOOL)["new_string"], "<parameter=limit>1")
 
     def test_on_in_a_stream_with_the_wrapper(self):
         text = f"<tool_call>\n{self.SKIPPED}\n</tool_call>"
