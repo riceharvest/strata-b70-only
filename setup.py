@@ -2961,7 +2961,7 @@ def build_vision_cpu(eng: Path, stamp: Path, meta: dict, llama, vsrc) -> Path:
     if not ((eng / VEXE).exists() and meta.get("vision_src") == vsrc):
         say("  Compiling the image encoder (for the CPU) ...")
         cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision", "strata-vision",
-                    [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=OFF", "-DSTRATA_PORTABLE=OFF"], None, "")
+                    [f"-DLLAMA_DIR={llama}", "-DSTRATA_PORTABLE=OFF"], None, "")
         shutil.copy2(ROOT / "build-vision" / "bin" / VEXE, eng / VEXE)
     stamp.write_text(json.dumps({**meta, "vision": "cpu", "vision_src": vsrc}, indent=1))
     ok(f"engine: {eng / EXE}, image encoder (CPU): {eng / VEXE}")
