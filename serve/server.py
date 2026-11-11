@@ -303,6 +303,7 @@ RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean s
 # server (the engine's main thread waits, untimed, for its next command): the engine is ended and the request fails;
 # the next request starts it again.  The config's "engine_silence_s" sets it (0: wait forever, as before).
 ENGINE_SILENCE_S = 300.0
+SLOT_QUIET_S = 600.0     # a slot whose consumer left: BDONE is waited for while the engine says nothing for this long
 # #4271: a streaming client that stops reading (a hung process, a network that dropped) leaves the thread that writes to
 # it blocked once the socket buffers are full - and that thread holds the engine's turn.  A write that makes no progress
 # for this long ends the request as a disconnect (the engine is stopped, the turn given back).  0: no limit, as before.
@@ -1679,7 +1680,10 @@ class StrataEngine:
         request does not read this one's leftovers.  Returns that line (None: the engine ended or never answered).
         `born`: the engine process (self.gen) the request started on; once that one is gone there is nothing to
         drain - its end line was read already (by the request's own EngineDied), and waiting for another one held
-        a request that had failed for the whole 300 s (#1012), or read the lines of the engine that replaced it."""
+        a request that had failed for the whole 300 s (#1012), or read the lines of the engine that replaced it.
+        `timeout` is a no-progress limit: it counts from the last line the engine wrote, so an engine that was told to
+        stop and still talks (a read or a decode that ends at its next chunk) is not given up on; only one that says
+        nothing for that long is."""
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             if born is not None and (self.gen != born or not self.alive()):
@@ -1690,6 +1694,7 @@ class StrataEngine:
                 continue
             if line is None:
                 return None
+            end = time.monotonic() + timeout                 # any line is progress
             if line.startswith("DONE"):
                 self._parse_done(line)
             if line.startswith(until) or line.startswith("ERR"):
@@ -1736,7 +1741,7 @@ class StrataEngine:
         releasing.add(slot)
 
         def wait():
-            end = time.monotonic() + 600.0
+            end = time.monotonic() + SLOT_QUIET_S           # no-progress limit: every line of the slot starts it again
             tail = list(stream or [])
             while time.monotonic() < end:
                 try:
@@ -1746,6 +1751,7 @@ class StrataEngine:
                 if line is None:
                     tail = []
                     break
+                end = time.monotonic() + SLOT_QUIET_S
                 if line.startswith("BT "):
                     try:
                         tail.append(int(line.split()[2]))

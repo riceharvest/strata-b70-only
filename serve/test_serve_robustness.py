@@ -88,5 +88,36 @@ class StalledClient(unittest.TestCase):
             httpd.server_close()
 
 
+class DrainCountsSilence(unittest.TestCase):
+    """The drain after a request left early counts silence, not time: an engine that keeps writing lines after its STOP
+    is waited for; one that says nothing for the limit is given up on."""
+
+    def engine(self, lines):
+        import queue
+        e = StrataEngine.__new__(StrataEngine)
+        e.gen, e.alive, e.lines = 1, (lambda: True), queue.Queue()
+        e._parse_done = lambda line: None
+        for x in lines:
+            e.lines.put(x)
+        return e
+
+    def test_a_talking_engine_is_not_given_up_on(self):
+        import threading
+        import time
+        e = self.engine([])
+
+        def talk():
+            for _ in range(8):
+                time.sleep(0.1)
+                e.lines.put("T 5")
+            e.lines.put("DONE 1 2 3 4 stop")
+        threading.Thread(target=talk, daemon=True).start()
+        self.assertTrue(e._drain_control("DONE", timeout=0.4, born=1).startswith("DONE"))   # ~0.9 s in all
+
+    def test_a_silent_engine_is_given_up_on(self):
+        e = self.engine([])
+        self.assertIsNone(e._drain_control("DONE", timeout=0.3, born=1))
+
+
 if __name__ == "__main__":
     unittest.main()
