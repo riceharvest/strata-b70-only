@@ -1277,6 +1277,11 @@ class OutputParser:
         for name in self.schemas:
             if isinstance(name, str) and "__" in name:
                 aliases.setdefault(name.replace("__", "_"), set()).add(name)
+                # #5281: a namespaced MCP tool (`mcp__assets__get_asset_info`) written with its last segment only (`get_asset_info`),
+                # as the bare member of a dotted name is accepted above; only when exactly one declared tool ends that way
+                last = name.rsplit("__", 1)[1]
+                if last:
+                    aliases.setdefault(last, set()).add(name)
         self.aliases = {alias: next(iter(names)) for alias, names in aliases.items()
                         if len(names) == 1 and alias not in self.schemas}
         self.name_repairs: list[str] = []   # "written -> declared" for every call NAME_REPAIR read as a declared tool
