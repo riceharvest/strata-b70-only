@@ -5097,10 +5097,7 @@ class Service:
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
-        defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
-        if defaults:                   # the request's own fields win (explicit 0 stays greedy)
-            req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
-            sampling = {**defaults, **req_values}
+        sampling = resolve_sampling(self.model_arch, thinking, self.sampling_defaults, self.shared, sampling)
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
@@ -8602,6 +8599,39 @@ def model_card_sampling(arch, thinking) -> dict:
     """The model card's sampling for the family `arch` and the thinking state ({} for an unknown or unset family)."""
     sets = MODEL_CARD_SAMPLING.get(arch) if arch else None
     return dict(sets["thinking" if thinking else "instruct"]) if sets else {}
+
+
+# strata-q36 drafts with its MTP block only for a greedy request: temperature 0 and no penalty (a penalty needs the logits on
+# the host one token at a time).  The dense family's instruct set (thinking off) carries presence_penalty 1.5, so a request that
+# asked for temperature 0 was not greedy any more: no draft was offered (0 of 0) and a 118K-token prompt was answered at 21.5
+# tok/s.  For these families a temperature of 0 (or none) now keeps the answer greedy: the card's penalties are left out.  A
+# penalty that the request, the config's `sampling` block or the Chat settings names stays.  STRATA_CARD_PENALTY_AT_GREEDY=1
+# (read once) keeps the card's penalty at temperature 0, as before.  Other families are not changed.
+CARD_PENALTY_AT_GREEDY = os.environ.get("STRATA_CARD_PENALTY_AT_GREEDY", "0") == "1"
+GREEDY_WITHOUT_CARD_PENALTY = ("qwen35",)
+CARD_PENALTY_KEYS = ("presence_penalty", "frequency_penalty", "repetition_penalty")
+
+
+def resolve_sampling(arch, thinking, config_block, shared, request):
+    """The sampling of one request: the model card's set for the thinking state, then the config's `sampling` block, then the
+    Chat settings shared with apps; the request's own fields win over all of them (an explicit 0 stays greedy).  With no
+    defaults at all the request's own dict is returned as it came.  For the families in GREEDY_WITHOUT_CARD_PENALTY a result
+    with a temperature of 0 (or none) has no penalty that came only from the card."""
+    card = model_card_sampling(arch, thinking)
+    defaults = {**card, **config_block, **shared}
+    if not defaults:
+        return request
+    named = {**config_block, **shared, **{k: v for k, v in (request or {}).items() if v is not None}}
+    merged = {**defaults, **{k: v for k, v in (request or {}).items() if v is not None}}
+    if CARD_PENALTY_AT_GREEDY or arch not in GREEDY_WITHOUT_CARD_PENALTY:
+        return merged
+    t = merged.get("temperature")
+    if t is not None and (isinstance(t, bool) or not isinstance(t, (int, float)) or t > 0):
+        return merged
+    for key in CARD_PENALTY_KEYS:
+        if key in card and key not in named:
+            merged.pop(key, None)
+    return merged
 
 
 def arch_from_tokenizer(arch, pre) -> str | None:
