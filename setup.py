@@ -1399,8 +1399,31 @@ def shard_pin(model: str, fam: dict, shard: Path):
     """The (bytes, SHA-256) a shard has once setup has prepared it: the grafted file's for the shard that gets a graft."""
     graft = MODELS.get(model, {}).get("graft")
     if graft and shard.name == graft["shard"]:
+        try:
+            if shard.stat().st_size == graft["compacted_size"]:      # `graft_tensor.py --compact` was run: graft_step checked its header
+                return None
+        except OSError:
+            pass
         return tuple(graft["result"])
     return fam.get("sha256", {}).get(shard.name)
+
+
+def private_copy(s: Path) -> None:
+    """Make `s` a file of its own: a symlink or a hard link (a Hugging Face cache blob, a shared file) would be changed in place for
+    every path that leads to it. The copy is a reflink where the filesystem has them, else a normal copy; the name `s` is then
+    replaced by it, the other paths are left as they were."""
+    size = s.stat().st_size
+    free = shutil.disk_usage(s.parent).free
+    if free < size + 1_000_000_000:
+        fail(f"{s.name} is a link to a file that other paths use, and setup must change it (the graft): it needs a copy of "
+             f"{size / 1e9:.0f} GB, {free / 1e9:.0f} GB are free in {s.parent}",
+             "free the space, or copy the file yourself (cp --reflink=auto) and run setup again")
+    say(f"  {s.name} is a link to a file that other paths use: making a copy of its own first ({size / 1e9:.1f} GB) ...")
+    tmp = s.with_name(s.name + ".copy")
+    r = subprocess.run(["cp", "--reflink=auto", str(s), str(tmp)], capture_output=True)
+    if r.returncode != 0:
+        shutil.copyfile(s, tmp)
+    atomic.replace(tmp, s)
 
 
 def graft_step(model: str, fam: dict, shards: list, own: bool = False) -> None:
@@ -1415,21 +1438,40 @@ def graft_step(model: str, fam: dict, shards: list, own: bool = False) -> None:
         fail(f"{model} has no shard {g['shard']}")
     size, sha = g["result"]
     mark_file = s.with_name(s.name + ".done")
+    sys.path.insert(0, str(ROOT / "tools"))
+    import graft_tensor as GT
+    if s.with_name(s.name + ".compact").exists():
+        fail(f"an earlier `graft_tensor.py --compact` of {s.name} was interrupted: the file is half moved",
+             f"run the same command again, it finishes the job: python3 tools/graft_tensor.py --target {s} --compact "
+             f"--expect-size {g['compacted_size']}")
+    try:
+        # a compacted shard (llama.cpp can read it): its size and its header (no holes, the grafted tensor) are checked; no hash is pinned
+        # for it, so the finish mark's check is not used
+        if s.exists() and s.stat().st_size == g["compacted_size"] and GT.grafted(s, g["tensor"], g["type"]) and GT.is_compact(s):
+            ok(f"{s.name} is compacted (no holes between its tensors) and has {g['tensor']} from {g['source_model']}; "
+               "its SHA-256 is not checked")
+            return
+    except GT.Refused:
+        return                                         # not a whole GGUF file: check_shards says so, in its own words
     if mark_file.exists() and f"sha256 {sha}" in mark_file.read_text(encoding="utf-8", errors="replace"):
         ok(f"{s.name} already has {g['tensor']} from {g['source_model']}")
         return
-    sys.path.insert(0, str(ROOT / "tools"))
-    import graft_tensor as GT
     rev = MODELS[model].get("revision")
     if model_source() == "modelscope":
         source = ms_url("unsloth/Qwen3.8-Flash-Next-GGUF", f"{g['source_model']}/{g['source_file']}")
     else:
         source = hf_folder(fam, g["source_model"], rev) + g["source_file"]
-    if not GT.grafted(s, g["tensor"], g["type"]):
+    try:
+        is_grafted = GT.grafted(s, g["tensor"], g["type"])
+    except GT.Refused:
+        return                                         # cut short or not a GGUF file: check_shards says so
+    if not is_grafted:
         if own:
             fail(f"{s.name} is not grafted: {g['tensor']} is still the type that tools/iq_pack.py cannot pack",
                  f"run: python3 tools/graft_tensor.py --target {s} --tensor {g['tensor']} --source {source} "
                  f"--source-sha256 {g['source_sha256']}   (it changes that file in place), or let setup download the files")
+        if s.is_symlink() or s.stat().st_nlink > 1:
+            private_copy(s)
         say(f"  {model}: taking {g['tensor']} from {g['source_model']} into {s.name} (about 216 MB read, nothing is quantized again) ...")
         try:
             GT.graft(s, g["tensor"], source, g["source_sha256"], log=lambda line: say("    " + line))

@@ -406,10 +406,15 @@ class GraftStep(unittest.TestCase):
         graft_tensor.graft(done, T.NAME, self.dir / "src" / "source.gguf", log=lambda *_: None)
         import hashlib
         self.expected = (done.stat().st_size, hashlib.sha256(done.read_bytes()).hexdigest())
+        compacted = self.dir / "compacted.gguf"
+        compacted.write_bytes(done.read_bytes())
+        graft_tensor.compact(compacted, log=lambda *_: None)
+        self.compacted_size = compacted.stat().st_size
         self.shard = self.dir / "shard-2.gguf"
         self.shard.write_bytes(self.pristine)
         self.graft = {"shard": "shard-2.gguf", "tensor": T.NAME, "type": "IQ2_XXS", "source_model": "UD-IQ1_M", "source_file": "source.gguf",
-                      "source_sha256": __import__("hashlib").sha256(T.NEW).hexdigest(), "result": self.expected}
+                      "source_sha256": __import__("hashlib").sha256(T.NEW).hexdigest(), "result": self.expected,
+                      "compacted_size": self.compacted_size}
         self.fam = setup.FAMILIES["unsloth"]
 
     def step(self, own=False, graft=None):
@@ -453,6 +458,51 @@ class GraftStep(unittest.TestCase):
         with self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()):
             self.step(own=True)
         self.assertEqual(self.shard.read_bytes(), self.pristine)
+
+    def test_a_hard_linked_shard_is_copied_first_and_the_other_link_is_untouched(self):
+        other = self.dir / "other.gguf"
+        other.hardlink_to(self.shard)
+        self.step()
+        self.assertEqual(other.read_bytes(), self.pristine)
+        self.assertEqual(self.shard.read_bytes(), (self.dir / "expected.gguf").read_bytes())
+        self.assertEqual(self.shard.stat().st_nlink, 1)
+
+    def test_a_linked_shard_with_no_room_for_a_copy_stops_with_the_command(self):
+        (self.dir / "other.gguf").hardlink_to(self.shard)
+        with mock.patch.object(setup.shutil, "disk_usage", return_value=mock.Mock(free=10)), \
+                self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.step()
+        self.assertEqual(self.shard.read_bytes(), self.pristine)
+
+    def test_a_cut_short_shard_is_left_for_check_shards_to_name(self):
+        self.shard.write_bytes(self.pristine[:100])
+        self.assertEqual(self.step(), "")                          # no traceback, no failure here
+        self.assertEqual(self.shard.read_bytes(), self.pristine[:100])
+
+    def test_a_compacted_shard_is_recognised_by_size_and_header_and_not_hashed(self):
+        self.shard.write_bytes((self.dir / "compacted.gguf").read_bytes())
+        self.shard.with_name("shard-2.gguf.done").write_text("sha256 " + self.expected[1])     # the mark of the graft run
+        out = self.step()
+        self.assertIn("is compacted", out)
+        with mock.patch.dict(setup.MODELS["UD-IQ1_S"], {"graft": self.graft}):
+            self.assertIsNone(setup.shard_pin("UD-IQ1_S", self.fam, self.shard))
+            self.shard.write_bytes((self.dir / "expected.gguf").read_bytes())
+            self.assertEqual(setup.shard_pin("UD-IQ1_S", self.fam, self.shard), tuple(self.expected))
+
+    def test_a_file_of_the_right_size_with_holes_is_not_taken_for_a_compacted_one(self):
+        self.shard.write_bytes(b"\0" * self.compacted_size)
+        self.assertEqual(self.step(), "")
+
+    def test_an_interrupted_compact_says_to_run_it_again_not_to_download(self):
+        self.shard.write_bytes((self.dir / "expected.gguf").read_bytes())
+        self.shard.with_name("shard-2.gguf.compact").write_text("{}")
+        said = []
+        with self.assertRaises(SystemExit), mock.patch.object(setup, "say", said.append):
+            self.step()
+        text = "\n".join(said)
+        self.assertIn("--compact", text)
+        self.assertNotIn("download it again", text)
+        self.assertTrue(self.shard.exists())
 
     def test_a_model_without_a_graft_is_left_alone(self):
         setup.graft_step("UD-IQ4_XS", self.fam, [self.shard])
