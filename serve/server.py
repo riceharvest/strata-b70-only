@@ -214,6 +214,12 @@ VISION_START = "<|vision_start|>"
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
 # sets it; 0 turns it off.
 REPEAT_STOP_TOKENS = 256
+# Opt-in ("repeat_cycle_tokens", 0 = off, else at least REPEAT_CYCLE_MIN): the same guard for a short cycle.  A reply
+# whose last N tokens repeat with a period of 2 to 4 tokens (a b a b ..., a b c a b c ...) is ended as "length", like
+# a run of one token.  One token (period 1) is the job of repeat_stop_tokens.  Nothing is exempt: a cycle that long is
+# rare in honest text, but a ruler made of two alternating tokens could reach it, so N has a floor.
+REPEAT_CYCLE_MIN = 64
+REPEAT_CYCLE_MAX_PERIOD = 4
 ANSWER_ROOM_MIN_CAP = 1024    # 0.1.45: from this max_tokens on, thinking without a budget is closed early enough to leave room to answer
 DS41_DEFAULT_BUDGET = 32768   # DeepSeek-V4.1 only: the thinking budget when neither the request nor the config names one
 DS41_SMALL_CAP_MIN = 48       # DeepSeek-V4.1 only: from this max_tokens up to ANSWER_ROOM_MIN_CAP, thinking is capped at half of it
@@ -3782,6 +3788,7 @@ class Service:
         self.reasoning_budget_configured = False         # the config named reasoning_budget_tokens (0 included): no family default
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
+        self.repeat_cycle_tokens = 0                     # opt-in: a cycle of 2-4 tokens over the last N tokens ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
@@ -4577,6 +4584,8 @@ class Service:
             ("strata:drafts_accepted_total", "counter", "Speculative draft tokens accepted", t["drafts_accepted"]),
             ("strata:tool_calls_unread_total", "counter", "<tool_call> blocks returned as text (an undeclared name or a form the template does not use)",
              t.get("tool_calls_unread", 0)),
+            ("strata:repeat_stops_total", "counter", "Replies ended because the model repeated one token or a short cycle (repeat_stop_tokens, repeat_cycle_tokens)",
+             t.get("repeat_stops", 0)),
             ("strata:tool_args_repaired_total", "counter", "Tool call arguments (a JSON array or object) that were damaged and read as written",
              t.get("tool_args_repaired", 0)),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
@@ -4711,6 +4720,11 @@ class Service:
                     print(f"[strata] a picture a tool returned was left out of the prompt: {why}", flush=True)
                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
         return fetched
+
+    def _count(self, name: str) -> None:
+        """Adds one to a counter of /metrics `totals`."""
+        with self.status_lock:
+            self.totals[name] = self.totals.get(name, 0) + 1
 
     def forget_prompt(self, ids):
         if self.prompts is not None:
@@ -5084,6 +5098,9 @@ class Service:
                                  declared_only=declared_only)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
+        cyc_hist = []                                   # repeat_cycle_tokens: the last few tokens
+        cyc_run = [0] * (REPEAT_CYCLE_MAX_PERIOD + 1)   # cyc_run[p]: how many tokens in a row equal the one p before
+        cycle = 0                                       # the period that ended the reply (0: none)
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
@@ -5294,6 +5311,18 @@ class Service:
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
+                                if self.repeat_cycle_tokens:
+                                    cyc_hist.append(t)
+                                    del cyc_hist[:-(REPEAT_CYCLE_MAX_PERIOD + 1)]
+                                    for p in range(2, REPEAT_CYCLE_MAX_PERIOD + 1):
+                                        same = len(cyc_hist) > p and cyc_hist[-1] == cyc_hist[-1 - p]
+                                        cyc_run[p] = cyc_run[p] + 1 if same else 0
+                                        # p tokens plus a run of N - p equal to the one p before: a window of N tokens
+                                        if cyc_run[p] >= self.repeat_cycle_tokens - p and len(set(cyc_hist[-p:])) > 1:
+                                            cycle = p
+                                            break
+                                    if cycle:
+                                        break
                                 piece = detok.push(t)
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
@@ -5469,7 +5498,13 @@ class Service:
                         print(f"[strata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
                               f"{n} tokens: ended as \"length\" (reasoning_loop_recovery: \"stop\" in "
                               "strata-<model>.json; remove it to turn this off)", flush=True)
+                    elif cycle:
+                        self._count("repeat_stops")
+                        print(f"[strata] the reply repeated a cycle of {cycle} tokens over the last "
+                              f"{self.repeat_cycle_tokens} tokens: ended as \"length\" (repeat_cycle_tokens in "
+                              "strata-<model>.json; 0 turns this off)", flush=True)
                     elif repeated:
+                        self._count("repeat_stops")
                         print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
                               "strata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
@@ -8581,7 +8616,7 @@ def tool_call_recovery_setting(cfg: dict) -> bool:
 # it on the Settings page) and the constant it replaces: a name is a global of this module, "Class.name" an attribute of that
 # class.  A key the config leaves out keeps the constant's value.  SESSION_WAIT_MAX_S is not here: it must match the engine's own
 # bound (session_phase_limit_s), and a lower value would end the engine at an SWAIT it announced in good order.
-# repeat_stop_tokens is read in main() (it is a Service attribute).
+# repeat_stop_tokens and repeat_cycle_tokens are read in main() (it is a Service attribute).
 SERVER_NUMBERS = {
     "loop_check_every": "LOOP_CHECK_EVERY", "loop_coverage": "LOOP_COVERAGE", "loop_history_words": "LOOP_HISTORY_WORDS",
     "loop_tail_chars": "LOOP_TAIL_CHARS", "loop_tail_period": "LOOP_TAIL_PERIOD",
@@ -9125,6 +9160,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
+    rc = cfg.get("repeat_cycle_tokens", 0)               # opt-in: a cycle of 2-4 tokens; 0 = off
+    if isinstance(rc, bool) or not isinstance(rc, int) or (rc != 0 and rc < REPEAT_CYCLE_MIN):
+        raise SystemExit(f"[strata] config \"repeat_cycle_tokens\" must be 0 (off) or a whole number >= "
+                         f"{REPEAT_CYCLE_MIN}, not {rc!r}")
+    svc.repeat_cycle_tokens = rc
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         svc.reasoning_budget_configured = True

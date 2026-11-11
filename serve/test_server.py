@@ -2287,6 +2287,43 @@ class RepeatStop(unittest.TestCase):
         self.assertEqual(done["finish"], "stop")
 
 
+class RepeatCycle(unittest.TestCase):
+    """repeat_cycle_tokens (opt-in): a cycle of 2-4 tokens over the last N tokens ends the reply as "length"."""
+
+    def run_reply(self, script, limit=None, cycle=0):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.repeat_cycle_tokens = cycle
+        if limit is not None:
+            svc.repeat_stop_tokens = limit
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            done = [x for kind, x in svc.run(tok.encode("hi"), False, None, 3000, {}, threading.Event()) if kind == "done"][0]
+        return done, out.getvalue(), svc
+
+    def test_cycles_are_ended_and_counted(self):
+        for unit in ("ab", "abc", "abcd"):
+            done, log, svc = self.run_reply("ok " + unit * 100, cycle=64)
+            self.assertEqual(done["finish"], "length", unit)
+            self.assertLess(done["completion_tokens"], 3 + 64 + 8, unit)
+            self.assertIn(f"cycle of {len(unit)} tokens", log)
+            self.assertEqual(svc.totals["repeat_stops"], 1)
+
+    def test_off_by_default_and_legit_text_is_kept(self):
+        done, log, svc = self.run_reply("ab" * 100)
+        self.assertEqual(done["finish"], "stop")
+        self.assertNotIn("repeat_stops", svc.totals)
+        done, _, _ = self.run_reply("ab" * 20 + " fine", cycle=64)    # a short pattern is not a loop
+        self.assertEqual(done["finish"], "stop")
+        done, _, _ = self.run_reply("abcde" * 100, cycle=64)           # period 5 is out of reach
+        self.assertEqual(done["finish"], "stop")
+        done, log, _ = self.run_reply("=" * 100, limit=0, cycle=64)    # one token is repeat_stop_tokens' job
+        self.assertEqual(done["finish"], "stop")
+
+    def test_single_token_stop_is_counted(self):
+        done, _, svc = self.run_reply("!" * 1000)
+        self.assertEqual((done["finish"], svc.totals["repeat_stops"]), ("length", 1))
+
+
 class NonFiniteEngine(MockEngine):
     """#879: each pass ends on the engine's `DONE ... nonfinite` after plan[i] tokens (None, or no plan left: the
     script runs whole), as StrataEngine.generate raises it.  A pass that ends on it had reused all but the last

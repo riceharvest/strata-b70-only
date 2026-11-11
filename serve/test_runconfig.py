@@ -128,6 +128,12 @@ class Apply(unittest.TestCase):
         new, _ = runconfig.apply({"sampling": {"top_k": 20}}, {"sampling.top_k": None})
         self.assertNotIn("sampling", new)                                 # an empty block goes
 
+    def test_repeat_cycle_tokens_is_off_or_at_least_64(self):
+        cfg, _ = runconfig.apply(CFG, {"repeat_cycle_tokens": 64})
+        self.assertEqual(cfg["repeat_cycle_tokens"], 64)
+        with self.assertRaises(ValueError):
+            runconfig.apply(CFG, {"repeat_cycle_tokens": 10})
+
     def test_refused(self):
         for changes in ({"api_key": "x"}, {"host": "0.0.0.0"}, {"mcp_servers": {}}, {"before_load": "calc.exe"},
                         {"args": []}, {"exe": "evil.exe"}, {"trusted_origins": ["*"]}, {"allowed_hosts": ["*"]},
