@@ -1,6 +1,7 @@
 // Optional SAVE admission: free reconstructible host caches, never the live device state.
 #pragma once
 
+#include "strata/core/conversation_cache.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/conversation_memory.hpp"
 
@@ -28,6 +29,7 @@ SessionSaveReclaimed session_save_reclaim(std::vector<ConversationCheckpoint>& c
     if (cache.retained_bytes()) {
         out.bytes += cache.retained_bytes();
         { auto unused = cache.take_reuse(); }
+        release_free_heap();   // #5697: the freed K/V may sit in the heap, where MemAvailable does not count it
         room = available();
         if (done()) return out;
     }
@@ -49,6 +51,7 @@ SessionSaveReclaimed session_save_reclaim(std::vector<ConversationCheckpoint>& c
             chain.erase(chain.begin() + static_cast<std::ptrdiff_t>(i));
             if (i < keep) --keep;
             ++out.checkpoints;
+            release_free_heap();   // #5697: the dropped checkpoint's state
             room = available();
             if (done()) return out;
         }

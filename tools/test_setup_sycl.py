@@ -339,7 +339,326 @@ class ToSycl(unittest.TestCase):
             m.install_shared_embeddings()
             m.S.combined_embeddings_path(Path("/tmp/x"), 10)
             m.S.combined_embeddings_path(Path("/tmp/x"), 10)
-        self.assertEqual(out.getvalue().count("/dev/shm has no room"), 1)
+        self.assertEqual(out.getvalue().count("is not where the engine's container can read it"), 1)
+
+
+def load_setup_intel():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("setup_intel_t", ROOT / "sycl" / "setup_intel.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+class ServedModel(unittest.TestCase):
+    """Unsloth's UD-IQ1_S: the model this fork serves on a B70 (pins, the revision of its own, the layer 18 graft)."""
+
+    def test_the_files_are_pinned_at_their_own_revision(self):
+        fam = setup.FAMILIES["unsloth"]
+        self.assertEqual(setup.model_shards(fam, "UD-IQ1_S"), 3)
+        names = [setup.model_file(fam, "UD-IQ1_S", i) for i in (1, 2, 3)]
+        self.assertEqual(names[1], "Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf")
+        pins = setup.REPO_PINS["unsloth/Qwen3.8-Flash-Next-GGUF"]
+        for n in names:
+            self.assertIn(n, pins)
+            self.assertIn(n, fam["sha256"])
+            self.assertRegex(pins[n][1], r"^[0-9a-f]{64}$")
+        self.assertIn("/resolve/" + setup.UNSLOTH_IQ1_S_REVISION + "/UD-IQ1_S/", setup.model_hf(fam, "UD-IQ1_S"))
+        # the other sizes stay at the family's revision
+        self.assertIn("/resolve/" + setup.HF_REVISIONS["unsloth/Qwen3.8-Flash-Next-GGUF"] + "/UD-IQ4_XS/", setup.model_hf(fam, "UD-IQ4_XS"))
+        self.assertIn("/resolve/" + setup.HF_REVISIONS["ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"] + "/", setup.model_hf(setup.FAMILIES["qwen"], "IQ2_XS"))
+
+    def test_the_graft_names_a_shard_of_the_model_and_keeps_its_size(self):
+        g = setup.MODELS["UD-IQ1_S"]["graft"]
+        fam = setup.FAMILIES["unsloth"]
+        self.assertEqual(g["result"][0], setup.REPO_PINS["unsloth/Qwen3.8-Flash-Next-GGUF"][g["shard"]][0])
+        self.assertEqual(g["compacted_size"], g["result"][0] - 52428800)      # the old IQ2_S slot minus the IQ2_XXS tensor
+        self.assertNotEqual(g["result"][1], setup.REPO_PINS["unsloth/Qwen3.8-Flash-Next-GGUF"][g["shard"]][1])
+        self.assertEqual(setup.shard_pin("UD-IQ1_S", fam, Path("/x") / g["shard"]), tuple(g["result"]))
+        other = setup.model_file(fam, "UD-IQ1_S", 3)
+        self.assertEqual(setup.shard_pin("UD-IQ1_S", fam, Path("/x") / other), setup.REPO_PINS["unsloth/Qwen3.8-Flash-Next-GGUF"][other])
+        self.assertIsNone(setup.MODELS["UD-IQ4_XS"].get("graft"))
+
+    def test_the_model_is_a_choice_of_the_unsloth_family_with_the_served_context(self):
+        d = setup.MODELS["UD-IQ1_S"]
+        self.assertEqual(d["families"], ("unsloth",))
+        self.assertEqual(d["rec_ctx"], 262144)
+        self.assertTrue(d["ple_gguf"])
+        self.assertFalse(d.get("budget"))
+
+
+class GraftStep(unittest.TestCase):
+    """setup.graft_step on tiny files: the graft, the check against the pinned result, the finish mark, a rerun, a file of the person's own."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "tools"))
+        import graft_tensor
+        import test_graft_tensor as T
+        self.G, self.T = graft_tensor, T
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        (self.dir / "src").mkdir()
+        (self.dir / "src" / "source.gguf").write_bytes(T.source_bytes(lead=True))
+        self.pristine = T.target_bytes()
+        done = self.dir / "expected.gguf"
+        done.write_bytes(self.pristine)
+        graft_tensor.graft(done, T.NAME, self.dir / "src" / "source.gguf", log=lambda *_: None)
+        import hashlib
+        self.expected = (done.stat().st_size, hashlib.sha256(done.read_bytes()).hexdigest())
+        compacted = self.dir / "compacted.gguf"
+        compacted.write_bytes(done.read_bytes())
+        graft_tensor.compact(compacted, log=lambda *_: None)
+        self.compacted_size = compacted.stat().st_size
+        self.shard = self.dir / "shard-2.gguf"
+        self.shard.write_bytes(self.pristine)
+        self.graft = {"shard": "shard-2.gguf", "tensor": T.NAME, "type": "IQ2_XXS", "source_model": "UD-IQ1_M", "source_file": "source.gguf",
+                      "source_sha256": __import__("hashlib").sha256(T.NEW).hexdigest(), "result": self.expected,
+                      "compacted_size": self.compacted_size}
+        self.fam = setup.FAMILIES["unsloth"]
+
+    def step(self, own=False, graft=None):
+        out = io.StringIO()
+        with mock.patch.dict(setup.MODELS["UD-IQ1_S"], {"graft": graft or self.graft}), \
+                mock.patch.object(setup, "hf_folder", lambda fam, q, rev=None: str(self.dir / "src") + "/"), \
+                contextlib.redirect_stdout(out):
+            setup.graft_step("UD-IQ1_S", self.fam, [self.dir / "shard-1.gguf", self.shard], own=own)
+        return out.getvalue()
+
+    def test_the_shard_is_grafted_checked_and_marked(self):
+        out = self.step()
+        self.assertEqual(self.shard.read_bytes(), (self.dir / "expected.gguf").read_bytes())
+        self.assertIn(self.expected[1], self.shard.with_name("shard-2.gguf.done").read_text())
+        self.assertIn("has blk.1.ffn_gate_exps.weight from UD-IQ1_M", out)
+
+    def test_a_second_run_does_nothing(self):
+        self.step()
+        with mock.patch.object(self.G, "graft", side_effect=AssertionError("grafted again")):
+            self.assertIn("already has", self.step())
+
+    def test_a_run_that_stopped_after_the_graft_only_checks_and_marks(self):
+        self.shard.write_bytes((self.dir / "expected.gguf").read_bytes())
+        with mock.patch.object(self.G, "graft", side_effect=AssertionError("grafted again")):
+            self.step()
+        self.assertIn(self.expected[1], self.shard.with_name("shard-2.gguf.done").read_text())
+
+    def test_a_wrong_source_leaves_the_shard_as_it_was(self):
+        bad = {**self.graft, "source_sha256": "0" * 64}
+        with self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()):
+            self.step(graft=bad)
+        self.assertEqual(self.shard.read_bytes(), self.pristine)
+
+    def test_a_wrong_result_is_said_and_the_file_is_not_deleted(self):
+        bad = {**self.graft, "result": (self.expected[0], "0" * 64)}
+        with self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()):
+            self.step(graft=bad)
+        self.assertTrue(self.shard.exists())
+
+    def test_a_file_of_the_persons_own_is_never_changed(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()):
+            self.step(own=True)
+        self.assertEqual(self.shard.read_bytes(), self.pristine)
+
+    def test_a_hard_linked_shard_is_copied_first_and_the_other_link_is_untouched(self):
+        other = self.dir / "other.gguf"
+        other.hardlink_to(self.shard)
+        self.step()
+        self.assertEqual(other.read_bytes(), self.pristine)
+        self.assertEqual(self.shard.read_bytes(), (self.dir / "expected.gguf").read_bytes())
+        self.assertEqual(self.shard.stat().st_nlink, 1)
+
+    def test_a_linked_shard_with_no_room_for_a_copy_stops_with_the_command(self):
+        (self.dir / "other.gguf").hardlink_to(self.shard)
+        with mock.patch.object(setup.shutil, "disk_usage", return_value=mock.Mock(free=10)), \
+                self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.step()
+        self.assertEqual(self.shard.read_bytes(), self.pristine)
+
+    def test_a_cut_short_shard_is_left_for_check_shards_to_name(self):
+        self.shard.write_bytes(self.pristine[:100])
+        self.assertEqual(self.step(), "")                          # no traceback, no failure here
+        self.assertEqual(self.shard.read_bytes(), self.pristine[:100])
+
+    def test_a_compacted_shard_is_recognised_by_size_and_header_and_not_hashed(self):
+        self.shard.write_bytes((self.dir / "compacted.gguf").read_bytes())
+        self.shard.with_name("shard-2.gguf.done").write_text("sha256 " + self.expected[1])     # the mark of the graft run
+        out = self.step()
+        self.assertIn("is compacted", out)
+        with mock.patch.dict(setup.MODELS["UD-IQ1_S"], {"graft": self.graft}):
+            self.assertIsNone(setup.shard_pin("UD-IQ1_S", self.fam, self.shard))
+            self.shard.write_bytes((self.dir / "expected.gguf").read_bytes())
+            self.assertEqual(setup.shard_pin("UD-IQ1_S", self.fam, self.shard), tuple(self.expected))
+
+    def test_a_file_of_the_right_size_with_holes_is_not_taken_for_a_compacted_one(self):
+        self.shard.write_bytes(b"\0" * self.compacted_size)
+        self.assertEqual(self.step(), "")
+
+    def test_an_interrupted_compact_says_to_run_it_again_not_to_download(self):
+        self.shard.write_bytes((self.dir / "expected.gguf").read_bytes())
+        self.shard.with_name("shard-2.gguf.compact").write_text("{}")
+        said = []
+        with self.assertRaises(SystemExit), mock.patch.object(setup, "say", said.append):
+            self.step()
+        text = "\n".join(said)
+        self.assertIn("--compact", text)
+        self.assertNotIn("download it again", text)
+        self.assertTrue(self.shard.exists())
+
+    def test_a_model_without_a_graft_is_left_alone(self):
+        setup.graft_step("UD-IQ4_XS", self.fam, [self.shard])
+        self.assertEqual(self.shard.read_bytes(), self.pristine)
+
+
+class ServedRecipe(unittest.TestCase):
+    """sycl/setup_intel.py: the config for UD-IQ1_S on one B70 is the served one; every other choice is as it was."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.si = load_setup_intel()
+
+    def cfg(self, **over):
+        si = self.si
+        args = ["--pack", str(si.ROOT.parent / "d" / "pack"), "--native", str(si.ROOT.parent / "d" / "a.gguf"),
+                "--ple-gguf", str(si.ROOT.parent / "d" / "c.gguf"), "--expert-profile", str(si.ROOT / "data" / "expert-profile.bin"),
+                "--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5",
+                "--mtp", str(si.ROOT.parent / "d" / "mtp" / "rt"), "--max-context", "262144", "--kv", "int8"]
+        return {"exe": "x", "args": args, **over}
+
+    def make(self, model="UD-IQ1_S", served=True, cfg=None, **kw):
+        notes = []
+        out = self.si.to_sycl(cfg or self.cfg(), self.si.ROOT / "build-sycl-aot" / "strata", 64.0, {}, 32.0, "xe", "e223",
+                              model=model, served=served, served_notes=notes, **kw)
+        return out, notes
+
+    def flag(self, out, name):
+        return self.si.flag(out["args"], name)
+
+    def test_the_served_settings(self):
+        out, notes = self.make()
+        self.assertEqual(self.flag(out, "--spec"), "6")
+        self.assertEqual(self.flag(out, "--spec-min-p"), "0.5")
+        self.assertEqual(self.flag(out, "--max-context"), "262144")
+        self.assertEqual(self.flag(out, "--kv"), "int8")
+        self.assertEqual(self.flag(out, "--kv-resident"), "32768")
+        self.assertEqual(self.flag(out, "--prefill"), "16384")
+        self.assertEqual(self.flag(out, "--mtp-window"), "8192")
+        self.assertEqual(self.flag(out, "--expert-cache"), "auto")
+        self.assertIn("--stream-experts", out["args"])
+        self.assertTrue(self.flag(out, "--expert-profile").endswith("/data/expert-profile-pi.bin"))
+        self.assertTrue(self.flag(out, "--mtp-draft-vocab").endswith("/data/draft_vocab_code.bin"))
+        self.assertTrue(self.flag(out, "--mtp-draft-vocab").startswith("/work/"))
+        self.assertEqual(out["env"], {"STRATA_SPEC_PROBE_MIN": "1", "STRATA_IQ_XXS_SGNMUL": "1", "STRATA_KREG2_R": "2,4,4,4,2,2,2,2"})
+        self.assertEqual(out["exe"], str(self.si.SYCL_WRAPPER))
+        self.assertTrue(notes)
+
+    def test_setup_hands_the_config_tag_not_the_size_name(self):
+        """write_run_script is called with the tag (unsloth-UD-IQ1_S), as the config and the start script are named."""
+        out, notes = self.make(model="unsloth-UD-IQ1_S")
+        self.assertEqual(self.flag(out, "--spec"), "6")
+        self.assertTrue(notes)
+        other, notes = self.make(model="unsloth-UD-IQ4_XS")
+        self.assertEqual(self.flag(other, "--spec"), "4")
+        self.assertEqual(notes, [])
+
+    def test_no_machine_specific_setting_is_written(self):
+        out, _ = self.make()
+        text = repr({"args": out["args"], "env": out["env"]})
+        for word in ("gpu_locks", "LEND_MIRROR", "USAGE_DUMP", "spill", "/home/"):
+            self.assertNotIn(word, text)
+
+    def test_the_recipe_is_off_for_another_model_and_when_not_asked_for(self):
+        plain, notes = self.make(served=False)
+        self.assertEqual(self.flag(plain, "--spec"), "4")
+        self.assertNotIn("--mtp-draft-vocab", plain["args"])
+        self.assertIsNone(plain.get("env"))
+        self.assertEqual(notes, [])
+        other, notes = self.make(model="UD-IQ4_XS")
+        self.assertEqual(self.flag(other, "--spec"), "4")
+        self.assertNotIn("--mtp-draft-vocab", other["args"])
+        self.assertIsNone(other.get("env"))
+        self.assertEqual(notes, [])
+
+    def test_what_the_person_chose_is_kept(self):
+        cfg = self.cfg()
+        cfg["args"][cfg["args"].index("--spec") + 1] = "8"
+        cfg["args"][cfg["args"].index("--expert-profile") + 1] = str(self.si.ROOT.parent / "mine.bin")
+        cfg["args"] += ["--mtp-draft-vocab", str(self.si.ROOT.parent / "v.bin")]
+        out, _ = self.make(cfg=cfg)
+        self.assertEqual(self.flag(out, "--spec"), "8")
+        self.assertEqual(self.flag(out, "--expert-profile"), "/work/mine.bin")
+        self.assertEqual(self.flag(out, "--mtp-draft-vocab"), str(self.si.ROOT.parent / "v.bin"))
+        asked, _ = self.make(draft_asked=True)
+        self.assertNotIn("--mtp-draft-vocab", asked["args"])
+        env = {"STRATA_KREG2_R": "1"}
+        self.si.apply_served_recipe(self.cfg()["args"], env)
+        self.assertEqual(env["STRATA_KREG2_R"], "1")
+
+    def test_the_b70_on_a_64_gb_pc_gets_the_served_model_preselected(self):
+        si = self.si
+        b70 = [{"devid": "e223", "vram_gb": 32.0, "driver": "xe"}]
+        with mock.patch.object(setup, "tier_pick", setup.tier_pick), mock.patch.object(setup, "RECOMMENDED_SIZES", dict(setup.RECOMMENDED_SIZES)):
+            self.assertEqual(setup.tier_pick(1024.0, 32.0), ("qwen", "IQ3_S"))
+            self.assertEqual(si.prefer_served(b70, 62.0, ["--check"]), ["--check"])
+            self.assertEqual(setup.tier_pick(1024.0, 32.0), (si.SERVED_FAMILY, si.SERVED_MODEL))
+            names = [m for m in setup.MODELS if "unsloth" in setup.MODELS[m].get("families", ("qwen", "swift"))]
+            self.assertEqual(setup.recommended_size("unsloth", names, 1024.0, 32.0), "UD-IQ1_S")
+            self.assertEqual(si.prefer_served(b70, 62.0, ["--model", "UD-IQ1_S"]), ["--model", "UD-IQ1_S", "--vision", "no"])
+            self.assertEqual(si.prefer_served(b70, 62.0, ["--model", "UD-IQ1_S", "--vision", "yes"]), ["--model", "UD-IQ1_S", "--vision", "yes"])
+
+    def test_another_card_or_less_ram_keeps_the_old_choice(self):
+        si = self.si
+        for intel, ram in (([{"devid": "e221", "vram_gb": 24.0, "driver": "xe"}], 62.0),
+                           ([{"devid": "e223", "vram_gb": 32.0, "driver": "xe"}], 32.0),
+                           ([{"devid": "e223", "vram_gb": 32.0}, {"devid": "e223", "vram_gb": 32.0}], 62.0)):
+            with self.subTest(ram=ram, cards=len(intel)), mock.patch.object(setup, "tier_pick", setup.tier_pick), \
+                    mock.patch.object(setup, "RECOMMENDED_SIZES", dict(setup.RECOMMENDED_SIZES)):
+                self.assertEqual(si.prefer_served(intel, ram, ["--model", "UD-IQ1_S"]), ["--model", "UD-IQ1_S"])
+                self.assertEqual(setup.tier_pick(1024.0, 32.0), ("qwen", "IQ3_S"))
+
+    def test_a_rerun_does_not_read_the_recipe_flags_as_the_persons_own(self):
+        from strata_control import user_args
+        cfg = self.cfg()
+        cfg["user_args"] = ["--vram-reserve-mib", "700"]
+        user_args.stamp(cfg)                                          # what setup does before to_sycl rewrites the args
+        out, _ = self.make(cfg=cfg)
+        self.assertEqual(out["args_written"], out["args"])
+        self.assertEqual(user_args.capture(out, setup.SETUP_CHOICE_FLAGS), ["--vram-reserve-mib", "700"])
+
+    def test_an_env_entry_the_person_set_survives_a_rerun_and_a_recipe_one_does_not_stay_without_the_recipe(self):
+        old = {"STRATA_KREG2_R": "1", "STRATA_MY_SWITCH": "x", "STRATA_SPEC_PROBE_MIN": "1", "STRATA_SYCL_BIN": "stale",
+               "IGC_EnableDPEmulation": "1", "STRATA_ROUTE_TAIL_SKIP": "0"}
+        cfg = self.cfg(env=old, model_name="qwen3.8-flash-next-unsloth-ud-iq1_s")
+        out, _ = self.make(cfg=cfg)
+        self.assertEqual(out["env"]["STRATA_KREG2_R"], "1")                       # the person's value beats the recipe's
+        self.assertEqual(out["env"]["STRATA_MY_SWITCH"], "x")
+        self.assertEqual(out["env"]["STRATA_SPEC_PROBE_MIN"], "1")
+        self.assertNotIn("STRATA_SYCL_BIN", out["env"])                           # what setup writes itself is regenerated
+        self.assertNotIn("IGC_EnableDPEmulation", out["env"])
+        self.assertNotIn("STRATA_ROUTE_TAIL_SKIP", out["env"])                    # setup's own entry of an Unsloth config
+        off, _ = self.make(served=False, cfg=self.cfg(env={**self.si.SERVED_ENV, "STRATA_MY_SWITCH": "x"}))
+        self.assertEqual(off["env"], {"STRATA_MY_SWITCH": "x"})                   # the recipe's values of an earlier run are gone
+        gone, _ = self.make(served=False, cfg=self.cfg(env=dict(self.si.SERVED_ENV)))
+        self.assertIsNone(gone.get("env"))
+
+    def test_the_recipe_is_for_exactly_one_b70(self):
+        si = self.si
+        b70 = {"devid": "e223"}
+        self.assertTrue(si.served_applies([b70], "e223", True))
+        self.assertFalse(si.served_applies([b70, b70], "e223", True))             # a layer split keeps its two-card --spec 2 rule
+        self.assertFalse(si.served_applies([{"devid": "e221"}], "e221", True))
+        self.assertFalse(si.served_applies([b70], "e223", False))
+
+    def test_the_model_and_vision_options_in_the_equals_form_are_seen(self):
+        si = self.si
+        b70 = [{"devid": "e223", "vram_gb": 32.0, "driver": "xe"}]
+        with mock.patch.object(setup, "tier_pick", setup.tier_pick), mock.patch.object(setup, "RECOMMENDED_SIZES", dict(setup.RECOMMENDED_SIZES)):
+            self.assertEqual(si.prefer_served(b70, 62.0, ["--model=UD-IQ1_S"]), ["--model=UD-IQ1_S", "--vision", "no"])
+            self.assertEqual(si.prefer_served(b70, 62.0, ["--model", "UD-IQ1_S", "--vision=yes"]), ["--model", "UD-IQ1_S", "--vision=yes"])
+
+    def test_the_off_switch_is_taken_out_before_setup_sees_it(self):
+        src = (ROOT / "sycl" / "setup_intel.py").read_text(encoding="utf-8")
+        self.assertIn("NO_RECIPE_FLAG not in argv", src)
+        self.assertIn("a != NO_RECIPE_FLAG", src)
 
 
 if __name__ == "__main__":

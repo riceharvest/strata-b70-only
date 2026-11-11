@@ -96,7 +96,7 @@ That is 12 gate/up formats (IQ2_XXS, IQ2_S, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS, IQ1_
 - One layer of one file is outside the engine as a whole, not only the prompt kernels: UD-IQ1_S layer 18 stores gate
   and up in two formats, and a layer has one gate/up format everywhere here (`tools/iq_pack.py` refuses the file:
   "gate and up differ in type"). The pack that is served takes that one tensor, `blk.18.ffn_gate_exps`, from UD-IQ1_M,
-  where it is IQ2_XXS like the layer's up (nothing is quantized again).
+  where it is IQ2_XXS like the layer's up (nothing is quantized again). Setup does this itself for `--model UD-IQ1_S` (`tools/graft_tensor.py`; [B70.md](B70.md#the-served-setup)).
 
 ## Quality: the yardstick
 

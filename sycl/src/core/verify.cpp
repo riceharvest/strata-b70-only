@@ -2668,8 +2668,10 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                         *hu = wt.find("output_hc_up.weight");
         if (!hn || !hd || !hu) { err = "verify: an output_hc_* weight is missing"; return false; }
         // S25 (STRATA_HC_Q8=1): the final mixer from the GGUF's Q8_0 projections too, through the same multi read
-        // (no pending write, no inject)
-        const bool mix_q8 = hd->hc_q8 != nullptr && hu->hc_q8 != nullptr && head_ != nullptr && head_->loaded();
+        // (no pending write, no inject).  Not with STRATA_FUSE_HEAD_GR=1: the last layer's write is then still
+        // pending and only the fused read below applies it, so this read would drop that layer's FFN output.
+        const bool mix_q8 = hd->hc_q8 != nullptr && hu->hc_q8 != nullptr && head_ != nullptr && head_->loaded() &&
+                            !fuse_head_gr;
         if (mix_q8) {
             FusedGrArgs fa[kFusedGrWideT];
             for (int t = 0; t < T; ++t) {

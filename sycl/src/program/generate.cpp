@@ -12466,9 +12466,16 @@ int main(int argc, char **argv) try {
                     }
                     const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                     auto admit_store = [&](uint64_t need, std::string& why) {
-                        const auto mem = strata::core::sample_host_memory();
-                        if (strata::core::conversation_memory_admit(mem ? std::optional<uint64_t>(mem->available) : std::nullopt, need, floor))
-                            return true;
+                        auto fits = [&](const std::optional<strata::core::HostMemoryReading>& m) {
+                            return strata::core::conversation_memory_admit(m ? std::optional<uint64_t>(m->available) : std::nullopt, need, floor);
+                        };
+                        auto mem = strata::core::sample_host_memory();
+                        if (fits(mem)) return true;
+                        // #5697: what the spill writer and dropped checkpoints freed may still sit in the heap
+                        if (strata::core::release_free_heap()) {
+                            mem = strata::core::sample_host_memory();
+                            if (fits(mem)) return true;
+                        }
                         why = "not enough RAM (" + (need == UINT64_MAX ? std::string("unknown") : std::to_string(need >> 20)) +
                               " MiB plus a floor of " + std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " +
                               ram_note(mem) + ")";
@@ -12641,9 +12648,10 @@ int main(int argc, char **argv) try {
                 // though every parked conversation could give its RAM back - and refusing here throws
                 // away the whole prompt read that produced this snapshot (measured: 270k tokens, 96 s).
                 // Evict the least recently active parked conversations until it fits, or until none are
-                // left.  Each ConversationBuffer is a list of 16 MiB segments, each segment its own
-                // allocation, so an evicted entry is back with the kernel before the next check reads
-                // /proc/meminfo; no waiting is needed.  slots() bounds the loop, and the two lines
+                // left.  #5697: freed memory can stay in the C library's heap, which MemAvailable does not
+                // count (make_room's evictions above, dropped checkpoints, a cancelled spill): a failed check
+                // hands it back first (release_free_heap), and evict_oldest() hands back each entry it drops, so
+                // the next check reads it from /proc/meminfo; no waiting is needed.  slots() bounds the loop, and the two lines
                 // below say what it did either way.  The reading is the guard's (MemAvailable, the cgroup
                 // limits above the engine, --memory-limit-mib); `mem` keeps the last one for the refusal line.
                 size_t evicted = 0;
@@ -12656,12 +12664,18 @@ int main(int argc, char **argv) try {
                 // an entry the SSD tier is still writing holds its RAM: it is dropped (the write stops at its next block) when
                 // this snapshot needs the memory now
                 auto relieve_spill = [&] {
-                    if (spill && spill->inflight_bytes() > 0 && !admit()) { spill->cancel_inflight(); spill_drain(); }
+                    if (spill && spill->inflight_bytes() > 0 && !admit()) {
+                        spill->cancel_inflight(); spill_drain();
+                        strata::core::release_free_heap();   // the dropped write's image
+                    }
                 };
                 relieve_spill();
-                while (!admit() && conversations.size() > 0 && evicted < conversations.slots() &&
-                       conversations.evict_oldest())
+                bool fits = admit() || (strata::core::release_free_heap() && admit());
+                while (!fits && conversations.size() > 0 && evicted < conversations.slots() &&
+                       conversations.evict_oldest()) {
                     ++evicted;
+                    fits = admit();
+                }
                 relieve_spill();
                 if (!admit()) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
@@ -16002,9 +16016,14 @@ int main(int argc, char **argv) try {
                             }
                         }
                         auto admit = [&](uint64_t need, std::string& why) {
-                            const auto mem = strata::core::sample_host_memory();
-                            const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
-                            if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                            auto mem = strata::core::sample_host_memory();
+                            auto avail_of = [&] { return mem ? std::optional<uint64_t>(mem->available) : std::nullopt; };
+                            if (strata::core::conversation_memory_admit(avail_of(), need, floor)) return true;
+                            // #5697: memory freed by the reclaim above may still sit in the C library's heap
+                            if (strata::core::release_free_heap()) {
+                                mem = strata::core::sample_host_memory();
+                                if (strata::core::conversation_memory_admit(avail_of(), need, floor)) return true;
+                            }
                             why = "not enough RAM to save the session (" +
                                   (need == UINT64_MAX ? std::string("unknown") : std::to_string(need >> 20)) +
                                   " MiB plus a floor of " + std::to_string((long long) o.conversation_cache_min_free_mib) +
@@ -16619,7 +16638,7 @@ int main(int argc, char **argv) try {
                                              "reading the prompt is cheaper; reading the prompt\n", (long long) dm.tokens,
                                      (double) spill->bytes_of(dm) / (1 << 20));
                     } else {
-                        if (spill->inflight_bytes() > 0) { spill->cancel_inflight(); spill_drain(); }   // a restore needs the RAM and the disk
+                        if (spill->inflight_bytes() > 0) { spill->cancel_inflight(); spill_drain(); strata::core::release_free_heap(); }   // a restore needs the RAM and the disk (#5697: the dropped write's image goes back to the system)
                         strata::core::SavedConversation img;
                         size_t file_bytes = 0;
                         std::string lerr;

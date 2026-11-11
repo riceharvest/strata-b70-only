@@ -13,7 +13,7 @@ Not affiliated with Intel or with upstream Strata.
 
 | Model | Status on one B70 |
 | --- | --- |
-| [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), [ISTA-DASLab GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | Usable at 128K-256K context, chats and coding agents included (measured at 118K and 250K). Numbers below |
+| [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), Unsloth's [UD-IQ1_S](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (the file set this fork serves, setup's choice on one B70 with 64 GB of RAM) | Usable at 128K-256K context, chats and coding agents included. The numbers under [Speed](#speed) were measured on the earlier IQ2_XS file ([ISTA-DASLab GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)); the UD-IQ1_S ones are in [docs/B70.md](docs/B70.md) |
 
 ## What counts as usable here
 
@@ -31,47 +31,46 @@ was fluent but had lost knowledge (in our tests it got simple facts wrong). Unpr
 
 ## Speed
 
-Qwen3.8-Flash-Next IQ2_XS on one Arc Pro B70, Ryzen 9 5950X, 64 GB RAM, measured 2026-11-02 (by day). Settings:
+Qwen3.8-Flash-Next UD-IQ1_S (the served recipe setup writes) on one Arc Pro B70, Ryzen 9 5950X, 64 GB RAM, measured
+2026-11-11. Settings:
 
-- MTP draft, `--spec 4`, int8 KV, 32K of the KV in VRAM, `--prefill 16384`
-- 7 GB of VRAM kept free, because the card also drives a desktop; `STRATA_MIRROR_MIB=25000` (24 GiB of experts pinned in RAM)
-- page cache dropped before every start
-- one 118,196-token prompt (this repo's docs with a fact hidden in the middle; every answer found it), a ~730-token
-  answer, temperature 0, two runs each
+- MTP draft, `--spec 6`, int8 KV, 32K of the KV in VRAM, `--prefill 16384`, `--max-context 262144`
+- 3 GB of VRAM kept free for the desktop; `STRATA_MIRROR_MIB=25000`
+- one start; every prompt begins with a new line of its own, so nothing is reused from an earlier request
+- long prompts: this repo's docs with a fact hidden in the middle (every answer found it), thinking off, temperature 0,
+  an answer of up to 900 tokens, two runs each
 
 | Context | Prompt (tok/s) | Answer (tok/s) |
 | --- | ---: | ---: |
-| 118K | 3,343 / 3,402 | 76.8 / 76.6 |
-| 250K | 3,333 / 3,339 / 3,335 | 75.4 / 76.4 / 75.6 |
+| 118K (118,227 tokens) | 3,475 / 3,356 | 85.6 / 86.5 |
+| 250K (249,650 tokens) | 3,325 / 3,329 | 84.7 / 87.5 |
 
-Short cold prompts (one user message, nothing cached, same settings but 3 GB kept free), prompt read time and time to the
-first token:
+Short cold prompts (one user message, nothing cached, same start), prompt read time and time to the first token:
 
 | Prompt | Read (tok/s) | First token |
 | --- | ---: | ---: |
-| 135 tokens | 340 ms (397) | 377 ms |
-| 393 tokens | 416 ms (944) | 454 ms |
-| 1,178 tokens | 678 ms (1,738) | 728 ms |
-| 5,382 tokens | 2,008 ms (2,680) | 2,121 ms |
+| 135 tokens | 313 ms (431) | 355 ms |
+| 393 tokens | 427 ms (921) | 468 ms |
+| 1,178 tokens | 637 ms (1,848) | 691 ms |
+| 5,382 tokens | 1,841 ms (2,923) | 1,963 ms |
 
-A short prompt cannot reach the long prompts' speed: about 40% of the experts live in RAM, and a few hundred tokens
+A short prompt cannot reach the long prompts' speed: about a third of the experts live in RAM, and a few hundred tokens
 already route to most of them, so every read has to bring most of those across PCIe whatever its length.
 
-The 250K row is the same test with a 249,618-token prompt (more of the same docs, the fact in the middle, found every
-time) and `--max-context 262144`, three runs. On 2026-11-01 the same tests read 3,228 / 3,213 and 3,171-3,174 tok/s with answers at 71.7 / 71.5 and 69.5-70.5 tok/s; the 2026-11-02 work (decode graphs without the shared-expert fork, cheaper drafts, the prompt's expert copies started a layer ahead, smaller tiles for experts of few rows) made the prompts 4-6% and the answers 7% faster here, and short prompts 20-30% faster to their first token ([docs/B70.md](docs/B70.md#short-prompts-2026-11-02)). Before the 2026-11-01 work the same tests read 2,861 / 2,857 tok/s at 118K
-and 2,750 / 2,832 at 250K: the prompt is now read 12-15% faster in these runs (14-18% in the night runs), mostly from mirroring the experts a prompt chunk
-borrows (the default now; it needs the `STRATA_MIRROR_MIB` above) and, past ~201K tokens, from keeping the prompt's
-selection on XMX. The answers are 6-8% faster than that day's first runs (64.6-67.8 tok/s): the experts that are not in
-VRAM are copied in by one wide-load kernel and kept in a VRAM ring that the next windows read again (from the cache's own
-budget, so it needs the larger `STRATA_MIRROR_MIB` above). The prompt numbers are lower than that night's runs of the
-previous build (3,261 / 3,289 and 3,246-3,248 tok/s), but that build rerun the same day read 3,190 / 3,108 (118K) and
-3,094 tok/s (250K), and no switch of the new work, turned off, read faster: the machine reads slower by day.
-Sampled answers (an agent's) also gain ~6% from exact sampled-draft acceptance, on by default. These numbers include the
-fix for the second-turn hang below, which costs about 2%.
-[docs/B70.md](docs/B70.md) has what changed, every change against upstream and who wrote it, and the earlier
-comparisons with upstream Strata on this card (+12% to +17% prompt speed at 4K and 16K on 2026-10-24, before this work).
+The two [localmaxxing](https://localmaxxing.com) prompts in the same start (greedy, 512 tokens, one measured run each
+after a warm-up): reasoning-v1 121.8 tok/s (345-token prompt read in 371 ms, first token 412 ms), code-v1 103.7 tok/s
+(280 tokens in 369 ms, first token 415 ms).
 
-**A coding agent on one B70, up to 256K.** The [pi](https://github.com/earendil-works/pi) agent with thinking `xhigh`,
+Does the tuning change what the model says? Measured 2026-11-11: the served kernels against their exact alternatives give
+the same top token in 36 of 36 prompt reads and in 99.1% of 2,867 decoded positions, and llama.cpp on the CPU scores the
+same as this engine on the same file on an instruction-following probe
+([docs/B70.md](docs/B70.md#instruction-following-the-served-kernels-against-exact-ones-and-llamacpp-2026-11-11)).
+
+[docs/B70.md](docs/B70.md) has what changed since upstream, who wrote it, and every earlier measurement (the earlier
+GSQ-RCO IQ2_XS files read 3,343-3,402 tok/s at 118K and answered at about 77 tok/s on 2026-11-02; upstream Strata on this
+card was 12-17% slower on prompts on 2026-10-24, before this work).
+
+**A coding agent on one B70, up to 256K** (measured 2026-10-31 to 2026-11-02 on the earlier IQ2_XS files). The [pi](https://github.com/earendil-works/pi) agent with thinking `xhigh`,
 `--max-context 262144` and 3 GB of VRAM kept for the desktop. A session with a 170K-token system prompt (a 156K-token
 `AGENTS.md`) ran eleven coding tasks: 82 requests, the context growing from 170K to 245K tokens, where pi compacted
 the conversation, then on from 195K to 225K. Every task finished. (Rerun on 2026-11-01 with that day's work: the cold
@@ -88,7 +87,7 @@ now works around it (2% prompt speed), see [docs/B70.md](docs/B70.md#agent-use-a
   `renderD128`)
 - Docker (or Podman). The engine builds and runs in a container, so the host needs no oneAPI
 - 64 GB of RAM (what it's measured on)
-- Disk: about 80 GB for Qwen3.8-Flash-Next IQ2_XS
+- Disk: about 75 GB for UD-IQ1_S (66 GB of model files and 5 GB of draft layer; IQ2_XS takes about 80 GB)
 
 ### The rest of your PC matters too
 
@@ -118,11 +117,22 @@ PCIe 4.0 x16 slot. Treat them as a floor; on a newer platform expect more, but n
 
    The build ends with `BUILD EXIT 0` and `errors: 0`.
 
-3. Set up a model and serve it:
+3. Set up the model and serve it:
 
-       ./setup.sh --backend sycl --model IQ2_XS
+       ./setup.sh --backend sycl --family unsloth --model UD-IQ1_S --context 262144 --vision no
 
-   Setup downloads the model, builds its pack, writes a config and a `run-<model>.sh` that starts the server.
+   On one B70 with 64 GB of RAM, a first `./setup.sh --backend sycl` with no `--family` or `--model` preselects the same
+   model and context in its menu (`--yes` takes them). That run keeps pictures on, which the served setup does not
+   have: use the command above for the served one.
+   Setup downloads Unsloth's UD-IQ1_S files at a pinned revision, checks them against pinned sizes and SHA-256 sums, and
+   takes one tensor (layer 18's gate experts) from the UD-IQ1_M file of the same repository into shard 2, about 216 MB read
+   (the file as published cannot be packed: `docs/QUANTS.md` says why; nothing is quantized again). It then builds the pack,
+   fetches the draft layer (about 5 GB of tensors from the Qwen checkpoint, read by range requests), writes a config
+   (`strata-unsloth-ud-iq1_s.json`, its `exe` is `sycl/serve/strata-sycl.sh`) and a `run-unsloth-ud-iq1_s.sh` that starts
+   the server, and starts it. The config carries the settings this fork serves with: `--spec 6`, the coding agent's expert
+   profile and draft vocabulary, `--prefill 16384`, int8 KV with 32K of it in VRAM, and three `STRATA_*` switches. The list
+   is printed when setup writes it and kept in [docs/B70.md](docs/B70.md#the-served-setup). `--no-served-recipe` leaves it
+   out. Another model: `--model IQ2_XS` (the earlier default), or any size of `--family`.
 
 Details, every engine switch and what was measured: [docs/INTEL.md](docs/INTEL.md).
 
@@ -140,20 +150,22 @@ The server speaks the OpenAI, Anthropic and OpenAI Responses APIs on the port se
 
 For one long agent session (a system prompt of 40K-60K tokens, the context up to the model's 262,144 tokens):
 
-    ./setup.sh --backend sycl --model IQ2_XS --context 262144 --vram-reserve-mib 3072 --vision no
+    ./setup.sh --backend sycl --family unsloth --model UD-IQ1_S --context 262144 --vram-reserve-mib 3072 --vision no
 
 - **3 GB of VRAM for the desktop** was enough on the test box (KDE and a browser). Everything else goes to the expert
   cache: about 16,000 experts in VRAM instead of 13,000 with 7 GB kept free, so less is read over PCIe.
 - **Drafts for code.** With a context above 64K setup drafts from an English + code token subset (`--draft-vocab code`)
-  over the last 8,192 cells (`--mtp-window 8192`): ~6% faster answers for a coding agent, the same tokens. For an agent
-  that writes code, `--expert-profile data/expert-profile-pi.bin` in the config's args keeps the experts pi sessions use
-  in VRAM (made from pi sessions on this repo; ~2.6% on those, the same elsewhere).
+  over the last 8,192 cells (`--mtp-window 8192`): ~6% faster answers for a coding agent, the same tokens. For UD-IQ1_S
+  the config also has `--expert-profile data/expert-profile-pi.bin`, which keeps the experts pi sessions use in VRAM (made
+  from pi sessions on this repo, on the IQ2_XS pack; not measured on UD-IQ1_S yet). For another model, add it to the
+  config's args by hand.
 - **Thinking** is on at the model's highest level (`xhigh`) unless the client asks for another (`reasoning_effort`:
   `low`, `medium`, `high` or `xhigh`, `none` turns it off).
 - **Earlier turns' thinking stays in the prompt** when the client sends it back (`reasoning_content`, as pi does). The
   history then matches what the engine already read, and each turn reads only its new tokens.
-- **Pictures** stay off with `--vision no`. Setup's default reads them on the CPU, from RAM; the first picture sent on a
-  B70 once reset the card ([docs/INTEL.md](docs/INTEL.md#pictures-on-an-arc)), and nobody has looked at it since.
+- **Pictures** stay off with `--vision no`. Setup's default reads them on the CPU, from RAM, and takes no VRAM. A
+  four-request test on 2026-11-11 answered every picture right (2.6 s for the first, 0.5 s for the same one again);
+  what it needs and what was not run is in [docs/B70.md](docs/B70.md#pictures-on-one-b70-by-hand).
 
 For [pi](https://github.com/earendil-works/pi), add the server to `~/.pi/agent/models.json`:
 
@@ -173,8 +185,8 @@ under [Speed](#speed); sessions past 118K tokens are not measured yet.
 - **Pictures run on the CPU by default** (setup's choice for this card). See the note under
   [For a coding agent](#for-a-coding-agent) before turning them on.
 - **Keep RAM headroom on a desktop.** On a 64 GB machine leave `--ple-io` at its default (`direct`); `ram` locks a
-  28.8 GB table into memory. Size `STRATA_MIRROR_MIB` so a few GB stay free: 25000 for Flash-Next IQ2_XS at 256K left
-  15.9 GB free on 64 GB.
+  28.8 GB table into memory. Size `STRATA_MIRROR_MIB` so a few GB stay free: 25000 for UD-IQ1_S through the 250K runs above
+  left 11 GB free on this 64 GB desktop, with a browser and an Android emulator open (15.9 GB for the earlier IQ2_XS files).
 - **B70 defaults are on.** The engine sets its B70 settings (`STRATA_VERIFY_DEVICE_PLAN`, `STRATA_SELECT_LONG`,
   `STRATA_HC_Q8` and the others listed in [docs/B70.md](docs/B70.md)) unless you set them yourself; `0` turns one off,
   `STRATA_B70_DEFAULTS=0` turns all of them off. The B70 prompt kernels (attention, selection, GDN, hyper-connections,

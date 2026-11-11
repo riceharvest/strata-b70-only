@@ -298,6 +298,31 @@ CODER_FILES = {
         (907543008, "b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0"),
 }
 
+# UD-IQ1_S's three shards at Unsloth's main of 2026-11-07 (sizes and SHA-256: the Hub's LFS pointers). The repository's files
+# changed after the revision in HF_REVISIONS: UD-IQ1_S is pinned at its own (MODELS "revision"), the other sizes stay where they were.
+# Shard 3 (the n-gram table) is the same file as UD-IQ1_M's.
+UNSLOTH_IQ1_S_REVISION = "084c631ac221016019d6e0a863afe92d90edd3b0"
+UNSLOTH_IQ1_S_SHARDS = {
+    "Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf":
+        (10946618, "df6ba2c00267aa4853231fdb203ba76b67b7eadcfb372df65842760b9efa1a8d"),
+    "Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf":
+        (37568095648, "7101e65fb6084e65c9e2c678291d8b6b62dfcce89c422958633cf5585a68cbb6"),
+    "Qwen3.8-Flash-Next-UD-IQ1_S-00003-of-00003.gguf":
+        (28800138432, "05716382c280d999b81afff92b2d527fadbfd926ac225ffdc273f2d1d13331c6"),
+}
+# UD-IQ1_S as Unsloth ships it cannot be packed: layer 18 has gate IQ2_S and up IQ2_XXS, and tools/iq_pack.py needs one type
+# for both. UD-IQ1_M of the same repository has that gate tensor as IQ2_XXS. Setup takes those bytes over into shard 2 (nothing is
+# quantized again; tools/graft_tensor.py), then checks the shard against "result" (its size and SHA-256 after the graft).
+UNSLOTH_IQ1_S_GRAFT = {
+    "shard": "Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf",
+    "tensor": "blk.18.ffn_gate_exps.weight",
+    "type": "IQ2_XXS",                                  # the tensor's type after the graft
+    "source_model": "UD-IQ1_M",
+    "source_file": "Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf",
+    "source_sha256": "38818a36ffd7c9f70921d148d67e94fe7a73cac8bd74de68ba7d34a7270c1640",   # of the tensor's 216,268,800 bytes
+    "result": (37568095648, "7ebee4c9cf63f36319574b0e7a90be7d4fb8a1e0f534db4ba3644f2d6aa191b8"),
+    "compacted_size": 37515666848,                      # shard 2 after `tools/graft_tensor.py --compact` (753 tensors move down; llama.cpp needs it, Strata does not)
+}
 MODELS = {
     # the original model only for now: Swift 1.5's Q2_0 files split one layer's experts across the two shards, which
     # the pack tool (tools/iq_pack.py) cannot prepare yet (#171)
@@ -347,6 +372,13 @@ MODELS = {
              "download_gb": 188.2, "ram_gb": 136, "arena_gb": 128.3, "families": ("unsloth",), "budget": True,
              "shards": 6, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00006.gguf", "engine": (0, 1, 38),
              "vision": True},
+    # Unsloth's 1.6-bit file (IQ2_XXS and IQ2_S experts, Q2_0 downs): the size the B70 is served with (docs/B70.md). Its layer 18
+    # needs the graft above before it can be packed. Not a "budget" size: its 33 GB of experts fit a 64 GB PC beside the system.
+    "UD-IQ1_S": {"about": "Unsloth's smallest dynamic file, the one this fork serves on a B70 (setup takes one tensor from "
+                          "UD-IQ1_M so it can be packed)",
+                 "download_gb": 66.4, "ram_gb": 40, "arena_gb": 33.3, "families": ("unsloth",), "shards": 3,
+                 "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "vision": True,
+                 "revision": UNSLOTH_IQ1_S_REVISION, "graft": UNSLOTH_IQ1_S_GRAFT, "ple_gguf": True, "rec_ctx": 262144},
     # Gyro (agentionai): "ram_gb" is the memory the weights need in total, VRAM and RAM together ("mem_total"): Gyro-S
     # 27.6 GB, Gyro-M 35 GB (the rest of the download is the n-gram table, read from the SSD).  Neither is anyone's
     # default: setup and the MCP server mention them where the other sizes do not fit.  Images: the same mmproj as every
@@ -460,14 +492,15 @@ FAMILIES = {
     # Unsloth's UD-IQ4_XS (three shards, #621), UD-Q4_K_XL (four), UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 (six) of the original
     # model (docs/QUANTS.md): regular choices since f-quants; the shard count and "vision" are per model (MODELS)
     "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "by": "Unsloth's 4- to 8-bit quantizations",
-                "about": "UD-IQ4_XS, UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL or Q8_0 (94 to 188 GB downloads): every expert in "
-                         "RAM from ~80 GB (UD-IQ4_XS) to ~136 GB (Q8_0) of RAM, else part of them read from the SSD",
+                "about": "UD-IQ1_S (66 GB, the one for a B70), UD-IQ4_XS, UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL or Q8_0 (94 to 188 GB "
+                         "downloads): every expert in RAM from ~80 GB (UD-IQ4_XS) to ~136 GB (Q8_0) of RAM, else part of them "
+                         "read from the SSD",
                 "hf": hf("unsloth/Qwen3.8-Flash-Next-GGUF") + "{q}/",
                 "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00004.gguf", "shards": 4, "tag": "unsloth-",
                 "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
                 "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "name": "qwen3.8-flash-next-unsloth",
                 "vision": True, "pack_args": ["--compat-bf16"],
-                "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS}},
+                "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS, **UNSLOTH_IQ1_S_SHARDS}},
     # agentionai's Gyro quantizations (see GYRO_FILES): after the regular families, never the default
     "gyro": {"title": "Qwen3.8-Flash-Next (Gyro)", "by": "Gyro quantizations by agentionai",
              "about": "Gyro-S (27.6 GB of memory) and Gyro-M (35 GB): the smallest sizes, for PCs with little memory; "
@@ -620,7 +653,7 @@ REPO_PINS = {
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": ISTA_FILES,
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": SWIFT_FILES,
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": CODER_FILES,
-    "unsloth/Qwen3.8-Flash-Next-GGUF": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS},
+    "unsloth/Qwen3.8-Flash-Next-GGUF": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS, **UNSLOTH_IQ1_S_SHARDS},
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": GYRO_FILES,
     "unsloth/DeepSeek-V4.1-Flash-1017-GGUF": DSV41_FILES,
     "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF": DSV41_ISTA_FILES,
@@ -1349,6 +1382,114 @@ def model_file(fam: dict, model: str, i: int) -> str:
 
 def model_shards(fam: dict, model: str) -> int:
     return MODELS.get(model, {}).get("shards", fam.get("shards", 2))
+
+
+def hf_folder(fam: dict, quant: str, revision: str | None = None) -> str:
+    """The download folder of one quantization of a family: at the family's pinned revision, or at `revision`."""
+    url = fam["hf"].format(q=quant)
+    return re.sub(r"/resolve/[0-9a-f]{40}/", f"/resolve/{revision}/", url, count=1) if revision else url
+
+
+def model_hf(fam: dict, model: str) -> str:
+    """Where a model's shards are downloaded from: the family's folder, at the model's own revision when MODELS names one."""
+    return hf_folder(fam, model, MODELS.get(model, {}).get("revision"))
+
+
+def shard_pin(model: str, fam: dict, shard: Path):
+    """The (bytes, SHA-256) a shard has once setup has prepared it: the grafted file's for the shard that gets a graft."""
+    graft = MODELS.get(model, {}).get("graft")
+    if graft and shard.name == graft["shard"]:
+        try:
+            if shard.stat().st_size == graft["compacted_size"]:      # `graft_tensor.py --compact` was run: graft_step checked its header
+                return None
+        except OSError:
+            pass
+        return tuple(graft["result"])
+    return fam.get("sha256", {}).get(shard.name)
+
+
+def private_copy(s: Path) -> None:
+    """Make `s` a file of its own: a symlink or a hard link (a Hugging Face cache blob, a shared file) would be changed in place for
+    every path that leads to it. The copy is a reflink where the filesystem has them, else a normal copy; the name `s` is then
+    replaced by it, the other paths are left as they were."""
+    size = s.stat().st_size
+    free = shutil.disk_usage(s.parent).free
+    if free < size + 1_000_000_000:
+        fail(f"{s.name} is a link to a file that other paths use, and setup must change it (the graft): it needs a copy of "
+             f"{size / 1e9:.0f} GB, {free / 1e9:.0f} GB are free in {s.parent}",
+             "free the space, or copy the file yourself (cp --reflink=auto) and run setup again")
+    say(f"  {s.name} is a link to a file that other paths use: making a copy of its own first ({size / 1e9:.1f} GB) ...")
+    tmp = s.with_name(s.name + ".copy")
+    r = subprocess.run(["cp", "--reflink=auto", str(s), str(tmp)], capture_output=True)
+    if r.returncode != 0:
+        shutil.copyfile(s, tmp)
+    atomic.replace(tmp, s)
+
+
+def graft_step(model: str, fam: dict, shards: list, own: bool = False) -> None:
+    """A model with a "graft" (UD-IQ1_S): take the named tensor from the other file of the repository into the shard, then check
+    the shard against its pinned size and SHA-256. Done once (the finish mark says so); a run that stopped half way is finished.
+    A file the person gave (--gguf-dir) is never changed: one that is not grafted yet is refused with the command to run."""
+    g = MODELS.get(model, {}).get("graft")
+    if not g:
+        return
+    s = next((x for x in shards if x.name == g["shard"]), None)
+    if s is None:
+        fail(f"{model} has no shard {g['shard']}")
+    size, sha = g["result"]
+    mark_file = s.with_name(s.name + ".done")
+    sys.path.insert(0, str(ROOT / "tools"))
+    import graft_tensor as GT
+    if s.with_name(s.name + ".compact").exists():
+        fail(f"an earlier `graft_tensor.py --compact` of {s.name} was interrupted: the file is half moved",
+             f"run the same command again, it finishes the job: python3 tools/graft_tensor.py --target {s} --compact "
+             f"--expect-size {g['compacted_size']}")
+    try:
+        # a compacted shard (llama.cpp can read it): its size and its header (no holes, the grafted tensor) are checked; no hash is pinned
+        # for it, so the finish mark's check is not used
+        if s.exists() and s.stat().st_size == g["compacted_size"] and GT.grafted(s, g["tensor"], g["type"]) and GT.is_compact(s):
+            ok(f"{s.name} is compacted (no holes between its tensors) and has {g['tensor']} from {g['source_model']}; "
+               "its SHA-256 is not checked")
+            return
+    except GT.Refused:
+        return                                         # not a whole GGUF file: check_shards says so, in its own words
+    if mark_file.exists() and f"sha256 {sha}" in mark_file.read_text(encoding="utf-8", errors="replace"):
+        ok(f"{s.name} already has {g['tensor']} from {g['source_model']}")
+        return
+    rev = MODELS[model].get("revision")
+    if model_source() == "modelscope":
+        source = ms_url("unsloth/Qwen3.8-Flash-Next-GGUF", f"{g['source_model']}/{g['source_file']}")
+    else:
+        source = hf_folder(fam, g["source_model"], rev) + g["source_file"]
+    try:
+        is_grafted = GT.grafted(s, g["tensor"], g["type"])
+    except GT.Refused:
+        return                                         # cut short or not a GGUF file: check_shards says so
+    if not is_grafted:
+        if own:
+            fail(f"{s.name} is not grafted: {g['tensor']} is still the type that tools/iq_pack.py cannot pack",
+                 f"run: python3 tools/graft_tensor.py --target {s} --tensor {g['tensor']} --source {source} "
+                 f"--source-sha256 {g['source_sha256']}   (it changes that file in place), or let setup download the files")
+        if s.is_symlink() or s.stat().st_nlink > 1:
+            private_copy(s)
+        say(f"  {model}: taking {g['tensor']} from {g['source_model']} into {s.name} (about 216 MB read, nothing is quantized again) ...")
+        try:
+            GT.graft(s, g["tensor"], source, g["source_sha256"], log=lambda line: say("    " + line))
+        except GT.Refused as e:
+            fail(f"the graft of {g['tensor']} into {s.name} did not work: {e}",
+                 "the shard was not changed; run setup again, and if it keeps failing tell us at the issue tracker")
+    say(f"  checking {s.name} after the graft (SHA-256, {size / 1e9:.1f} GB) ...")
+    have = s.stat().st_size
+    digest = _hash_file(s, size) if have == size else ""
+    if digest != sha:
+        if own:
+            warn(f"{s.name} is not the grafted file this setup publishes (SHA-256 {digest[:12] or 'n/a'}..., expected {sha[:12]}...); "
+                 "it is used as it is")
+            return
+        fail(f"{s.name} after the graft is not the expected file (SHA-256 {digest or 'n/a'}, expected {sha}, {have:,} bytes)",
+             "it was left as it is; delete it and its .done mark and run setup again to download it again")
+    mark(s, f"sha256 {sha} (grafted: {g['tensor']} from {g['source_model']})")
+    ok(f"{s.name} has {g['tensor']} from {g['source_model']}")
 
 
 def budget_model(cfg: dict) -> str:
@@ -2717,7 +2858,7 @@ def menu_families(hip: bool) -> list:
 def family_menu_note(family: str, hip: bool, gpu, avx2: bool = True, avx512: bool = True) -> str:
     """The card-, CPU- and RAM-dependent tail of a family's line in the model menu."""
     if family == "unsloth" and hip:
-        return "   [UD-IQ4_XS is the 4-bit choice on Intel cards]"
+        return "   [UD-IQ1_S is the one served on an Arc Pro B70; UD-IQ4_XS is the 4-bit choice]"
     if family == "gyro":
         return ("   [for PCs with little memory: VRAM + RAM together 27.6 GB (Gyro-S) or 35 GB (Gyro-M)"
                 + ("; not for Intel Arc" if hip else "") + "]")
@@ -2820,7 +2961,7 @@ def build_vision_cpu(eng: Path, stamp: Path, meta: dict, llama, vsrc) -> Path:
     if not ((eng / VEXE).exists() and meta.get("vision_src") == vsrc):
         say("  Compiling the image encoder (for the CPU) ...")
         cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision", "strata-vision",
-                    [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=OFF", "-DSTRATA_PORTABLE=OFF"], None, "")
+                    [f"-DLLAMA_DIR={llama}", "-DSTRATA_PORTABLE=OFF"], None, "")
         shutil.copy2(ROOT / "build-vision" / "bin" / VEXE, eng / VEXE)
     stamp.write_text(json.dumps({**meta, "vision": "cpu", "vision_src": vsrc}, indent=1))
     ok(f"engine: {eng / EXE}, image encoder (CPU): {eng / VEXE}")
@@ -5693,6 +5834,8 @@ def main() -> int:
         rec_ctx = 8192 if small < 14 else 32768
     # #406: the RAM rule is part of the recommendation (the smaller of the two), no longer a cap over the user's choice
     rec_ctx = min(rec_ctx, ram_ctx(model, ram, low_ram))
+    if small >= 24 and MODELS[model].get("rec_ctx"):   # a model that is served at a context of its own on a card with 24 GB or more
+        rec_ctx = MODELS[model]["rec_ctx"]
     if a.context:
         ctx = a.context
     else:
@@ -5911,11 +6054,13 @@ def main() -> int:
                     continue
                 except OSError:
                     pass
-            download(fam["hf"].format(q=model) + s.name, s)
+            download(model_hf(fam, model) + s.name, s)
+    graft_step(model, fam, shards, own=bool(a.gguf_dir))
     check_shards(shards)
-    for s in shards:                                   # the Unsloth files: pinned sizes and SHA-256
-        if s.name in fam.get("sha256", {}):
-            verify_sha256(s, *fam["sha256"][s.name], own=bool(a.gguf_dir))
+    for s in shards:                                   # the Unsloth files: pinned sizes and SHA-256 (a grafted shard: its grafted ones)
+        pin = shard_pin(model, fam, s)
+        if pin:
+            verify_sha256(s, *pin, own=bool(a.gguf_dir))
     ok("model files present")
     mmproj = Path(a.models_dir) / fam.get("mmproj", MMPROJ)
     if not mmproj.exists():                            # an earlier install's copy (the same file for every family)
@@ -5987,7 +6132,7 @@ def main() -> int:
         fail("the model has no per_layer_token_embd tensor (is this a Qwen3.8-Flash-Next GGUF?)")
     # (a 4-shard file: the engine finds the PLE table's shard itself from shard 1, the measured setup)
     model_args = ["--pack", str(pack), "--native", str(shards[0]),
-                  *(["--ple-gguf", str(ple)] if len(shards) <= 2 else [])]
+                  *(["--ple-gguf", str(ple)] if len(shards) <= 2 or MODELS[model].get("ple_gguf") else [])]
     args = [*model_args,
             "--expert-profile", str(ROOT / "data" / fam.get("profile", "expert-profile.bin")), "--expert-cache", "auto",
             "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--mtp", str(rt),

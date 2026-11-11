@@ -147,6 +147,24 @@
   ],
   "repo": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF"
  },
+ "unsloth/UD-IQ1_S": {
+  "arch": "qwen4exp",
+  "tensors": 1224,
+  "bytes": 66368156160,
+  "expert_bytes": {
+   "IQ2_S": 6717440000,
+   "IQ2_XXS": 15355084800,
+   "Q2_0": 11324620800
+  },
+  "experts_bpw": 2.212,
+  "bpw": 3.001,
+  "files": [
+   "UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf",
+   "UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf",
+   "UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00003-of-00003.gguf"
+  ],
+  "repo": "unsloth/Qwen3.8-Flash-Next-GGUF"
+ },
  "unsloth/UD-IQ4_XS": {
   "arch": "qwen4exp",
   "tensors": 1224,
@@ -476,7 +494,8 @@
   ],
   "blk.N.ple_conv1d.weight": [
    "F16",
-   "F32"
+   "F32",
+   "BF16"
   ],
   "blk.N.ple_key.weight": [
    "BF16",

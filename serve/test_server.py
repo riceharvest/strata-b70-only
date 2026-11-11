@@ -99,6 +99,24 @@ class MaxTokens(unittest.TestCase):
         self.assertEqual(s2, 200)
         self.assertEqual(b["input_tokens"], n_in)
 
+    def test_tokenize_is_the_prompt_chat_reads(self):
+        # POST /tokenize renders and tokenizes the prompt /v1/chat/completions would read, without running it
+        msgs = [{"role": "user", "content": "how many tokens is this?"}]
+        s, b = self.post("/tokenize", {"model": "m", "messages": msgs})
+        self.assertEqual(s, 200)
+        self.assertEqual(list(b), ["count"])
+        s2, _, n_in, _ = self.call("openai", "how many tokens is this?", max_tokens=8)
+        self.assertEqual((s2, b["count"]), (200, n_in))
+        s, b2 = self.post("/tokenize", {"model": "m", "messages": msgs, "ids": True})
+        self.assertEqual((s, len(b2["tokens"]), b2["count"]), (200, b["count"], b["count"]))
+        tool = {"type": "function", "function": {"name": "f", "description": "d", "parameters": {"type": "object"}}}
+        s, b3 = self.post("/tokenize", {"model": "m", "messages": msgs, "tools": [tool]})
+        self.assertGreater(b3["count"], b["count"])               # the tool list is part of the prompt
+        s, b4 = self.post("/tokenize", {"model": "m", "messages": msgs, "tools": [tool], "tool_choice": "none"})
+        self.assertEqual(b4["count"], b["count"])
+        self.assertEqual(self.post("/tokenize", {"model": "m", "messages": []})[0], 400)
+        self.assertEqual(self.post("/tokenize", {"model": "m", "messages": msgs, "ids": "yes"})[0], 400)
+
     def test_request_line_parses_the_engine_summary(self):
         line = ("strata serve: prompt 1200 tokens = 1000 reused + 200 read in 50 ms (4000.0 tok/s), 30 generated in "
                 "300 ms (100.0 tok/s), drafts accepted 20 of 28, 2 checkpoints")
@@ -565,6 +583,31 @@ class VisionTempFiles(unittest.TestCase):
             try:
                 self.assertNotIn(" ", str(d))
                 self.assertTrue(d.is_dir())
+            finally:
+                d.rmdir()
+
+    def test_work_dir_follows_STRATA_VISION_DIR_only_when_set(self):
+        from serve.server import Vision
+        with tempfile.TemporaryDirectory() as base:
+            want = Path(base) / "vis"
+            with mock.patch.dict(os.environ, {"STRATA_VISION_DIR": str(want)}):
+                d = Vision.work_dir()
+            try:
+                self.assertEqual(d.parent, want)
+            finally:
+                d.rmdir()
+            with mock.patch.dict(os.environ, {"STRATA_VISION_DIR": ""}):
+                d = Vision.work_dir()
+            try:
+                self.assertNotEqual(d.parent, want)
+            finally:
+                d.rmdir()
+            spaced = Path(base) / "a b"
+            with mock.patch.dict(os.environ, {"STRATA_VISION_DIR": str(spaced)}):
+                d = Vision.work_dir()
+            try:
+                self.assertNotEqual(d.parent, spaced)
+                self.assertFalse(spaced.exists())
             finally:
                 d.rmdir()
 
@@ -2285,6 +2328,77 @@ class RepeatStop(unittest.TestCase):
         self.assertNotIn("repeated one token", log)
         done, _ = self.run_reply("ab" * 400, limit=8)       # alternating tokens are not one run
         self.assertEqual(done["finish"], "stop")
+
+
+class RepeatStopChannels(unittest.TestCase):
+    """repeat_stop_tokens counts every token the engine yields, so the channel does not matter: inside the thinking, and
+    in a burst of tokens (a drafted step hands several at once; the engine's generator still yields them one by one)."""
+
+    def run_reply(self, script, thinking):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            done = [x for kind, x in svc.run(tok.encode("hi"), thinking, None, 3000, {}, threading.Event())
+                    if kind == "done"][0]
+        return done, out.getvalue(), svc
+
+    def test_inside_the_thinking(self):
+        done, log, svc = self.run_reply("let me think " + "!" * 1000, True)
+        self.assertEqual(done["finish"], "length")
+        self.assertIn("repeated one token ('!') 256 times", log)
+        self.assertEqual(svc.totals["repeat_stops"], 1)
+
+    def test_in_bursts_of_tokens(self):
+        class Burst(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                toks = list(super().generate(ids, max_new, sampling, cancel, embeddings))
+                for i in range(0, len(toks), 6):
+                    yield from toks[i:i + 6]
+
+        tok = ByteTokenizer()
+        svc = Service(Burst(tok, "ok " + "!" * 1000, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            done = [x for kind, x in svc.run(tok.encode("hi"), False, None, 3000, {}, threading.Event())
+                    if kind == "done"][0]
+        self.assertEqual((done["finish"], done["completion_tokens"]), ("length", 3 + 256))
+
+
+class RepeatCycle(unittest.TestCase):
+    """repeat_cycle_tokens (opt-in): a cycle of 2-4 tokens over the last N tokens ends the reply as "length"."""
+
+    def run_reply(self, script, limit=None, cycle=0):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.repeat_cycle_tokens = cycle
+        if limit is not None:
+            svc.repeat_stop_tokens = limit
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            done = [x for kind, x in svc.run(tok.encode("hi"), False, None, 3000, {}, threading.Event()) if kind == "done"][0]
+        return done, out.getvalue(), svc
+
+    def test_cycles_are_ended_and_counted(self):
+        for unit in ("ab", "abc", "abcd"):
+            done, log, svc = self.run_reply("ok " + unit * 100, cycle=64)
+            self.assertEqual(done["finish"], "length", unit)
+            self.assertLess(done["completion_tokens"], 3 + 64 + 8, unit)
+            self.assertIn(f"cycle of {len(unit)} tokens", log)
+            self.assertEqual(svc.totals["repeat_stops"], 1)
+
+    def test_off_by_default_and_legit_text_is_kept(self):
+        done, log, svc = self.run_reply("ab" * 100)
+        self.assertEqual(done["finish"], "stop")
+        self.assertNotIn("repeat_stops", svc.totals)
+        done, _, _ = self.run_reply("ab" * 20 + " fine", cycle=64)    # a short pattern is not a loop
+        self.assertEqual(done["finish"], "stop")
+        done, _, _ = self.run_reply("abcde" * 100, cycle=64)           # period 5 is out of reach
+        self.assertEqual(done["finish"], "stop")
+        done, log, _ = self.run_reply("=" * 100, limit=0, cycle=64)    # one token is repeat_stop_tokens' job
+        self.assertEqual(done["finish"], "stop")
+
+    def test_single_token_stop_is_counted(self):
+        done, _, svc = self.run_reply("!" * 1000)
+        self.assertEqual((done["finish"], svc.totals["repeat_stops"]), ("length", 1))
 
 
 class NonFiniteEngine(MockEngine):
@@ -4185,8 +4299,8 @@ class CallingEngine(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.prompts.append(list(ids))
         prompt = self.tok.decode(ids)
-        if prompt.endswith("<function="):
-            text = "search>\n" + self.ARGS
+        if prompt.endswith("<tool_call>\n"):
+            text = "<function=search>\n" + self.ARGS
         elif prompt.endswith("<function=search>\n"):
             text = self.ARGS
         elif prompt.endswith("</think>\n\n"):
@@ -4365,7 +4479,7 @@ class ForcedToolChoice(unittest.TestCase):
                     self.assertEqual((finish, calls), ("tool_calls", [("search", {"q": "2+2"})]))
                     self.assertEqual(reasoning, CallingEngine.THOUGHT)
                     first, second = self.engine.prompts
-                    opening = "<tool_call>\n<function=" + ("search>\n" if choice == self.NAMED else "")
+                    opening = "<tool_call>\n" + ("<function=search>\n" if choice == self.NAMED else "")
                     # where the thinking ended, after the blank line the template puts before a call
                     self.assertEqual(second, first + self.tok.encode(CallingEngine.THOUGHT + "</think>\n\n" + opening))
 
@@ -4374,7 +4488,7 @@ class ForcedToolChoice(unittest.TestCase):
         thought, calling = 'I will search for "2+2"', self.engine.generate
 
         def generate(ids, max_new, sampling, cancel, embeddings=None):
-            if self.tok.decode(ids).endswith(("<function=", "<function=search>\n")):
+            if self.tok.decode(ids).endswith(("<tool_call>\n", "<function=search>\n")):
                 yield from calling(ids, max_new, sampling, cancel)
                 return
             self.engine.prompts.append(list(ids))
@@ -4387,7 +4501,7 @@ class ForcedToolChoice(unittest.TestCase):
                 finish, calls, reasoning = self.call_of(code, b, stream)
                 self.assertEqual((finish, calls, reasoning), ("tool_calls", [("search", {"q": "2+2"})], thought))
                 first, second = self.engine.prompts
-                self.assertEqual(second, first + self.tok.encode(thought + "</think>\n\n<tool_call>\n<function="))
+                self.assertEqual(second, first + self.tok.encode(thought + "</think>\n\n<tool_call>\n"))
 
     def test_without_thinking_the_prompt_ends_with_the_opening(self):
         for choice in ("required", self.NAMED):
@@ -4398,7 +4512,7 @@ class ForcedToolChoice(unittest.TestCase):
                     finish, calls, reasoning = self.call_of(code, b, stream)
                     self.assertEqual((finish, calls, reasoning), ("tool_calls", [("search", {"q": "2+2"})], ""))
                     self.assertEqual(len(self.engine.prompts), 1)
-                    opening = "<tool_call>\n<function=" + ("search>\n" if choice == self.NAMED else "")
+                    opening = "<tool_call>\n" + ("<function=search>\n" if choice == self.NAMED else "")
                     self.assertTrue(self.tok.decode(self.engine.prompts[0]).endswith("</think>\n\n" + opening))
 
     def test_the_budget_wrap_up_opens_the_call(self):
@@ -4408,7 +4522,7 @@ class ForcedToolChoice(unittest.TestCase):
         self.assertEqual((finish, calls), ("tool_calls", [("search", {"q": "2+2"})]))
         self.assertEqual(reasoning, CallingEngine.THOUGHT[:20] + REASONING_WRAP_UP.split("</think>")[0])
         first, second = self.engine.prompts
-        extra = self.tok.encode(REASONING_WRAP_UP + "<tool_call>\n<function=", parse_special=True)
+        extra = self.tok.encode(REASONING_WRAP_UP + "<tool_call>\n", parse_special=True)
         self.assertEqual(second, first + self.tok.encode(CallingEngine.THOUGHT[:20]) + extra)
 
     def test_auto_absent_and_none_leave_the_tools_to_the_model(self):

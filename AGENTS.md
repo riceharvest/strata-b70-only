@@ -34,10 +34,13 @@ kernel (about 47 s).
 ## Serve
 
 `serve/server.py --engine strata --config <config.json>`. The config is JSON (`exe`, `args`, `cwd`, `tokenizer`, `model_name`,
-`env`). Its `exe` is `sycl/serve/strata-sycl.sh` (setup.py does not write that for this fork; the config is made by hand), which runs the built
-binary (`build-sycl-aot/strata` by default) in the `strata-sycl-dev` container; the variables it reads are described at the top of
-that script. `--host` and `--port` (default 8095) choose the address. The flags the engine is served with, and what each costs
-and gains, are in docs/B70.md.
+`env`). `./setup.sh --backend sycl` writes it (`sycl/setup_intel.py`, `to_sycl`) with `exe` = `sycl/serve/strata-sycl.sh`, which runs the
+built binary (`build-sycl-aot/strata` by default) in the `strata-sycl-dev` container, and a `run-<tag>.sh` that starts the server; the
+variables the wrapper reads are described at the top of that script. For `--family unsloth --model UD-IQ1_S`, the model this fork
+serves, setup downloads the files at a pinned revision, grafts one tensor into shard 2 (`tools/graft_tensor.py`, see "The served
+setup" in docs/B70.md), builds the pack and writes the served flags and `env` into the config (`--no-served-recipe` leaves them
+out). `--host` and `--port` (default 8095) choose the address. The flags the engine is served with, and what each costs and gains,
+are in docs/B70.md.
 
 ## Working rules for agents here
 
@@ -53,7 +56,7 @@ and gains, are in docs/B70.md.
 - Compare two settings with a fixed `--expert-cache <n>` (not `auto`) and `STRATA_SPEC_COST=0`, so the window sizes do not follow
   timings that differ between runs. Give the numbers with what they were measured on. Make no claim without a measurement.
 - Tests that need no GPU: `python3 -m pytest serve/test_<name>.py -q` for one server test file, `python3 tools/test_setup_sycl.py`
-  for setup. The host-only C++ tests (`conversation_spill_test`, `draft_policy_test`, `gated_proposal_test`, `spec_admission_test`) are always configured;
+  for setup, `python3 tools/test_graft_tensor.py` for the graft tool. The host-only C++ tests (`conversation_spill_test`, `draft_policy_test`, `gated_proposal_test`, `spec_admission_test`) are always configured;
   build one by name with `build.sh <target>`.
 - Plain words and short sentences in docs and comments.
 

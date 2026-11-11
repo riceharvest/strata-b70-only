@@ -156,7 +156,7 @@ picture). The rule is the same on NVIDIA and AMD.
 
 - **AMD:** `strata-vision-hip` is the card's reader. If it cannot start, Strata uses the CPU reader ([AMD_HIP.md](AMD_HIP.md)).
 - **Mac:** pictures run on the GPU ([MAC.md](MAC.md)).
-- **Intel Arc:** an Arc with 24 GB or more keeps the CPU reader unless you pass `--vision gpu`. A Battlemage card (B580, B70) has pictures off until you pass `--vision on` ([INTEL.md](INTEL.md)).
+- **Intel Arc:** an Arc with 24 GB or more keeps the CPU reader unless you pass `--vision gpu`. Pictures are on by default on every Arc card, a Battlemage card (B580, B70) included. The first picture on a B70 once reset the card and has not been looked at since ([INTEL.md](INTEL.md#pictures-on-an-arc), [B70.md](B70.md#pictures-on-one-b70-by-hand)).
 
 More: [Images](DETAILS.md#images-vision).
 
