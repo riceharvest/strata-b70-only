@@ -42,7 +42,7 @@ SHA-256), so a PC that has one of them can link those two shards instead of down
 
 - "FP16 path": the prompt's experts dequantized to FP16 and multiplied by the BLAS library. It works for every format
   above but reads each expert as ~10 MB of FP16.
-- Intel (SYCL) prompt, on a Battlemage card: `STRATA_F16X_ANY=1` (off by default) multiplies every format of this table
+- Intel (SYCL) prompt, on a Battlemage card: `STRATA_F16X_ANY` (on by default, `0` turns it off) multiplies every format of this table
   straight from the quantized weights with one kernel, a group of experts per launch, in place of the FP16 path. Each
   format pair is checked and timed on random blocks, without a model file: `esimd_f16_parity <rows> <experts> <reps>
   <seed> all` ([B70.md](B70.md), "Other expert formats"). Not run with these files yet.
@@ -91,7 +91,7 @@ That is 12 gate/up formats (IQ2_XXS, IQ2_S, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS, IQ1_
 - Prompt, as served: IQ2_S and IQ2_XXS with a Q2_0 down have the FP16 products; the pairs of IQ gate/up with a Q2_0,
   IQ4_NL or Q8_0 down have the int8 chain; a Q5_0 or Q5_1 down, the K-quants, Q8_0, IQ1_M or Q2_0 as gate/up take a
   dequantize and two oneMKL products per expert.
-- Prompt, with `STRATA_F16X_ANY=1`: every one of the 23 pairs has the FP16 products. `esimd_f16_parity <rows> <experts>
+- Prompt, with `STRATA_F16X_ANY` (the default): every one of the 23 pairs has the FP16 products. `esimd_f16_parity <rows> <experts>
   <reps> <seed> all` runs exactly these pairs on random blocks ([B70.md](B70.md), "Other expert formats").
 - One layer of one file is outside the engine as a whole, not only the prompt kernels: UD-IQ1_S layer 18 stores gate
   and up in two formats, and a layer has one gate/up format everywhere here (`tools/iq_pack.py` refuses the file:

@@ -1624,7 +1624,7 @@ void launch_dn_h(sycl::queue& q, const HArgsT<G> a, int nrb, int ncb, int wgn) {
 }
 
 // ------------------------------------------------------------------------------------------------ FP16 products, the other formats
-// STRATA_F16X_ANY=1 (off by default; f16_handles): the FP16 products for expert formats launch_gu_h / launch_dn_h do not take.  One
+// STRATA_F16X_ANY (on by default, 0 = off; f16_handles): the FP16 products for expert formats launch_gu_h / launch_dn_h do not take.  One
 // kernel, launch_x, for gate/up and for down, with their tile: a thread owns 8 MT rows of one expert and two tiles of 16 output
 // columns (16 gate rows and the same 16 up rows with SwiGLU in the epilogue, or 32 down columns), walks K in steps of 16, reads the
 // FP16 activations with 2-D block loads and adds one FP16 DPAS per row tile and column tile into FP32 accumulators.
@@ -2138,9 +2138,12 @@ int henv(const char* name, int def) {
 }
 bool al64(const void* p) { return ((uintptr_t) p & 63) == 0; }
 
-// STRATA_F16X_ANY (read once; unset or 0: off): f16_handles also takes the formats of launch_x
+// STRATA_F16X_ANY (read once; on unless it is 0): f16_handles also takes the formats of launch_x.  On by default since
+// 2026-11-11: the first pack in those formats run in the engine (UD-IQ2_XS, IQ4_NL and Q5_0 downs in 25 of 48 layers) read a
+// 118K prompt at 2,980-3,076 tok/s with it (six reads) and at 1,910 / 2,671 / 2,844 without (three reads of one start, in
+// order), the same top token in 36 of 36 first windows (KL mean 0.00009).
 bool x_any_on() {
-    static const bool v = [] { const char* e = std::getenv("STRATA_F16X_ANY"); return e != nullptr && e[0] != '\0' && e[0] != '0'; }();
+    static const bool v = [] { const char* e = std::getenv("STRATA_F16X_ANY"); return e == nullptr || e[0] != '0'; }();
     return v;
 }
 int x_rowb(int f, int K) { return (K / x_kv(f)) * (x_b8(f) * x_kv(f) / 256); }   // bytes of a row of K values

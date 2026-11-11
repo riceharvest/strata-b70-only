@@ -152,14 +152,15 @@ EDITABLE = [
      "experts are mostly IQ2_XXS, such as UD-IQ1_S). 0 or empty: from a table, as before. The numbers are the same bit for "
      "bit either way; it needs STRATA_IQ_GRID on (the default) and has no effect with STRATA_XE2_IQ"),
     ("f16_products_any_format", ("env", "STRATA_F16X_ANY", 0, 1),
-     "Which expert formats the prompt path multiplies straight from the quantized weights (STRATA_F16X_ANY). 1: also the "
-     "formats without kernels of their own (Q4_K, Q5_K, Q6_K, Q8_0, IQ3_S, IQ3_XXS, IQ2_XS, IQ4_XS, IQ1_M, Q2_0 gate/up; "
-     "IQ4_NL, Q5_0, Q5_1, Q8_0 down: with it, every format of Unsloth's files and of the GSQ-RCO packs), by one kernel "
-     "that decodes any of them; they otherwise take a dequantize and two library products per "
-     "expert. 0 or empty: only IQ2_S / IQ2_XXS with a Q2_0 down, as before. It changes nothing for a pack in those three "
-     "formats (UD-IQ1_S). Not measured on a real pack yet: esimd_f16_parity <rows> <experts> <reps> <seed> all times every "
-     "format on random blocks, without a model file. The products add in another order than the library's, so the "
-     "numbers differ in the last bits"),
+     "Which expert formats the prompt path multiplies straight from the quantized weights (STRATA_F16X_ANY). 1 or empty "
+     "(the default): also the formats without kernels of their own (Q4_K, Q5_K, Q6_K, Q8_0, IQ3_S, IQ3_XXS, IQ2_XS, "
+     "IQ4_XS, IQ1_M, Q2_0 gate/up; IQ4_NL, Q5_0, Q5_1, Q8_0 down: with it, every format of Unsloth's files and of the "
+     "GSQ-RCO packs), by one kernel that decodes any of them. 0: only IQ2_S / IQ2_XXS with a Q2_0 down; the other "
+     "formats then take a dequantize and two library products per expert, as before 2026-11-11. It changes nothing for a "
+     "pack in those three formats (UD-IQ1_S). Measured on UD-IQ2_XS on one B70: a 118K prompt at about 3,000 words a "
+     "second with it; without it 1,900 on the first read of a start and 2,700 to 2,850 on later ones; the same first "
+     "word in 36 of 36 prompts. The products add in another order than the "
+     "library's, so the numbers differ in the last bits"),
     ("mtp_window", ("arg", "--mtp-window", 0, 2147483647),
      "How far back the draft layer looks (--mtp-window): the last N cells of the context, 0 = every cell. A smaller window is "
      "cheaper to draft on a long context (setup picks 8192 above 64K) and a very small one (2048) costs accepted drafts. A "
