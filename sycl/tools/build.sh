@@ -4,6 +4,8 @@
 #   configure with PARITY=ON (a new build folder, or an existing one: the switch is applied to it) and name them, e.g.
 #   PARITY=ON sycl/tools/build.sh gdn_parity   (or PARITY=ON sycl/tools/build.sh all  for every one of them)
 #   The DeepSeek-V4.1 path (strata-dsv41) is not maintained and is off: DSV41=ON adds it.
+#   The dense Qwen3.8-27B engine (strata-q36) is optional and off: Q36=ON bash sycl/tools/build.sh strata-q36 (docs/Q36.md; with
+#   AOT=bmg-g31 it needs the two projects bash sycl/tools/get-q36-tla.sh fetches into third_party/).
 #   BUILD_DIR=...       build folder (default <repo>/build-sycl)
 #   HOST_MARCH=x86-64-v3  -march of the engine's host code (empty: baseline x86-64; native: this PC only). Gain not measured.
 #   AOT=bmg-g31         ahead-of-time device code (empty: SPIR-V, JIT at the first start)
@@ -45,12 +47,13 @@ repo=${REPO:-$(git rev-parse --show-toplevel)}
 b=${BUILD_DIR:-$repo/build-sycl}
 [ -f $b/build.ninja ] || cmake -S $repo/sycl -B $b -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
     -DSTRATA_SYCL_AOT="${AOT:-}" -DSTRATA_SYCL_SPIN_MAX="${SPIN_MAX:-}" -DSTRATA_SYCL_I8_ESIMD="${I8_ESIMD:-AUTO}" -DSTRATA_SYCL_IQ_DECODE_FAST="${IQ_DECODE_FAST:-ON}" \
-    -DSTRATA_HOST_MARCH="${HOST_MARCH:-}" -DSTRATA_SYCL_PARITY="${PARITY:-OFF}" -DSTRATA_BUILD_DSV41="${DSV41:-OFF}" 2>&1 | tail -15
+    -DSTRATA_HOST_MARCH="${HOST_MARCH:-}" -DSTRATA_SYCL_PARITY="${PARITY:-OFF}" -DSTRATA_BUILD_DSV41="${DSV41:-OFF}" -DSTRATA_BUILD_Q36="${Q36:-OFF}" 2>&1 | tail -15
 # an existing build folder keeps its cache: a switch given now reaches it (only this one, so AOT and the rest stay as configured)
 [ -z "${I8_ESIMD:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_SYCL_I8_ESIMD="$I8_ESIMD" >/dev/null 2>&1
 [ -z "${HOST_MARCH+x}" ] || cmake -S $repo/sycl -B $b -DSTRATA_HOST_MARCH="$HOST_MARCH" >/dev/null 2>&1
 [ -z "${PARITY:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_SYCL_PARITY="$PARITY" >/dev/null 2>&1
 [ -z "${DSV41:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_BUILD_DSV41="$DSV41" >/dev/null 2>&1
+[ -z "${Q36:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_BUILD_Q36="$Q36" 2>&1 | grep -E 'CMake Error|needs third_party|get-q36-tla' | head -5
 cmake --build $b -j ${JOBS:-12} --target ${@:-strata} -- -k 0 2>&1 | tee $b/build.log | grep -E '^FAILED|error:|^ninja: build stopped|Linking|^\[[0-9]+/[0-9]+\] Linking' | tail -40
 rc=${PIPESTATUS[0]}                       # cmake's status, kept: the script ends with this, not with the status of the greps below (#2990)
 echo "BUILD EXIT $rc"
