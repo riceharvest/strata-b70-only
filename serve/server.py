@@ -7260,6 +7260,8 @@ def make_handler(svc: Service):
                     self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
+                elif path == "/tokenize":
+                    self._tokenize(req)
                 elif path == "/v1/images/generations":
                     self._images(req)
                 else:
@@ -7841,6 +7843,22 @@ def make_handler(svc: Service):
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False))})
+
+        def _tokenize(self, req):
+            """POST /tokenize: the prompt a /v1/chat/completions request with this body would read, rendered and
+            tokenized; the model does not run.  {"tokens": N}, and {"ids": [...]} too when the body has "ids": true."""
+            req = svc.with_shared(req, "openai")
+            messages, tools, kw = openai_to_messages(req)
+            require_messages(messages)
+            if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the request itself: no tools are offered
+                tools = None
+            if "ids" in req and not isinstance(req["ids"], bool):
+                raise ValueError('ids: true or false')
+            ids = svc.encode_prompt(messages, tools, kw, store=False)
+            body = {"tokens": len(ids)}
+            if req.get("ids"):
+                body["ids"] = list(ids)
+            self._json(200, body)
 
         def _anthropic(self, req):
             svc.load()

@@ -99,6 +99,24 @@ class MaxTokens(unittest.TestCase):
         self.assertEqual(s2, 200)
         self.assertEqual(b["input_tokens"], n_in)
 
+    def test_tokenize_is_the_prompt_chat_reads(self):
+        # POST /tokenize renders and tokenizes the prompt /v1/chat/completions would read, without running it
+        msgs = [{"role": "user", "content": "how many tokens is this?"}]
+        s, b = self.post("/tokenize", {"model": "m", "messages": msgs})
+        self.assertEqual(s, 200)
+        self.assertEqual(list(b), ["tokens"])
+        s2, _, n_in, _ = self.call("openai", "how many tokens is this?", max_tokens=8)
+        self.assertEqual((s2, b["tokens"]), (200, n_in))
+        s, b2 = self.post("/tokenize", {"model": "m", "messages": msgs, "ids": True})
+        self.assertEqual((s, len(b2["ids"]), b2["tokens"]), (200, b["tokens"], b["tokens"]))
+        tool = {"type": "function", "function": {"name": "f", "description": "d", "parameters": {"type": "object"}}}
+        s, b3 = self.post("/tokenize", {"model": "m", "messages": msgs, "tools": [tool]})
+        self.assertGreater(b3["tokens"], b["tokens"])               # the tool list is part of the prompt
+        s, b4 = self.post("/tokenize", {"model": "m", "messages": msgs, "tools": [tool], "tool_choice": "none"})
+        self.assertEqual(b4["tokens"], b["tokens"])
+        self.assertEqual(self.post("/tokenize", {"model": "m", "messages": []})[0], 400)
+        self.assertEqual(self.post("/tokenize", {"model": "m", "messages": msgs, "ids": "yes"})[0], 400)
+
     def test_request_line_parses_the_engine_summary(self):
         line = ("strata serve: prompt 1200 tokens = 1000 reused + 200 read in 50 ms (4000.0 tok/s), 30 generated in "
                 "300 ms (100.0 tok/s), drafts accepted 20 of 28, 2 checkpoints")
