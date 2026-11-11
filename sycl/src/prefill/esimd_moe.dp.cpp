@@ -1621,6 +1621,468 @@ void launch_dn_h(sycl::queue& q, const HArgsT<G> a, int nrb, int ncb, int wgn) {
     });
 }
 
+// ------------------------------------------------------------------------------------------------ FP16 products, the other formats
+// STRATA_F16X_ANY=1 (off by default; f16_handles): the FP16 products for expert formats launch_gu_h / launch_dn_h do not take.  One
+// kernel, launch_x, for gate/up and for down, with their tile: a thread owns 8 MT rows of one expert and two tiles of 16 output
+// columns (16 gate rows and the same 16 up rows with SwiGLU in the epilogue, or 32 down columns), walks K in steps of 16, reads the
+// FP16 activations with 2-D block loads and adds one FP16 DPAS per row tile and column tile into FP32 accumulators.
+//  * One decode for every format.  Per 32 of K and tile the weights become 32 signed code bytes (cq: dword j holds values 4 j ..
+//    4 j + 3), a float scale per 16 of K (cs) and a float offset (cm); x_pack makes the B operand as FP16(cs * code + cm).  That is
+//    the float expression iq_dequant_expert_f16 evaluates for the format, and its products are exact in FP32 (an 11-bit d times
+//    integer factors, 24 bits at most), so the weights are the FP16 chain's and a product differs from the chain in its summation
+//    order only.  What a format adds is its unpack to code bytes and its scales: the blocks in the K loop below.
+//  * Formats.  Blocks of 256 values (gate/up; K a multiple of 256): Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, IQ3_XXS, IQ2_XS.  Blocks of 32
+//    values (gate/up and down; K a multiple of 32): Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL.  IQ2_S, IQ2_XXS and Q2_0 keep the kernels
+//    above; IQ1_M and the trellis types have no FP16 products.
+//  * Reads stay inside the matrix (a.lim: the byte offset of its last dword): a dword gather starts at a dword inside it, ld32c and
+//    ld4u clamp the one dword they may read past the bytes they need.  Row bytes are a multiple of 4 (x_shape).
+//  * Not tuned: the next 32-block is not loaded ahead as in launch_gu_h, and the IQ4 table costs four gathers a dword.
+constexpr int T_Q4_0 = 2, T_Q4_1 = 3, T_Q5_0 = 6, T_Q5_1 = 7, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14;
+constexpr int x_b8(int f) {   // bytes per 256 values (0: not a format of launch_x)
+    return f == T_Q4_0 || f == T_IQ4NL || f == T_Q4_K ? 144 : f == T_Q4_1 ? 160 : f == T_Q5_0 || f == T_Q5_K ? 176 : f == T_Q5_1 ? 192 :
+           f == T_Q8_0 ? 272 : f == T_Q6_K ? 210 : f == T_IQ4XS ? 136 : f == T_IQ3S ? 110 : f == T_IQ3XXS ? 98 : f == T_IQ2XS ? 74 : 0;
+}
+constexpr bool x_blk32(int f) {   // blocks of 32 values (the others: 256)
+    return f == T_Q4_0 || f == T_Q4_1 || f == T_Q5_0 || f == T_Q5_1 || f == T_Q8_0 || f == T_IQ4NL;
+}
+constexpr bool x_has_m(int f) { return f == T_Q4_1 || f == T_Q5_1 || f == T_Q4_K || f == T_Q5_K; }   // w = scale * code + offset
+// the roles launch_x is built for (the engine's gate/up and down formats, native_expert_supported, without the ones named above)
+constexpr bool x_gu(int f) {
+    return f == T_Q4_K || f == T_Q5_K || f == T_Q6_K || f == T_Q8_0 || f == T_IQ3S || f == T_IQ3XXS || f == T_IQ2XS || f == T_IQ4XS ||
+           f == T_Q4_0 || f == T_Q4_1 || f == T_Q5_0;
+}
+constexpr bool x_dn(int f) { return f == T_IQ4NL || f == T_Q5_1 || f == T_Q8_0 || f == T_Q4_0 || f == T_Q4_1 || f == T_Q5_0; }
+
+// four consecutive dwords ([dword j][lane]) at a dword-aligned byte offset
+SYCL_ESIMD_FUNCTION inline simd<uint32_t, 64> ld4a(const uint8_t* base, simd<uint32_t, 16> off) {
+    return gather<uint32_t, 64, 4>(reinterpret_cast<const uint32_t*>(base), off);
+}
+// the same at a 2-byte aligned byte offset: the four dwords from the dword below it and, for a lane 2 bytes off, the low half of the
+// fifth.  The 16 bytes are inside the matrix, so a fifth dword past `lim` belongs to a lane that is not 2 bytes off and does not use it.
+SYCL_ESIMD_FUNCTION inline simd<uint32_t, 64> ld4u(const uint8_t* base, simd<uint32_t, 16> off, uint32_t lim) {
+    simd<uint32_t, 16> a = off & ~3u;
+    simd<uint32_t, 64> v = gather<uint32_t, 64, 4>(reinterpret_cast<const uint32_t*>(base), a);
+    simd<uint32_t, 16> e = gather<uint32_t, 16>(reinterpret_cast<const uint32_t*>(base), min(a + 16u, simd<uint32_t, 16>(lim)));
+    simd<uint32_t, 16> s = (off & 2u) << 3;   // 0 or 16
+    simd<uint32_t, 16> d0 = v.template select<16, 1>(0), d1 = v.template select<16, 1>(16);
+    simd<uint32_t, 16> d2 = v.template select<16, 1>(32), d3 = v.template select<16, 1>(48);
+    simd<uint32_t, 64> r;
+    r.template select<16, 1>(0) = (d0 >> s) | ((d1 << 16) << (16u - s));
+    r.template select<16, 1>(16) = (d1 >> s) | ((d2 << 16) << (16u - s));
+    r.template select<16, 1>(32) = (d2 >> s) | ((d3 << 16) << (16u - s));
+    r.template select<16, 1>(48) = (d3 >> s) | ((e << 16) << (16u - s));
+    return r;
+}
+// each byte u (< 128) of the dwords as the int8 u - bias (bias4: the bias, at most 127, in its four bytes)
+SYCL_ESIMD_FUNCTION inline simd<uint32_t, 16> x_sub8(simd<uint32_t, 16> u, uint32_t bias4) {
+    return ((u | 0x80808080u) - bias4) ^ 0x80808080u;
+}
+// the four bits of n (one nibble a lane) to bit 4 of the dword's four bytes
+SYCL_ESIMD_FUNCTION inline simd<uint32_t, 16> x_bit4(simd<uint32_t, 16> n) {
+    return ((n * 0x00204081u) & 0x01010101u) << 4;
+}
+// byte i (0..11) of the 12 bytes in w0, w1, w2
+SYCL_ESIMD_FUNCTION inline simd<uint32_t, 16> x_b12(simd<uint32_t, 16> w0, simd<uint32_t, 16> w1, simd<uint32_t, 16> w2, int i) {
+    simd<uint32_t, 16> w = w2;
+    if (i < 4) w = w0;
+    else if (i < 8) w = w1;
+    return (w >> (uint32_t) (8 * (i & 3))) & 0xffu;
+}
+// a dword of IQ4_NL / IQ4_XS codes: [0, 16) the values of its four low nibbles, [16, 32) of its four high nibbles (O_IQ4: a byte's two)
+SYCL_ESIMD_FUNCTION inline simd<uint32_t, 32> x_iq4(const uint32_t* T, simd<uint32_t, 16> qd) {
+    simd<uint32_t, 16> t0 = gather<uint32_t, 16>(T + O_IQ4, (qd & 0xffu) << 2);
+    simd<uint32_t, 16> t1 = gather<uint32_t, 16>(T + O_IQ4, ((qd >> 8) & 0xffu) << 2);
+    simd<uint32_t, 16> t2 = gather<uint32_t, 16>(T + O_IQ4, ((qd >> 16) & 0xffu) << 2);
+    simd<uint32_t, 16> t3 = gather<uint32_t, 16>(T + O_IQ4, (qd >> 24) << 2);
+    simd<uint32_t, 32> r;
+    r.template select<16, 1>(0) = (t0 & 0xffu) | ((t1 & 0xffu) << 8) | ((t2 & 0xffu) << 16) | (t3 << 24);
+    r.template select<16, 1>(16) = ((t0 >> 8) & 0xffu) | (t1 & 0xff00u) | ((t2 & 0xff00u) << 8) | ((t3 & 0xff00u) << 16);
+    return r;
+}
+// Four values' code bytes (one dword a lane) as FP16(s * code + m), rounded once: two K pairs in VNNI order ([pair][lane], a dword
+// holding the pair's two values).
+template <bool HASM>
+SYCL_ESIMD_FUNCTION inline simd<uint32_t, 32> x_pack4(simd<uint32_t, 16> w, simd<float, 16> s, simd<float, 16> m) {
+    auto cb = w.template bit_cast_view<int8_t>();
+    simd<uint32_t, 32> b;
+    auto bh = b.template bit_cast_view<half>();
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        simd<int8_t, 16> c0 = cb.template select<16, 4>(2 * p);
+        simd<int8_t, 16> c1 = cb.template select<16, 4>(2 * p + 1);
+        simd<float, 16> f0 = simd<float, 16>(simd<int, 16>(c0)) * s;
+        simd<float, 16> f1 = simd<float, 16>(simd<int, 16>(c1)) * s;
+        if constexpr (HASM) {
+            f0 += m;
+            f1 += m;
+        }
+        simd<half, 32> v;
+        v.template select<16, 2>(0) = simd<half, 16>(f0);
+        v.template select<16, 2>(1) = simd<half, 16>(f1);
+        bh.template select<32, 1>(32 * p) = v;
+    }
+    return b;
+}
+// The B operand of 16 K values (lane = output column) from their code bytes in q0..q3 (dword j: values 4 j .. 4 j + 3), in VNNI
+// order (dword j of a lane holds K values 2 j and 2 j + 1).
+template <bool HASM>
+SYCL_ESIMD_FUNCTION inline simd<uint32_t, 128> x_pack(simd<uint32_t, 16> q0, simd<uint32_t, 16> q1, simd<uint32_t, 16> q2,
+                                                      simd<uint32_t, 16> q3, simd<float, 16> s, simd<float, 16> m) {
+    simd<uint32_t, 128> b;
+    b.template select<32, 1>(0) = x_pack4<HASM>(q0, s, m);
+    b.template select<32, 1>(32) = x_pack4<HASM>(q1, s, m);
+    b.template select<32, 1>(64) = x_pack4<HASM>(q2, s, m);
+    b.template select<32, 1>(96) = x_pack4<HASM>(q3, s, m);
+    return b;
+}
+
+template <int F, int MT, bool GU, int G> struct TagX;
+
+// GU: gate/up (the group's rows x 16 gate rows from 16 cb and the same up rows, H out); else down (x 32 columns from 32 cb, FP32 out)
+template <int F, int MT, bool GU, int G = kMaxGroupH>
+void launch_x(sycl::queue& q, const HArgsT<G> a, int nrb, int ncb, int wgn) {
+    constexpr int NT = 2;
+    constexpr int B8 = x_b8(F);
+    constexpr int BS = B8 / 8;   // a block's bytes (the formats of x_blk32)
+    constexpr bool HASM = x_has_m(F);
+    static_assert(B8 != 0, "a format of x_b8");
+    static_assert(MT == 1 || MT == 2 || MT == 4 || MT == 8, "row tiles: 8-row block loads (MT 1, 2) or 32-row ones (4, 8)");
+    constexpr int LR = MT >= 4 ? 32 : 8;   // rows per activation block load
+    constexpr int NL = MT * 8 / LR;        // block loads per step
+    auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for<TagX<F, MT, GU, G>>(sycl::nd_range<2>(sycl::range<2>((size_t) nrb, (size_t) ncb), sycl::range<2>(1, (size_t) wgn)), props,
+                                         [=](sycl::nd_item<2> it) SYCL_ESIMD_KERNEL {
+            const int rbg = (int) it.get_group(0), cb = (int) it.get_global_id(1);
+            const HPick pk = pick_h(a, rbg);
+            const int r0 = (rbg - pk.rb0) * (8 * MT);
+            const int left = pk.cnt - r0;
+            const int nvalid = left >= 8 * MT ? MT : (left + 7) >> 3;
+            const half* Xe = a.X + (size_t) pk.row0 * a.K;
+            const uint32_t sw = (uint32_t) a.K * 2u - 1u, sh = (uint32_t) pk.cnt - 1u;
+            const uint8_t* We = pk.blob;
+            const uint32_t* T = a.tab;
+            const uint32_t lim = a.lim;
+            simd<uint32_t, 16> lane(0, 1);
+            simd<uint32_t, 16> ro[NT];
+            if constexpr (GU) {
+                ro[0] = (lane + (uint32_t) (16 * cb)) * (uint32_t) a.rowb;
+                ro[1] = ro[0] + a.sec_off;
+            } else {
+#pragma unroll
+                for (int t = 0; t < NT; ++t) ro[t] = (lane + (uint32_t) (16 * (NT * cb + t))) * (uint32_t) a.rowb + a.sec_off;
+            }
+            simd<float, 128> acc[MT][NT];
+#pragma unroll
+            for (int i = 0; i < MT; ++i)
+#pragma unroll
+                for (int t = 0; t < NT; ++t) acc[i][t] = 0.f;
+            const int nkb = a.K >> 5;   // 32-blocks of K
+            for (int sb = 0; 8 * sb < nkb; ++sb) {
+                const uint32_t P = (uint32_t) sb * B8;
+                const int nib = nkb - 8 * sb < 8 ? nkb - 8 * sb : 8;
+                if (8 * (sb + 1) < nkb && !(a.dbg & 8)) {   // the next 256 values' bytes of each lane's row into L1, kept inside the matrix
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) {
+                        simd<uint32_t, 16> l0 = (ro[t] + (P + B8)) & ~63u;
+#pragma unroll
+                        for (int c = 0; c < (B8 + 63) / 64 + 1; ++c)
+                            prefetch<uint32_t, 16>(reinterpret_cast<const uint32_t*>(We), min(l0 + 64u * c, simd<uint32_t, 16>(lim & ~63u)), kPfL1h);
+                    }
+                }
+                // the fields a 256-value block has once: hd its scale d, hm the K-quants' dmin, h0..h3 packed scales / high bits
+                simd<float, 16> hd[NT], hm[NT];
+                simd<uint32_t, 16> h0[NT], h1[NT], h2[NT], h3[NT];
+#pragma unroll
+                for (int t = 0; t < NT; ++t) {
+                    simd<uint32_t, 16> o = ro[t] + P;
+                    hd[t] = 0.f;
+                    hm[t] = 0.f;
+                    h0[t] = 0u;
+                    h1[t] = 0u;
+                    h2[t] = 0u;
+                    h3[t] = 0u;
+                    if constexpr (F == T_Q4_K || F == T_Q5_K) {   // d, dmin (FP16), scales[12]
+                        simd<uint32_t, 64> v = ld4a(We, o);
+                        simd<uint32_t, 16> dm = v.template select<16, 1>(0);
+                        hd[t] = half_of(dm);
+                        hm[t] = half_of(dm >> 16);
+                        h0[t] = v.template select<16, 1>(16);
+                        h1[t] = v.template select<16, 1>(32);
+                        h2[t] = v.template select<16, 1>(48);
+                    } else if constexpr (F == T_Q6_K) {           // ql[128], qh[64], scales[16] (int8), d
+                        hd[t] = half_of(ld16(We, o + 208u));
+                        simd<uint32_t, 64> v = ld4u(We, o + 192u, lim);
+                        h0[t] = v.template select<16, 1>(0);
+                        h1[t] = v.template select<16, 1>(16);
+                        h2[t] = v.template select<16, 1>(32);
+                        h3[t] = v.template select<16, 1>(48);
+                    } else if constexpr (F == T_IQ4XS) {          // d, scales_h, scales_l[4], qs[128]
+                        hd[t] = half_of(ld16(We, o));
+                        h0[t] = ld16(We, o + 2u);
+                        h1[t] = ld32c(We, o + 4u, lim);
+                    } else if constexpr (F == T_IQ3S) {           // d, qs[64], qh[8], signs[32], scales[4]
+                        hd[t] = half_of(ld16(We, o));
+                        h0[t] = ld32c(We, o + 106u, lim);   // scales
+                        h1[t] = ld32c(We, o + 66u, lim);    // qh 0..3
+                        h2[t] = ld32c(We, o + 70u, lim);    // qh 4..7
+                    } else if constexpr (F == T_IQ3XXS) {         // d, qs[64], scales and signs[32]
+                        hd[t] = half_of(ld16(We, o));
+                    } else if constexpr (F == T_IQ2XS) {          // d, qs[32] (16 bit), scales[8]
+                        hd[t] = half_of(ld16(We, o));
+                        h0[t] = ld32c(We, o + 66u, lim);    // scales 0..3
+                        h1[t] = ld32c(We, o + 70u, lim);    // scales 4..7
+                    }
+                }
+#pragma unroll 1
+                for (int ib = 0; ib < nib; ++ib) {
+                    simd<uint32_t, 16> cq[NT][8];
+                    simd<float, 16> cs[NT][2], cm[NT];
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) {
+                        simd<uint32_t, 16> o = ro[t] + P;
+                        cm[t] = 0.f;
+                        if constexpr (F == T_Q4_K || F == T_Q5_K) {
+                            // 64 values share 32 bytes: the low nibbles are its first 32 values, the high nibbles its last 32.  Q5_K: bit ib
+                            // of qh's byte l is the fifth bit of value l of this 32.  Scale and min: llama.cpp's get_scale_min_k4(ib).
+                            constexpr uint32_t QS = F == T_Q4_K ? 16u : 48u;
+                            simd<uint32_t, 16> qo = o + (QS + 32u * (uint32_t) (ib >> 1));
+                            simd<uint32_t, 64> x0 = ld4a(We, qo), x1 = ld4a(We, qo + 16u);
+                            const uint32_t nsh = 4u * (uint32_t) (ib & 1);
+#pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                simd<uint32_t, 16> xa = x0.template select<16, 1>(16 * j), xb = x1.template select<16, 1>(16 * j);
+                                cq[t][j] = (xa >> nsh) & 0x0F0F0F0Fu;
+                                cq[t][4 + j] = (xb >> nsh) & 0x0F0F0F0Fu;
+                            }
+                            if constexpr (F == T_Q5_K) {
+                                simd<uint32_t, 64> hb0 = ld4a(We, o + 16u), hb1 = ld4a(We, o + 32u);
+#pragma unroll
+                                for (int j = 0; j < 4; ++j) {
+                                    simd<uint32_t, 16> ya = hb0.template select<16, 1>(16 * j), yb = hb1.template select<16, 1>(16 * j);
+                                    cq[t][j] |= ((ya >> (uint32_t) ib) & 0x01010101u) << 4;
+                                    cq[t][4 + j] |= ((yb >> (uint32_t) ib) & 0x01010101u) << 4;
+                                }
+                            }
+                            simd<uint32_t, 16> sc, mn;
+                            if (ib < 4) {
+                                sc = x_b12(h0[t], h1[t], h2[t], ib) & 63u;
+                                mn = x_b12(h0[t], h1[t], h2[t], ib + 4) & 63u;
+                            } else {
+                                sc = (x_b12(h0[t], h1[t], h2[t], ib + 4) & 0xFu) | ((x_b12(h0[t], h1[t], h2[t], ib - 4) >> 6) << 4);
+                                mn = (x_b12(h0[t], h1[t], h2[t], ib + 4) >> 4) | ((x_b12(h0[t], h1[t], h2[t], ib) >> 6) << 4);
+                            }
+                            cs[t][0] = hd[t] * simd<float, 16>(simd<int, 16>(sc));
+                            cs[t][1] = cs[t][0];
+                            cm[t] = 0.f - hm[t] * simd<float, 16>(simd<int, 16>(mn));
+                        } else if constexpr (F == T_Q6_K) {
+                            // llama.cpp's dequantize_q6_K: 128 values share 64 bytes of ql and 32 of qh; the 32 values c4 of them take ql's bytes
+                            // [32 (c4 & 1), + 32), low nibbles for c4 < 2, and bits 2 c4, 2 c4 + 1 of qh's bytes; scale 2 ib + hf, minus 32
+                            const int ip = ib >> 2, c4 = ib & 3;
+                            simd<uint32_t, 16> lo_ = o + (uint32_t) (64 * ip + 32 * (c4 & 1));
+                            simd<uint32_t, 16> ho_ = o + (uint32_t) (128 + 32 * ip);
+                            simd<uint32_t, 64> x0 = ld4u(We, lo_, lim), x1 = ld4u(We, lo_ + 16u, lim);
+                            simd<uint32_t, 64> hb0 = ld4u(We, ho_, lim), hb1 = ld4u(We, ho_ + 16u, lim);
+                            const uint32_t nsh = 4u * (uint32_t) (c4 >> 1), qsh = 2u * (uint32_t) c4;
+#pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                simd<uint32_t, 16> xa = x0.template select<16, 1>(16 * j), xb = x1.template select<16, 1>(16 * j);
+                                simd<uint32_t, 16> ya = hb0.template select<16, 1>(16 * j), yb = hb1.template select<16, 1>(16 * j);
+                                cq[t][j] = x_sub8(((xa >> nsh) & 0x0F0F0F0Fu) | (((ya >> qsh) & 0x03030303u) << 4), 0x20202020u);
+                                cq[t][4 + j] = x_sub8(((xb >> nsh) & 0x0F0F0F0Fu) | (((yb >> qsh) & 0x03030303u) << 4), 0x20202020u);
+                            }
+                            simd<uint32_t, 16> scw = h3[t];   // scales 2 ib, 2 ib + 1: bytes 2 (ib & 1), + 1 of dword ib / 2
+                            if (ib < 2) scw = h0[t];
+                            else if (ib < 4) scw = h1[t];
+                            else if (ib < 6) scw = h2[t];
+#pragma unroll
+                            for (int hf = 0; hf < 2; ++hf) {
+                                simd<uint32_t, 16> s8 = (scw >> (uint32_t) (8 * (2 * (ib & 1) + hf))) & 0xffu;
+                                cs[t][hf] = hd[t] * simd<float, 16>(simd<int, 16>(s8 ^ 0x80u) - 128);
+                            }
+                        } else if constexpr (F == T_IQ4XS) {
+                            simd<uint32_t, 16> ls = ((h1[t] >> (uint32_t) (4 * ib)) & 0xfu) | (((h0[t] >> (uint32_t) (2 * ib)) & 3u) << 4);
+                            cs[t][0] = hd[t] * simd<float, 16>(simd<int, 16>(ls) - 32);
+                            cs[t][1] = cs[t][0];
+                            simd<uint32_t, 64> x0 = ld4a(We, o + (8u + 16u * (uint32_t) ib));
+#pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                simd<uint32_t, 16> xa = x0.template select<16, 1>(16 * j);
+                                simd<uint32_t, 32> kv = x_iq4(T, xa);
+                                cq[t][j] = kv.template select<16, 1>(0);
+                                cq[t][4 + j] = kv.template select<16, 1>(16);
+                            }
+                        } else if constexpr (F == T_IQ3S) {       // as launch_gu's
+                            simd<uint32_t, 16> q0 = ld32c(We, o + (2u + 8u * (uint32_t) ib), lim);
+                            simd<uint32_t, 16> q1 = ld32c(We, o + (6u + 8u * (uint32_t) ib), lim);
+                            simd<uint32_t, 16> sg = ld32c(We, o + (74u + 4u * (uint32_t) ib), lim);
+                            simd<uint32_t, 16> qhw = h2[t];
+                            if (ib < 4) qhw = h1[t];
+                            simd<uint32_t, 16> qhv = (qhw >> (uint32_t) (8 * (ib & 3))) & 0xffu;
+                            simd<uint32_t, 16> scn = ((h0[t] >> (uint32_t) (8 * (ib >> 1))) >> (uint32_t) (4 * (ib & 1))) & 0xfu;
+                            cs[t][0] = hd[t] * simd<float, 16>(simd<int, 16>(scn * 2u + 1u));
+                            cs[t][1] = cs[t][0];
+#pragma unroll
+                            for (int r = 0; r < 8; ++r) {
+                                simd<uint32_t, 16> qsw = r < 4 ? q0 : q1;
+                                simd<uint32_t, 16> idx = ((qsw >> (8 * (r & 3))) & 0xffu) | (((qhv >> r) & 1u) << 8);
+                                simd<uint32_t, 16> g = gather<uint32_t, 16>(T + O_IQ3S, idx << 2);
+                                simd<uint32_t, 16> sgn = ((sg >> (8 * (r >> 1))) >> (4 * (r & 1))) & 0xfu;
+                                cq[t][r] = apply_signs(g, sgn);
+                            }
+                        } else if constexpr (F == T_IQ3XXS) {     // as launch_gu's
+                            simd<uint32_t, 16> q0 = ld32c(We, o + (2u + 8u * (uint32_t) ib), lim);
+                            simd<uint32_t, 16> q1 = ld32c(We, o + (6u + 8u * (uint32_t) ib), lim);
+                            simd<uint32_t, 16> aux = ld32c(We, o + (66u + 4u * (uint32_t) ib), lim);
+                            cs[t][0] = hd[t] * simd<float, 16>(simd<int, 16>((aux >> 28) * 2u + 1u)) * 0.25f;
+                            cs[t][1] = cs[t][0];
+#pragma unroll
+                            for (int il = 0; il < 4; ++il) {
+                                simd<uint32_t, 16> sbyte = ksigns((aux >> (7 * il)) & 127u);
+#pragma unroll
+                                for (int hh = 0; hh < 2; ++hh) {
+                                    const int r = 2 * il + hh;
+                                    simd<uint32_t, 16> qsw = r < 4 ? q0 : q1;
+                                    simd<uint32_t, 16> idx = (qsw >> (8 * (r & 3))) & 0xffu;
+                                    simd<uint32_t, 16> g = gather<uint32_t, 16>(T + O_IQ3XXS, idx << 2);
+                                    cq[t][r] = apply_signs(g, (sbyte >> (4 * hh)) & 0xfu);
+                                }
+                            }
+                        } else if constexpr (F == T_IQ2XS) {      // as launch_gu's: a scale per 16 values
+                            simd<uint32_t, 16> q0 = ld32c(We, o + (2u + 8u * (uint32_t) ib), lim);
+                            simd<uint32_t, 16> q1 = ld32c(We, o + (6u + 8u * (uint32_t) ib), lim);
+                            simd<uint32_t, 16> scw = h1[t];
+                            if (ib < 4) scw = h0[t];
+                            simd<uint32_t, 16> scb = (scw >> (uint32_t) (8 * (ib & 3))) & 0xffu;
+                            cs[t][0] = hd[t] * simd<float, 16>(simd<int, 16>((scb & 0xfu) * 2u + 1u)) * 0.125f;
+                            cs[t][1] = hd[t] * simd<float, 16>(simd<int, 16>((scb >> 4) * 2u + 1u)) * 0.125f;
+#pragma unroll
+                            for (int il = 0; il < 4; ++il) {
+                                simd<uint32_t, 16> qsw = (il < 2) ? q0 : q1;
+                                simd<uint32_t, 16> qv = (il & 1) ? (qsw >> 16) : (qsw & 0xffffu);
+                                simd<uint32_t, 16> idx = qv & 511u;
+                                simd<uint32_t, 32> g2 = gather<uint32_t, 32, 2>(T + O_IQ2XS, idx << 3);   // the 8-byte entry in one message
+                                simd<uint32_t, 16> gl = g2.template select<16, 1>(0), gh = g2.template select<16, 1>(16);
+                                simd<uint32_t, 16> sbyte = ksigns(qv >> 9);
+                                cq[t][2 * il] = apply_signs(gl, sbyte & 0xfu);
+                                cq[t][2 * il + 1] = apply_signs(gh, sbyte >> 4);
+                            }
+                        } else {
+                            // the blocks of 32 values: d (FP16) first, then Q4_1 / Q5_1's offset m (FP16), Q5_0 / Q5_1's 32 high bits, the codes.
+                            // A code byte's low nibble is one of the block's first 16 values, its high nibble one of the last 16.
+                            simd<uint32_t, 16> bo = o + (uint32_t) (BS * ib);
+                            if constexpr (F == T_Q8_0) {
+                                cs[t][0] = half_of(ld16(We, bo));
+                                simd<uint32_t, 64> x0 = ld4u(We, bo + 2u, lim), x1 = ld4u(We, bo + 18u, lim);
+#pragma unroll
+                                for (int j = 0; j < 4; ++j) {
+                                    cq[t][j] = x0.template select<16, 1>(16 * j);
+                                    cq[t][4 + j] = x1.template select<16, 1>(16 * j);
+                                }
+                            } else if constexpr (F == T_IQ4NL) {
+                                cs[t][0] = half_of(ld16(We, bo));
+                                simd<uint32_t, 64> x0 = ld4u(We, bo + 2u, lim);
+#pragma unroll
+                                for (int j = 0; j < 4; ++j) {
+                                    simd<uint32_t, 16> xa = x0.template select<16, 1>(16 * j);
+                                    simd<uint32_t, 32> kv = x_iq4(T, xa);
+                                    cq[t][j] = kv.template select<16, 1>(0);
+                                    cq[t][4 + j] = kv.template select<16, 1>(16);
+                                }
+                            } else if constexpr (F == T_Q4_0) {
+                                cs[t][0] = half_of(ld16(We, bo));
+                                simd<uint32_t, 64> x0 = ld4u(We, bo + 2u, lim);
+#pragma unroll
+                                for (int j = 0; j < 4; ++j) {
+                                    simd<uint32_t, 16> xa = x0.template select<16, 1>(16 * j);
+                                    cq[t][j] = x_sub8(xa & 0x0F0F0F0Fu, 0x08080808u);
+                                    cq[t][4 + j] = x_sub8((xa >> 4) & 0x0F0F0F0Fu, 0x08080808u);
+                                }
+                            } else if constexpr (F == T_Q4_1) {
+                                simd<uint32_t, 16> dm = gather<uint32_t, 16>(reinterpret_cast<const uint32_t*>(We), bo);
+                                cs[t][0] = half_of(dm);
+                                cm[t] = half_of(dm >> 16);
+                                simd<uint32_t, 64> x0 = ld4a(We, bo + 4u);
+#pragma unroll
+                                for (int j = 0; j < 4; ++j) {
+                                    simd<uint32_t, 16> xa = x0.template select<16, 1>(16 * j);
+                                    cq[t][j] = xa & 0x0F0F0F0Fu;
+                                    cq[t][4 + j] = (xa >> 4) & 0x0F0F0F0Fu;
+                                }
+                            } else if constexpr (F == T_Q5_0) {
+                                cs[t][0] = half_of(ld16(We, bo));
+                                simd<uint32_t, 16> qh = ld32c(We, bo + 2u, lim);
+                                simd<uint32_t, 64> x0 = ld4u(We, bo + 6u, lim);
+#pragma unroll
+                                for (int j = 0; j < 4; ++j) {
+                                    simd<uint32_t, 16> xa = x0.template select<16, 1>(16 * j);
+                                    cq[t][j] = x_sub8((xa & 0x0F0F0F0Fu) | x_bit4((qh >> (4 * j)) & 0xfu), 0x10101010u);
+                                    cq[t][4 + j] = x_sub8(((xa >> 4) & 0x0F0F0F0Fu) | x_bit4((qh >> (16 + 4 * j)) & 0xfu), 0x10101010u);
+                                }
+                            } else {   // T_Q5_1
+                                simd<uint32_t, 16> dm = gather<uint32_t, 16>(reinterpret_cast<const uint32_t*>(We), bo);
+                                cs[t][0] = half_of(dm);
+                                cm[t] = half_of(dm >> 16);
+                                simd<uint32_t, 16> qh = gather<uint32_t, 16>(reinterpret_cast<const uint32_t*>(We), bo + 4u);
+                                simd<uint32_t, 64> x0 = ld4a(We, bo + 8u);
+#pragma unroll
+                                for (int j = 0; j < 4; ++j) {
+                                    simd<uint32_t, 16> xa = x0.template select<16, 1>(16 * j);
+                                    cq[t][j] = (xa & 0x0F0F0F0Fu) | x_bit4((qh >> (4 * j)) & 0xfu);
+                                    cq[t][4 + j] = ((xa >> 4) & 0x0F0F0F0Fu) | x_bit4((qh >> (16 + 4 * j)) & 0xfu);
+                                }
+                            }
+                            cs[t][1] = cs[t][0];
+                        }
+                    }
+#pragma unroll
+                    for (int hf = 0; hf < 2; ++hf) {
+                        const int k0 = 256 * sb + 32 * ib + 16 * hf;
+                        simd<half, 16 * LR> av[NL];
+#pragma unroll
+                        for (int p = 0; p < NL; ++p) av[p] = load_2d<half, 16, LR, 1>(Xe, sw, sh, sw, k0, r0 + LR * p);   // (past the expert: zeros)
+                        simd<uint32_t, 128> bt[NT];
+#pragma unroll
+                        for (int t = 0; t < NT; ++t)
+                            bt[t] = x_pack<HASM>(cq[t][4 * hf], cq[t][4 * hf + 1], cq[t][4 * hf + 2], cq[t][4 * hf + 3], cs[t][hf], cm[t]);
+#pragma unroll
+                        for (int i = 0; i < MT; ++i) {
+                            simd<half, 128> ai = av[i * 8 / LR].template select<128, 1>(128 * (i % (LR / 8)));
+#pragma unroll
+                            for (int t = 0; t < NT; ++t) acc[i][t] = dpas_h(acc[i][t], bt[t], ai);
+                        }
+                    }
+                }
+            }
+            if (a.dbg & 4) return;
+            if constexpr (GU) {
+                half* He = reinterpret_cast<half*>(a.Y) + (size_t) pk.row0 * a.n_out;
+                const uint32_t hw = (uint32_t) a.n_out * 2u - 1u;
+#pragma unroll
+                for (int i = 0; i < MT; ++i) {
+                    if (i < nvalid) {
+                        simd<float, 128> gg = acc[i][0], uu = acc[i][1];
+                        simd<float, 128> hv = gg / (1.f + exp(-gg)) * uu;
+                        hv = max(min(hv, 65504.f), -65504.f);
+                        simd<half, 128> hh = hv;
+                        store_2d<half, 16, 8>(He, hw, sh, hw, 16 * cb, r0 + 8 * i, hh);
+                    }
+                }
+            } else {
+                float* De = reinterpret_cast<float*>(a.Y) + (size_t) pk.row0 * a.n_out;
+                const uint32_t dw = (uint32_t) a.n_out * 4u - 1u;
+#pragma unroll
+                for (int i = 0; i < MT; ++i) {
+                    if (i < nvalid) {
+#pragma unroll
+                        for (int t = 0; t < NT; ++t) store_2d<float, 16, 8>(De, dw, sh, dw, 16 * (NT * cb + t), r0 + 8 * i, acc[i][t]);
+                    }
+                }
+            }
+        });
+    });
+}
+
 int hdbg_flags() {
     static const int v = [] { const char* s = std::getenv("STRATA_F16X_DBG"); return s ? std::atoi(s) : 0; }();
     return v;
@@ -1631,19 +2093,81 @@ int henv(const char* name, int def) {
     return s ? std::atoi(s) : def;
 }
 bool al64(const void* p) { return ((uintptr_t) p & 63) == 0; }
+
+// STRATA_F16X_ANY (read once; unset or 0: off): f16_handles also takes the formats of launch_x
+bool x_any_on() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_F16X_ANY"); return e != nullptr && e[0] != '\0' && e[0] != '0'; }();
+    return v;
+}
+int x_rowb(int f, int K) { return x_blk32(f) ? (K / 32) * (x_b8(f) / 8) : (K / 256) * x_b8(f); }   // bytes of a row of K values
+// K is whole blocks of the format and a row is whole dwords (ld4a / ld4u, and the matrix then ends on a dword)
+bool x_shape(int f, int K) { return K > 0 && K % (x_blk32(f) ? 32 : 256) == 0 && (x_rowb(f, K) & 3) == 0; }
+// launch_x for a group of up to kMaxGroupH experts (cnt[i] rows each, back to back): gate/up (GU; sec_off the up rows' byte offset, n_out
+// = n_ff, Y = H) or down (sec_off the down rows' byte offset, n_out = n_embd, Y = Dm).  `mt` 1, 2 or 8; `skip` as gate_up_f16_n's.
+template <bool GU>
+void x_n(int type, const uint8_t* const* blob, size_t sec_off, int n_out, const int32_t* cnt, int n, int K, const uint16_t* X, void* Y,
+         sycl::queue& q, int mt, uint64_t skip) {
+    HArgsT<kMaxGroupH> a{};
+    for (int i = 0; i < n; ++i) a.blob[i] = blob[i];
+    a.sec_off = (uint32_t) sec_off;
+    a.X = reinterpret_cast<const half*>(X);
+    a.Y = Y;
+    a.tab = tables(q);
+    a.K = K;
+    a.n_out = n_out;
+    a.rowb = x_rowb(type, K);
+    a.lim = (uint32_t) (sec_off + (size_t) n_out * (size_t) a.rowb) - 4u;   // the last dword of the up / down matrix
+    a.dbg = hdbg_flags();
+    static const int wg = henv("STRATA_F16X_WG", 8);
+    const int nrb = fill_hargs_n(a, cnt, n, 8 * mt, skip);
+    if (nrb == 0) return;
+    const int ncb = GU ? n_out / 16 : n_out / 32;
+    const int wgn = ncb % wg == 0 ? wg : 1;
+#define STRATA_X(F_)                                                    \
+    case F_:                                                            \
+        if (mt == 1) launch_x<F_, 1, GU>(q, a, nrb, ncb, wgn);          \
+        else if (mt == 2) launch_x<F_, 2, GU>(q, a, nrb, ncb, wgn);     \
+        else launch_x<F_, 8, GU>(q, a, nrb, ncb, wgn);                  \
+        break;
+    if constexpr (GU) {   // the formats of x_gu
+        switch (type) {
+            STRATA_X(T_Q4_K) STRATA_X(T_Q5_K) STRATA_X(T_Q6_K) STRATA_X(T_Q8_0) STRATA_X(T_IQ3S) STRATA_X(T_IQ3XXS) STRATA_X(T_IQ2XS)
+            STRATA_X(T_IQ4XS) STRATA_X(T_Q4_0) STRATA_X(T_Q4_1) STRATA_X(T_Q5_0)
+            default: break;
+        }
+    } else {              // the formats of x_dn
+        switch (type) {
+            STRATA_X(T_IQ4NL) STRATA_X(T_Q5_1) STRATA_X(T_Q8_0) STRATA_X(T_Q4_0) STRATA_X(T_Q4_1) STRATA_X(T_Q5_0)
+            default: break;
+        }
+    }
+#undef STRATA_X
+}
 }  // namespace
 
 bool f16_handles(int gu_type, int d_type, int n_ff, int n_embd, void* stream) {
-    return (gu_type == T_IQ2S || gu_type == T_IQ2XXS) && d_type == T_Q2_0 && n_embd % 256 == 0 && n_ff % 64 == 0 && n_ff % 32 == 0 &&
-           n_embd % 64 == 0 && available(stream);
+    const bool gu_h = gu_type == T_IQ2S || gu_type == T_IQ2XXS, d_h = d_type == T_Q2_0;
+    if (!gu_h || !d_h) {   // a format of launch_x: STRATA_F16X_ANY
+        if (!x_any_on()) return false;
+        if (!gu_h && !(x_gu(gu_type) && x_shape(gu_type, n_embd))) return false;
+        if (!d_h && !(x_dn(d_type) && x_shape(d_type, n_ff))) return false;
+    }
+    return n_embd % 256 == 0 && n_ff % 64 == 0 && n_ff % 32 == 0 && n_embd % 64 == 0 && available(stream);
 }
 
 bool gate_up_f16(int gu_type, const uint8_t* const* blob, size_t up_off, int n_ff, const Layout& lo, int K, const uint16_t* X,
                  uint16_t* H, void* stream) {
     if (lo.n == 0 || lo.row0[lo.n] == 0) return true;
-    if ((gu_type != T_IQ2S && gu_type != T_IQ2XXS) || K % 256 != 0 || n_ff % 32 != 0 || (up_off & 3) != 0 || lo.n > kMaxGroup ||
-        !al64(X) || !al64(H))
-        return false;
+    if (gu_type != T_IQ2S && gu_type != T_IQ2XXS) {   // launch_x (the 64-expert form at 64 rows a thread: the same bits as a 16-expert one)
+        if (!x_gu(gu_type) || !x_shape(gu_type, K) || K % 256 != 0 || n_ff % 32 != 0 || (up_off & 3) != 0 || lo.n > kMaxGroup ||
+            !al64(X) || !al64(H))
+            return false;
+        int32_t cnt[kMaxGroup];
+        for (int i = 0; i < lo.n; ++i) cnt[i] = lo.cnt[i];
+        x_n<true>(gu_type, blob, up_off, n_ff, cnt, lo.n, K, X, H, *strata::q_of(stream), 8, 0);
+        return true;
+    }
+    if (K % 256 != 0 || n_ff % 32 != 0 || (up_off & 3) != 0 || lo.n > kMaxGroup || !al64(X) || !al64(H)) return false;
     sycl::queue& q = *strata::q_of(stream);
     HArgs a{};
     for (int i = 0; i < lo.n; ++i) a.blob[i] = blob[i];
@@ -1668,8 +2192,16 @@ bool gate_up_f16(int gu_type, const uint8_t* const* blob, size_t up_off, int n_f
 bool down_f16(int d_type, const uint8_t* const* blob, size_t down_off, int n_embd, const Layout& lo, int n_ff, const uint16_t* H,
               float* Dm, void* stream) {
     if (lo.n == 0 || lo.row0[lo.n] == 0) return true;
-    if (d_type != T_Q2_0 || n_ff % 64 != 0 || n_embd % 64 != 0 || (down_off & 3) != 0 || lo.n > kMaxGroup || !al64(H) || !al64(Dm))
-        return false;
+    if (d_type != T_Q2_0) {   // launch_x
+        if (!x_dn(d_type) || !x_shape(d_type, n_ff) || n_ff % 64 != 0 || n_embd % 64 != 0 || (down_off & 3) != 0 || lo.n > kMaxGroup ||
+            !al64(H) || !al64(Dm))
+            return false;
+        int32_t cnt[kMaxGroup];
+        for (int i = 0; i < lo.n; ++i) cnt[i] = lo.cnt[i];
+        x_n<false>(d_type, blob, down_off, n_embd, cnt, lo.n, n_ff, H, Dm, *strata::q_of(stream), 8, 0);
+        return true;
+    }
+    if (n_ff % 64 != 0 || n_embd % 64 != 0 || (down_off & 3) != 0 || lo.n > kMaxGroup || !al64(H) || !al64(Dm)) return false;
     sycl::queue& q = *strata::q_of(stream);
     HArgs a{};
     for (int i = 0; i < lo.n; ++i) a.blob[i] = blob[i];
@@ -1788,11 +2320,16 @@ bool gate_up_f16_n(int gu_type, const uint8_t* const* blob, size_t up_off, int n
     int64_t rows = 0;
     for (int i = 0; i < n; ++i) rows += cnt[i];
     if (n <= 0 || rows == 0) return true;
-    if ((gu_type != T_IQ2S && gu_type != T_IQ2XXS) || K % 256 != 0 || n_ff % 32 != 0 || (up_off & 3) != 0 || n > kMaxGroupH ||
+    const bool gen = gu_type != T_IQ2S && gu_type != T_IQ2XXS;   // launch_x
+    if ((gen && !(x_gu(gu_type) && x_shape(gu_type, K))) || K % 256 != 0 || n_ff % 32 != 0 || (up_off & 3) != 0 || n > kMaxGroupH ||
         !al64(X) || !al64(H))
         return false;
     sycl::queue& q = *strata::q_of(stream);
     mt = f16_mt_for(cnt, n, mt, skip);
+    if (gen) {
+        x_n<true>(gu_type, blob, up_off, n_ff, cnt, n, K, X, H, q, mt, skip);
+        return true;
+    }
     if (mt != 8) gu_h_n<kMaxGroupH>(gu_type, blob, up_off, n_ff, cnt, n, K, X, H, q, mt, skip);   // (the small tiles: the 64-expert form only)
     else if (n <= 32) gu_h_n<32>(gu_type, blob, up_off, n_ff, cnt, n, K, X, H, q, 8, skip);
     else gu_h_n<kMaxGroupH>(gu_type, blob, up_off, n_ff, cnt, n, K, X, H, q, 8, skip);
@@ -1804,10 +2341,16 @@ bool down_f16_n(int d_type, const uint8_t* const* blob, size_t down_off, int n_e
     int64_t rows = 0;
     for (int i = 0; i < n; ++i) rows += cnt[i];
     if (n <= 0 || rows == 0) return true;
-    if (d_type != T_Q2_0 || n_ff % 64 != 0 || n_embd % 64 != 0 || (down_off & 3) != 0 || n > kMaxGroupH || !al64(H) || !al64(Dm))
+    const bool gen = d_type != T_Q2_0;   // launch_x
+    if ((gen && !(x_dn(d_type) && x_shape(d_type, n_ff))) || n_ff % 64 != 0 || n_embd % 64 != 0 || (down_off & 3) != 0 || n > kMaxGroupH ||
+        !al64(H) || !al64(Dm))
         return false;
     sycl::queue& q = *strata::q_of(stream);
     mt = f16_mt_for(cnt, n, mt, skip);
+    if (gen) {
+        x_n<false>(d_type, blob, down_off, n_embd, cnt, n, n_ff, H, Dm, q, mt, skip);
+        return true;
+    }
     if (mt != 8) dn_h_n<kMaxGroupH>(blob, down_off, n_embd, cnt, n, n_ff, H, Dm, q, mt, skip);
     else if (n <= 32) dn_h_n<32>(blob, down_off, n_embd, cnt, n, n_ff, H, Dm, q, 8, skip);
     else dn_h_n<kMaxGroupH>(blob, down_off, n_embd, cnt, n, n_ff, H, Dm, q, 8, skip);

@@ -500,6 +500,7 @@ if(STRATA_SYCL_PARITY)
   add_executable(esimd_f16_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/esimd_f16_parity.cpp)   # the FP16 expert products (larger groups) vs the FP16 chain and FP64
   target_link_libraries(esimd_f16_parity PRIVATE strata_kernels strata_prefill)
   add_test(NAME esimd_f16_parity COMMAND esimd_f16_parity 320 16 2)
+  add_test(NAME esimd_f16_parity_all COMMAND esimd_f16_parity 60 8 2 1 all)   # STRATA_F16X_ANY: every format pair of launch_x on random blocks
   # the other tile heights (mean 8 rows -> MT 2, 24 -> MT 4) and the non-work-group kernels in both register modes
   add_test(NAME esimd_moe_parity_mt2 COMMAND esimd_moe_parity 8 16 2)
   add_test(NAME esimd_moe_parity_mt4 COMMAND esimd_moe_parity 24 16 2)
