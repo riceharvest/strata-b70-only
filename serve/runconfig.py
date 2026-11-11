@@ -254,6 +254,16 @@ EDITABLE = [
      "least 64. The reply ends as \"length\" with a note in the log, and /metrics counts it. Cost: a few comparisons a "
      "token, and an honest text made of one short pattern that long (a ruler of two alternating marks) is cut. A single "
      "repeated token is repeat_stop_tokens' job. Empty: off"),
+    ("tool_arg_coercion", "bool",
+     "Off by default. On: a tool argument is read by the type the request's schema declares, so a boolean the model wrote as "
+     "True or False is true or false, and a quoted number for an integer or number parameter is a number. A parameter typed "
+     "string (or string among several types) is never changed. Cost: a client that wanted the text \"True\" for a boolean "
+     "parameter now gets true. Empty: off"),
+    ("tool_skipped_closer", "bool",
+     "Off by default. On: when the model writes a nested <parameter=X>...</parameter> inside a value (a file that documents the "
+     "call format) and leaves out the value's own </parameter>, the value keeps the nested pair and ends before </function>, "
+     "instead of being cut after the nested close. Cost: a value that mentions an opener with no closer of its own, followed "
+     "by the real closer, is read to the end of the call. Empty: off"),
     ("tool_name_repair", ("enum", ["prefix"]),
      "What to do when the model calls a tool the request did not declare. Empty: the call goes back as text (and "
      "strata_rejected_tool_calls names it). prefix: read it as the one declared tool whose name it extends, or that "
@@ -348,7 +358,7 @@ GROUPS = {
                  "conversation_cache_park_ssd_deepest_checkpoint", "conversation_cache_spill_probe_mib",
                  "conversation_cache_spill_probe_s", "conversation_cache_spill_min_tokens", "conversation_cache_spill_mbps",
                  "conversation_cache_spill_prefill_us", "conversation_cache_spill_verify"),
-    "Thinking and answers": ("tool_name_repair", "sampling.temperature", "sampling.top_p", "sampling.top_k", "sampling.min_p",
+    "Thinking and answers": ("tool_name_repair", "tool_arg_coercion", "tool_skipped_closer", "sampling.temperature", "sampling.top_p", "sampling.top_k", "sampling.min_p",
                              "reasoning_budget_tokens", "fit_max_tokens", "anthropic_thinking", "effort_position",
                              "answer_room", "answer_room_min_cap", "answer_reserve_min", "repeat_stop_tokens",
                              "repeat_cycle_tokens", "reasoning_loop_recovery", "loop_check_every", "loop_coverage", "loop_history_words",

@@ -845,15 +845,43 @@ _LOOSE_PART = re.compile(r"<\s*(?:function[ \t]*[=:]?\s*|=\s*)?[A-Za-z0-9_.\-]*\
 _QUOTED_OPEN = re.compile(r"<function=[^<>\s]+>\s*(?:<parameter=|</function>)")
 
 
+# Opt-in, set once at start from the run config ("tool_skipped_closer"): a `</parameter>` that closes a nested
+# `<parameter=X>` opener inside a value is value text, and a value whose own closer the model left out ends before the
+# call's `</function>` (upstream issue 5756).  Off: the first close with a valid follower ends the value, as before.
+TOOL_SKIPPED_CLOSER = False
+# Opt-in ("tool_arg_coercion"): a parameter's text is read by the declared JSON schema type even when the model wrote it
+# as Python (`True`, `False`) or as a quoted number (upstream issue 5743).  Off: the text goes through as written.
+TOOL_ARG_COERCION = False
+_NESTED_OPEN = re.compile(r"<parameter=[^<>\s]+>")
+
+
+def close_len(text: str, end: int) -> int:
+    """How much to skip after a value that param_end said ends at `end`: the `</parameter>`, or nothing when the model
+    skipped it (the value ends right before `</function>`)."""
+    return len(PARAM_END) if text.startswith(PARAM_END, end) else 0
+
+
 def param_end(text: str, final: bool = False, name: str | None = None) -> int:
     """Where a parameter value in `text` ends: the first PARAM_END followed (after whitespace) by the next
     PARAM_START or FUNC_END, or by the wrapper's CALL_END when the call's `</function>` was left out (#4427) - the
     same text inside a value (a file that documents the call format, #210) is
     part of the value.  #4078: a close inside a call the value itself quotes (more _QUOTED_OPEN than FUNC_END before
     it), or one followed by the same parameter `name` again, is part of the value too.  `text` starts at the value.
-    -1: none yet; -2: a candidate whose follower has not arrived (streaming; `final` accepts it)."""
+    -1: none yet; -2: a candidate whose follower has not arrived (streaming; `final` accepts it).  With
+    TOOL_SKIPPED_CLOSER a close that matches a nested `<parameter=X>` opener is passed over; when no other close
+    ends the value but the call's `</function>` follows, the value ends right before it (the returned place then holds
+    no `</parameter>`: see close_len)."""
     at = text.find(PARAM_END)
+    skipped = -1                                      # the first nested close followed by the call's end
     while at >= 0:
+        if TOOL_SKIPPED_CLOSER and len(_NESTED_OPEN.findall(text, 0, at)) > text.count(PARAM_END, 0, at):
+            after = text[at + len(PARAM_END):].lstrip()
+            if skipped < 0 and after.startswith((FUNC_END, CALL_END)):
+                skipped = at + len(PARAM_END)
+            elif skipped < 0 and not final and (not after or FUNC_END.startswith(after) or CALL_END.startswith(after)):
+                return -2
+            at = text.find(PARAM_END, at + 1)
+            continue
         if len(_QUOTED_OPEN.findall(text, 0, at)) <= text.count(FUNC_END, 0, at):
             after = text[at + len(PARAM_END):].lstrip()
             if after.startswith(PARAM_START):
@@ -867,6 +895,12 @@ def param_end(text: str, final: bool = False, name: str | None = None) -> int:
             elif not after or PARAM_START.startswith(after) or FUNC_END.startswith(after) or CALL_END.startswith(after):
                 return at if final else -2
         at = text.find(PARAM_END, at + 1)
+    if skipped >= 0:
+        close = text.find(FUNC_END, skipped)
+        tail = text[close + len(FUNC_END):].lstrip()
+        if final or tail.startswith(CALL_END):         # streaming waits until the wrapper confirms the call's end
+            return close
+        return -2
     return -1
 
 
@@ -893,7 +927,7 @@ def call_end(text: str) -> int:
             end = param_end(text[gt + 1:], name=text[pos:gt].split("=", 1)[1].strip())
             if end < 0:
                 return -1
-            pos = gt + 1 + end + len(PARAM_END)
+            pos = gt + 1 + end + close_len(text[gt + 1:], end)
         elif s.startswith(FUNC_END):
             rest = text[pos + len(FUNC_END):]
             s = rest.lstrip()
@@ -975,7 +1009,7 @@ def function_end(text: str) -> int:
             end = param_end(text[gt + 1:], name=text[pos:gt].split("=", 1)[1].strip())
             if end < 0:
                 return -1
-            pos = gt + 1 + end + len(PARAM_END)
+            pos = gt + 1 + end + close_len(text[gt + 1:], end)
         elif s.startswith(FUNC_END):
             return pos + len(FUNC_END)
         else:
@@ -1134,6 +1168,12 @@ def coerce_value(value: str, declared, notes: list | None = None):
     arrived as a JSON string of itself is decoded once more."""
     if declared == "string":
         return value
+    if TOOL_ARG_COERCION:
+        kinds = declared if isinstance(declared, list) else [declared]
+        if "boolean" in kinds and "string" not in kinds:
+            word = value.strip().lower()
+            if word in ("true", "false"):
+                return word == "true"
     try:
         v = json.loads(value)
     except ValueError:
@@ -1146,6 +1186,12 @@ def coerce_value(value: str, declared, notes: list | None = None):
         if notes is not None:
             notes.append("a damaged JSON " + ("array" if isinstance(v, list) else "object") + " argument was read as written")
         return v
+    if TOOL_ARG_COERCION and isinstance(v, str) and declared in ("integer", "number"):
+        try:                                           # a number the model quoted: "450" for an integer parameter
+            n = float(v) if declared == "number" or not v.strip().lstrip("+-").isdigit() else int(v)
+        except ValueError:
+            return v
+        return int(n) if declared == "integer" and n == int(n) else n
     if isinstance(v, str) and declared in ("array", "object") and v.lstrip().startswith(("[", "{")):
         try:
             return json.loads(v)
@@ -1171,7 +1217,7 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
         rest = rest[rest.index(">") + 1:]
         end = param_end(rest, final=True, name=pname.strip())
         value = rest[:end] if end >= 0 else rest
-        rest = rest[end + len(PARAM_END):] if end >= 0 else ""
+        rest = rest[end + close_len(rest, end):] if end >= 0 else ""
         if value.startswith("\n"):
             value = value[1:]
         if value.endswith("\n"):
@@ -1531,7 +1577,7 @@ class OutputParser:
                     if value.endswith("\n"):
                         value = value[:-1]
                     args(json.dumps(value)[1:-1] + '"')
-                    self.sp += end + len(PARAM_END)
+                    self.sp += end + close_len(rest, end)
                     self.ss = "between"
                     continue
                 # an undecided </parameter> (-2) is held from its start, like a tag still arriving
@@ -1553,7 +1599,7 @@ class OutputParser:
                     value = value[:-1]
                 v = coerce_value(value, self.sdeclared.get(self.spname))    # the note comes with the final call (parse_tool_call)
                 args(json.dumps(v, ensure_ascii=False))
-                self.sp += end + len(PARAM_END)
+                self.sp += end + close_len(rest, end)
                 self.ss = "between"
             else:
                 return out

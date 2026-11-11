@@ -8912,6 +8912,14 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
         print(f"[strata] from the config: tool_name_repair {cfg['tool_name_repair']}", flush=True)
+    for key, attr in (("tool_arg_coercion", "TOOL_ARG_COERCION"), ("tool_skipped_closer", "TOOL_SKIPPED_CLOSER")):
+        if (cfg or {}).get(key) is not None:           # opt-in tool-call parser switches (serve/frontend.py)
+            if not isinstance(cfg[key], bool):
+                raise SystemExit(f"[strata] config \"{key}\" must be true or false, not {cfg[key]!r}")
+            import serve.frontend as _fe_flags
+            setattr(_fe_flags, attr, cfg[key])
+            if cfg[key]:
+                print(f"[strata] from the config: {key} on", flush=True)
     lazy = False
     gpu_locks = None
     if a.engine == "strata":
