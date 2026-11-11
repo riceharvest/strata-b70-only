@@ -43,6 +43,20 @@ EOF
   fi
 fi
 
+# Which device compiler builds the engine decides its speed: measured 3-5% slower answers with IGC 2.42.6 than with 2.41.5 (docs/B70.md).
+# One line says what was found; a second one warns when it is not the pinned pair. Never fails the build; silent without dpkg.
+PINNED_IGC=2.41.5 PINNED_OCLOC=26.35.39758.10
+if command -v dpkg-query >/dev/null 2>&1; then
+  igc_v=$(dpkg-query -W -f='${Version}' intel-igc-core-2 2>/dev/null || true)
+  ocl_v=$(ocloc_version || true)
+  if [[ -n "$igc_v" || -n "$ocl_v" ]]; then
+    echo "build.sh: device compiler: ocloc ${ocl_v:-?}, IGC ${igc_v:-?}"
+    if [[ "$igc_v" != "$PINNED_IGC"* || "$ocl_v" != "$PINNED_OCLOC"* ]]; then
+      echo "build.sh: WARNING: not the pinned compiler (IGC $PINNED_IGC, ocloc $PINNED_OCLOC): answers measured 3-5% slower with IGC 2.42.6; see docs/B70.md. Rebuild the image: docker build -t strata-sycl-dev sycl/tools" >&2
+    fi
+  fi
+fi
+
 repo=${REPO:-$(git rev-parse --show-toplevel)}
 b=${BUILD_DIR:-$repo/build-sycl}
 # strata-q36's long-prompt attention (an AOT build for Battlemage / Lunar Lake) compiles against two projects fetched into
