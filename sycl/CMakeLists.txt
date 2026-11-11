@@ -321,6 +321,10 @@ add_executable(conversation_spill_test ${STRATA_ROOT}/src/core/conversation_spil
 target_include_directories(conversation_spill_test PRIVATE ${STRATA_ROOT}/include ${STRATA_ROOT}/sycl/include)
 target_link_libraries(conversation_spill_test PRIVATE Threads::Threads)
 add_test(NAME conversation_spill_test COMMAND conversation_spill_test)
+# #5697: an evicted parked conversation gives its RAM back to the system (glibc's heap; RSS before and after); no device.
+add_executable(conversation_heap_test ${STRATA_ROOT}/src/core/conversation_heap_test.cpp)
+target_include_directories(conversation_heap_test PRIVATE ${STRATA_ROOT}/include)
+add_test(NAME conversation_heap_test COMMAND conversation_heap_test)
 add_executable(spec_admission_test ${STRATA_ROOT}/src/core/spec_admission_test.cpp ${STRATA_ROOT}/src/spec/draft_policy.cpp)
 target_include_directories(spec_admission_test PRIVATE ${STRATA_ROOT}/include)
 add_test(NAME spec_admission_default COMMAND ${CMAKE_COMMAND} -E env --unset=STRATA_SPEC_PROB_GATE $<TARGET_FILE:spec_admission_test>)
