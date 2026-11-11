@@ -460,7 +460,7 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
         env["STRATA_SYCL_BIN"] = exe.relative_to(ROOT).as_posix()
     if MOUNT.resolve() != ROOT.parent.resolve():
         env["STRATA_SYCL_ROOT"] = str(MOUNT)
-    if served and model == SERVED_MODEL:
+    if served and model in (SERVED_MODEL, S.FAMILIES[SERVED_FAMILY]["tag"] + SERVED_MODEL):   # setup names the config's tag: "unsloth-UD-IQ1_S"
         notes = apply_served_recipe(out["args"], env, draft_asked)
         if served_notes is not None:
             served_notes.extend(notes)

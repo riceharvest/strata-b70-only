@@ -500,6 +500,15 @@ class ServedRecipe(unittest.TestCase):
         self.assertEqual(out["exe"], str(self.si.SYCL_WRAPPER))
         self.assertTrue(notes)
 
+    def test_setup_hands_the_config_tag_not_the_size_name(self):
+        """write_run_script is called with the tag (unsloth-UD-IQ1_S), as the config and the start script are named."""
+        out, notes = self.make(model="unsloth-UD-IQ1_S")
+        self.assertEqual(self.flag(out, "--spec"), "6")
+        self.assertTrue(notes)
+        other, notes = self.make(model="unsloth-UD-IQ4_XS")
+        self.assertEqual(self.flag(other, "--spec"), "4")
+        self.assertEqual(notes, [])
+
     def test_no_machine_specific_setting_is_written(self):
         out, _ = self.make()
         text = repr({"args": out["args"], "env": out["env"]})
