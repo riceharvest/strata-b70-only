@@ -342,5 +342,121 @@ class ToSycl(unittest.TestCase):
         self.assertEqual(out.getvalue().count("/dev/shm has no room"), 1)
 
 
+def load_setup_intel():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("setup_intel_t", ROOT / "sycl" / "setup_intel.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+class ServedModel(unittest.TestCase):
+    """Unsloth's UD-IQ1_S: the model this fork serves on a B70 (pins, the revision of its own, the layer 18 graft)."""
+
+    def test_the_files_are_pinned_at_their_own_revision(self):
+        fam = setup.FAMILIES["unsloth"]
+        self.assertEqual(setup.model_shards(fam, "UD-IQ1_S"), 3)
+        names = [setup.model_file(fam, "UD-IQ1_S", i) for i in (1, 2, 3)]
+        self.assertEqual(names[1], "Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf")
+        pins = setup.REPO_PINS["unsloth/Qwen3.8-Flash-Next-GGUF"]
+        for n in names:
+            self.assertIn(n, pins)
+            self.assertIn(n, fam["sha256"])
+            self.assertRegex(pins[n][1], r"^[0-9a-f]{64}$")
+        self.assertIn("/resolve/" + setup.UNSLOTH_IQ1_S_REVISION + "/UD-IQ1_S/", setup.model_hf(fam, "UD-IQ1_S"))
+        # the other sizes stay at the family's revision
+        self.assertIn("/resolve/" + setup.HF_REVISIONS["unsloth/Qwen3.8-Flash-Next-GGUF"] + "/UD-IQ4_XS/", setup.model_hf(fam, "UD-IQ4_XS"))
+        self.assertIn("/resolve/" + setup.HF_REVISIONS["ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"] + "/", setup.model_hf(setup.FAMILIES["qwen"], "IQ2_XS"))
+
+    def test_the_graft_names_a_shard_of_the_model_and_keeps_its_size(self):
+        g = setup.MODELS["UD-IQ1_S"]["graft"]
+        fam = setup.FAMILIES["unsloth"]
+        self.assertEqual(g["result"][0], setup.REPO_PINS["unsloth/Qwen3.8-Flash-Next-GGUF"][g["shard"]][0])
+        self.assertNotEqual(g["result"][1], setup.REPO_PINS["unsloth/Qwen3.8-Flash-Next-GGUF"][g["shard"]][1])
+        self.assertEqual(setup.shard_pin("UD-IQ1_S", fam, Path("/x") / g["shard"]), tuple(g["result"]))
+        other = setup.model_file(fam, "UD-IQ1_S", 3)
+        self.assertEqual(setup.shard_pin("UD-IQ1_S", fam, Path("/x") / other), setup.REPO_PINS["unsloth/Qwen3.8-Flash-Next-GGUF"][other])
+        self.assertIsNone(setup.MODELS["UD-IQ4_XS"].get("graft"))
+
+    def test_the_model_is_a_choice_of_the_unsloth_family_with_the_served_context(self):
+        d = setup.MODELS["UD-IQ1_S"]
+        self.assertEqual(d["families"], ("unsloth",))
+        self.assertEqual(d["rec_ctx"], 262144)
+        self.assertTrue(d["ple_gguf"])
+        self.assertFalse(d.get("budget"))
+
+
+class GraftStep(unittest.TestCase):
+    """setup.graft_step on tiny files: the graft, the check against the pinned result, the finish mark, a rerun, a file of the person's own."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "tools"))
+        import graft_tensor
+        import test_graft_tensor as T
+        self.G, self.T = graft_tensor, T
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        (self.dir / "src").mkdir()
+        (self.dir / "src" / "source.gguf").write_bytes(T.source_bytes(lead=True))
+        self.pristine = T.target_bytes()
+        done = self.dir / "expected.gguf"
+        done.write_bytes(self.pristine)
+        graft_tensor.graft(done, T.NAME, self.dir / "src" / "source.gguf", log=lambda *_: None)
+        import hashlib
+        self.expected = (done.stat().st_size, hashlib.sha256(done.read_bytes()).hexdigest())
+        self.shard = self.dir / "shard-2.gguf"
+        self.shard.write_bytes(self.pristine)
+        self.graft = {"shard": "shard-2.gguf", "tensor": T.NAME, "type": "IQ2_XXS", "source_model": "UD-IQ1_M", "source_file": "source.gguf",
+                      "source_sha256": __import__("hashlib").sha256(T.NEW).hexdigest(), "result": self.expected}
+        self.fam = setup.FAMILIES["unsloth"]
+
+    def step(self, own=False, graft=None):
+        out = io.StringIO()
+        with mock.patch.dict(setup.MODELS["UD-IQ1_S"], {"graft": graft or self.graft}), \
+                mock.patch.object(setup, "hf_folder", lambda fam, q, rev=None: str(self.dir / "src") + "/"), \
+                contextlib.redirect_stdout(out):
+            setup.graft_step("UD-IQ1_S", self.fam, [self.dir / "shard-1.gguf", self.shard], own=own)
+        return out.getvalue()
+
+    def test_the_shard_is_grafted_checked_and_marked(self):
+        out = self.step()
+        self.assertEqual(self.shard.read_bytes(), (self.dir / "expected.gguf").read_bytes())
+        self.assertIn(self.expected[1], self.shard.with_name("shard-2.gguf.done").read_text())
+        self.assertIn("has blk.1.ffn_gate_exps.weight from UD-IQ1_M", out)
+
+    def test_a_second_run_does_nothing(self):
+        self.step()
+        with mock.patch.object(self.G, "graft", side_effect=AssertionError("grafted again")):
+            self.assertIn("already has", self.step())
+
+    def test_a_run_that_stopped_after_the_graft_only_checks_and_marks(self):
+        self.shard.write_bytes((self.dir / "expected.gguf").read_bytes())
+        with mock.patch.object(self.G, "graft", side_effect=AssertionError("grafted again")):
+            self.step()
+        self.assertIn(self.expected[1], self.shard.with_name("shard-2.gguf.done").read_text())
+
+    def test_a_wrong_source_leaves_the_shard_as_it_was(self):
+        bad = {**self.graft, "source_sha256": "0" * 64}
+        with self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()):
+            self.step(graft=bad)
+        self.assertEqual(self.shard.read_bytes(), self.pristine)
+
+    def test_a_wrong_result_is_said_and_the_file_is_not_deleted(self):
+        bad = {**self.graft, "result": (self.expected[0], "0" * 64)}
+        with self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()):
+            self.step(graft=bad)
+        self.assertTrue(self.shard.exists())
+
+    def test_a_file_of_the_persons_own_is_never_changed(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()):
+            self.step(own=True)
+        self.assertEqual(self.shard.read_bytes(), self.pristine)
+
+    def test_a_model_without_a_graft_is_left_alone(self):
+        setup.graft_step("UD-IQ4_XS", self.fam, [self.shard])
+        self.assertEqual(self.shard.read_bytes(), self.pristine)
+
+
 if __name__ == "__main__":
     unittest.main()
