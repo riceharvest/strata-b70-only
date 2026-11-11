@@ -13,7 +13,7 @@ Not affiliated with Intel or with upstream Strata.
 
 | Model | Status on one B70 |
 | --- | --- |
-| [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), [ISTA-DASLab GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | Usable at 128K-256K context, chats and coding agents included (measured at 118K and 250K). Numbers below |
+| [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), Unsloth's [UD-IQ1_S](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (the file set this fork serves, setup's choice on one B70 with 64 GB of RAM) | Usable at 128K-256K context, chats and coding agents included. The numbers under [Speed](#speed) were measured on the earlier IQ2_XS file ([ISTA-DASLab GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)); the UD-IQ1_S ones are in [docs/B70.md](docs/B70.md) |
 
 ## What counts as usable here
 
@@ -88,7 +88,7 @@ now works around it (2% prompt speed), see [docs/B70.md](docs/B70.md#agent-use-a
   `renderD128`)
 - Docker (or Podman). The engine builds and runs in a container, so the host needs no oneAPI
 - 64 GB of RAM (what it's measured on)
-- Disk: about 80 GB for Qwen3.8-Flash-Next IQ2_XS
+- Disk: about 75 GB for UD-IQ1_S (66 GB of model files and 5 GB of draft layer; IQ2_XS takes about 80 GB)
 
 ### The rest of your PC matters too
 
@@ -118,11 +118,21 @@ PCIe 4.0 x16 slot. Treat them as a floor; on a newer platform expect more, but n
 
    The build ends with `BUILD EXIT 0` and `errors: 0`.
 
-3. Set up a model and serve it:
+3. Set up the model and serve it:
 
-       ./setup.sh --backend sycl --model IQ2_XS
+       ./setup.sh --backend sycl --family unsloth --model UD-IQ1_S --context 262144 --vision no
 
-   Setup downloads the model, builds its pack, writes a config and a `run-<model>.sh` that starts the server.
+   On one B70 with 64 GB of RAM, a first `./setup.sh --backend sycl` with no `--family` or `--model` preselects the same
+   model and context in its menu (`--yes` takes them).
+   Setup downloads Unsloth's UD-IQ1_S files at a pinned revision, checks them against pinned sizes and SHA-256 sums, and
+   takes one tensor (layer 18's gate experts) from the UD-IQ1_M file of the same repository into shard 2, about 216 MB read
+   (the file as published cannot be packed: `docs/QUANTS.md` says why; nothing is quantized again). It then builds the pack,
+   fetches the draft layer (about 5 GB of tensors from the Qwen checkpoint, read by range requests), writes a config
+   (`strata-unsloth-ud-iq1_s.json`, its `exe` is `sycl/serve/strata-sycl.sh`) and a `run-unsloth-ud-iq1_s.sh` that starts
+   the server, and starts it. The config carries the settings this fork serves with: `--spec 6`, the coding agent's expert
+   profile and draft vocabulary, `--prefill 16384`, int8 KV with 32K of it in VRAM, and three `STRATA_*` switches. The list
+   is printed when setup writes it and kept in [docs/B70.md](docs/B70.md#the-served-setup). `--no-served-recipe` leaves it
+   out. Another model: `--model IQ2_XS` (the earlier default), or any size of `--family`.
 
 Details, every engine switch and what was measured: [docs/INTEL.md](docs/INTEL.md).
 
@@ -140,14 +150,15 @@ The server speaks the OpenAI, Anthropic and OpenAI Responses APIs on the port se
 
 For one long agent session (a system prompt of 40K-60K tokens, the context up to the model's 262,144 tokens):
 
-    ./setup.sh --backend sycl --model IQ2_XS --context 262144 --vram-reserve-mib 3072 --vision no
+    ./setup.sh --backend sycl --family unsloth --model UD-IQ1_S --context 262144 --vram-reserve-mib 3072 --vision no
 
 - **3 GB of VRAM for the desktop** was enough on the test box (KDE and a browser). Everything else goes to the expert
   cache: about 16,000 experts in VRAM instead of 13,000 with 7 GB kept free, so less is read over PCIe.
 - **Drafts for code.** With a context above 64K setup drafts from an English + code token subset (`--draft-vocab code`)
-  over the last 8,192 cells (`--mtp-window 8192`): ~6% faster answers for a coding agent, the same tokens. For an agent
-  that writes code, `--expert-profile data/expert-profile-pi.bin` in the config's args keeps the experts pi sessions use
-  in VRAM (made from pi sessions on this repo; ~2.6% on those, the same elsewhere).
+  over the last 8,192 cells (`--mtp-window 8192`): ~6% faster answers for a coding agent, the same tokens. For UD-IQ1_S
+  the config also has `--expert-profile data/expert-profile-pi.bin`, which keeps the experts pi sessions use in VRAM (made
+  from pi sessions on this repo, on the IQ2_XS pack; not measured on UD-IQ1_S yet). For another model, add it to the
+  config's args by hand.
 - **Thinking** is on at the model's highest level (`xhigh`) unless the client asks for another (`reasoning_effort`:
   `low`, `medium`, `high` or `xhigh`, `none` turns it off).
 - **Earlier turns' thinking stays in the prompt** when the client sends it back (`reasoning_content`, as pi does). The
@@ -174,7 +185,7 @@ under [Speed](#speed); sessions past 118K tokens are not measured yet.
   [For a coding agent](#for-a-coding-agent) before turning them on.
 - **Keep RAM headroom on a desktop.** On a 64 GB machine leave `--ple-io` at its default (`direct`); `ram` locks a
   28.8 GB table into memory. Size `STRATA_MIRROR_MIB` so a few GB stay free: 25000 for Flash-Next IQ2_XS at 256K left
-  15.9 GB free on 64 GB.
+  15.9 GB free on 64 GB (not measured for UD-IQ1_S).
 - **B70 defaults are on.** The engine sets its B70 settings (`STRATA_VERIFY_DEVICE_PLAN`, `STRATA_SELECT_LONG`,
   `STRATA_HC_Q8` and the others listed in [docs/B70.md](docs/B70.md)) unless you set them yourself; `0` turns one off,
   `STRATA_B70_DEFAULTS=0` turns all of them off. The B70 prompt kernels (attention, selection, GDN, hyper-connections,

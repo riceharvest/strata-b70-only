@@ -22,6 +22,7 @@ cd Strata
 docker build --pull -t strata-sycl-dev sycl/tools                 # once, about 6 minutes, 13 GB
 # build the engine: see "How to build it", then
 ./setup.sh --backend sycl [setup's options, e.g. --model IQ3_S --context 32768 --port 8085]
+# the B70's served model: ./setup.sh --backend sycl --family unsloth --model UD-IQ1_S --context 262144 --vision no (docs/B70.md, "The served setup")
 ```
 
 `setup.sh` makes its own Python environment in `.venv`. Do not run `python3 sycl/setup_intel.py` yourself: Ubuntu's system
@@ -38,7 +39,7 @@ MTP draft layer and the context and KV questions are setup's own.
 | GPU check | The Arc is found in sysfs (vendor 8086 under `xe` or `i915`) and offered through setup's AMD path (it builds locally and has no images). |
 | Engine | Uses the SYCL build (`build-sycl-aot/strata` or `build-sycl/strata`, run in the `strata-sycl-dev` image by `sycl/serve/strata-sycl.sh`). |
 | RAM rule | Does not apply on an `xe` card: the port streams the experts from the GGUF into VRAM (`--stream-experts`), so RAM only decides KV streaming. `--check` lists what fits by VRAM. |
-| Config | Container paths and `"backend": "sycl"`. VRAM reserve 1,024 MiB up to 32K context and 2,048 MiB above, 300 MiB on a card under 12 GB. A `--vram-reserve-mib N` you give is kept. KV streaming (`--kv-resident 32768`) is on from 64K when the RAM holds the KV. |
+| Config | Container paths and `"backend": "sycl"`. For UD-IQ1_S on a B70 the served recipe on top ([B70.md](B70.md#the-served-setup); `--no-served-recipe` leaves it out). VRAM reserve 1,024 MiB up to 32K context and 2,048 MiB above, 300 MiB on a card under 12 GB. A `--vram-reserve-mib N` you give is kept. KV streaming (`--kv-resident 32768`) is on from 64K when the RAM holds the KV. |
 | Fit rule | A model that does not fit the card at the default context gets a context down the ladder 32K, 16K, 8K, a smaller prompt chunk and a lower reserve until it does. Setup prints one plain line per change. |
 | Prompt chunk | 4,096 tokens; 8,192 on a Battlemage card with 24 GB or more above 32K context. A `--prefill` in the config is kept. |
 | Alchemist (A-series) | A different config: [Arc A750 and the other Alchemist cards](#arc-a750-and-the-other-alchemist-cards). |
