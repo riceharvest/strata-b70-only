@@ -119,6 +119,7 @@ PCIe 4.0 x16 slot. Treat them as a floor; on a newer platform expect more, but n
            -e BUILD_DIR=/work/$H/build-sycl-aot strata-sycl-dev "cd /work/$H && bash sycl/tools/build.sh strata"
 
    The build ends with `BUILD EXIT 0` and `errors: 0`.
+   The image pins the device compiler (IGC 2.41.5, ocloc 26.35.39758.10): a newer one made answers 3-5% slower (docs/B70.md, "Build and run").
 
 3. Set up the model and serve it:
 
