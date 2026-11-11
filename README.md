@@ -109,7 +109,8 @@ PCIe 4.0 x16 slot. Treat them as a floor; on a newer platform expect more, but n
        sudo apt install docker.io git        # or your distro's equivalent
        sudo usermod -aG docker,render $USER  # then log out and in again
 
-2. Get the code and build the engine. The image takes about 6 minutes once; the engine takes a few minutes:
+2. Get the code and build the engine. The image takes about 6 minutes once (13 GB); the engine takes about 11 minutes on
+   a 16-core desktop:
 
        git clone -b b70 https://github.com/riceharvest/strata-b70-only && cd strata-b70-only
        docker build --pull -t strata-sycl-dev sycl/tools
@@ -135,6 +136,14 @@ PCIe 4.0 x16 slot. Treat them as a floor; on a newer platform expect more, but n
    profile and draft vocabulary, `--prefill 16384`, int8 KV with 32K of it in VRAM, and three `STRATA_*` switches. The list
    is printed when setup writes it and kept in [docs/B70.md](docs/B70.md#the-served-setup). `--no-served-recipe` leaves it
    out. Another model: `--model IQ2_XS` (the earlier default), or any size of `--family`.
+
+   Useful with it: `--gguf-dir <folder>` when the model files are already on the PC (setup checks them, downloads nothing
+   it finds there and leaves a small `.done` mark beside each file), `--data-dir <folder>` for where the pack and the draft
+   layer go (default: next to the repository), `--yes` to take the defaults without questions, `--no-start` to stop after
+   the config and the run script are written. The model and the repository must be under the same folder the container
+   mounts (the repository's parent); a model elsewhere needs its folder in `STRATA_SYCL_MOUNTS`.
+   On a 64 GB PC setup leaves the n-gram table on the SSD; with 85 GB of RAM or more it keeps it in RAM (`--ple-io ram`).
+   A fresh clone took 20 minutes here from `git clone` to a config that starts, with the model files already on disk.
 
 Details, every engine switch and what was measured: [docs/INTEL.md](docs/INTEL.md).
 

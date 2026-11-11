@@ -116,12 +116,32 @@ def sycl_dsv41_exe(eng=None):
 def sycl_path(path) -> str:
     """A host path as the engine's container sees it: the folder above the Strata checkout (or STRATA_SYCL_ROOT) is
     mounted at /work."""
-    p, root = Path(path).resolve(), MOUNT.resolve()
+    root = MOUNT.resolve()
+    # The path as the person's folder names it first: a shard that is a link (a hub cache's snapshot folder, a file kept on
+    # another disk) keeps its own name.  Its target's name gave the engine the same shard twice ("duplicate split shard
+    # number": once found beside shard 1, once under --ple-gguf), or none at all.
+    for p in (Path(os.path.abspath(path)), Path(path).resolve()):
+        try:
+            return "/work/" + p.relative_to(root).as_posix()
+        except ValueError:
+            continue
+    S.fail(f"{Path(path).resolve()} is outside {root}, which the SYCL engine's container mounts",
+           f"keep the models and the data folder under {root} (--models-dir / --data-dir)")
+
+
+def link_outside_mount(path) -> str | None:
+    """The target of a link the container cannot follow: one that leaves the mounted folder (the container sees /work, so an
+    absolute target, or one outside the folder, is not there unless its folder is in STRATA_SYCL_MOUNTS)."""
+    p = Path(os.path.abspath(path))
+    if not p.is_symlink():
+        return None
+    raw = os.readlink(p)
+    target = Path(raw) if os.path.isabs(raw) else p.parent / raw
     try:
-        return "/work/" + p.relative_to(root).as_posix()
+        Path(os.path.abspath(target)).relative_to(MOUNT.resolve())
     except ValueError:
-        S.fail(f"{p} is outside {root}, which the SYCL engine's container mounts",
-               f"keep the models and the data folder under {root} (--models-dir / --data-dir)")
+        return str(target)
+    return str(target) if os.path.isabs(raw) else None
 
 
 def sycl_version() -> str:
@@ -369,6 +389,15 @@ def _model_title(model: str, args: list) -> str:
     return model if model and "/" not in model and chr(92) not in model else ""
 
 
+PLE_TABLE_GB = 28.8                                  # Qwen3.8-Flash-Next's n-gram table (per_layer_token_embd), the size setup.py assumes
+
+
+def ple_ram_need(model: str) -> float:
+    """The RAM from which setup's rule keeps the n-gram table in RAM: the model's own need, the table and 16 GB to spare."""
+    entry = S.MODELS.get(model) or S.MODELS.get(model.split("-", 1)[-1]) or {}
+    return float(entry.get("ram_gb", 48)) + PLE_TABLE_GB + 16
+
+
 def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, driver: str = "xe",
             devid: str = "", fit_notes: list | None = None, model: str = "", ctx_asked: bool = False,
             auto_reserve: bool = False, fit: bool = True, served: bool = False, draft_asked: bool = False,
@@ -405,6 +434,7 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
         i = args.index("--expert-profile") + 1
         if args[i].replace("\\", "/").rsplit("/", 1)[-1] == "expert-profile.bin":
             args[i] = args[i][:-len("expert-profile.bin")] + SYCL_PROFILE
+    native_host = flag(args, "--native")                # the host path, before it becomes the container's
     for f in ("--pack", "--native", "--ple-gguf", "--expert-profile", "--mtp", "--control-vector-scaled"):
         if f in args:
             v = args[args.index(f) + 1]
@@ -453,7 +483,26 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
             args += ["--ple-io", "ram"]
         args += ["--vram-reserve-mib", reserve]
     else:
+        # setup adds --ple-io ram (the n-gram table in RAM) when the PC has 16 GB to spare beyond the model's own need.  This
+        # route gives setup a made-up RAM size (the experts go to VRAM), so that rule fired on every PC: a 64 GB PC then
+        # pinned a 29 GB table beside the mirror of the experts that VRAM does not hold.  Here the rule is applied to the real
+        # RAM; a --ple-io the person wrote into the config themselves ("user_args") is kept.
+        if flag(args, "--ple-io") == "ram" and "--ple-io" not in (cfg.get("user_args") or []) and ram < ple_ram_need(model):
+            drop(args, "--ple-io", True)
+            if fit_notes is not None:
+                fit_notes.append(f"{ram:.0f} GB of RAM: the n-gram table is read from the SSD (no --ple-io ram; it would pin "
+                                 f"{PLE_TABLE_GB:.0f} GB, and that needs {ple_ram_need(model):.0f} GB of RAM for this model)")
+        elif flag(args, "--ple-io") == "ram" and fit_notes is not None:
+            fit_notes.append(f"{ram:.0f} GB of RAM: the {PLE_TABLE_GB:.0f} GB n-gram table is kept in RAM (--ple-io ram), so a new "
+                             "prompt does not wait for its rows from the SSD")
         args += ["--stream-experts", "--vram-reserve-mib", reserve]
+    if fit_notes is not None and native_host:
+        folder = Path(native_host).parent
+        for shard in sorted(folder.glob("*.gguf")) if folder.is_dir() else []:
+            target = link_outside_mount(shard)
+            if target:
+                fit_notes.append(f"{shard.name} is a link to {target}: the engine's container does not see that file. Copy it "
+                                 f"into {folder}, or put the target's folder into STRATA_SYCL_MOUNTS (the config's \"env\")")
     if ctx > 32768 or vram_gb >= 24:                    # long contexts: 4096-token chunks keep the prompt buffers small; a
         # 24 GB+ card with part of the experts in the RAM mirror streams those over PCIe once per chunk, so fewer, bigger
         # chunks read the prompt faster (Arc Pro B70, IQ3_S, a 4,095-token prompt: 2,048-token chunks 618 tok/s, 4,096: 1,002;
@@ -555,6 +604,8 @@ def install(argv) -> None:
         msg = re.sub(r"\b(xe|i915) \(AMD: docs/AMD_HIP\.md\)", r"\1 driver (Intel Arc: docs/INTEL.md)", msg)
         where = ("the experts the card does not hold are computed on the CPU" if alch
                  else "the experts are streamed into VRAM")
+        if real_ram < fake_ram and f"{fake_ram:.0f} GB of RAM: the" in msg and "(--ple-io ram)" in msg:
+            return                                      # setup's n-gram table rule on the made-up RAM size: to_sycl decides it on the real one and says so
         msg = msg.replace(f"RAM: {fake_ram:.0f} GB", f"RAM: {real_ram:.0f} GB ({where})")
         msg = msg.replace(f"({fake_ram:.0f} GB RAM +", f"({real_ram:.0f} GB RAM +").replace(f"you have {fake_ram:.0f} GB RAM", f"you have {real_ram:.0f} GB RAM")
         if re.match(r"\s+\S+\s+needs ~\d+ GB RAM:", msg):   # --check's CUDA verdicts: replaced by the Intel one

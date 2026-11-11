@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import io
 import re
+import os
 import sys
 import tempfile
 import unittest
@@ -221,6 +222,53 @@ class ToSycl(unittest.TestCase):
             c = m.to_sycl(self.cfg(m, ["--vram-reserve-mib", "500"]), m.ROOT / "build-sycl-aot" / "strata", 64.0, {}, vram, drv)
             self.assertEqual(c["args"].count("--vram-reserve-mib"), 1)
             self.assertEqual(c["args"][c["args"].index("--vram-reserve-mib") + 1], "500")
+
+    def test_a_linked_shard_keeps_its_own_name_and_a_link_out_of_the_mount_is_said(self):
+        # shard 3 as a link gave the engine "duplicate split shard number" (found beside shard 1 and again, under its target's
+        # name, as --ple-gguf) or "missing model shard" (an absolute target the container does not mount)
+        import tempfile
+        m = self.mod()
+        with tempfile.TemporaryDirectory() as inside, tempfile.TemporaryDirectory() as outside, \
+                mock.patch.object(m, "MOUNT", Path(inside)):
+            models, store = Path(inside) / "models", Path(inside) / "store"
+            models.mkdir(); store.mkdir()
+            for f in (models / "a-00001-of-00003.gguf", store / "table.gguf", Path(outside) / "far.gguf"):
+                f.write_bytes(b"x")
+            near, far = models / "a-00003-of-00003.gguf", models / "a-00002-of-00003.gguf"
+            os.symlink("../store/table.gguf", near)
+            os.symlink(str(Path(outside) / "far.gguf"), far)
+            self.assertEqual(m.sycl_path(near), "/work/models/a-00003-of-00003.gguf")
+            self.assertEqual(m.sycl_path(far), "/work/models/a-00002-of-00003.gguf")
+            self.assertIsNone(m.link_outside_mount(near))
+            self.assertIsNone(m.link_outside_mount(models / "a-00001-of-00003.gguf"))
+            self.assertEqual(m.link_outside_mount(far), str(Path(outside) / "far.gguf"))
+            cfg = {"exe": "x", "cwd": "y", "args": ["--pack", str(models), "--native", str(models / "a-00001-of-00003.gguf"),
+                                                     "--ple-gguf", str(near), "--expert-cache", "auto", "--prefill", "auto",
+                                                     "--max-context", "32768", "--kv", "int8"]}
+            notes = []
+            c = m.to_sycl(cfg, m.ROOT / "build-sycl-aot" / "strata", 64.0, {}, 32.0, "xe", fit_notes=notes)
+            self.assertEqual(c["args"][c["args"].index("--ple-gguf") + 1], "/work/models/a-00003-of-00003.gguf")
+            said = [n for n in notes if "is a link to" in n]
+            self.assertEqual(len(said), 1, notes)
+            self.assertIn("a-00002-of-00003.gguf", said[0])
+            self.assertIn("STRATA_SYCL_MOUNTS", said[0])
+
+    def test_the_ngram_table_stays_on_the_ssd_unless_the_real_ram_holds_it(self):
+        # setup's rule (16 GB to spare beyond the model and the table) saw this route's made-up RAM size and put --ple-io ram
+        # into every config: 29 GB pinned on a 64 GB PC beside the experts' mirror
+        m = self.mod()
+        exe = m.ROOT / "build-sycl-aot" / "strata"
+        notes = []
+        c = m.to_sycl(self.cfg(m, ["--ple-io", "ram"]), exe, 63.0, {}, 32.0, "xe", model="unsloth-UD-IQ1_S", fit_notes=notes)
+        self.assertNotIn("--ple-io", c["args"])
+        self.assertIn("--stream-experts", c["args"])
+        self.assertTrue(any("n-gram table is read from the SSD" in n for n in notes), notes)
+        c = m.to_sycl(self.cfg(m, ["--ple-io", "ram"]), exe, 128.0, {}, 32.0, "xe", model="unsloth-UD-IQ1_S")
+        self.assertEqual(c["args"][c["args"].index("--ple-io") + 1], "ram")       # 40 + 28.8 + 16 GB fits
+        mine = {**self.cfg(m, ["--ple-io", "ram"]), "user_args": ["--ple-io", "ram"]}
+        c = m.to_sycl(mine, exe, 63.0, {}, 32.0, "xe", model="unsloth-UD-IQ1_S")
+        self.assertEqual(c["args"][c["args"].index("--ple-io") + 1], "ram")       # the person's own choice is kept
+        self.assertEqual(m.ple_ram_need("UD-IQ1_S"), m.ple_ram_need("unsloth-UD-IQ1_S"))
 
     def test_a_series_loads_experts_into_ram_and_leaves_no_host_off(self):
         m = self.mod()
