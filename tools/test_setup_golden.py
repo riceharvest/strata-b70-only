@@ -58,7 +58,7 @@ def normalize(v, t: Path):
     if isinstance(v, str):
         v = v.replace(str(t), "<T>").replace("\\", "/")
         # the platform's own names of the programs (strata.exe or strata, strata-vision.exe or strata-vision, ...) so the baseline compares on Windows and Linux (#3325)
-        for name, label in ((setup.HVEXE, "<HVEXE>"), (setup.VEXE, "<VEXE>"), (setup.EXE, "<EXE>")):
+        for name, label in ((setup.VEXE, "<VEXE>"), (setup.EXE, "<EXE>")):
             v = re.sub(rf"(?<![w.-]){re.escape(name)}(?![w.-])", label, v)   # #973: only the whole name, not "strata-x.log" on Linux
         return v
     return v
