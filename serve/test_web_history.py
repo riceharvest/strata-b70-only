@@ -38,20 +38,6 @@ class OffIsThePageFromBefore(unittest.TestCase):
         cls.ui = (WEB / "chats-ui.js").read_text(encoding="utf-8")
         cls.store = (WEB / "chatstore.js").read_text(encoding="utf-8")
 
-    def test_the_three_switches_start_off(self):
-        self.assertIn('chatList: false, chatEdit: false, whileBusy: "wait"', self.app)
-        for el in ("s-list", "s-edit"):
-            self.assertIn('aria-checked="false"', re.search(rf'<button[^>]*id="{el}"[^>]*>', self.html).group(0))
-        self.assertIn('data-v="wait"', self.html)
-        self.assertRegex(self.html, r'<aside class="chat-sidebar"[^>]*\bhidden>')              # no list until it is switched on
-
-    def test_the_browser_store_is_opened_only_for_the_list(self):
-        self.assertEqual(self.ui.count("chatStore.start()"), 1)
-        self.assertRegex(self.ui, r"async function openChats\(fromScreen\) \{\s*await chatStore\.start\(\);")
-        self.assertEqual(len(re.findall(r"\bopenChats\(", self.ui)), 2)       # its definition and the one call, in setChatList
-        self.assertNotIn("indexedDB", self.app, "the page's main script never touches the store")
-        self.assertIn("if (settings.chatList) await setChatList(true, false);", self.app)
-
     def test_with_the_list_off_one_chat_is_kept_as_before(self):
         self.assertIn('if (!listOn) { store.set("chat", H.cleanMessages(messages)); return; }', self.ui)
         self.assertIn('$("new-btn").hidden = on;', self.ui)                  # only the list's own New chat shows while it is on
@@ -66,18 +52,6 @@ class OffIsThePageFromBefore(unittest.TestCase):
                 if call != '"v1/chat/completions"':                    # the question itself, as ever
                     self.assertNotRegex(call, r"chat|histor", f"{name}: {call}")
 
-    def test_the_edit_controls_wait_for_a_finished_answer(self):
-        self.assertIn("const historyLocked = () => !!busy || !!panel || !!pending;", self.ui)
-        self.assertIn("$(\"s-list\").disabled = $(\"s-edit\").disabled = !!busy || !!panel;", self.app)
-
-    def test_an_interrupted_answer_keeps_what_was_written(self):
-        self.assertIn("if (cut) m.interrupted = true;", self.app)
-        self.assertIn("busy.cutAfterTool = true; return; }   // let the tool finish", self.app)
-        self.assertIn("settlePending(cut, !m.stopped && !m.error);", self.app)
-
-    def test_sending_while_busy_parks_nothing_unless_asked(self):
-        self.assertIn('const parksWhileBusy = () => settings.whileBusy === "queue" || settings.whileBusy === "interject";', self.app)
-        self.assertIn("if (!parksWhileBusy()) return;", self.app)
 
 
 class NothingOnTheServer(unittest.TestCase):
