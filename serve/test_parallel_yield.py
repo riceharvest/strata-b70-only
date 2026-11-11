@@ -309,14 +309,15 @@ class ParallelServiceYield(tp.FakeEngineCase):
         seen = []
         while t.is_alive() and time.time() - t0 < 20:
             live = self.get("/metrics")["live"]
-            seen.append((live.get("running"), live.get("queued"), live.get("admitting")))
+            seen.append((live.get("running"), live.get("outside_slots"), live.get("queued"), live.get("admitting")))
             time.sleep(0.05)
         t.join(5)
         self.assertEqual(errs, [])
         self.assertFalse(t.is_alive(), "the request hung on a slot nobody owns")
         self.assertEqual(res["r"]["choices"][0]["message"]["content"], "ok, done.")
-        # while it waited it was visible: running as a request, and counted as waiting for a slot - never 0 / 0 / 0
-        self.assertTrue(any(r == 1 and a == 1 for r, q, a in seen), seen)
+        # while it waited it was visible: a request in flight outside the slots (running counts slots only, d2491e47)
+        # and counted as waiting for a slot; once admitted it is running in a slot - never all zero
+        self.assertTrue(any(r == 0 and o == 1 and a == 1 for r, o, q, a in seen), seen)
         first = next(i for i, x in enumerate(seen) if sum(v or 0 for v in x))
         self.assertTrue(all(sum(v or 0 for v in x) for x in seen[first:-1]), seen)   # never invisible once it arrived
         self.assertEqual(e.admitting, 0)

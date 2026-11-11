@@ -501,7 +501,7 @@ const clock = (t) => new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit",
 const clockShort = (t) => new Date(t * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
 const dayLabel = (iso) => new Date(`${iso}T12:00:00`).toLocaleDateString([], {month: "short", day: "numeric"});
 const FINISH = {stop: ["st-badge--generating", "Done"], length: ["st-badge--reading", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
-                disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
+                disconnect: ["st-badge--queued", "Closed"], timeout: ["st-badge--queued", "Timeout"], error: ["st-badge--error", "Error"]};
 const COLORS = {decode: "var(--c-decode)", prefill: "var(--c-prefill)", cached: "var(--c-cached)", fresh: "var(--c-fresh)", out: "var(--c-out)"};
 
 // % change of the recent half against the one before it, as a small chip; better = "up" or "down"
@@ -1222,7 +1222,7 @@ function markdown(text) {
 // fields: the server picks the card's set for the request's thinking state (thinking 1.0 / 0.95 / 20, not thinking
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
-const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true};
+const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, math: false};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 function samplingUntouched(s) {
   const t = +s.temperature;
@@ -1306,17 +1306,21 @@ function toolHtml(t, k) {
     `<span class="st-badge ${cls}">${esc(label)}</span>${t.ms != null && t.state !== "skipped" ? `<span class="muted small">${fmt(t.ms / 1000, 1)} s</span>` : ""}` +
     `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body">${body}</div></details>`;
 }
+// math (opt-in, serve/web/math.js): formulas become placeholders before the Markdown runs and are drawn after it
+function answerMarkdown(text) {
+  return settings.math ? StrataMath.markdown(text, markdown) : markdown(text);
+}
 // the answer's text with the tool blocks where the model called them
 function answerHtml(m) {
-  if (!m.tools || !m.tools.length) return markdown(m.text || "");
+  if (!m.tools || !m.tools.length) return answerMarkdown(m.text || "");
   let html = "", pos = 0;
   m.tools.forEach((t, k) => {
     const at = Math.min(Math.max(t.at || 0, pos), m.text.length);
-    if (at > pos) html += markdown(m.text.slice(pos, at));
+    if (at > pos) html += answerMarkdown(m.text.slice(pos, at));
     pos = at;
     html += toolHtml(t, k);
   });
-  return html + markdown(m.text.slice(pos));
+  return html + answerMarkdown(m.text.slice(pos));
 }
 // a tool event from the stream (the `strata_mcp` field of a chunk)
 function onTool(m, x) {
@@ -1353,6 +1357,7 @@ function updateAssistant(el, m, streaming) {
     bubble.innerHTML = m.reasoning ? `<span class="muted cursor">Writing</span>` : `<span class="cursor"></span>`;
   } else {
     bubble.innerHTML = answerHtml(m);
+    if (settings.math) StrataMath.hydrate(bubble);
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
   }
   el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? "Stopped" : "");
@@ -1365,8 +1370,36 @@ function renderChat() {
   messages.forEach((m, i) => chat.appendChild(msgEl(m, i)));
   scrollDown(true);
 }
-function nearBottom() { const s = $("chat-scroll"); return s.scrollHeight - s.scrollTop - s.clientHeight < 120; }
-function scrollDown(force) { const s = $("chat-scroll"); if (force || nearBottom()) s.scrollTop = s.scrollHeight; }
+// Follow the answer while the reader has not left (#4014). Asking "am I within 120 px of the bottom?" on every frame pulled
+// the view back after every wheel notch (a notch is about 100 px), so scrolling up during a long answer only worked by
+// dragging the scrollbar. Now the reader's own input lets go (wheel up, a finger or a key moving up, the scrollbar), and a
+// scroll back to the bottom follows again.
+let stickToBottom = true, lastReaderInput = 0;
+const FOLLOW_SLACK = 24, FAR_AWAY = 400, INPUT_WINDOW_MS = 400;
+function followAfterScroll(distance, wasFollowing, msSinceInput) {
+  if (distance <= FOLLOW_SLACK) return true;
+  if (msSinceInput <= INPUT_WINDOW_MS || distance > FAR_AWAY) return false;
+  return wasFollowing;
+}
+function scrollDown(force) {
+  const s = $("chat-scroll");
+  if (force) stickToBottom = true;
+  if (stickToBottom) s.scrollTop = s.scrollHeight;
+}
+(function watchReader() {
+  const s = $("chat-scroll");
+  const touch = () => { lastReaderInput = Date.now(); };
+  s.addEventListener("wheel", (e) => { touch(); if (e.deltaY < 0 && s.scrollTop > 0) stickToBottom = false; }, {passive: true});
+  s.addEventListener("touchmove", touch, {passive: true});
+  s.addEventListener("pointerdown", touch, {passive: true});
+  s.addEventListener("keydown", (e) => {
+    touch();
+    if (["PageUp", "ArrowUp", "Home"].includes(e.key) && e.target === s && s.scrollTop > 0) stickToBottom = false;
+  });
+  s.addEventListener("scroll", () => {
+    stickToBottom = followAfterScroll(s.scrollHeight - s.scrollTop - s.clientHeight, stickToBottom, Date.now() - lastReaderInput);
+  }, {passive: true});
+})();
 
 $("chat").addEventListener("click", (e) => {
   const cc = e.target.closest("[data-code-copy]");
@@ -1672,6 +1705,7 @@ function loadDrawer(s = settings) {
   $("s-effort").disabled = s.thinking === "none";
   $("s-temp").value = s.temperature; $("s-topp").value = s.top_p; $("s-topk").value = s.top_k;
   $("s-max").value = s.max; $("s-seed").value = s.seed;
+  $("s-math").setAttribute("aria-checked", String(!!s.math));
   $("s-show").setAttribute("aria-checked", String(!!s.show));
   $("s-esp").setAttribute("aria-checked", String(s.esp !== false));
   $("esp-row").hidden = !projectionLoaded();
@@ -1734,6 +1768,7 @@ $("s-effort").oninput = () => {   // (a number of one's own: no word is selected
   outputs();
 };
 for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
+$("s-math").onclick = () => $("s-math").setAttribute("aria-checked", String($("s-math").getAttribute("aria-checked") !== "true"));
 $("s-show").onclick = () => $("s-show").setAttribute("aria-checked", String($("s-show").getAttribute("aria-checked") !== "true"));
 $("s-esp").onclick = () => $("s-esp").setAttribute("aria-checked", String($("s-esp").getAttribute("aria-checked") !== "true"));
 $("s-mcp").onclick = () => $("s-mcp").setAttribute("aria-checked", String($("s-mcp").getAttribute("aria-checked") !== "true"));
@@ -1743,10 +1778,12 @@ $("s-apply").onclick = async () => {
   const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
   settings = {thinking: sel ? sel.dataset.v : effortShown() ? +$("s-effort").value : "high", temperature: +$("s-temp").value, top_p: +$("s-topp").value,
               top_k: +$("s-topk").value, max: $("s-max").value.trim(), seed: $("s-seed").value.trim(),
+              math: $("s-math").getAttribute("aria-checked") === "true",
               show: $("s-show").getAttribute("aria-checked") === "true",
               esp: $("s-esp").getAttribute("aria-checked") === "true",
               mcp: $("s-mcp").getAttribute("aria-checked") === "true"};
   store.set("sampling", settings);
+  StrataMath.reset();                                  // math on or off: every answer is drawn again
   const share = $("s-share").getAttribute("aria-checked") === "true";
   openDrawer(false);
   if (share || sharedOn) {
