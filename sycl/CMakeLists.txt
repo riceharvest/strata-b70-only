@@ -671,7 +671,7 @@ if(STRATA_BUILD_Q36)
       message(FATAL_ERROR "strata-q36 with AOT=${STRATA_SYCL_AOT} needs third_party/sycl-tla and third_party/vllm-xpu-kernels "
                           "(its long-prompt attention).  Run once:  bash sycl/tools/get-q36-tla.sh")
     endif()
-    file(STRINGS ${_q36_tla_dir}/vllm-xpu-kernels/csrc/xpu/attn/fmha_utils.hpp _q36_torch REGEX "torch/all\\.h")
+    file(STRINGS ${_q36_tla_dir}/vllm-xpu-kernels/csrc/xpu/attn/fmha_utils.hpp _q36_torch REGEX "^[ \t]*#[ \t]*include[ \t]*[<\"]torch/all\\.h")   # an include line, not the header's own note about it
     if(_q36_torch)
       message(FATAL_ERROR "third_party/vllm-xpu-kernels is not patched (fmha_utils.hpp still includes torch).  "
                           "Remove third_party/vllm-xpu-kernels and run:  bash sycl/tools/get-q36-tla.sh")
