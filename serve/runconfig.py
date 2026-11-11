@@ -260,11 +260,10 @@ EDITABLE = [
      "string (or string among several types) is never changed. Off: the text goes through as written, so a client may get "
      "the string \"True\" for a boolean parameter. Empty: on"),
     ("tool_skipped_closer", "bool",
-     "On by default. When the model writes a nested <parameter=X>...</parameter> inside a value (a file that documents the "
-     "call format) and leaves out the value's own </parameter>, the value keeps the nested pair and ends before </function>, "
-     "instead of being cut after the nested close. Not used when the value before that point quotes a whole call "
-     "(<function=...>). Off: the value ends at the first close that is followed by </function>. Misreads: a value that "
-     "mentions an opener with no closer of its own, then ends properly, is read to the end of the call. Empty: on"),
+     "Off by default. On: when the model writes a nested <parameter=X>...</parameter> inside a value and leaves out the "
+     "value's own </parameter>, the value keeps the nested pair and ends before </function>, instead of being cut after the "
+     "nested close. Misreads a value that itself contains an unbalanced <parameter=...> opener (text that mentions the "
+     "tag): that value can get a stray </parameter> appended. Empty: off"),
     ("tool_name_repair", ("enum", ["prefix"]),
      "What to do when the model calls a tool the request did not declare. Empty: the call goes back as text (and "
      "strata_rejected_tool_calls names it). prefix: read it as the one declared tool whose name it extends, or that "

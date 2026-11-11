@@ -858,11 +858,11 @@ _LOOSE_PART = re.compile(r"<\s*(?:function[ \t]*[=:]?\s*|=\s*)?[A-Za-z0-9_.\-]*\
 _QUOTED_OPEN = re.compile(r"<function=[^<>\s]+>\s*(?:<parameter=|</function>)")
 
 
-# On by default, set once at start from the run config ("tool_skipped_closer": false turns it off): a `</parameter>`
+# Off by default, set once at start from the run config ("tool_skipped_closer": true turns it on): a `</parameter>`
 # that closes a nested `<parameter=X>` opener inside a value is value text, and a value whose own closer the model left
 # out ends before the call's `</function>` (upstream issue 5756).  Off: the first close with a valid follower ends the
 # value, as before.
-TOOL_SKIPPED_CLOSER = True
+TOOL_SKIPPED_CLOSER = False
 # On by default ("tool_arg_coercion": false turns it off): a parameter's text is read by the declared JSON schema type
 # even when the model wrote it as Python (`True`, `False`) or as a quoted number (upstream issue 5743).  Off: the text
 # goes through as written.

@@ -2,7 +2,7 @@
 
 Upstream issues 5743 (a boolean written True/False came back as a string) and 5756 (a nested <parameter=..> pair
 ended the value early when the model left out the value's own closer).  Both fixes are settings:
-tool_arg_coercion and tool_skipped_closer (both on by default); with one off, the parser behaves as before.
+tool_arg_coercion (on by default) and tool_skipped_closer (off by default); with one off, the parser behaves as before.
 
     python -m unittest serve.test_tool_call_schema -v
 """
@@ -99,9 +99,9 @@ class SkippedCloser(unittest.TestCase):
             self.assertEqual("<parameter=limit>25</parameter>\n</function>"[:e], "<parameter=limit>25")
             self.assertEqual(call(self.SKIPPED, EDIT_TOOL)["new_string"], "<parameter=limit>25")
 
-    def test_on_is_the_default(self):
-        self.assertTrue(frontend.TOOL_SKIPPED_CLOSER)
-        self.assertEqual(call(self.SKIPPED, EDIT_TOOL)["new_string"], "<parameter=limit>25</parameter>")
+    def test_off_is_the_default(self):
+        self.assertFalse(frontend.TOOL_SKIPPED_CLOSER)
+        self.assertEqual(call(self.SKIPPED, EDIT_TOOL)["new_string"], "<parameter=limit>25")
 
     def test_a_value_that_quotes_a_whole_call_is_left_alone(self):
         # the corpus's 4078 shape: the nested pair belongs to a quoted call that has its own </function></tool_call>
