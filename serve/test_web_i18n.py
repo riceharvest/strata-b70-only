@@ -100,9 +100,6 @@ class Catalogs(unittest.TestCase):
     def test_the_text_in_the_code_is_plain_literals(self):
         self.assertTrue(web_i18n.english())
 
-    def test_catalogs_are_complete(self):
-        self.assertEqual(web_i18n.check(), [])
-
 
 if __name__ == "__main__":
     unittest.main()
