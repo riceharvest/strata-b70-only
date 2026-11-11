@@ -9,6 +9,8 @@
 #   STRATA_SYCL_NAME   the container's name                   (default: strata-sycl-serve)
 #   STRATA_SYCL_MOUNTS host paths outside the data root the args name (a model on another disk), mounted at the same path,
 #                      separated by spaces (default: none)
+#   STRATA_VISION_DIR  a host folder for the picture reader's files (serve/server.py reads it too); mounted at the same path, so the
+#                      embeddings file the server names on the GENI line is visible when /dev/shm has no room (default: none)
 #   STRATA_SYCL_SHM    1 (default): the host's /dev/shm is the container's /dev/shm. Pictures: the server (on the host) writes the
 #                      image embeddings of a request into /dev/shm and names that file on the engine's GENI line, so the engine in
 #                      the container must see the same file. 0: the container keeps a private /dev/shm.
@@ -47,6 +49,7 @@ shm=()
 if [ "${STRATA_SYCL_SHM:-1}" != 0 ] && [ -d /dev/shm ]; then shm=(-v /dev/shm:/dev/shm); fi
 mounts=()
 for m in ${STRATA_SYCL_MOUNTS:-}; do mounts+=(-v "$m:$m"); done
+if [ -n "${STRATA_VISION_DIR:-}" ]; then mkdir -p "$STRATA_VISION_DIR"; mounts+=(-v "$STRATA_VISION_DIR:$STRATA_VISION_DIR"); fi
 run_cmd="cd $repo_in && exec ${STRATA_SYCL_BIN:-build-sycl-aot/strata}$args"
 runner=${STRATA_SYCL_RUNNER:-docker}
 case "$runner" in

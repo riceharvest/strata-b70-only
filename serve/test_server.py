@@ -568,6 +568,31 @@ class VisionTempFiles(unittest.TestCase):
             finally:
                 d.rmdir()
 
+    def test_work_dir_follows_STRATA_VISION_DIR_only_when_set(self):
+        from serve.server import Vision
+        with tempfile.TemporaryDirectory() as base:
+            want = Path(base) / "vis"
+            with mock.patch.dict(os.environ, {"STRATA_VISION_DIR": str(want)}):
+                d = Vision.work_dir()
+            try:
+                self.assertEqual(d.parent, want)
+            finally:
+                d.rmdir()
+            with mock.patch.dict(os.environ, {"STRATA_VISION_DIR": ""}):
+                d = Vision.work_dir()
+            try:
+                self.assertNotEqual(d.parent, want)
+            finally:
+                d.rmdir()
+            spaced = Path(base) / "a b"
+            with mock.patch.dict(os.environ, {"STRATA_VISION_DIR": str(spaced)}):
+                d = Vision.work_dir()
+            try:
+                self.assertNotEqual(d.parent, spaced)
+                self.assertFalse(spaced.exists())
+            finally:
+                d.rmdir()
+
     def test_enc_line_names_files_relative_to_the_encoder_dir(self):
         from serve.server import Vision
 

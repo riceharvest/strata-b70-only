@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import collections
 import json
+import os
 import sys
 import time
 import urllib.parse
@@ -45,20 +46,33 @@ def install_xe_reader():
     T.gpu_reader = gpu_reader
 
 
+def container_sees(path, env=None) -> bool:
+    """Can the engine's container open `path`?  It sees the host's /dev/shm (strata-sycl.sh, unless STRATA_SYCL_SHM=0) and the folder
+    STRATA_VISION_DIR (mounted at the same path); nothing else of the host's temp folders."""
+    env = os.environ if env is None else env
+    p = str(path)
+    if p.startswith("/dev/shm/") and env.get("STRATA_SYCL_SHM", "1") != "0":
+        return True
+    d = (env.get("STRATA_VISION_DIR") or "").strip().rstrip("/")
+    return bool(d) and p.startswith(d + "/")
+
+
 def install_shared_embeddings():
     """Pictures: the engine runs in a container, and a request's image embeddings reach it as a file named on its GENI line.
     serve/server.py writes that file to /dev/shm when that has room, and strata-sycl.sh shares the host's /dev/shm with the
-    container, so the path means the same on both sides.  Anywhere else (a full /dev/shm) the container cannot see the file:
-    said once, in the log, in plain words."""
+    container (STRATA_SYCL_SHM=0 keeps a private one), so the path means the same on both sides.  Anywhere else the container
+    cannot see the file: said once, in the log, in plain words, with the way out (STRATA_VISION_DIR)."""
     orig = S.combined_embeddings_path
     said = []
 
     def path(vision_dir, nbytes):
         p = orig(vision_dir, nbytes)
-        if not str(p).startswith("/dev/shm/") and not said:
+        if not container_sees(p) and not said:
             said.append(1)
-            print("[strata] /dev/shm has no room for this picture: the engine runs in a container that sees only the host's /dev/shm, so it "
-                  "cannot read the picture. Free /dev/shm (or enlarge it: mount -o remount,size=4G /dev/shm) and send it again.", flush=True)
+            print(f"[strata] the picture file {p} is not where the engine's container can read it (it sees the host's /dev/shm, "
+                  "unless STRATA_SYCL_SHM=0, and the folder STRATA_VISION_DIR), so the picture will fail with 'cannot open'. "
+                  "Free /dev/shm (or enlarge it: mount -o remount,size=4G /dev/shm), or set STRATA_VISION_DIR to a folder "
+                  "and start again.", flush=True)
         return p
     S.combined_embeddings_path = path
 

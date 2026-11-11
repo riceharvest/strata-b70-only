@@ -2760,6 +2760,18 @@ class Vision:
         (a %TEMP% under a user name with a space) broke every image.  The system temp directory is used while its path
         has no space, then the working directory, then the system drive's root; the plain temp directory is the last
         resort (the encoder's own files are then named relative to it, see `_start`)."""
+        # STRATA_VISION_DIR (unset by default): a folder for the encoder's files and for the combined embeddings file when
+        # /dev/shm has no room.  An engine in a container (sycl/serve/strata-sycl.sh) mounts it at the same path, so the
+        # file named on the GENI line is the same file on both sides.
+        chosen = os.environ.get("STRATA_VISION_DIR", "").strip()
+        if chosen and " " in chosen:
+            print(f"[strata] STRATA_VISION_DIR {chosen} has a space (the engine's GENI line is split at spaces); the system temp folder is used", flush=True)
+        elif chosen:
+            try:
+                Path(chosen).mkdir(parents=True, exist_ok=True)
+                return Path(tempfile.mkdtemp(prefix="strata-vision-", dir=chosen))
+            except OSError as e:
+                print(f"[strata] STRATA_VISION_DIR {chosen} cannot be used ({e}); the system temp folder is used", flush=True)
         for parent in (None, Path.cwd(), Path(os.environ.get("SystemDrive", "C:") + os.sep)):
             try:
                 d = Path(tempfile.mkdtemp(prefix="strata-vision-", dir=parent))
