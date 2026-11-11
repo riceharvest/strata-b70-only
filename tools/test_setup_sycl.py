@@ -458,5 +458,108 @@ class GraftStep(unittest.TestCase):
         self.assertEqual(self.shard.read_bytes(), self.pristine)
 
 
+class ServedRecipe(unittest.TestCase):
+    """sycl/setup_intel.py: the config for UD-IQ1_S on one B70 is the served one; every other choice is as it was."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.si = load_setup_intel()
+
+    def cfg(self, **over):
+        si = self.si
+        args = ["--pack", str(si.ROOT.parent / "d" / "pack"), "--native", str(si.ROOT.parent / "d" / "a.gguf"),
+                "--ple-gguf", str(si.ROOT.parent / "d" / "c.gguf"), "--expert-profile", str(si.ROOT / "data" / "expert-profile.bin"),
+                "--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5",
+                "--mtp", str(si.ROOT.parent / "d" / "mtp" / "rt"), "--max-context", "262144", "--kv", "int8"]
+        return {"exe": "x", "args": args, **over}
+
+    def make(self, model="UD-IQ1_S", served=True, cfg=None, **kw):
+        notes = []
+        out = self.si.to_sycl(cfg or self.cfg(), self.si.ROOT / "build-sycl-aot" / "strata", 64.0, {}, 32.0, "xe", "e223",
+                              model=model, served=served, served_notes=notes, **kw)
+        return out, notes
+
+    def flag(self, out, name):
+        return self.si.flag(out["args"], name)
+
+    def test_the_served_settings(self):
+        out, notes = self.make()
+        self.assertEqual(self.flag(out, "--spec"), "6")
+        self.assertEqual(self.flag(out, "--spec-min-p"), "0.5")
+        self.assertEqual(self.flag(out, "--max-context"), "262144")
+        self.assertEqual(self.flag(out, "--kv"), "int8")
+        self.assertEqual(self.flag(out, "--kv-resident"), "32768")
+        self.assertEqual(self.flag(out, "--prefill"), "16384")
+        self.assertEqual(self.flag(out, "--mtp-window"), "8192")
+        self.assertEqual(self.flag(out, "--expert-cache"), "auto")
+        self.assertIn("--stream-experts", out["args"])
+        self.assertTrue(self.flag(out, "--expert-profile").endswith("/data/expert-profile-pi.bin"))
+        self.assertTrue(self.flag(out, "--mtp-draft-vocab").endswith("/data/draft_vocab_code.bin"))
+        self.assertTrue(self.flag(out, "--mtp-draft-vocab").startswith("/work/"))
+        self.assertEqual(out["env"], {"STRATA_SPEC_PROBE_MIN": "1", "STRATA_IQ_XXS_SGNMUL": "1", "STRATA_KREG2_R": "2,4,4,4,2,2,2,2"})
+        self.assertEqual(out["exe"], str(self.si.SYCL_WRAPPER))
+        self.assertTrue(notes)
+
+    def test_no_machine_specific_setting_is_written(self):
+        out, _ = self.make()
+        text = repr({"args": out["args"], "env": out["env"]})
+        for word in ("gpu_locks", "LEND_MIRROR", "USAGE_DUMP", "spill", "/home/"):
+            self.assertNotIn(word, text)
+
+    def test_the_recipe_is_off_for_another_model_and_when_not_asked_for(self):
+        plain, notes = self.make(served=False)
+        self.assertEqual(self.flag(plain, "--spec"), "4")
+        self.assertNotIn("--mtp-draft-vocab", plain["args"])
+        self.assertIsNone(plain.get("env"))
+        self.assertEqual(notes, [])
+        other, notes = self.make(model="UD-IQ4_XS")
+        self.assertEqual(self.flag(other, "--spec"), "4")
+        self.assertNotIn("--mtp-draft-vocab", other["args"])
+        self.assertIsNone(other.get("env"))
+        self.assertEqual(notes, [])
+
+    def test_what_the_person_chose_is_kept(self):
+        cfg = self.cfg()
+        cfg["args"][cfg["args"].index("--spec") + 1] = "8"
+        cfg["args"][cfg["args"].index("--expert-profile") + 1] = str(self.si.ROOT.parent / "mine.bin")
+        cfg["args"] += ["--mtp-draft-vocab", str(self.si.ROOT.parent / "v.bin")]
+        out, _ = self.make(cfg=cfg)
+        self.assertEqual(self.flag(out, "--spec"), "8")
+        self.assertEqual(self.flag(out, "--expert-profile"), "/work/mine.bin")
+        self.assertEqual(self.flag(out, "--mtp-draft-vocab"), str(self.si.ROOT.parent / "v.bin"))
+        asked, _ = self.make(draft_asked=True)
+        self.assertNotIn("--mtp-draft-vocab", asked["args"])
+        env = {"STRATA_KREG2_R": "1"}
+        self.si.apply_served_recipe(self.cfg()["args"], env)
+        self.assertEqual(env["STRATA_KREG2_R"], "1")
+
+    def test_the_b70_on_a_64_gb_pc_gets_the_served_model_preselected(self):
+        si = self.si
+        b70 = [{"devid": "e223", "vram_gb": 32.0, "driver": "xe"}]
+        with mock.patch.object(setup, "tier_pick", setup.tier_pick), mock.patch.object(setup, "RECOMMENDED_SIZES", dict(setup.RECOMMENDED_SIZES)):
+            self.assertEqual(setup.tier_pick(1024.0, 32.0), ("qwen", "IQ3_S"))
+            self.assertEqual(si.prefer_served(b70, 62.0, ["--check"]), ["--check"])
+            self.assertEqual(setup.tier_pick(1024.0, 32.0), (si.SERVED_FAMILY, si.SERVED_MODEL))
+            names = [m for m in setup.MODELS if "unsloth" in setup.MODELS[m].get("families", ("qwen", "swift"))]
+            self.assertEqual(setup.recommended_size("unsloth", names, 1024.0, 32.0), "UD-IQ1_S")
+            self.assertEqual(si.prefer_served(b70, 62.0, ["--model", "UD-IQ1_S"]), ["--model", "UD-IQ1_S", "--vision", "no"])
+            self.assertEqual(si.prefer_served(b70, 62.0, ["--model", "UD-IQ1_S", "--vision", "yes"]), ["--model", "UD-IQ1_S", "--vision", "yes"])
+
+    def test_another_card_or_less_ram_keeps_the_old_choice(self):
+        si = self.si
+        for intel, ram in (([{"devid": "e221", "vram_gb": 24.0, "driver": "xe"}], 62.0),
+                           ([{"devid": "e223", "vram_gb": 32.0, "driver": "xe"}], 32.0),
+                           ([{"devid": "e223", "vram_gb": 32.0}, {"devid": "e223", "vram_gb": 32.0}], 62.0)):
+            with self.subTest(ram=ram, cards=len(intel)), mock.patch.object(setup, "tier_pick", setup.tier_pick), \
+                    mock.patch.object(setup, "RECOMMENDED_SIZES", dict(setup.RECOMMENDED_SIZES)):
+                self.assertEqual(si.prefer_served(intel, ram, ["--model", "UD-IQ1_S"]), ["--model", "UD-IQ1_S"])
+                self.assertEqual(setup.tier_pick(1024.0, 32.0), ("qwen", "IQ3_S"))
+
+    def test_the_off_switch_is_taken_out_before_setup_sees_it(self):
+        src = (ROOT / "sycl" / "setup_intel.py").read_text(encoding="utf-8")
+        self.assertIn("NO_RECIPE_FLAG not in argv", src)
+        self.assertIn("a != NO_RECIPE_FLAG", src)
+
+
 if __name__ == "__main__":
     unittest.main()
