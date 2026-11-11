@@ -151,6 +151,14 @@ EDITABLE = [
      "already does, which makes that kernel about 13% faster on a B70 (1 to 3% more words per second with a pack whose "
      "experts are mostly IQ2_XXS, such as UD-IQ1_S). 0 or empty: from a table, as before. The numbers are the same bit for "
      "bit either way; it needs STRATA_IQ_GRID on (the default) and has no effect with STRATA_XE2_IQ"),
+    ("f16_products_any_format", ("env", "STRATA_F16X_ANY", 0, 1),
+     "Which expert formats the prompt path multiplies straight from the quantized weights (STRATA_F16X_ANY). 1: also the "
+     "formats without kernels of their own (Q4_K, Q5_K, Q6_K, Q8_0, IQ3_S, IQ3_XXS, IQ2_XS, IQ4_XS gate/up; IQ4_NL, Q5_1, "
+     "Q8_0 down), by one kernel that decodes any of them; they otherwise take a dequantize and two library products per "
+     "expert. 0 or empty: only IQ2_S / IQ2_XXS with a Q2_0 down, as before. It changes nothing for a pack in those three "
+     "formats (UD-IQ1_S). Not measured on a real pack yet: esimd_f16_parity <rows> <experts> <reps> <seed> all times every "
+     "format on random blocks, without a model file. The products add in another order than the library's, so the "
+     "numbers differ in the last bits"),
     ("mtp_window", ("arg", "--mtp-window", 0, 2147483647),
      "How far back the draft layer looks (--mtp-window): the last N cells of the context, 0 = every cell. A smaller window is "
      "cheaper to draft on a long context (setup picks 8192 above 64K) and a very small one (2048) costs accepted drafts. A "
@@ -321,7 +329,7 @@ SPEC = {k: kind for k, kind, _ in EDITABLE}
 GROUPS = {
     "Model and context": ("max_context", "kv_format", "kv_resident", "vram_reserve_mib", "expert_cache",
                           "expert_copies_max_mib", "expert_copies_margin_mib", "expert_copies_loan_slots", "lazy_load"),
-    "Speed": ("mtp", "spec", "spec_min_p", "spec_probe_min", "spec_probes", "spec_stale_rounds", "iq_xxs_sign_arith", "mtp_window", "prefill_chunk", "parallel", "batch_mtp", "yields_max",
+    "Speed": ("mtp", "spec", "spec_min_p", "spec_probe_min", "spec_probes", "spec_stale_rounds", "iq_xxs_sign_arith", "f16_products_any_format", "mtp_window", "prefill_chunk", "parallel", "batch_mtp", "yields_max",
               "admit_short_first"),
     "Parked conversations": ("conversation_cache_slots", "conversation_cache_mib", "conversation_cache_auto_pct",
                              "conversation_cache_auto_max_mib", "conversation_cache_min_free_mib",

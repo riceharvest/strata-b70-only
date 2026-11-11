@@ -42,6 +42,10 @@ SHA-256), so a PC that has one of them can link those two shards instead of down
 
 - "FP16 path": the prompt's experts dequantized to FP16 and multiplied by the BLAS library. It works for every format
   above but reads each expert as ~10 MB of FP16.
+- Intel (SYCL) prompt, on a Battlemage card: `STRATA_F16X_ANY=1` (off by default) multiplies every format of this table
+  straight from the quantized weights with one kernel, a group of experts per launch, in place of the FP16 path. Each
+  format pair is checked and timed on random blocks, without a model file: `esimd_f16_parity <rows> <experts> <reps>
+  <seed> all` ([B70.md](B70.md), "Other expert formats"). Not run with these files yet.
 - **Formats cost nothing unless used.** The engine loads every kernel of its own binary when it starts (so that no
   kernel needs VRAM later, mid-prompt), which is why kernels for formats a model does not have used to take expert
   slots from every model. The Q6_K expert kernels are now part of every build: one more instance per grouped kernel,

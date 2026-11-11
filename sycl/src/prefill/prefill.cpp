@@ -7565,12 +7565,20 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         // 151-b70: the fused int8 DPAS products (IQ3_S gate/up, IQ4_NL down, the 640 x 2560 expert), the same
                         // held group of staged experts as above
                         const int i8m = i8_mode(m.cs);
+                        // the formats the int8 kernels take
+                        const bool i8fmt = lay.native &&
+                                           (lay.fmt[(size_t) l].gu_type == 21 || lay.fmt[(size_t) l].gu_type == 18 ||
+                                            lay.fmt[(size_t) l].gu_type == 22 || lay.fmt[(size_t) l].gu_type == 23 ||
+                                            lay.fmt[(size_t) l].gu_type == 17 || lay.fmt[(size_t) l].gu_type == 16) &&
+                                           (lay.fmt[(size_t) l].d_type == 20 || lay.fmt[(size_t) l].d_type == 42 ||
+                                            lay.fmt[(size_t) l].d_type == 8);
+                        // STRATA_F16X_ANY: formats only the FP16 products take (the K-quants, a Q5_1 down): the same held groups,
+                        // every group on the products (there is no int8 chain to choose)
+                        const bool f16only = lay.native && !i8fmt &&
+                                             f16x_on(m.cs, lay.fmt[(size_t) l].gu_type, lay.fmt[(size_t) l].d_type,
+                                                     lay.fmt[(size_t) l].n_ff, lay.fmt[(size_t) l].n_embd);
                         const bool i8on = !xmx2_only && i8m != 0 && !use_mmq && lay.native && !had_gu && !had_d &&
-                                          (lay.fmt[(size_t) l].gu_type == 21 || lay.fmt[(size_t) l].gu_type == 18 ||
-                                           lay.fmt[(size_t) l].gu_type == 22 || lay.fmt[(size_t) l].gu_type == 23 ||
-                                           lay.fmt[(size_t) l].gu_type == 17 || lay.fmt[(size_t) l].gu_type == 16) &&
-                                          (lay.fmt[(size_t) l].d_type == 20 || lay.fmt[(size_t) l].d_type == 42 ||
-                                           lay.fmt[(size_t) l].d_type == 8) &&
+                                          (i8fmt || f16only) &&
                                           lay.fmt[(size_t) l].n_ff == 640 && lay.fmt[(size_t) l].n_embd == 2560 &&
                                           strata::prefill::i8::available(m.cs);
                         // STRATA_PF_NAT (pf_nat_rows): the held groups of few rows per expert on the decode kernels; a layer whose
@@ -7580,7 +7588,11 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         if (pf_nat_rows() > 0 && m.nat_xq != nullptr && !stream_all && lay.native && !had_gu && !had_d && !use_mmq &&
                             !xmx2_only) {
                             const auto& ff = lay.fmt[(size_t) l];
-                            const bool fmt_ok = pf_nat_fmt_set() ? pf_nat_fmt(ff.gu_type) : !f16x_on(m.cs, ff.gu_type, ff.d_type, ff.n_ff, ff.n_embd);
+                            // (STRATA_F16X_ANY's formats have the FP16 products only in the held groups of i8on: without those the
+                            //  layer is held for the decode kernels as before the switch; IQ2_S / IQ2_XXS with Q2_0 as they were)
+                            const bool f16_own = (ff.gu_type == 22 || ff.gu_type == 16) && ff.d_type == 42;
+                            const bool fmt_ok = pf_nat_fmt_set() ? pf_nat_fmt(ff.gu_type)
+                                                                 : (!f16x_on(m.cs, ff.gu_type, ff.d_type, ff.n_ff, ff.n_embd) || (!i8on && !f16_own));
                             if (fmt_ok && strata::kernels::native_expert_supported(ff.gu_type, ff.d_type, ff.n_embd, ff.n_ff) && ff.n_embd == N &&
                                 ff.n_ff == 640 && !ff.tail_off) {
                                 nat_L = strata::kernels::native_expert_layout(ff.gu_type, ff.d_type, ff.n_embd, ff.n_ff);
@@ -7595,7 +7607,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             const auto& ff = lay.fmt[(size_t) l];
                             if (said_fmt.insert({ff.gu_type, ff.d_type, (int) ff.n_ff, (int) ff.n_embd, (int) i8on}).second)
                                 std::fprintf(stderr, "strata: layer %lld experts gate/up type %d, down type %d, n_ff %d, n_embd %d -> int8 path %s\n",
-                                             (long long) l, ff.gu_type, ff.d_type, (int) ff.n_ff, (int) ff.n_embd, i8on ? "yes" : "no");
+                                             (long long) l, ff.gu_type, ff.d_type, (int) ff.n_ff, (int) ff.n_embd,
+                                             !i8on ? "no" : i8fmt ? "yes" : "no (the FP16 products, STRATA_F16X_ANY)");
                         }
                         if (strata::prefill::xmx::mode() == 2 && !xmx2) {
                             static bool said = false;
@@ -7784,8 +7797,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 // measured on this GPU (i8_calibrate); a group above it takes the FP16 chain below
                                 bool done8 = false;
                                 try {
-                                bool use_i8 = true;
-                                if (i8m == 2) {
+                                bool use_i8 = i8fmt;   // (STRATA_F16X_ANY's other formats: the FP16 products below)
+                                if (i8fmt && i8m == 2) {
                                     use_i8 = (double) nr / xg_n < i8_rows();
                                     if (use_i8 && pf_f16_over_i8() && nr <= (int64_t) pf_f16_small() * xg_n &&
                                         f16x_on(m.cs, f.gu_type, f.d_type, f.n_ff, f.n_embd))
@@ -7883,8 +7896,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 } else {
                                     // STRATA_PF_F16X_GROUP: the held 16-expert groups take the FP16 products together when each of them
                                     // would on its own (auto, every group at or above the crossover); else each group as before
-                                    bool big = i8m == 2 && f16x_on(m.cs, f.gu_type, f.d_type, f.n_ff, f.n_embd);
-                                    for (int i0 = 0; big && i0 < xg_n; i0 += G16) {
+                                    bool big = (i8m == 2 || !i8fmt) && f16x_on(m.cs, f.gu_type, f.d_type, f.n_ff, f.n_embd);
+                                    for (int i0 = 0; big && i8fmt && i0 < xg_n; i0 += G16) {   // (no int8 chain: no crossover)
                                         const int ns_ = std::min(G16, xg_n - i0);
                                         int64_t nr_ = 0;
                                         for (int i = i0; i < i0 + ns_; ++i) nr_ += xg_c[i];
