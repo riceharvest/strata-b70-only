@@ -222,6 +222,23 @@ class ToSycl(unittest.TestCase):
             self.assertEqual(c["args"].count("--vram-reserve-mib"), 1)
             self.assertEqual(c["args"][c["args"].index("--vram-reserve-mib") + 1], "500")
 
+    def test_the_ngram_table_stays_on_the_ssd_unless_the_real_ram_holds_it(self):
+        # setup's rule (16 GB to spare beyond the model and the table) saw this route's made-up RAM size and put --ple-io ram
+        # into every config: 29 GB pinned on a 64 GB PC beside the experts' mirror
+        m = self.mod()
+        exe = m.ROOT / "build-sycl-aot" / "strata"
+        notes = []
+        c = m.to_sycl(self.cfg(m, ["--ple-io", "ram"]), exe, 63.0, {}, 32.0, "xe", model="unsloth-UD-IQ1_S", fit_notes=notes)
+        self.assertNotIn("--ple-io", c["args"])
+        self.assertIn("--stream-experts", c["args"])
+        self.assertTrue(any("n-gram table is read from the SSD" in n for n in notes), notes)
+        c = m.to_sycl(self.cfg(m, ["--ple-io", "ram"]), exe, 128.0, {}, 32.0, "xe", model="unsloth-UD-IQ1_S")
+        self.assertEqual(c["args"][c["args"].index("--ple-io") + 1], "ram")       # 40 + 28.8 + 16 GB fits
+        mine = {**self.cfg(m, ["--ple-io", "ram"]), "user_args": ["--ple-io", "ram"]}
+        c = m.to_sycl(mine, exe, 63.0, {}, 32.0, "xe", model="unsloth-UD-IQ1_S")
+        self.assertEqual(c["args"][c["args"].index("--ple-io") + 1], "ram")       # the person's own choice is kept
+        self.assertEqual(m.ple_ram_need("UD-IQ1_S"), m.ple_ram_need("unsloth-UD-IQ1_S"))
+
     def test_a_series_loads_experts_into_ram_and_leaves_no_host_off(self):
         m = self.mod()
         c = m.to_sycl(self.cfg(m), m.ROOT / "build-sycl" / "strata", 64.0, {}, 8.0, "i915")

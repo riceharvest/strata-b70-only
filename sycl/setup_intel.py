@@ -369,6 +369,15 @@ def _model_title(model: str, args: list) -> str:
     return model if model and "/" not in model and chr(92) not in model else ""
 
 
+PLE_TABLE_GB = 28.8                                  # Qwen3.8-Flash-Next's n-gram table (per_layer_token_embd), the size setup.py assumes
+
+
+def ple_ram_need(model: str) -> float:
+    """The RAM from which setup's rule keeps the n-gram table in RAM: the model's own need, the table and 16 GB to spare."""
+    entry = S.MODELS.get(model) or S.MODELS.get(model.split("-", 1)[-1]) or {}
+    return float(entry.get("ram_gb", 48)) + PLE_TABLE_GB + 16
+
+
 def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, driver: str = "xe",
             devid: str = "", fit_notes: list | None = None, model: str = "", ctx_asked: bool = False,
             auto_reserve: bool = False, fit: bool = True, served: bool = False, draft_asked: bool = False,
@@ -453,6 +462,18 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
             args += ["--ple-io", "ram"]
         args += ["--vram-reserve-mib", reserve]
     else:
+        # setup adds --ple-io ram (the n-gram table in RAM) when the PC has 16 GB to spare beyond the model's own need.  This
+        # route gives setup a made-up RAM size (the experts go to VRAM), so that rule fired on every PC: a 64 GB PC then
+        # pinned a 29 GB table beside the mirror of the experts that VRAM does not hold.  Here the rule is applied to the real
+        # RAM; a --ple-io the person wrote into the config themselves ("user_args") is kept.
+        if flag(args, "--ple-io") == "ram" and "--ple-io" not in (cfg.get("user_args") or []) and ram < ple_ram_need(model):
+            drop(args, "--ple-io", True)
+            if fit_notes is not None:
+                fit_notes.append(f"{ram:.0f} GB of RAM: the n-gram table is read from the SSD (no --ple-io ram; it would pin "
+                                 f"{PLE_TABLE_GB:.0f} GB, and that needs {ple_ram_need(model):.0f} GB of RAM for this model)")
+        elif flag(args, "--ple-io") == "ram" and fit_notes is not None:
+            fit_notes.append(f"{ram:.0f} GB of RAM: the {PLE_TABLE_GB:.0f} GB n-gram table is kept in RAM (--ple-io ram), so a new "
+                             "prompt does not wait for its rows from the SSD")
         args += ["--stream-experts", "--vram-reserve-mib", reserve]
     if ctx > 32768 or vram_gb >= 24:                    # long contexts: 4096-token chunks keep the prompt buffers small; a
         # 24 GB+ card with part of the experts in the RAM mirror streams those over PCIe once per chunk, so fewer, bigger
@@ -555,6 +576,8 @@ def install(argv) -> None:
         msg = re.sub(r"\b(xe|i915) \(AMD: docs/AMD_HIP\.md\)", r"\1 driver (Intel Arc: docs/INTEL.md)", msg)
         where = ("the experts the card does not hold are computed on the CPU" if alch
                  else "the experts are streamed into VRAM")
+        if real_ram < fake_ram and f"{fake_ram:.0f} GB of RAM: the" in msg and "(--ple-io ram)" in msg:
+            return                                      # setup's n-gram table rule on the made-up RAM size: to_sycl decides it on the real one and says so
         msg = msg.replace(f"RAM: {fake_ram:.0f} GB", f"RAM: {real_ram:.0f} GB ({where})")
         msg = msg.replace(f"({fake_ram:.0f} GB RAM +", f"({real_ram:.0f} GB RAM +").replace(f"you have {fake_ram:.0f} GB RAM", f"you have {real_ram:.0f} GB RAM")
         if re.match(r"\s+\S+\s+needs ~\d+ GB RAM:", msg):   # --check's CUDA verdicts: replaced by the Intel one
