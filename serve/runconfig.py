@@ -153,8 +153,9 @@ EDITABLE = [
      "bit either way; it needs STRATA_IQ_GRID on (the default) and has no effect with STRATA_XE2_IQ"),
     ("f16_products_any_format", ("env", "STRATA_F16X_ANY", 0, 1),
      "Which expert formats the prompt path multiplies straight from the quantized weights (STRATA_F16X_ANY). 1: also the "
-     "formats without kernels of their own (Q4_K, Q5_K, Q6_K, Q8_0, IQ3_S, IQ3_XXS, IQ2_XS, IQ4_XS gate/up; IQ4_NL, Q5_1, "
-     "Q8_0 down), by one kernel that decodes any of them; they otherwise take a dequantize and two library products per "
+     "formats without kernels of their own (Q4_K, Q5_K, Q6_K, Q8_0, IQ3_S, IQ3_XXS, IQ2_XS, IQ4_XS, IQ1_M, Q2_0 gate/up; "
+     "IQ4_NL, Q5_0, Q5_1, Q8_0 down: with it, every format of Unsloth's files and of the GSQ-RCO packs), by one kernel "
+     "that decodes any of them; they otherwise take a dequantize and two library products per "
      "expert. 0 or empty: only IQ2_S / IQ2_XXS with a Q2_0 down, as before. It changes nothing for a pack in those three "
      "formats (UD-IQ1_S). Not measured on a real pack yet: esimd_f16_parity <rows> <experts> <reps> <seed> all times every "
      "format on random blocks, without a model file. The products add in another order than the library's, so the "

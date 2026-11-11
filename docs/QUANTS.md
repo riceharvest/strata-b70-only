@@ -57,6 +57,47 @@ SHA-256), so a PC that has one of them can link those two shards instead of down
 - `STRATA_MMQ_KQ=1` is opt-in because MMQ rounds the prompt's products differently from the FP16 path (the output
   differs at the rounding level); its speed and KL are measured before it becomes a default.
 
+## Every file's routed experts, and the B70's prompt kernels (2026-11-11)
+
+Read from the headers on 2026-11-11 (`tools/quant_formats.py --hf`): Unsloth's repository at `084c631` (its files changed
+since the revision above: UD-IQ4_XS and the smaller ones now mix IQ3_XXS, IQ4_XS and IQ2_S with IQ4_NL, Q5_0 and Q2_0
+downs), the GSQ-RCO packs at `ed59f92` and the Coder pack at `bba8885`. Gate / up / down per layer, with the number of
+layers:
+
+| File | Layers |
+|---|---|
+| UD-IQ1_S | IQ2_XXS / Q2_0 x35, IQ2_S / Q2_0 x12, layer 18: gate IQ2_S, up IQ2_XXS, down Q2_0 |
+| UD-IQ1_M | IQ2_XXS / Q2_0 x23, IQ2_S / Q2_0 x16, IQ2_XS / Q2_0 x7, IQ2_S / IQ4_NL x2 |
+| UD-Q2_0 | IQ2_S / Q2_0 x25, IQ2_XXS / Q2_0 x14, IQ2_S / IQ4_NL x5, IQ2_XXS / IQ4_NL x4 |
+| UD-IQ2_XS | IQ2_S / IQ4_NL x21, IQ2_S / Q2_0 x18, IQ2_XXS / Q2_0 x5, IQ2_XXS / IQ4_NL x3, IQ2_S / Q5_0 x1 |
+| UD-Q2_K_XL | IQ2_S / IQ4_NL x18, IQ3_XXS / IQ4_NL x11, IQ2_S / Q2_0 x7, IQ3_XXS / Q2_0 x6, IQ2_XXS / Q2_0 x3, IQ2_XXS / IQ4_NL x2, IQ2_S / Q5_0 x1 |
+| UD-IQ3_XXS | IQ2_S / IQ4_NL x23, IQ3_XXS / IQ4_NL x21, IQ2_S / Q2_0 x3, IQ4_XS / IQ4_NL x1 |
+| UD-Q3_K_XL | IQ3_XXS / IQ4_NL x21, IQ3_XXS / Q5_0 x17, IQ4_XS / IQ4_NL x4, IQ4_XS / Q5_0 x2, IQ2_S / Q2_0 x2, IQ2_S / Q5_0 x1, IQ2_S / IQ4_NL x1 |
+| UD-IQ4_XS | IQ3_XXS / Q5_0 x20, IQ4_XS / Q5_0 x13, IQ3_XXS / IQ4_NL x8, IQ4_XS / IQ4_NL x4, IQ2_S / Q2_0 x2, IQ2_S / IQ4_NL x1 |
+| UD-Q4_K_XL | Q4_K / Q5_1 x43, Q4_K / Q8_0 x4, Q5_K / Q8_0 x1 |
+| UD-Q5_K_XL | Q5_K / Q8_0 x47, Q6_K / Q8_0 x1 |
+| UD-Q6_K_XL | Q6_K / Q8_0 x47, Q8_0 / Q8_0 x1 |
+| Q8_0 | Q8_0 / Q8_0 x48 |
+| GSQ-RCO IQ2_XS | IQ2_S / Q2_0 x34, IQ2_XXS / Q2_0 x11, IQ1_M / Q2_0 x3 |
+| GSQ-RCO IQ3_XXS | IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and IQ3_S with Q2_0 or IQ4_NL (10 pairs) |
+| GSQ-RCO IQ3_S, Coder IQ1_M | IQ2_S / IQ4_NL x15, IQ3_XXS / IQ4_NL x14, IQ3_S / IQ4_NL x9, IQ2_S / Q2_0 x5, IQ3_XXS / Q2_0 x3, IQ3_S / Q2_0 x1, IQ4_XS / IQ4_NL x1 |
+| GSQ-RCO Q2_0 | Q2_0 / Q2_0 x48 |
+| UD-IQ4_XS at `38bb39e` | IQ3_S / IQ4_NL x43, IQ3_S / Q8_0 x4, IQ4_XS / Q8_0 x1 |
+
+That is 12 gate/up formats (IQ2_XXS, IQ2_S, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS, IQ1_M, Q2_0, Q4_K, Q5_K, Q6_K, Q8_0) and
+5 down formats (Q2_0, IQ4_NL, Q5_0, Q5_1, Q8_0), in 23 pairs.
+
+- Decode: the grouped expert kernels take every one of them (one template per format, `sycl/src/kernels/cuda/iq_kernels.dp.cpp`).
+- Prompt, as served: IQ2_S and IQ2_XXS with a Q2_0 down have the FP16 products; the pairs of IQ gate/up with a Q2_0,
+  IQ4_NL or Q8_0 down have the int8 chain; a Q5_0 or Q5_1 down, the K-quants, Q8_0, IQ1_M or Q2_0 as gate/up take a
+  dequantize and two oneMKL products per expert.
+- Prompt, with `STRATA_F16X_ANY=1`: every one of the 23 pairs has the FP16 products. `esimd_f16_parity <rows> <experts>
+  <reps> <seed> all` runs exactly these pairs on random blocks ([B70.md](B70.md), "Other expert formats").
+- One layer of one file is outside the engine as a whole, not only the prompt kernels: UD-IQ1_S layer 18 stores gate
+  and up in two formats, and a layer has one gate/up format everywhere here (`tools/iq_pack.py` refuses the file:
+  "gate and up differ in type"). The pack that is served takes that one tensor, `blk.18.ffn_gate_exps`, from UD-IQ1_M,
+  where it is IQ2_XXS like the layer's up (nothing is quantized again).
+
 ## Quality: the yardstick
 
 `tools/quant_quality.py` scores a quant against Q8_0 on one fixed text set (`data/quant_quality/v1`: code, docs,

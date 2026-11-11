@@ -88,8 +88,8 @@ bool down(int d_type, const uint8_t* const* blob, size_t down_off, int n_embd, c
 /// copy of each expert, one launch per product for the whole group.  True when this build and device have them and the formats /
 /// shape are handled: gate/up IQ2_S or IQ2_XXS, down Q2_0, K a multiple of 256, n_ff a multiple of 64.
 /// With STRATA_F16X_ANY=1 (read once, off by default) also the other formats, by one kernel that decodes any of them (launch_x in
-/// esimd_moe.dp.cpp): gate/up Q4_K, Q5_K, Q6_K, Q8_0, IQ3_S, IQ3_XXS, IQ2_XS, IQ4_XS, Q4_0, Q4_1, Q5_0; down IQ4_NL, Q5_1, Q8_0, Q4_0,
-/// Q4_1, Q5_0; in any pairing, also with the three formats above.  gate_up_f16 / down_f16 and the _n forms take a format by its type,
+/// esimd_moe.dp.cpp): gate/up Q4_K, Q5_K, Q6_K, Q8_0, IQ3_S, IQ3_XXS, IQ2_XS, IQ4_XS, IQ1_M, Q2_0, Q4_0, Q4_1, Q5_0; down IQ4_NL, Q5_1,
+/// Q8_0, Q4_0, Q4_1, Q5_0; in any pairing, also with the three formats above.  gate_up_f16 / down_f16 and the _n forms take a format by its type,
 /// whatever the switch says (esimd_f16_parity checks and times every one of them on random blocks, no model file).
 bool f16_handles(int gu_type, int d_type, int n_ff, int n_embd, void* stream);
 /// H[row][n_ff] (FP16) = silu(gate) * up of X[row][K] (FP16), saturated at +-65504 as swiglu_interleaved; X and H 64-byte aligned.

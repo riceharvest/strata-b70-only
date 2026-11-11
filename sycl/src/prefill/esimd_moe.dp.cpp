@@ -97,7 +97,8 @@ constexpr int O_IQ4 = 2944;      // [256]: byte b -> kvalues_iq4nl[b & 15] in by
 constexpr int O_Q2 = 3200;       // [256]: byte b -> its four 2-bit codes minus 1, as four int8 (Q2_0 values)
 constexpr int O_IQ2XS = 3456;    // iq2xs_grid[512] as 1024 dwords
 constexpr int O_IQ2XXS = 4480;   // iq2xxs_grid[256] as 512 dwords
-constexpr int N_TABLE = 4992;
+constexpr int O_IQ1S = 4992;     // iq1s_grid_gpu[2048] (IQ1_M: 8 values of 4 bits)
+constexpr int N_TABLE = 7040;
 
 uint32_t* tables(sycl::queue& q) {
     static std::mutex mu;
@@ -118,6 +119,7 @@ uint32_t* tables(sycl::queue& q) {
         }
         for (int i = 0; i < 512; ++i) { h[O_IQ2XS + 2 * i] = (uint32_t) iq2xs_grid[i]; h[O_IQ2XS + 2 * i + 1] = (uint32_t) (iq2xs_grid[i] >> 32); }
         for (int i = 0; i < 256; ++i) { h[O_IQ2XXS + 2 * i] = (uint32_t) iq2xxs_grid[i]; h[O_IQ2XXS + 2 * i + 1] = (uint32_t) (iq2xxs_grid[i] >> 32); }
+        for (int i = 0; i < 2048; ++i) h[O_IQ1S + i] = iq1s_grid_gpu[i];
         uint32_t* d = sycl::malloc_device<uint32_t>(N_TABLE, q);
         q.memcpy(d, h.data(), N_TABLE * 4);
         q.wait();
@@ -1631,25 +1633,28 @@ void launch_dn_h(sycl::queue& q, const HArgsT<G> a, int nrb, int ncb, int wgn) {
 //    the float expression iq_dequant_expert_f16 evaluates for the format, and its products are exact in FP32 (an 11-bit d times
 //    integer factors, 24 bits at most), so the weights are the FP16 chain's and a product differs from the chain in its summation
 //    order only.  What a format adds is its unpack to code bytes and its scales: the blocks in the K loop below.
-//  * Formats.  Blocks of 256 values (gate/up; K a multiple of 256): Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, IQ3_XXS, IQ2_XS.  Blocks of 32
-//    values (gate/up and down; K a multiple of 32): Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL.  IQ2_S, IQ2_XXS and Q2_0 keep the kernels
-//    above; IQ1_M and the trellis types have no FP16 products.
+//  * Formats.  Blocks of 256 values (gate/up; K a multiple of 256): Q4_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, IQ3_XXS, IQ2_XS, IQ1_M.  Blocks
+//    of 64: Q2_0 as gate/up.  Blocks of 32 values (gate/up and down; K a multiple of 32): Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL.
+//    IQ2_S and IQ2_XXS gate/up and a Q2_0 down keep the kernels above.  With them that is every routed-expert format of Unsloth's
+//    files of the model and of the GSQ-RCO packs before them (read from their headers, tools/quant_formats.py --hf); the trellis
+//    types have no FP16 products.
 //  * Reads stay inside the matrix (a.lim: the byte offset of its last dword): a dword gather starts at a dword inside it, ld32c and
 //    ld4u clamp the one dword they may read past the bytes they need.  Row bytes are a multiple of 4 (x_shape).
 //  * Not tuned: the next 32-block is not loaded ahead as in launch_gu_h, and the IQ4 table costs four gathers a dword.
-constexpr int T_Q4_0 = 2, T_Q4_1 = 3, T_Q5_0 = 6, T_Q5_1 = 7, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14;
+constexpr int T_Q4_0 = 2, T_Q4_1 = 3, T_Q5_0 = 6, T_Q5_1 = 7, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14, T_IQ1M = 29;
 constexpr int x_b8(int f) {   // bytes per 256 values (0: not a format of launch_x)
     return f == T_Q4_0 || f == T_IQ4NL || f == T_Q4_K ? 144 : f == T_Q4_1 ? 160 : f == T_Q5_0 || f == T_Q5_K ? 176 : f == T_Q5_1 ? 192 :
-           f == T_Q8_0 ? 272 : f == T_Q6_K ? 210 : f == T_IQ4XS ? 136 : f == T_IQ3S ? 110 : f == T_IQ3XXS ? 98 : f == T_IQ2XS ? 74 : 0;
+           f == T_Q8_0 ? 272 : f == T_Q6_K ? 210 : f == T_IQ4XS ? 136 : f == T_IQ3S ? 110 : f == T_IQ3XXS ? 98 : f == T_IQ2XS ? 74 :
+           f == T_Q2_0 ? 72 : f == T_IQ1M ? 56 : 0;
 }
-constexpr bool x_blk32(int f) {   // blocks of 32 values (the others: 256)
-    return f == T_Q4_0 || f == T_Q4_1 || f == T_Q5_0 || f == T_Q5_1 || f == T_Q8_0 || f == T_IQ4NL;
+constexpr int x_kv(int f) {   // values a block: 32, 64 (Q2_0) or 256
+    return f == T_Q4_0 || f == T_Q4_1 || f == T_Q5_0 || f == T_Q5_1 || f == T_Q8_0 || f == T_IQ4NL ? 32 : f == T_Q2_0 ? 64 : 256;
 }
 constexpr bool x_has_m(int f) { return f == T_Q4_1 || f == T_Q5_1 || f == T_Q4_K || f == T_Q5_K; }   // w = scale * code + offset
 // the roles launch_x is built for (the engine's gate/up and down formats, native_expert_supported, without the ones named above)
 constexpr bool x_gu(int f) {
     return f == T_Q4_K || f == T_Q5_K || f == T_Q6_K || f == T_Q8_0 || f == T_IQ3S || f == T_IQ3XXS || f == T_IQ2XS || f == T_IQ4XS ||
-           f == T_Q4_0 || f == T_Q4_1 || f == T_Q5_0;
+           f == T_Q4_0 || f == T_Q4_1 || f == T_Q5_0 || f == T_Q2_0 || f == T_IQ1M;
 }
 constexpr bool x_dn(int f) { return f == T_IQ4NL || f == T_Q5_1 || f == T_Q8_0 || f == T_Q4_0 || f == T_Q4_1 || f == T_Q5_0; }
 
@@ -1743,7 +1748,7 @@ template <int F, int MT, bool GU, int G = kMaxGroupH>
 void launch_x(sycl::queue& q, const HArgsT<G> a, int nrb, int ncb, int wgn) {
     constexpr int NT = 2;
     constexpr int B8 = x_b8(F);
-    constexpr int BS = B8 / 8;   // a block's bytes (the formats of x_blk32)
+    constexpr int BS = B8 / 8;   // a block's bytes (the formats with blocks of 32 values)
     constexpr bool HASM = x_has_m(F);
     static_assert(B8 != 0, "a format of x_b8");
     static_assert(MT == 1 || MT == 2 || MT == 4 || MT == 8, "row tiles: 8-row block loads (MT 1, 2) or 32-row ones (4, 8)");
@@ -1832,6 +1837,10 @@ void launch_x(sycl::queue& q, const HArgsT<G> a, int nrb, int ncb, int wgn) {
                         hd[t] = half_of(ld16(We, o));
                         h0[t] = ld32c(We, o + 66u, lim);    // scales 0..3
                         h1[t] = ld32c(We, o + 70u, lim);    // scales 4..7
+                    } else if constexpr (F == T_IQ1M) {           // qs[32], qh[16], scales[8]: four 16-bit words, their top nibbles the FP16 d
+                        h0[t] = gather<uint32_t, 16>(reinterpret_cast<const uint32_t*>(We), o + 48u);   // words 0, 1
+                        h1[t] = gather<uint32_t, 16>(reinterpret_cast<const uint32_t*>(We), o + 52u);   // words 2, 3
+                        hd[t] = half_of(((h0[t] >> 12) & 0xfu) | ((h0[t] >> 24) & 0xf0u) | ((h1[t] >> 4) & 0xf00u) | ((h1[t] >> 16) & 0xf000u));
                     }
                 }
 #pragma unroll 1
@@ -1967,6 +1976,41 @@ void launch_x(sycl::queue& q, const HArgsT<G> a, int nrb, int ncb, int wgn) {
                                 cq[t][2 * il] = apply_signs(gl, sbyte & 0xfu);
                                 cq[t][2 * il + 1] = apply_signs(gh, sbyte >> 4);
                             }
+                        } else if constexpr (F == T_IQ1M) {
+                            // 8 values a grid entry of 4-bit codes q (0, 1, 2): w = d (2 s + 1) (q - 1 -+ 1 / 8), so the code is 8 (q - 1) -+ 1
+                            // and the scale d (2 s + 1) / 8.  s: 3 bits per 16 values, 4 of them in a scale word; qh: 4 bits per 8 values, 3
+                            // the grid index's high bits, the fourth the sign of the 1 / 8.
+                            simd<uint32_t, 16> qsd = gather<uint32_t, 16>(reinterpret_cast<const uint32_t*>(We), o + 4u * (uint32_t) ib);
+                            simd<uint32_t, 16> qhw = ld16(We, o + (32u + 2u * (uint32_t) ib));
+                            simd<uint32_t, 16> scw = h1[t];
+                            if (ib < 4) scw = h0[t];
+                            simd<uint32_t, 16> sck = (scw >> (uint32_t) (16 * ((ib >> 1) & 1))) & 0xffffu;
+#pragma unroll
+                            for (int hf = 0; hf < 2; ++hf) {
+                                simd<uint32_t, 16> s3 = (sck >> (uint32_t) (3 * (2 * (ib & 1) + hf))) & 7u;
+                                cs[t][hf] = hd[t] * simd<float, 16>(simd<int, 16>(s3 * 2u + 1u)) * 0.125f;
+                            }
+#pragma unroll
+                            for (int il = 0; il < 4; ++il) {
+                                simd<uint32_t, 16> nq = (qhw >> (4 * il)) & 0xfu;
+                                simd<uint32_t, 16> idx = ((qsd >> (8 * il)) & 0xffu) | ((nq & 7u) << 8);
+                                simd<uint32_t, 16> g = gather<uint32_t, 16>(T + O_IQ1S, idx << 2);
+                                simd<uint32_t, 16> bias = (nq >> 3) * 0x02020202u + 0x07070707u;   // 9 with the fourth bit, else 7
+                                cq[t][2 * il] = ((((g & 0x0f0f0f0fu) << 3) | 0x80808080u) - bias) ^ 0x80808080u;
+                                cq[t][2 * il + 1] = (((((g >> 4) & 0x0f0f0f0fu) << 3) | 0x80808080u) - bias) ^ 0x80808080u;
+                            }
+                        } else if constexpr (F == T_Q2_0) {
+                            // 64 values a block: d, then 16 bytes of four 2-bit codes (value = code - 1); this 32's are bytes 8 (ib & 1) .. + 8
+                            simd<uint32_t, 16> bo = o + (uint32_t) (18 * (ib >> 1));
+                            cs[t][0] = half_of(ld16(We, bo));
+                            cs[t][1] = cs[t][0];
+                            simd<uint32_t, 16> q0 = ld32c(We, bo + (2u + 8u * (uint32_t) (ib & 1)), lim);
+                            simd<uint32_t, 16> q1 = ld32c(We, bo + (6u + 8u * (uint32_t) (ib & 1)), lim);
+#pragma unroll
+                            for (int r = 0; r < 8; ++r) {
+                                simd<uint32_t, 16> qb = ((r < 4 ? q0 : q1) >> (8 * (r & 3))) & 0xffu;
+                                cq[t][r] = x_sub8((qb | (qb << 6) | (qb << 12) | (qb << 18)) & 0x03030303u, 0x01010101u);
+                            }
                         } else {
                             // the blocks of 32 values: d (FP16) first, then Q4_1 / Q5_1's offset m (FP16), Q5_0 / Q5_1's 32 high bits, the codes.
                             // A code byte's low nibble is one of the block's first 16 values, its high nibble one of the last 16.
@@ -2099,9 +2143,9 @@ bool x_any_on() {
     static const bool v = [] { const char* e = std::getenv("STRATA_F16X_ANY"); return e != nullptr && e[0] != '\0' && e[0] != '0'; }();
     return v;
 }
-int x_rowb(int f, int K) { return x_blk32(f) ? (K / 32) * (x_b8(f) / 8) : (K / 256) * x_b8(f); }   // bytes of a row of K values
+int x_rowb(int f, int K) { return (K / x_kv(f)) * (x_b8(f) * x_kv(f) / 256); }   // bytes of a row of K values
 // K is whole blocks of the format and a row is whole dwords (ld4a / ld4u, and the matrix then ends on a dword)
-bool x_shape(int f, int K) { return K > 0 && K % (x_blk32(f) ? 32 : 256) == 0 && (x_rowb(f, K) & 3) == 0; }
+bool x_shape(int f, int K) { return K > 0 && K % x_kv(f) == 0 && (x_rowb(f, K) & 3) == 0; }
 // launch_x for a group of up to kMaxGroupH experts (cnt[i] rows each, back to back): gate/up (GU; sec_off the up rows' byte offset, n_out
 // = n_ff, Y = H) or down (sec_off the down rows' byte offset, n_out = n_embd, Y = Dm).  `mt` 1, 2 or 8; `skip` as gate_up_f16_n's.
 template <bool GU>
@@ -2132,7 +2176,7 @@ void x_n(int type, const uint8_t* const* blob, size_t sec_off, int n_out, const 
     if constexpr (GU) {   // the formats of x_gu
         switch (type) {
             STRATA_X(T_Q4_K) STRATA_X(T_Q5_K) STRATA_X(T_Q6_K) STRATA_X(T_Q8_0) STRATA_X(T_IQ3S) STRATA_X(T_IQ3XXS) STRATA_X(T_IQ2XS)
-            STRATA_X(T_IQ4XS) STRATA_X(T_Q4_0) STRATA_X(T_Q4_1) STRATA_X(T_Q5_0)
+            STRATA_X(T_IQ4XS) STRATA_X(T_Q4_0) STRATA_X(T_Q4_1) STRATA_X(T_Q5_0) STRATA_X(T_Q2_0) STRATA_X(T_IQ1M)
             default: break;
         }
     } else {              // the formats of x_dn
