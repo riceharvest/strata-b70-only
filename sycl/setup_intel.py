@@ -35,7 +35,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import setup as S  # noqa: E402
-from strata_control import intel_spec, sycl_build, vram_fit  # noqa: E402
+from strata_control import intel_spec, sycl_build, user_args, vram_fit  # noqa: E402
 
 SYCL_WRAPPER = sycl_build.wrapper(ROOT)       # the paths `strata launch` and the runtime host use too (strata_control/sycl_build.py)
 SYCL_IMAGE = "strata-sycl-dev"
@@ -232,6 +232,91 @@ def build_vision_sycl(stub: Path, stamp: Path, llama, vsrc) -> None:
         S.ok(f"picture reader (GPU): {stub / 'strata-vision-sycl'}, (CPU fallback): {stub / 'strata-vision'}")
 
 
+# The recipe this fork serves on one Arc Pro B70 (docs/B70.md, "The served setup"): Unsloth's UD-IQ1_S at 256K. Setup makes the
+# model files (the layer 18 graft, setup.py graft_step) and, for this model only, a config with these settings on top of its own.
+# A value the person chose is kept. --no-served-recipe turns the recipe and the B70 preselection off (a config written by an earlier
+# run with the recipe is rewritten without it).
+SERVED_MODEL = "UD-IQ1_S"
+SERVED_FAMILY = "unsloth"
+SERVED_SPEC = "6"                                    # draft length: +6.5% on code, -1.5% on prose against 4 (docs/INTEL.md)
+SERVED_PROFILE = "expert-profile-pi.bin"             # data/: the experts a coding agent's sessions use
+SERVED_DRAFT_VOCAB = "draft_vocab_code.bin"          # data/: English and code tokens for the drafts
+SERVED_ENV = {"STRATA_SPEC_PROBE_MIN": "1", "STRATA_IQ_XXS_SGNMUL": "1", "STRATA_KREG2_R": "2,4,4,4,2,2,2,2"}
+SERVED_MIN_RAM_GB = 56.0                             # a 64 GB PC reports a little less than 64
+B70_DEVID = "e223"
+NO_RECIPE_FLAG = "--no-served-recipe"
+
+
+def served_card(intel: list, real_ram: float) -> bool:
+    """One Arc Pro B70 and a 64 GB PC: the setup the recipe was measured on."""
+    return len(intel) == 1 and intel[0].get("devid") == B70_DEVID and real_ram >= SERVED_MIN_RAM_GB
+
+
+def served_applies(intel: list, sel_devid: str, recipe_on: bool) -> bool:
+    """The recipe is for exactly one card, a B70: on two cards (a layer split) it was not measured, and its --spec 6 would stop the
+    two-card --spec 2 rule (strata_control/intel_spec.py) from applying."""
+    return recipe_on and len(intel) == 1 and sel_devid == B70_DEVID
+
+
+# the "env" entries setup writes itself on every run (to_sycl, write_run_script): not carried over from an earlier config
+GENERATED_ENV = frozenset({"STRATA_SYCL_BIN", "STRATA_SYCL_ROOT", "IGC_EnableDPEmulation", "OverrideDefaultFP64Settings",
+                           "NEOReadDebugKeys", "STRATA_VERIFY_NO_HOST", "ONEAPI_DEVICE_SELECTOR", "STRATA_STAGE_TRIM"})
+
+
+def person_env(cfg: dict) -> dict:
+    """The "env" entries of the earlier config that the person added or changed: not what setup writes (setup.SETUP_ENV, GENERATED_ENV)
+    and not a recipe value left by an earlier run (an entry with the recipe's own value is dropped, so --no-served-recipe undoes it)."""
+    old = cfg.get("env")
+    if not isinstance(old, dict):
+        return {}
+    mine = S.SETUP_ENV if "-unsloth-" in str(cfg.get("model_name") or "") else S.SETUP_ENV - S.SETUP_ENV_UNSLOTH
+    return {k: v for k, v in old.items() if k not in mine and k not in GENERATED_ENV and SERVED_ENV.get(k) != v}
+
+
+def prefer_served(intel: list, real_ram: float, argv: list) -> list:
+    """One Arc Pro B70 on a 64 GB PC: the model menu preselects the served model (a choice, never forced: --model and --family win,
+    and a plain ./setup.sh run again starts what is installed). With --model UD-IQ1_S and no --vision, pictures are off too (the
+    served setup has none, docs/INTEL.md "Pictures on an Arc"). Returns the arguments to go on with."""
+    if not served_card(intel, real_ram):
+        return argv
+    S.RECOMMENDED_SIZES = {**S.RECOMMENDED_SIZES, SERVED_FAMILY: (SERVED_MODEL,)}
+    S.tier_pick = lambda ram, vram=0.0: (SERVED_FAMILY, SERVED_MODEL)
+    model = flag(argv, "--model") or next((a.split("=", 1)[1] for a in argv if a.startswith("--model=")), None)
+    if model == SERVED_MODEL and not any(a == "--vision" or a.startswith("--vision=") for a in argv):
+        return [*argv, "--vision", "no"]
+    return argv
+
+
+def apply_served_recipe(args: list, env: dict, draft_asked: bool = False) -> list:
+    """The served recipe's settings over the generated `args` and `env` (changed in place); returns the lines to say.
+    Each setting is skipped where the person already chose another value: --spec other than setup's 4, another expert profile,
+    --draft-vocab given on the command line, an env variable already set."""
+    notes = []
+    if flag(args, "--spec") == "4":
+        args[args.index("--spec") + 1] = SERVED_SPEC
+        notes.append(f"--spec {SERVED_SPEC}")
+    if "--spec" not in args and "--mtp" in args:
+        args += ["--spec", SERVED_SPEC]
+        notes.append(f"--spec {SERVED_SPEC}")
+    if "--spec-min-p" not in args and "--mtp" in args:
+        args += ["--spec-min-p", "0.5"]
+    profile = ROOT / "data" / SERVED_PROFILE
+    if "--expert-profile" in args and profile.is_file():
+        i = args.index("--expert-profile") + 1
+        if args[i].replace("\\", "/").rsplit("/", 1)[-1] in ("expert-profile.bin", SYCL_PROFILE):
+            args[i] = sycl_path(profile)
+            notes.append(f"--expert-profile data/{SERVED_PROFILE}")
+    vocab = ROOT / "data" / SERVED_DRAFT_VOCAB
+    if "--mtp" in args and "--mtp-draft-vocab" not in args and not draft_asked and vocab.is_file():
+        args += ["--mtp-draft-vocab", sycl_path(vocab)]
+        notes.append(f"--mtp-draft-vocab data/{SERVED_DRAFT_VOCAB}")
+    for k, v in SERVED_ENV.items():
+        if k not in env:
+            env[k] = v
+            notes.append(f"{k}={v}")
+    return notes
+
+
 SYCL_PROFILE = "expert-profile-sycl.bin"   # data/: the xe cards' expert ranking (to_sycl)
 SMALL_CARD_GB = 12.0       # under this the engine's own advice is --vram-reserve-mib 300 (a 1024 MiB reserve leaves an
                            # 8 GB card no room for even one expert slot) and the English draft vocabulary
@@ -286,7 +371,8 @@ def _model_title(model: str, args: list) -> str:
 
 def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, driver: str = "xe",
             devid: str = "", fit_notes: list | None = None, model: str = "", ctx_asked: bool = False,
-            auto_reserve: bool = False, fit: bool = True) -> dict:
+            auto_reserve: bool = False, fit: bool = True, served: bool = False, draft_asked: bool = False,
+            served_notes: list | None = None) -> dict:
     """setup's config (written for its HIP path) -> the SYCL port's: the container's paths, experts streamed from the
     GGUF into VRAM (--stream-experts: the engine reads them from the GGUF and keeps what does not fit in a pinned RAM
     mirror; the VRAM reserve is the smallest that leaves the KV and the prompt buffers room - docs/INTEL.md), KV
@@ -383,7 +469,7 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
             args += ["--prefill", new_prefill]
     out = {k: v for k, v in cfg.items() if k not in ("lib_dirs", "env", "gpus")}   # "vision" stays: the CPU reader runs on the host
     out.update({"backend": "sycl", "exe": str(SYCL_WRAPPER), "args": args, "sycl_root": str(MOUNT)})
-    env = {}
+    env = person_env(cfg)                               # what the person put in "env" by hand survives a rerun
     if alchemist:
         if driver == "i915":
             # on i915 the CPU computes the misses and the GPU waits for them at every layer (NO_HOST=0). On xe the
@@ -397,8 +483,14 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
         env["STRATA_SYCL_BIN"] = exe.relative_to(ROOT).as_posix()
     if MOUNT.resolve() != ROOT.parent.resolve():
         env["STRATA_SYCL_ROOT"] = str(MOUNT)
+    if served and model in (SERVED_MODEL, S.FAMILIES[SERVED_FAMILY]["tag"] + SERVED_MODEL):   # setup names the config's tag: "unsloth-UD-IQ1_S"
+        notes = apply_served_recipe(out["args"], env, draft_asked)
+        if served_notes is not None:
+            served_notes.extend(notes)
     if env:
         out["env"] = env
+    if user_args.WRITTEN_KEY in out:      # setup stamped the args before this rewrite: stamp the final ones, so a rerun does not read
+        user_args.stamp(out)              # the flags written here (--stream-experts, the served recipe) as the person's own
     out.update(keep)
     return out
 
@@ -416,6 +508,10 @@ def asked_context(argv) -> int:
 
 
 def install(argv) -> None:
+    argv = list(argv)
+    recipe_on = NO_RECIPE_FLAG not in argv           # setup.py does not know this option: it is taken out here
+    argv = [a for a in argv if a != NO_RECIPE_FLAG]
+    draft_asked = "--draft-vocab" in argv
     intel = [] if S.WIN else intel_gpus()
     if not intel:
         S.fail("no Intel Arc found (an xe or i915 card in /sys/class/drm)", "on an NVIDIA or AMD card, run ./setup.sh")
@@ -428,6 +524,8 @@ def install(argv) -> None:
             S.fail(f"setup.py has no {name}() any more: sycl/setup_intel.py needs updating for this setup.py")
 
     real_ram = S.ram_gb()
+    if recipe_on:
+        argv = prefer_served(intel, real_ram, argv)
     # what the person chose on the command line is kept by the fit rule (vram_fit); the small-card reserve added below is not theirs
     asked_ctx = any(a == "--context" or a.startswith("--context=") or a == "--max-context" for a in argv)
     asked_reserve = any(a == "--vram-reserve-mib" or a.startswith("--vram-reserve-mib=") for a in argv)
@@ -517,10 +615,14 @@ def install(argv) -> None:
         split = isinstance(gsel, list)
         idx = gsel if isinstance(gsel, int) and 0 <= gsel < len(intel) else 0
         sel = intel[idx]
-        fit_notes = []
+        fit_notes, served_notes = [], []
         cfg = to_sycl(cfg, exe, real_ram, keep.get(Path(cfg_path).name, {}), sel["vram_gb"], sel["driver"],
                       sel.get("devid", ""), fit_notes=fit_notes, model=model, ctx_asked=asked_ctx,
-                      auto_reserve=not asked_reserve, fit=not split)
+                      auto_reserve=not asked_reserve, fit=not split, served=served_applies(intel, sel.get("devid"), recipe_on), draft_asked=draft_asked,
+                      served_notes=served_notes)
+        if served_notes:
+            S.say("  The served B70 recipe for " + SERVED_MODEL + " is in the config: " + ", ".join(served_notes)
+                  + f" ({NO_RECIPE_FLAG} leaves it out; docs/B70.md)")
         for line in fit_notes:                              # one plain line: what was chosen and why (never a refusal)
             S.say("  " + line)
         if len(intel) > 1:                                  # pin the SYCL device(s)
