@@ -638,3 +638,75 @@ if(STRATA_BUILD_DSV41)
     set_tests_properties(ds4_xmx_test PROPERTIES TIMEOUT 300)
   endif()
 endif()
+
+# -----------------------------------------------------------------------------
+# Qwen3.8-27B (dense, GGUF architecture qwen35) SYCL engine path (strata-q36), optional (docs/Q36.md)
+# -----------------------------------------------------------------------------
+# The binary `strata` does not need it and is built the same with it off.  Q36=ON bash sycl/tools/build.sh strata-q36
+# q36_engine.dp.cpp began as SYCLomatic's migration of a CUDA engine and has been edited by hand since (nothing is migrated
+# again); the dense qwen35 path (Qwen3.8-27B) is what this build runs.
+option(STRATA_BUILD_Q36 "Build the dense Qwen3.8-27B SYCL engine (strata-q36), optional" OFF)
+if(STRATA_BUILD_Q36)
+  if(NOT STRATA_NATIVE_EXPERTS)
+    message(FATAL_ERROR "strata-q36 needs STRATA_NATIVE_EXPERTS=ON (ggml's CPU dequantizer for q36_requant.cpp)")
+  endif()
+  # STRATA_Q36_BUILD is set on this target only: the few lines of shared headers that know the dense family
+  # (include/strata/artifact/model_family.hpp, include/strata/core/family_layout.hpp and its sycl/ copy) sit behind it, so every
+  # other target compiles them as before.  The 27B's decode forms are q36_mmvq_dense.dp.cpp, a source of this target only.
+  add_executable(strata-q36
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_engine.dp.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense.dp.cpp
+    ${STRATA_ROOT}/src/qwen35/q36_main.cpp
+    ${STRATA_ROOT}/src/qwen35/q36_requant.cpp)
+  target_compile_definitions(strata-q36 PRIVATE STRATA_Q36_PORT=1 STRATA_Q36_BUILD=1)
+  target_include_directories(strata-q36 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35 ${STRATA_ROOT}/third_party/ggml)
+  target_link_libraries(strata-q36 PRIVATE strata_prefill strata_engine strata_kernels strata_kernels_cpu Threads::Threads)
+  # LP3: the 8-bit cache's prompt attention on vllm-xpu-kernels' Xe2 chunk_prefill (on sycl-tla), a shared library of its own
+  # built the way vllm-xpu-kernels builds libattn_kernels_xe_2 (cmake/utils.cmake add_xe2_kernel_library): its defines, -O3
+  # without strata's -fp-model=precise and sub-group 32, gnu++20, and at the AOT link the 2D-block / split-barrier / DPAS
+  # SPIR-V extensions and 256 registers a thread - those link options on this library only, strata-q36's own link keeps its
+  # options.  Those two projects are not in this repository: sycl/tools/get-q36-tla.sh fetches them into third_party/ (pinned
+  # commits, licences in THIRD_PARTY_NOTICES.md).  Without an AOT target for Battlemage / Lunar Lake there is no LP3 (the
+  # chunks take the engine's own attention) and nothing to fetch.
+  if(STRATA_SYCL_AOT MATCHES "^(bmg|lnl)")
+    set(_q36_tla_dir ${STRATA_ROOT}/third_party)
+    if(NOT EXISTS ${_q36_tla_dir}/sycl-tla/include/cutlass OR
+       NOT EXISTS ${_q36_tla_dir}/vllm-xpu-kernels/csrc/xpu/attn/xe_2/chunk_prefill.hpp)
+      message(FATAL_ERROR "strata-q36 with AOT=${STRATA_SYCL_AOT} needs third_party/sycl-tla and third_party/vllm-xpu-kernels "
+                          "(its long-prompt attention).  Run once:  bash sycl/tools/get-q36-tla.sh")
+    endif()
+    file(STRINGS ${_q36_tla_dir}/vllm-xpu-kernels/csrc/xpu/attn/fmha_utils.hpp _q36_torch REGEX "^[ \t]*#[ \t]*include[ \t]*[<\"]torch/all\\.h")   # an include line, not the header's own note about it
+    if(_q36_torch)
+      message(FATAL_ERROR "third_party/vllm-xpu-kernels is not patched (fmha_utils.hpp still includes torch).  "
+                          "Remove third_party/vllm-xpu-kernels and run:  bash sycl/tools/get-q36-tla.sh")
+    endif()
+    add_library(q36_tla SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_tla_fmha.cpp)
+    set_target_properties(q36_tla PROPERTIES CXX_EXTENSIONS ON)
+    set_property(TARGET q36_tla PROPERTY COMPILE_OPTIONS
+                 -fsycl -fsycl-targets=spir64_gen -O3 -Wno-unused-command-line-argument -ftemplate-backtrace-limit=0
+                 -fno-sycl-instrument-device-code)
+    target_compile_definitions(q36_tla PRIVATE NDEBUG CUTLASS_ENABLE_HEADERS_ONLY CUTLASS_ENABLE_SYCL SYCL_INTEL_TARGET
+                               CUTLASS_VERSIONS_GENERATED VLLM_XPU_ENABLE_XE2 VLLM_GRF_SIZE=256)
+    target_include_directories(q36_tla PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35
+                               ${_q36_tla_dir}/vllm-xpu-kernels
+                               ${_q36_tla_dir}/sycl-tla/include
+                               ${_q36_tla_dir}/sycl-tla/tools/util/include
+                               ${_q36_tla_dir}/sycl-tla/applications)
+    set_property(TARGET q36_tla PROPERTY LINK_OPTIONS
+                 -fsycl -fsycl-targets=spir64_gen -Wno-unused-command-line-argument
+                 "SHELL:-Xspirv-translator -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate"
+                 "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${STRATA_SYCL_AOT} -internal_options -cl-intel-256-GRF-per-thread\"")
+    target_link_libraries(strata-q36 PRIVATE q36_tla)
+    # $ORIGIN, not the build tree's absolute path: the serve wrapper mounts the repo at /work/<repo name>.
+    set_target_properties(strata-q36 PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
+    target_compile_definitions(strata-q36 PRIVATE STRATA_Q36_TLA=1)
+  endif()
+  # the 27B's decode forms against a float64 reference and against native_mmvq on the card (PARITY=ON; docs/Q36.md)
+  if(STRATA_SYCL_PARITY)
+    add_executable(q36_mmvq_dense_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense_parity.cpp
+                   ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense.dp.cpp)
+    target_include_directories(q36_mmvq_dense_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
+    target_link_libraries(q36_mmvq_dense_parity PRIVATE strata_kernels)
+    add_test(NAME q36_mmvq_dense_parity COMMAND q36_mmvq_dense_parity --selftest)
+  endif()
+endif()

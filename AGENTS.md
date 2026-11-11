@@ -4,6 +4,9 @@ This is a fork of [Strata](https://github.com/Niko1221/Strata) for exactly one s
 `bmg-g31`) on Linux with the `xe` driver, serving Qwen3.8-Flash-Next from the SYCL engine in `sycl/`. Work that does not help
 this setup is out of scope. The NVIDIA, AMD and Apple runtimes, the desktop app and the Windows and macOS packages are not part of it.
 
+A second model exists: the dense Qwen3.8-27B, on its own optional binary `strata-q36` (`sycl/src/qwen35`, [docs/Q36.md](docs/Q36.md)).
+It is off by default (`Q36=ON` for `sycl/tools/build.sh`) and `strata` does not depend on it.
+
 DeepSeek V4.1-Flash (`sycl/src/dsv41`) is not maintained since 2026-10-30 and its build is off by default.
 
 ## Where things are
@@ -27,7 +30,8 @@ The engine builds in the `strata-sycl-dev` image. From the repository folder (as
         -e BUILD_DIR=/work/$H/build-sycl-aot strata-sycl-dev "cd /work/$H && bash sycl/tools/build.sh strata"
 
 The build ends with `BUILD EXIT 0` and `errors: 0`. `sycl/tools/build.sh` with no target builds `strata` only. The kernel parity
-programs are built on request: `PARITY=ON bash sycl/tools/build.sh <target>`. Other variables of `build.sh` (`AOT`, `I8_ESIMD`,
+programs are built on request: `PARITY=ON bash sycl/tools/build.sh <target>`. The dense engine: `Q36=ON bash sycl/tools/build.sh
+strata-q36` (docs/Q36.md; for the long-prompt attention run `bash sycl/tools/get-q36-tla.sh` once first). Other variables of `build.sh` (`AOT`, `I8_ESIMD`,
 `IQ_DECODE_FAST`, `HOST_MARCH`, `BUILD_DIR`, `JOBS`) are listed at the top of the script. Without `AOT` the first start compiles every
 kernel (about 47 s).
 
@@ -44,7 +48,11 @@ are in docs/B70.md.
 
 ## Working rules for agents here
 
-- One configuration: the one in docs/B70.md. Do not add a second model, a second quant or a second GPU path.
+- One configuration: the one in docs/B70.md (Flash-Next, `strata`). `strata-q36` (the dense Qwen3.8-27B, docs/Q36.md) is the one
+  optional second model; it stays off by default and apart from `strata`. Do not add a third model, another quant, or a second GPU
+  path. What `strata-q36` needs differently from a shared kernel or header goes into sources of its own (`sycl/src/qwen35`, as
+  `q36_mmvq_dense.dp.cpp` does) or behind `STRATA_Q36_BUILD`, which only the `strata-q36` target defines, so `strata` compiles the
+  same sources as without it; a change that moves `strata` needs a measurement on `strata`.
 - One stream. The served setup is single-stream (`parallel` unset). Two streams were measured on the B70 and did not beat one:
   102-118 tok/s solo against 81-102 together, and a prompt read and a decode take turns. `parallel` stays an opt-in setting;
   work goes into the single stream unless parallel is asked for.
@@ -55,7 +63,8 @@ are in docs/B70.md.
   off, so it can be compared on one binary.
 - Compare two settings with a fixed `--expert-cache <n>` (not `auto`) and `STRATA_SPEC_COST=0`, so the window sizes do not follow
   timings that differ between runs. Give the numbers with what they were measured on. Make no claim without a measurement.
-- Tests that need no GPU: `python3 -m pytest serve/test_<name>.py -q` for one server test file, `python3 tools/test_setup_sycl.py`
+- Tests that need no GPU: `python3 -m pytest serve/test_<name>.py -q` for one server test file (`serve/test_q36_dense.py` for the 27B's
+  config), `python3 tools/test_setup_sycl.py`
   for setup, `python3 tools/test_graft_tensor.py` for the graft tool. The host-only C++ tests (`conversation_spill_test`, `draft_policy_test`, `gated_proposal_test`, `spec_admission_test`) are always configured;
   build one by name with `build.sh <target>`.
 - Plain words and short sentences in docs and comments.

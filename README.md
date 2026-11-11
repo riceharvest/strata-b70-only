@@ -14,6 +14,7 @@ Not affiliated with Intel or with upstream Strata.
 | Model | Status on one B70 |
 | --- | --- |
 | [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), Unsloth's [UD-IQ1_S](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (the file set this fork serves, setup's choice on one B70 with 64 GB of RAM) | Usable at 128K-256K context, chats and coding agents included. The numbers under [Speed](#speed) were measured on the earlier IQ2_XS file ([ISTA-DASLab GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)); the UD-IQ1_S ones are in [docs/B70.md](docs/B70.md) |
+| [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) (dense), Unsloth's [UD-Q4_K_M and UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF), on a second engine, `strata-q36` (optional, off by default: `Q36=ON`) | Usable to about 128K: with 262,144 tokens of context loaded (8-bit K/V cache) a 118K-token prompt is read at 1,096 tok/s and answered at 21 tok/s. Works, not usable at 256K (a 262K-token prompt read at 721 tok/s on 2026-11-03, not measured again). Short context: 81.0 / 65.2 tok/s on the two localmaxxing prompts, the whole model in VRAM. Measured 2026-11-11 on this tree unless a date says otherwise. [docs/Q36.md](docs/Q36.md) |
 
 ## What counts as usable here
 
@@ -213,6 +214,8 @@ under [Speed](#speed); sessions past 118K tokens are not measured yet.
   changes here are community pull requests to upstream, credited in [docs/B70.md](docs/B70.md).
 - The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. The quantized sets
   are by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab), who also made the DeepSeek V4.1-Flash sets.
-- Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp).
+- Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). The optional 27B engine's long-prompt attention is
+  built on Intel's [sycl-tla](https://github.com/intel/sycl-tla) and [vllm-xpu-kernels](https://github.com/vllm-project/vllm-xpu-kernels);
+  licences and what was changed: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 MIT License ([LICENSE](LICENSE)). The models have their own licenses.
