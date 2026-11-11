@@ -565,6 +565,15 @@ class ServedRecipe(unittest.TestCase):
                 self.assertEqual(si.prefer_served(intel, ram, ["--model", "UD-IQ1_S"]), ["--model", "UD-IQ1_S"])
                 self.assertEqual(setup.tier_pick(1024.0, 32.0), ("qwen", "IQ3_S"))
 
+    def test_a_rerun_does_not_read_the_recipe_flags_as_the_persons_own(self):
+        from strata_control import user_args
+        cfg = self.cfg()
+        cfg["user_args"] = ["--vram-reserve-mib", "700"]
+        user_args.stamp(cfg)                                          # what setup does before to_sycl rewrites the args
+        out, _ = self.make(cfg=cfg)
+        self.assertEqual(out["args_written"], out["args"])
+        self.assertEqual(user_args.capture(out, setup.SETUP_CHOICE_FLAGS), ["--vram-reserve-mib", "700"])
+
     def test_the_off_switch_is_taken_out_before_setup_sees_it(self):
         src = (ROOT / "sycl" / "setup_intel.py").read_text(encoding="utf-8")
         self.assertIn("NO_RECIPE_FLAG not in argv", src)

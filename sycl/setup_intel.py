@@ -35,7 +35,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import setup as S  # noqa: E402
-from strata_control import intel_spec, sycl_build, vram_fit  # noqa: E402
+from strata_control import intel_spec, sycl_build, user_args, vram_fit  # noqa: E402
 
 SYCL_WRAPPER = sycl_build.wrapper(ROOT)       # the paths `strata launch` and the runtime host use too (strata_control/sycl_build.py)
 SYCL_IMAGE = "strata-sycl-dev"
@@ -234,7 +234,8 @@ def build_vision_sycl(stub: Path, stamp: Path, llama, vsrc) -> None:
 
 # The recipe this fork serves on one Arc Pro B70 (docs/B70.md, "The served setup"): Unsloth's UD-IQ1_S at 256K. Setup makes the
 # model files (the layer 18 graft, setup.py graft_step) and, for this model only, a config with these settings on top of its own.
-# A value the person chose is kept. --no-served-recipe turns the recipe and the B70 preselection off.
+# A value the person chose is kept. --no-served-recipe turns the recipe and the B70 preselection off (a config written by an earlier
+# run with the recipe is rewritten without it).
 SERVED_MODEL = "UD-IQ1_S"
 SERVED_FAMILY = "unsloth"
 SERVED_SPEC = "6"                                    # draft length: +6.5% on code, -1.5% on prose against 4 (docs/INTEL.md)
@@ -466,6 +467,8 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
             served_notes.extend(notes)
     if env:
         out["env"] = env
+    if user_args.WRITTEN_KEY in out:      # setup stamped the args before this rewrite: stamp the final ones, so a rerun does not read
+        user_args.stamp(out)              # the flags written here (--stream-experts, the served recipe) as the person's own
     out.update(keep)
     return out
 
