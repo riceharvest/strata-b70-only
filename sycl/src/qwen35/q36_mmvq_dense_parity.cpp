@@ -40,6 +40,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "q36_mmvq_dense.hpp"
 #include "q36_xr_dense.hpp"
+#include "q36_xatt.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -687,10 +688,216 @@ int floor_bench() {
     return 0;
 }
 
+// --xatt [T list] [cells]: the matrix-engine decode attention (q36_xatt.dp.cpp) on random K / V / queries.  Checks it
+// against the same quantized math in float64 (the device's exp is a 1.2e-7 series: a 16-bit weight may differ by one),
+// reports how far the quantized result is from the plain FP attention, checks that a window's rows are bitwise the
+// one-row calls, and times a call (16 a graph: the 27B's attention layers).
+int xatt_bench(const char* tl_s, int cells) {
+    namespace xa = strata::q36xatt;
+    const std::vector<int> tl = parse_list(tl_s);
+    sycl::queue q(sycl::gpu_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()});
+    const int HKV = 4, H = 24, HD = 256, NCHK = 96, TM = 16;
+    const int ctx = cells + 64, ctxp = xa::ctx_pad(ctx), capc = xa::chunk_cap(ctx, NCHK);
+    uint64_t st = 0x9E3779B97F4A7C15ull;
+    auto xr = [&] { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
+    auto nrm = [&] { double a = 0; for (int i = 0; i < 6; ++i) a += (double) (xr() >> 11) / 9007199254740992.0; return (float) ((a - 3.0) * 1.41421356); };
+    std::vector<float> K((size_t) HKV * cells * HD), V(K.size()), Q((size_t) TM * H * HD);
+    for (auto& v : K) v = nrm() * 1.5f;
+    for (auto& v : V) v = nrm();
+    for (auto& v : Q) v = nrm() * 1.5f;
+    for (size_t c = 0; c < (size_t) HKV * cells; ++c) {   // (cells of unequal size, as a real cache's)
+        const float a = 0.5f + (float) (xr() & 1023) / 512.0f;
+        for (int d = 0; d < HD; ++d) V[c * HD + d] *= a;
+    }
+    std::vector<uint32_t> hk8(xa::k8_dwords(HKV, ctxp), 0), hv8(xa::v8t_dwords(HKV, ctxp), 0);
+    std::vector<float> hks(xa::sc_floats(HKV, ctxp), 0.f), hvs(hks.size(), 0.f);
+    auto* k8b = reinterpret_cast<int8_t*>(hk8.data());
+    auto* v8b = reinterpret_cast<int8_t*>(hv8.data());
+    auto code = [](float v, float sc) { int c = sc > 0.f ? (int) std::nearbyint(v / sc) : 0; return (int8_t) std::max(-127, std::min(127, c)); };
+    for (int h = 0; h < HKV; ++h)
+        for (int c = 0; c < cells; ++c) {
+            const float* k = &K[((size_t) h * cells + c) * HD];
+            const float* v = &V[((size_t) h * cells + c) * HD];
+            float mk = 0.f, mv = 0.f;
+            for (int d = 0; d < HD; ++d) { mk = std::max(mk, std::fabs(k[d])); mv = std::max(mv, std::fabs(v[d])); }
+            const float sk = mk / 127.0f, sv = mv / 127.0f;
+            hks[(size_t) h * ctxp + c] = sk;
+            hvs[(size_t) h * ctxp + c] = sv;
+            for (int d = 0; d < HD; ++d) {
+                k8b[((size_t) h * ctxp + c) * HD + d] = code(k[d], sk);
+                v8b[(((size_t) h * (ctxp / 32) + c / 32) * 256 + d) * 32 + c % 32] = code(v[d], sv);
+            }
+        }
+    auto dev = [&](size_t bytes) { return sycl::aligned_alloc_device((size_t) 2 << 20, std::max<size_t>(bytes, 64), q); };
+    auto* dk8 = (uint32_t*) dev(hk8.size() * 4); auto* dv8 = (uint32_t*) dev(hv8.size() * 4);
+    auto* dks = (float*) dev(hks.size() * 4); auto* dvs = (float*) dev(hvs.size() * 4);
+    auto* dq = (float*) dev(Q.size() * 4);
+    auto* dpos = (int32_t*) dev(64);
+    auto* dqb = (uint32_t*) dev(xa::qb_dwords(HKV) * 4); auto* dqs = (float*) dev(xa::qs_floats(HKV) * 4);
+    auto* dsc = (float*) dev(xa::score_floats(HKV, NCHK, capc) * 4);
+    auto* dpb = (uint32_t*) dev(xa::pb_dwords(HKV, NCHK, capc) * 4);
+    auto* dsr = (float*) dev(xa::srow_floats(HKV, NCHK) * 4);
+    const size_t rows_m = (size_t) TM * H;
+    auto* dpa = (float*) dev(rows_m * NCHK * HD * 4); auto* dpm = (float*) dev(rows_m * NCHK * 4); auto* dpl = (float*) dev(rows_m * NCHK * 4);
+    q.memcpy(dk8, hk8.data(), hk8.size() * 4); q.memcpy(dv8, hv8.data(), hv8.size() * 4);
+    q.memcpy(dks, hks.data(), hks.size() * 4); q.memcpy(dvs, hvs.data(), hvs.size() * 4);
+    q.memcpy(dq, Q.data(), Q.size() * 4);
+    q.wait();
+    std::printf("xatt: %d cells, %d KV heads x %d query heads, %d chunks a row, a chunk's scratch %d cells; scratch %.0f MB\n", cells, HKV, H / HKV, NCHK,
+                capc, (double) (xa::score_floats(HKV, NCHK, capc) + xa::pb_dwords(HKV, NCHK, capc)) * 4 / 1048576.0);
+    auto chunk_cells = [&](int n) { const int per = (n + NCHK - 1) / NCHK; const int cs = (per + 63) / 64 * 64; return cs > 64 ? cs : 64; };
+    auto call_of = [&](const float* qrows, int t0, int nt) {
+        xa::Call c{};
+        c.q = qrows; c.pos0 = dpos; c.t0 = t0; c.nt = nt; c.H = H; c.HKV = HKV; c.nchk = NCHK; c.scale = 1.0f / 16.0f;
+        c.k8 = dk8; c.ks = dks; c.v8t = dv8; c.vs = dvs; c.ctxp = ctxp;
+        c.qb = dqb; c.qs = dqs; c.sc = dsc; c.pb = dpb; c.srow = dsr; c.capc = capc;
+        c.pacc = dpa; c.pm = dpm; c.pl = dpl;
+        return c;
+    };
+    // the device's partials merged on the host: out[row][256]
+    std::vector<float> pa, pm, pl;   // (the last call's partials)
+    auto merged = [&](int nt, int pos0, std::vector<float>& out) {
+        const size_t rows = (size_t) nt * H;
+        pa.assign(rows * NCHK * HD, 0.f); pm.assign(rows * NCHK, 0.f); pl.assign(rows * NCHK, 0.f);
+        q.memcpy(pa.data(), dpa, pa.size() * 4); q.memcpy(pm.data(), dpm, pm.size() * 4); q.memcpy(pl.data(), dpl, pl.size() * 4);
+        q.wait();
+        out.assign(rows * HD, 0.f);
+        for (size_t row = 0; row < rows; ++row) {
+            const int n = pos0 + (int) (row / H) + 1, cs = chunk_cells(n), nc = (n + cs - 1) / cs;
+            double M = -1e30;
+            for (int c = 0; c < nc; ++c) M = std::max(M, (double) pm[row * NCHK + c]);
+            double den = 0;
+            std::vector<double> num(HD, 0.0);
+            for (int c = 0; c < nc; ++c) {
+                const double w = std::exp((double) pm[row * NCHK + c] - M);
+                den += w * pl[row * NCHK + c];
+                for (int d = 0; d < HD; ++d) num[d] += w * pa[(row * NCHK + c) * HD + d];
+            }
+            for (int d = 0; d < HD; ++d) out[row * HD + d] = (float) (num[d] / den);
+        }
+    };
+    int bad = 0;
+    for (int T : tl) {
+        if (T < 1 || T > TM || cells < T + 64) continue;
+        const int pos0 = cells - T;
+        q.memcpy(dpos, &pos0, 4).wait();
+        const xa::Call c = call_of(dq, 0, T);
+        if (!xa::attend(c, &q)) { std::printf("xatt T=%d: not taken\n", T); ++bad; continue; }
+        q.wait();
+        std::vector<float> out;
+        merged(T, pos0, out);
+        const std::vector<float> wpa = pa, wpm = pm, wpl = pl;
+        // the references for a sample of rows: the same quantized math in float64, and the plain attention
+        double e_q = 0, e_x = 0, nrm2 = 0;
+        const int samp[] = {0, 7, H - 1, (T - 1) * H + 3, T * H - 1};
+        for (int row : samp) {
+            const int t = row / H, head = row % H, kvh = head / (H / HKV), n = pos0 + t + 1;
+            const float* qr = &Q[(size_t) row * HD];
+            float mx = 0.f;
+            for (int d = 0; d < HD; ++d) mx = std::max(mx, std::fabs(qr[d]));
+            const float qsc0 = mx / 127.0f, inv = qsc0 > 0.f ? 1.0f / qsc0 : 0.f, qsc = qsc0 * (1.0f / 16.0f);
+            int8_t qc[256];
+            for (int d = 0; d < HD; ++d) qc[d] = (int8_t) std::max(-127, std::min(127, (int) std::nearbyint(qr[d] * inv)));
+            const int cs = chunk_cells(n), nc = (n + cs - 1) / cs;
+            std::vector<double> cm(nc), cl(nc), cacc((size_t) nc * HD, 0.0);
+            std::vector<double> sx(n);
+            for (int cc = 0; cc < n; ++cc) {
+                double a = 0;
+                for (int d = 0; d < HD; ++d) a += (double) qr[d] * K[((size_t) kvh * cells + cc) * HD + d];
+                sx[cc] = a / 16.0;
+            }
+            for (int ci = 0; ci < nc; ++ci) {
+                const int a = ci * cs, b = std::min(a + cs, n);
+                std::vector<float> s(b - a);
+                float m = -1e30f, vmx = 0.f;
+                for (int cc = a; cc < b; ++cc) {
+                    int dot = 0;
+                    const int8_t* kk = &k8b[((size_t) kvh * ctxp + cc) * HD];
+                    for (int d = 0; d < HD; ++d) dot += (int) qc[d] * kk[d];
+                    s[cc - a] = (float) dot * (qsc * hks[(size_t) kvh * ctxp + cc]);
+                    m = std::max(m, s[cc - a]);
+                    vmx = std::max(vmx, hvs[(size_t) kvh * ctxp + cc]);
+                }
+                const float i65 = 65535.0f / std::max(vmx, 1e-30f);
+                double l = 0;
+                std::vector<long long> acc(HD, 0);
+                for (int cc = a; cc < b; ++cc) {
+                    const float pr = (float) std::exp((double) std::max(s[cc - a] - m, -87.0f));
+                    l += pr;
+                    const float w = std::min(pr * (i65 * hvs[(size_t) kvh * ctxp + cc]) + 0.5f, 65535.0f);
+                    const long long qw = (long long) w;
+                    for (int d = 0; d < HD; ++d) acc[d] += qw * v8b[(((size_t) kvh * (ctxp / 32) + cc / 32) * 256 + d) * 32 + cc % 32];
+                }
+                cm[ci] = m; cl[ci] = l;
+                for (int d = 0; d < HD; ++d) cacc[(size_t) ci * HD + d] = (double) acc[d] * (double) (vmx * (1.0f / 65535.0f));
+            }
+            double M = -1e30, MX = -1e300;
+            for (int ci = 0; ci < nc; ++ci) M = std::max(M, cm[ci]);
+            for (int cc = 0; cc < n; ++cc) MX = std::max(MX, sx[cc]);
+            double den = 0, dx = 0;
+            std::vector<double> num(HD, 0.0), nx(HD, 0.0);
+            for (int ci = 0; ci < nc; ++ci) {
+                const double w = std::exp(cm[ci] - M);
+                den += w * cl[ci];
+                for (int d = 0; d < HD; ++d) num[d] += w * cacc[(size_t) ci * HD + d];
+            }
+            for (int cc = 0; cc < n; ++cc) {
+                const double w = std::exp(sx[cc] - MX);
+                dx += w;
+                for (int d = 0; d < HD; ++d) nx[d] += w * V[((size_t) kvh * cells + cc) * HD + d];
+            }
+            for (int d = 0; d < HD; ++d) {
+                const double o = out[(size_t) row * HD + d], rq = num[d] / den, rx = nx[d] / dx;
+                e_q += (o - rq) * (o - rq); e_x += (o - rx) * (o - rx); nrm2 += rx * rx;
+            }
+        }
+        const double rq = std::sqrt(e_q / nrm2), rx = std::sqrt(e_x / nrm2);
+        // a window's rows against the one-row calls of the same tokens
+        int diff = 0;
+        for (int t = 0; t < T && T > 1; ++t) {
+            const int p1 = pos0 + t;
+            q.memcpy(dpos, &p1, 4).wait();
+            const xa::Call c1 = call_of(dq + (size_t) t * H * HD, 0, 1);
+            xa::attend(c1, &q);
+            q.wait();
+            std::vector<float> o1;
+            merged(1, p1, o1);
+            if (std::memcmp(o1.data(), &out[(size_t) t * H * HD], (size_t) H * HD * 4) != 0) {
+                ++diff;
+                if (t == 0 || t == T - 1) {   // which part differs: the chunks' max, sum, value sums (the row's own chunks only)
+                    const int n = p1 + 1, cs = chunk_cells(n), nc = (n + cs - 1) / cs;
+                    long dm = 0, dl = 0, da = 0;
+                    double worst = 0;
+                    for (int row = 0; row < H; ++row)
+                        for (int c2 = 0; c2 < nc; ++c2) {
+                            const size_t i1 = (size_t) row * NCHK + c2, iw = ((size_t) t * H + row) * NCHK + c2;
+                            dm += pm[i1] != wpm[iw];
+                            dl += pl[i1] != wpl[iw];
+                            for (int d = 0; d < HD; ++d) {
+                                const float x1 = pa[i1 * HD + d], xw = wpa[iw * HD + d];
+                                if (x1 != xw) { ++da; worst = std::max(worst, (double) std::fabs(x1 - xw) / (std::fabs(x1) + 1e-30)); }
+                            }
+                        }
+                    std::printf("  token %d: chunk max differs %ld, sum %ld, value sums %ld (worst relative %.2e)\n", t, dm, dl, da, worst);
+                }
+            }
+        }
+        q.memcpy(dpos, &pos0, 4).wait();
+        const double us = time_graph(q, 16, [&](int) { xa::attend(c, &q); }, 15);
+        const bool ok = rq < 2e-4 && diff == 0;
+        if (!ok) ++bad;
+        std::printf("xatt T=%2d (%2d rows a KV head): %8.1f us a call | vs the quantized float64 %.2e, vs plain FP attention %.2e, "
+                    "tokens differing from their one-row call %d %s\n", T, T * H / HKV, us, rq, rx, diff, ok ? "ok" : "FAIL");
+        std::fflush(stdout);
+    }
+    return bad ? 1 : 0;
+}
+
 int main(int argc, char** argv) try {
     setenv("STRATA_MMVQ_KREG", "1", 1);   // the dense forms' latch (strata-q36 sets it for the 27B)
     bool selftest_flag = false;
     if (argc > 1 && std::string(argv[1]) == "--floor") return floor_bench();
+    if (argc > 1 && std::string(argv[1]) == "--xatt") return xatt_bench(argc > 2 ? argv[2] : "1,5,6,16", argc > 3 ? std::atoi(argv[3]) : 25120);
     if (argc > 1 && std::string(argv[1]) == "--w4") return w4_bench(argc > 2 ? argv[2] : "1,4,5,6,8", argc > 3 ? argv[3] : "27");
     if (argc > 1 && std::string(argv[1]) == "--bench")
         return bench(argc > 2 ? argv[2] : "12,13,14,23", argc > 3 ? argv[3] : "1,2,3,4,6", argc > 4 ? argv[4] : "all");
