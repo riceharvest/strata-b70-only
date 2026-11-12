@@ -92,17 +92,30 @@ namespace K = strata::kernels;
 // The 27B's decode forms (q36_mmvq_dense.dp.cpp, built into this binary only) take the dense model's products; every other
 // call, and any that they decline, is the shared native_mmvq's.
 bool g_q36_dense_forms = false;
-// STRATA_Q36_DRAFT_Q4=1: the draft side (the MTP block's matrices and the draft head) requantized to Q4_K at load, where the
+// The draft side (STRATA_Q36_DRAFT_Q4=0: as the file has it): (the MTP block's matrices and the draft head) requantized to Q4_K at load, where the
 // file has them in a larger type (Q6_K in the 27B's files: 0.63 GB a draft call, 0.43 GB as Q4_K).  A draft only proposes
 // and the verify window decides with the file's own weights, so the text is the plain greedy text; only the acceptance can move.
 inline bool q36_draft_q4() {
-    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_DRAFT_Q4"); return e && e[0] == '1'; }();
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_DRAFT_Q4"); return !(e && e[0] == '0'); }();
     return on;
 }
-// STRATA_Q36_XR=1: the XMX rows forms (q36_xr_dense.dp.cpp: Q4_K, Q5_K, IQ4_XS; 1-8 columns for the price of one) take the
+// The drafts a step offers, by the cells already in the cache.  Every column of the verify window reads the whole K / V
+// cache, so a draft more costs more the longer the conversation is.  Measured on the B70 (2026-11-12, UD-Q4_K_M, XMX forms):
+// short context, depth 3 / 4 / 5: 42.3 / 44.7 / 47.1 ms a step, 3.2 / 3.7 / 3.9 tokens a step -> 5 is best; after a 118K
+// prompt, depth 3 / 5: 85.3 / 114.6 ms a step, 32.5 / 27.0 tok/s -> 3 is best.  The crossing is near 20K cells.
+// STRATA_Q36_MTP_CELLS="a,b" (16384,32768): --mtp's depth below a cells, at most 4 below b, at most 3 from b on.
+inline int q36_depth_at(int64_t cells, int mtp_d) {
+    static const std::pair<long long, long long> lim = [] {
+        long long a = 16384, b = 32768;
+        if (const char* e = std::getenv("STRATA_Q36_MTP_CELLS")) std::sscanf(e, "%lld,%lld", &a, &b);
+        return std::make_pair(a, std::max(a, b));
+    }();
+    return cells < lim.first ? mtp_d : cells < lim.second ? std::min(mtp_d, 4) : std::min(mtp_d, 3);
+}
+// The XMX rows forms (STRATA_Q36_XR=0: off) (q36_xr_dense.dp.cpp: Q4_K, Q5_K, IQ4_XS; 1-8 columns for the price of one) take the
 // dense model's products before the KREG forms; they read the same q8_1 image.
 inline bool q36_xr_on() {
-    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_XR"); return e && e[0] == '1'; }();
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_XR"); return !(e && e[0] == '0'); }();
     return on;
 }
 inline void q36_mmvq(int type, const void* w, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream) {
@@ -6616,6 +6629,12 @@ work-group size if needed.
                         spec_step(filler, fix, mtp_d, drafts, picks, nullptr, &wsel);
                     }
                 }
+                // the long-context depths' graphs (q36_depth_at: 4 and 3 below --mtp), every redo count
+                for (int D = std::min(mtp_d, 4); D >= 3 && D < mtp_d; --D)
+                    for (int f = 0; f <= mtp_d && pos + (int64_t) 2 * (mtp_d + 2) < ctx; ++f) {
+                        fix.assign((size_t) f, filler);
+                        spec_step(filler, fix, D, drafts, picks);
+                    }
                 for (int n = 1; n <= mtp_d + 1; ++n) commit_graph(n);
             }
         }
@@ -7555,8 +7574,9 @@ struct Serve {
             if (!emit(nx)) break;
             if (n_active > 0) window();
             if (spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
-                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop, plan.ok ? &sel : nullptr);
-                offered += E.mtp_d;
+                const int D = q36_depth_at(E.pos, E.mtp_d);
+                const int a = E.spec_step(nx, fix, D, drafts, picks, &stop, plan.ok ? &sel : nullptr);
+                offered += D;
                 accepted += a;
                 // the state now holds x and every accepted draft, whether or not the answer ends inside them (an end of
                 // answer, max_new): the held tokens say so, so a later request that continues this conversation matches them
@@ -7853,7 +7873,7 @@ int strata::qwen35::run(int argc, char** argv) {
     // M2: without --mtp, the dense model (Qwen3.8-27B) drafts kDenseMtp tokens a step with its MTP block (greedy requests only;
     // the answer is the plain greedy one), the best combined number on the two localmaxxing prompts on the B70; --mtp 0: off.  Other
     // families keep MTP off unless asked.
-    constexpr int kDenseMtp = 3;
+    constexpr int kDenseMtp = 5;
     if (mtp_d < 0) mtp_d = m.dense && m.has_mtp ? kDenseMtp : 0;
     E.mtp_d = m.has_mtp ? mtp_d : 0;
     if (draft_vocab < 0 && std::getenv("STRATA_Q36_DRAFT_VOCAB") != nullptr) draft_vocab = std::atoi(std::getenv("STRATA_Q36_DRAFT_VOCAB"));
@@ -7971,12 +7991,13 @@ int strata::qwen35::run(int argc, char** argv) {
             if ((int) gen.size() >= n_gen) break;
             // (a verify window whose rows' chunk sizes differ: the case M3b's per-row chunking makes bitwise the decode steps)
             straddled += att_chunk_cells((int) E.pos + 1, E.n_chunk) != att_chunk_cells((int) E.pos + E.mtp_d + 1, E.n_chunk);
-            const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks);
+            const int D = q36_depth_at(E.pos, E.mtp_d);
+            const int a = E.spec_step(nx, fix, D, drafts, picks);
             for (int i = 0; ff && i <= a && dumped < n_gen; ++i, ++dumped) {
                 E.host_logits_row(i, lg);
                 std::fwrite(lg.data(), 4, lg.size(), ff);
             }
-            offered += E.mtp_d;
+            offered += D;
             accepted += a;
             fix.assign(drafts.begin(), drafts.begin() + a);
             for (int i = 0; i < a && (int) gen.size() < n_gen; ++i) gen.push_back(drafts[(size_t) i]);
