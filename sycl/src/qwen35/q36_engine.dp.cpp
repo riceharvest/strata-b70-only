@@ -2984,8 +2984,13 @@ struct Engine {
     // The matrix-engine decode attention (q36_xatt.dp.cpp; STRATA_Q36_XATT=1, one session): each attention layer's mirror
     // (int8 K, transposed int8 V, a scale a cell), one set of scratch.  xatt_now: this window's rows take it (the cells
     // reach STRATA_Q36_XATT_MIN, default 4096); its graphs are recorded apart (run_graph_key).
+    // The mirror is written only by the windows that read it: xmir_n = the cells [0, xmir_n) it holds (any other write of
+    // cells - a prompt chunk, a window below the threshold - lowers it); the first window past the threshold fills the
+    // cells up to its own first (xatt_catch_up), from then on each window writes its rows.
     bool xatt_ready = false, xatt_now = false;
     int xatt_min = 4096, xctxp = 0, xcapc = 0;
+    int64_t xmir_n = 0;
+    int32_t* xpos_d = nullptr;
     std::vector<uint32_t*> xk8, xv8t;
     std::vector<float*> xks, xvs;
     uint32_t *xqb = nullptr, *xpb = nullptr;
@@ -3439,8 +3444,8 @@ struct Engine {
                 xks.assign(m->layers.size() + 1, nullptr);
                 xvs.assign(m->layers.size() + 1, nullptr);
                 size_t bytes = 0;
-                for (size_t li = 0; li < m->layers.size(); ++li)
-                    if (m->layers[li].attn) {
+                for (size_t li = 0; li <= m->layers.size(); ++li)   // (index n_layers: the MTP block's cache)
+                    if (li < m->layers.size() ? m->layers[li].attn : m->has_mtp) {
                         xk8[li] = reinterpret_cast<uint32_t*>(dalloc(xa::k8_dwords(hkv, xctxp)));
                         xv8t[li] = reinterpret_cast<uint32_t*>(dalloc(xa::v8t_dwords(hkv, xctxp)));
                         xks[li] = dalloc(xa::sc_floats(hkv, xctxp));
@@ -3452,6 +3457,7 @@ struct Engine {
                 xsc = dalloc(xa::score_floats(hkv, n_chunk, xcapc));
                 xpb = reinterpret_cast<uint32_t*>(dalloc(xa::pb_dwords(hkv, n_chunk, xcapc)));
                 xsrow = dalloc(xa::srow_floats(hkv, n_chunk));
+                xpos_d = reinterpret_cast<int32_t*>(dalloc(4));
                 bytes += (xa::qb_dwords(hkv) + xa::qs_floats(hkv) + xa::score_floats(hkv, n_chunk, xcapc) + xa::pb_dwords(hkv, n_chunk, xcapc) +
                           xa::srow_floats(hkv, n_chunk)) * 4;
                 xatt_ready = true;
@@ -4496,6 +4502,32 @@ work-group size if needed.
     /// An attention layer's attention after its q / k / v products (qg, kx, vx), into att (gated): the rows' q and k
     /// prepared and their K / V appended to the cache (k_attn_prep), then a prompt chunk (T > kGemmT) as FP16 GEMMs over
     /// the cache's cells, or the rows (a decode step, a verify window, the MTP block's rows; batch rows in rows_mode) on
+    /// The cells [*dpos, *dpos + T) of layer li's cache into its mirror (k_xatt_mirror).
+    template <typename KV>
+    void xmirror(size_t li, int T, const int32_t* dpos) {
+        const KV *const kcm = static_cast<const KV*>(kc[li]), *const vcm = static_cast<const KV*>(vc[li]);
+        const int hkv = (int) m->g.n_head_kv, cxm = ctx, cxp = xctxp;
+        int8_t* const k8 = reinterpret_cast<int8_t*>(xk8[li]);
+        int8_t* const v8 = reinterpret_cast<int8_t*>(xv8t[li]);
+        float *const ksm = xks[li], *const vsm = xvs[li];
+        st->parallel_for<dpct_kernel_name<class k_xatt_mirror_91d2, KV>>(
+            sycl::nd_range<3>(sycl::range<3>(1, (size_t) T, (size_t) hkv * 256), sycl::range<3>(1, 1, 256)),
+            [=](sycl::nd_item<3>) { k_xatt_mirror<KV>(kcm, vcm, dpos, hkv, cxm, cxp, k8, ksm, v8, vsm); });
+    }
+    /// Before a window that reads the mirror: the cells it does not hold yet, up to the window's position.
+    void xatt_catch_up() {
+        if (xmir_n >= pos) { xmir_n = INT64_MAX / 4; return; }
+        const int32_t a = (int32_t) std::max<int64_t>(0, xmir_n);
+        const int n = (int) (pos - a);
+        st->memcpy(xpos_d, &a, 4).wait();
+        for (size_t li = 0; li < xk8.size(); ++li) {
+            if (xk8[li] == nullptr || li >= kc.size() || kc[li] == nullptr) continue;
+            if (kv_f32) xmirror<float>(li, n, xpos_d);
+            else if (kv_q8) xmirror<int8_t>(li, n, xpos_d);
+            else xmirror<sycl::half>(li, n, xpos_d);
+        }
+        xmir_n = INT64_MAX / 4;   // (the windows keep it whole from here)
+    }
     /// k_attn_gqa + k_attn_merge_gqa (STRATA_Q36_ATTN_HEAD=1: k_attn_part + k_attn_merge).  KV: the cache's element type.
     template <typename KV>
     void attn_core(size_t li, const Layer &L, int T, int64_t p0, const int32_t *dpos, bool graph_mode) try {
@@ -4544,17 +4576,9 @@ work-group size if needed.
                     });
             });
         }
-        const bool xmir = xatt_ready && !rows_mode && li < xk8.size() && xk8[li] != nullptr;
-        if (xmir) {   // the stored cells into the layer's mirror
-            const KV *const kcm = kcl, *const vcm = vcl;
-            const int hkv = HKV, cxm = ctx, cxp = xctxp;
-            int8_t* const k8 = reinterpret_cast<int8_t*>(xk8[li]);
-            int8_t* const v8 = reinterpret_cast<int8_t*>(xv8t[li]);
-            float *const ksm = xks[li], *const vsm = xvs[li];
-            st->parallel_for<dpct_kernel_name<class k_xatt_mirror_91d2, KV>>(
-                sycl::nd_range<3>(sycl::range<3>(1, (size_t) T, (size_t) HKV * 256), sycl::range<3>(1, 1, 256)),
-                [=](sycl::nd_item<3>) { k_xatt_mirror<KV>(kcm, vcm, dpos, hkv, cxm, cxp, k8, ksm, v8, vsm); });
-        }
+        const bool xmir = xatt_ready && xatt_now && !rows_mode && li < xk8.size() && xk8[li] != nullptr;
+        if (xmir) xmirror<KV>(li, T, dpos);   // the stored cells into the layer's mirror
+        else if (xatt_ready) xmir_n = std::min<int64_t>(xmir_n, p0);   // (cells written past the mirror)
         if (T > kGemmT) {
             // M4b: the flash kernel (q36_prefill.dp.hpp) on the FP16 cache unless STRATA_Q36_PATTN=gemm or the shape is not
             // its: q -> q16 below, then flash_prompt_attn instead of the slices, then the gate as before.  The 8-bit cache
@@ -5978,6 +6002,8 @@ work-group size if needed.
 
     template <class F>
     void graph_run(dpct::experimental::command_graph_exec_ptr &gx, F body) try {
+        // (a graph that does not write the mirror, replayed: its cells are no longer in it)
+        if (xatt_ready && !xatt_now) xmir_n = std::min<int64_t>(xmir_n, std::max<int64_t>(0, pos - kVerify));
         if (!use_graph) { body(); return; }
         if (!gx) {
             dpct::experimental::command_graph_ptr graph = nullptr;
@@ -6122,6 +6148,7 @@ work-group size if needed.
                 // depth - a teacher-forced logit dump then measures it)
                 static const bool xall = [] { const char* e = std::getenv("STRATA_Q36_XATT_ALL"); return e && e[0] == '1'; }();
                 xatt_now = xatt_ready && xall;
+                if (xatt_now) xatt_catch_up();
                 graph_run(gs().g1, [&] { forward(1, pos, 1, use_graph, false); });
                 xatt_now = false;
             }
@@ -6231,6 +6258,8 @@ work-group size if needed.
 
     void run_graph_key(int key, const std::function<void()>& body) {
         xatt_now = xatt_ready && pos >= xatt_min;   // (the window's attention kernel: a graph of its own)
+        if (xatt_now) xatt_catch_up();
+        else if (xatt_ready) xmir_n = std::min<int64_t>(xmir_n, std::max<int64_t>(0, pos - kVerify));   // (a replayed graph's cells)
         if (!use_graph) body();
         else graph_run(row_graphs[key + (xatt_now ? 1000000 : 0)], body);
         xatt_now = false;
