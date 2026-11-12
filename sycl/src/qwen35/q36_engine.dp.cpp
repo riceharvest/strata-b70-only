@@ -81,6 +81,8 @@ namespace strata::qwen35 {
 /// A matrix of GGUF type `type` (n_out rows of n_in) requantized to Q8_0 blocks through ggml's CPU dequantizer
 /// (q36_requant.cpp); false when ggml cannot dequantize the type.
 bool requant_q8_0(int type, const void* src, int64_t n_in, int64_t n_out, std::vector<uint8_t>& out);
+/// ... to any ggml type (q36_requant.cpp).
+bool requant(int type, const void* src, int64_t n_in, int64_t n_out, int dst_type, std::vector<uint8_t>& out);
 }
 
 namespace {
@@ -90,6 +92,13 @@ namespace K = strata::kernels;
 // The 27B's decode forms (q36_mmvq_dense.dp.cpp, built into this binary only) take the dense model's products; every other
 // call, and any that they decline, is the shared native_mmvq's.
 bool g_q36_dense_forms = false;
+// STRATA_Q36_DRAFT_Q4=1: the draft side (the MTP block's matrices and the draft head) requantized to Q4_K at load, where the
+// file has them in a larger type (Q6_K in the 27B's files: 0.63 GB a draft call, 0.43 GB as Q4_K).  A draft only proposes
+// and the verify window decides with the file's own weights, so the text is the plain greedy text; only the acceptance can move.
+inline bool q36_draft_q4() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_DRAFT_Q4"); return e && e[0] == '1'; }();
+    return on;
+}
 // STRATA_Q36_XR=1: the XMX rows forms (q36_xr_dense.dp.cpp: Q4_K, Q5_K, IQ4_XS; 1-8 columns for the price of one) take the
 // dense model's products before the KREG forms; they read the same q8_1 image.
 inline bool q36_xr_on() {
@@ -2320,6 +2329,7 @@ bool load(const std::string &path, Model &m, std::string &err, bool want_mtp) {
         bytes += t->elements() * 4;
         return upload_f32(*t, gm.shard(s).tensor_data(*t));
     };
+    bool rq_draft = false;   // the tensors being loaded are the MTP block's (q36_draft_q4)
     auto mat = [&](const std::string &name) -> Mat {
     dpct::device_ext &dev_ct1 = dpct::get_current_device();
     sycl::queue &q_ct1 = dev_ct1.in_order_queue();
@@ -2332,7 +2342,14 @@ bool load(const std::string &path, Model &m, std::string &err, bool want_mtp) {
         const uint8_t* src = gm.shard(s).tensor_data(*t);
         uint64_t nb = strata::tensor_payload_bytes(*t);
         std::vector<uint8_t> rq;   // a type the native MMVQ does not take, as Q8_0
-        if (!K::native_mmvq_supported(w.type) && w.n_in % 32 == 0 &&
+        if (rq_draft && (w.type == 13 || w.type == 14) && w.n_in % 256 == 0 &&
+            strata::qwen35::requant(w.type, src, w.n_in, w.n_out, 12, rq)) {
+            std::fprintf(stderr, "strata-q36: draft side: %s (%s) as Q4_K (%.1f -> %.1f MiB)\n", name.c_str(), t->type_name(),
+                         nb / 1048576.0, rq.size() / 1048576.0);
+            w.type = 12;
+            src = rq.data();
+            nb = rq.size();
+        } else if (!K::native_mmvq_supported(w.type) && w.n_in % 32 == 0 &&
             strata::qwen35::requant_q8_0(w.type, src, w.n_in, w.n_out, rq)) {
             std::fprintf(stderr, "strata-q36: %s is %s, which the native MMVQ does not take: requantized to Q8_0 at load (%.1f MiB "
                          "-> %.1f MiB)\n", name.c_str(), t->type_name(), nb / 1048576.0, rq.size() / 1048576.0);
@@ -2378,6 +2395,7 @@ bool load(const std::string &path, Model &m, std::string &err, bool want_mtp) {
     m.has_mtp = g.n_mtp_layers > 0;
     for (int64_t l = 0; l < g.n_layers + (m.has_mtp ? 1 : 0); ++l) {
         const bool is_mtp = l == g.n_layers;
+        rq_draft = is_mtp && q36_draft_q4();
         Layer& y = is_mtp ? m.mtp : m.layers[(size_t) l];
         y.attn = is_mtp || strata::core::is_qsa_layer(g, l);
         y.attn_norm = f32(L(l, "attn_norm.weight"));
@@ -2453,6 +2471,7 @@ bool load(const std::string &path, Model &m, std::string &err, bool want_mtp) {
         m.mtp_shnorm = f32(L(l, "nextn.shared_head_norm.weight"));
     }
     m.out_norm = f32("output_norm.weight");
+    rq_draft = false;   // (the MTP block was the last layer of the loop; what follows is the main model's)
     m.head = mat("output.weight");
     {
         size_t s = 0;
@@ -4895,6 +4914,19 @@ work-group size if needed.
         }).wait();
         head_d.d = dst;
         head_d.type = hd.type;
+        if (q36_draft_q4() && (hd.type == 13 || hd.type == 14) && hd.n_in % 256 == 0) {   // the gathered rows as Q4_K
+            std::vector<uint8_t> hrows(rb * (size_t) n), rq;
+            st->memcpy(hrows.data(), dst, hrows.size()).wait();
+            if (strata::qwen35::requant(hd.type, hrows.data(), hd.n_in, n, 12, rq)) {
+                uint8_t* d4 = (uint8_t*) sycl::malloc_device(rq.size(), *st);
+                st->memcpy(d4, rq.data(), rq.size()).wait();
+                sycl::free(dst, *st);
+                head_d.d = d4;
+                head_d.type = 12;
+                std::fprintf(stderr, "strata-q36: draft side: the draft head as Q4_K (%.0f -> %.0f MB)\n", (double) rb * n / 1e6,
+                             (double) rq.size() / 1e6);
+            }
+        }
         head_d.n_in = hd.n_in;
         head_d.n_out = n;
         draft_n = n;
