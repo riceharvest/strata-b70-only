@@ -165,7 +165,8 @@ inline int q36_depth_at(int64_t cells, int mtp_d) {
 // Drafts beyond the base depth only on a run of accepted drafts.  A step offers kDraftBase drafts (or --mtp's, when that
 // is less); after a step whose drafts were all accepted the next offers one more, up to --mtp; after a miss it is back at
 // the base.  Text that the draft block predicts almost fully (an edit that repeats a file: 1,227 of 1,255 accepted) then
-// runs at the full depth, text it predicts half of stays at the base (the int4 pack, depth 5 / 7 fixed: 83.7 / 79.6 tok/s
+// runs at the full depth (15 with the pack: a window of 16 rows), text it predicts half of stays at the base (the int4
+// pack, depth 5 / 7 fixed: 83.7 / 79.6 tok/s
 // on code-v1, 147.7 / 174.0 on a whole-file edit).  STRATA_Q36_MTP_BASE=N: another base (N >= --mtp: always --mtp).
 constexpr int kDraftBase = 5;
 inline int q36_draft_base(int mtp_d) {
@@ -173,7 +174,11 @@ inline int q36_draft_base(int mtp_d) {
     return std::min(e, mtp_d);
 }
 inline int q36_next_cap(int offered, int accepted, int mtp_d) {
-    return accepted >= offered ? std::min(mtp_d, offered + 1) : q36_draft_base(mtp_d);
+    // every draft accepted: one more (two from 8 on); a miss: one more than was accepted, the base at least (a long accepted run that
+    // ends in one miss stays deep: a whole-file edit accepts 93% of its drafts and still misses once in most deep steps)
+    // (measured, int4 pack: +2 at every depth cost code-v1 3.3 tok/s, a reset to the base after a miss cost the edit 22)
+    if (accepted >= offered) return std::min(mtp_d, offered + (offered < 8 ? 1 : 2));
+    return std::min(mtp_d, std::max(q36_draft_base(mtp_d), accepted + 1));
 }
 // The XMX rows forms (STRATA_Q36_XR=0: off) (q36_xr_dense.dp.cpp: Q4_K, Q5_K, IQ4_XS; 1-8 columns for the price of one) take the
 // dense model's products before the KREG forms; they read the same q8_1 image.
@@ -2053,7 +2058,7 @@ may need to adjust the code.
 // forward takes).  These three kernels replace k_conv_seq / k_gdn_seq (+ the q8_1 quantizer of ssm_out's input) there, so a
 // decode step, a verify window's rows and the commit compute the same bits as one another (the MTP text is the plain text).
 // STRATA_Q36_GDN_DEC=0: the M2 kernels.  (The prompt chunks and the batch rows keep their own kernels.)
-constexpr int kDecT = 8;   // the most tokens (Engine::kGemmT, Engine::kVerify)
+constexpr int kDecT = 16;   // the most tokens (Engine::kGemmT, Engine::kVerify)
 
 /// The conv of T <= kDecT tokens: k_conv_seq's expressions per token, but a token's sum reads inputs only (the history and
 /// the tokens before it), so the tokens are independent, and the q/k heads' L2 norms of all T tokens share one barrier
@@ -2707,7 +2712,7 @@ struct Engine {
     q36pf::TlaBufs tla;
 #endif
     // verify windows (T <= kVerify): the GDN inputs of every row per layer, kept for the commit
-    static constexpr int kVerify = 8;
+    static constexpr int kVerify = 16;
     std::vector<float*> v_qkv, v_hc, v_alpha, v_beta;
     // the MTP block (when loaded)
     float *mtp_cat = nullptr, *hmtp = nullptr, *logits_m = nullptr;
@@ -3118,7 +3123,7 @@ struct Engine {
         the migrated code and was removed or replaced with 0. You may need to
         check the migrated code.
         */
-        CK(DPCT_CHECK_ERROR(hpin = sycl::malloc_host<int32_t>(64, q_ct1)));
+        CK(DPCT_CHECK_ERROR(hpin = sycl::malloc_host<int32_t>(256, q_ct1)));   // ([64..] a window's picks, [96..] its tokens, [128..] its drafts)
         // the rows' attention partials (T <= kGemmT rows take it): k_attn_gqa's chunks per row (STRATA_Q36_ATT_CHUNKS,
         // 8 .. kAttMaxChunks; 96 measured best on the B70 - k_attn_gqa + merge per layer at depth 2K / 12K: 32 48.5 /
         // 155.2 us, 64 42.0 / 178.6, 96 40.6 / 153.9, 128 41.8 / 159.4), or with STRATA_Q36_ATTN_HEAD k_attn_part's
@@ -3368,7 +3373,7 @@ struct Engine {
 
     /// A batch above kGemmT tokens (a prompt chunk) runs its projections as GEMMs (prefill::Gemm::native: the GGUF
     /// blocks dequantized to FP16, the activations FP16); a decode batch on the native MMVQ (q8_1 activations).
-    static constexpr int kGemmT = 8;
+    static constexpr int kGemmT = 16;
     static_assert(kDecT >= kGemmT && kDecT >= kVerify, "the decode GDN kernels take every decode-side row count");
     void prep(const float* xin, int n, int T, void* q) {
         if (T > kGemmT) {
@@ -4083,7 +4088,7 @@ work-group size if needed.
         if (q8_small(w, q, out, T)) return;
         // (M2: 8 columns a call everywhere; KREG itself runs a row wider than 16384 - the 27B's ffn_down - with its K split over
         // work-groups (M4: 4 parts, 5-8 columns in one pass).  A T-column call is bitwise T one-column calls.)
-        const int maxc = 8;
+        const int maxc = w.type == kW4Type ? 32 : 8;   // (the pack's form: up to 32 columns in one read of the weights)
         const size_t qb = K::native_q8_1_bytes(w.n_in, 1);
         for (int c0 = 0; c0 < T; c0 += maxc) {
             const int nc = std::min(maxc, T - c0);
@@ -4102,7 +4107,8 @@ work-group size if needed.
             if (!xq_post) quant(h, N, T, xq);
             mmq(L.ffn_gate, xq, sg, T);
             mmq(L.ffn_up, xq, su, T);
-            K::native_swiglu_quantize_q8_1(sg, su, q8, FF, T, st);
+            if (T <= 8) K::native_swiglu_quantize_q8_1(sg, su, q8, FF, T, st);
+            else K::native_swiglu_quantize_q8_1(sg, su, q8, FF * T, 1, st);   // (9+ columns: as one vector, the same blocks)
             mmq(L.ffn_down, q8, sy, T);
         } else {
             {
@@ -6489,12 +6495,12 @@ work-group size if needed.
         const int N = (int) m->g.n_embd;
         const int T0 = (int) fix.size() + 1, T = D + 1;
         CK(DPCT_CHECK_ERROR(st->wait()));
-        for (int i = 0; i < (int) fix.size(); ++i) hpin[16 + i] = fix[(size_t) i];
-        hpin[16 + fix.size()] = x_tok;
+        for (int i = 0; i < (int) fix.size(); ++i) hpin[96 + i] = fix[(size_t) i];
+        hpin[96 + fix.size()] = x_tok;
         hpin[1] = (int32_t) (pos - (int64_t) fix.size());
         hpin[40] = (int32_t) pos;
         hpin[41] = x_tok;
-        CK(DPCT_CHECK_ERROR(st->memcpy(tok_m, hpin + 16, (size_t) T0 * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(tok_m, hpin + 96, (size_t) T0 * 4)));
         CK(DPCT_CHECK_ERROR(st->memcpy(pos0_m, hpin + 1, 4)));
         CK(DPCT_CHECK_ERROR(st->memcpy(pos0, hpin + 40, 4)));
         CK(DPCT_CHECK_ERROR(st->memcpy(tok, hpin + 41, 4)));
@@ -6528,17 +6534,17 @@ work-group size if needed.
         if (sel == nullptr) run_graph_key(50000 + T0 * 16 + D, body);   // (greedy: the graph as before)
         else run_graph_key(70000 + T0 * 16 + D, [&] { body(); sp_topm(T); });
         rows_deferred = false;
-        if (sel == nullptr) CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 2, pick, (size_t) T * 4)));
+        if (sel == nullptr) CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 64, pick, (size_t) T * 4)));
         else CK(DPCT_CHECK_ERROR(st->memcpy(sp_h + 1, sp_rows, (size_t) T * kSpecRowWords * 4)));   // one copy: every row's candidates
-        CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 48, tok + 1, (size_t) D * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 128, tok + 1, (size_t) D * 4)));
         CK(DPCT_CHECK_ERROR(st->wait()));
         drafts.assign((size_t) D, 0);
-        for (int d = 0; d < D; ++d) drafts[(size_t) d] = hpin[48 + d];
+        for (int d = 0; d < D; ++d) drafts[(size_t) d] = hpin[128 + d];
         int a = 0;
         if (sel == nullptr) {
-            while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+            while (a < D && hpin[64 + a] == drafts[(size_t) a]) ++a;
             if (cancel != nullptr && cancel->load()) a = 0;
-            for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+            for (int i = 0; i <= a; ++i) picks[i] = hpin[64 + i];
         } else {
             if (q36_spec_check_on()) sp_check(T);
             // the host draws row 0, then row 1 only if row 0 gave draft 0, and so on: picks[0 .. a], one draw a row, as the plain path
@@ -6558,8 +6564,8 @@ work-group size if needed.
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
         CK(DPCT_CHECK_ERROR(st->wait()));
         // rows of the first MTP call: (hmain row i, fix[i]) at positions pos - fix.size() + i, then (hlast, x) at pos
-        for (int i = 0; i < (int) fix.size(); ++i) hpin[16 + i] = fix[(size_t) i];
-        hpin[16 + fix.size()] = x_tok;
+        for (int i = 0; i < (int) fix.size(); ++i) hpin[96 + i] = fix[(size_t) i];
+        hpin[96 + fix.size()] = x_tok;
         hpin[1] = (int32_t) (pos - (int64_t) fix.size());
         /*
         DPCT1124:136: cudaMemcpyAsync is migrated to asynchronous memcpy API.
@@ -6567,7 +6573,7 @@ work-group size if needed.
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
-        CK(DPCT_CHECK_ERROR(st->memcpy(tok_m, hpin + 16, (size_t)T0 * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(tok_m, hpin + 96, (size_t)T0 * 4)));
         /*
         DPCT1124:137: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
@@ -6648,8 +6654,8 @@ work-group size if needed.
         }
         // the verify window
         const int T = D + 1;
-        hpin[16] = x_tok;
-        for (int d = 0; d < D; ++d) hpin[17 + d] = drafts[(size_t) d];
+        hpin[96] = x_tok;
+        for (int d = 0; d < D; ++d) hpin[97 + d] = drafts[(size_t) d];
         hpin[1] = (int32_t) pos;
         /*
         DPCT1124:145: cudaMemcpyAsync is migrated to asynchronous memcpy API.
@@ -6657,7 +6663,7 @@ work-group size if needed.
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
-        CK(DPCT_CHECK_ERROR(st->memcpy(tok, hpin + 16, (size_t)T * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(tok, hpin + 96, (size_t)T * 4)));
         /*
         DPCT1124:146: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
@@ -6674,12 +6680,12 @@ work-group size if needed.
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
-        CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 2, pick, (size_t)T * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 64, pick, (size_t)T * 4)));
         CK(DPCT_CHECK_ERROR(st->wait()));
         int a = 0;
-        while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+        while (a < D && hpin[64 + a] == drafts[(size_t) a]) ++a;
         if (cancel != nullptr && cancel->load()) a = 0;
-        for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+        for (int i = 0; i <= a; ++i) picks[i] = hpin[64 + i];
         commit(a + 1);
         /*
         DPCT1124:148: cudaMemcpyAsync is migrated to asynchronous memcpy API.
@@ -6736,7 +6742,7 @@ work-group size if needed.
                     }
                 }
                 // the long-context depths' graphs (q36_depth_at: 4 and 3 below --mtp), every redo count
-                for (int D = mtp_d - 1; D >= 3; --D)
+                for (int D = std::min(mtp_d - 1, 7); D >= 3; --D)   // (deeper ones are recorded at their first use)
                     for (int f = 0; f <= mtp_d && pos + (int64_t) 2 * (mtp_d + 2) < ctx; ++f) {
                         fix.assign((size_t) f, filler);
                         spec_step(filler, fix, D, drafts, picks);
@@ -7852,7 +7858,7 @@ int strata::qwen35::run(int argc, char** argv) {
     if (std::getenv("STRATA_Q8_PACKED") == nullptr) _putenv_s("STRATA_Q8_PACKED", "1");   // as on Linux (it was missing here)
     if (std::getenv("CUDA_MODULE_LOADING") == nullptr) _putenv_s("CUDA_MODULE_LOADING", "EAGER");
 #endif
-    if (mtp_d < -1 || mtp_d > 7) { std::fprintf(stderr, "strata-q36: --mtp takes 0 .. 7 drafts\n"); return 2; }
+    if (mtp_d < -1 || mtp_d > 15) { std::fprintf(stderr, "strata-q36: --mtp takes 0 .. 15 drafts\n"); return 2; }
     if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "strata-q36: bad --chunk / --max-context\n"); return 2; }
     q36_kv_set(kv_cli, ctx);   // (before anything sizes the cache)
     Model m;
@@ -7990,7 +7996,7 @@ int strata::qwen35::run(int argc, char** argv) {
     // the answer is the plain greedy one), the best combined number on the two localmaxxing prompts on the B70; --mtp 0: off.  Other
     // families keep MTP off unless asked.
     constexpr int kDenseMtp = 5;
-    if (mtp_d < 0) mtp_d = m.dense && m.has_mtp ? (m.w4_mats > 0 ? 7 : kDenseMtp) : 0;   // (the pack: up to 7 on a run of accepted drafts)
+    if (mtp_d < 0) mtp_d = m.dense && m.has_mtp ? (m.w4_mats > 0 ? 15 : kDenseMtp) : 0;   // (the pack: up to 7 on a run of accepted drafts)
     E.mtp_d = m.has_mtp ? mtp_d : 0;
     if (draft_vocab < 0 && std::getenv("STRATA_Q36_DRAFT_VOCAB") != nullptr) draft_vocab = std::atoi(std::getenv("STRATA_Q36_DRAFT_VOCAB"));
     E.draft_n = std::max(0, draft_vocab);
