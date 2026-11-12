@@ -215,9 +215,9 @@ SYCL_ESIMD_FUNCTION inline void pair(simd<float, 128>& acc, const simd<uint32_t,
 
 // IQ4_XS sub-block S: its 16 qs bytes are dwords 4 (S & 1) .. + 3 of `qq` (the 32 bytes of sub-blocks S and S ^ 1); a
 // byte's low nibble is value j of the 32, its high nibble value j + 16.  The table is at offset 0 of shared local memory.
-template <int NC, int S, bool Q81>
-SYCL_ESIMD_FUNCTION inline void sub_iq4(simd<float, 128>& acc, simd<uint32_t, 128> qq, simd<uint32_t, 16> h0, simd<uint32_t, 16> h1,
-                                        simd<float, 16> d, const int* xi, Acts& ac, const simd<float, 64>& dxv) {
+// iq4_fr: the 16 lookups of a sub-block (the B operand); sub_iq4: its scale and its product.  A block issues sub-block
+// S + 1's lookups before it computes S, so their latency runs under S's arithmetic.
+template <int S> SYCL_ESIMD_FUNCTION inline simd<uint32_t, 128> iq4_fr(simd<uint32_t, 128> qq) {
     simd<uint32_t, 128> fr;
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
@@ -228,6 +228,11 @@ SYCL_ESIMD_FUNCTION inline void sub_iq4(simd<float, 128>& acc, simd<uint32_t, 12
         fr.template select<16, 1>(16 * k) = (P & 0xffffu) | (Q << 16);
         fr.template select<16, 1>(16 * (k + 4)) = (P >> 16) | (Q & 0xffff0000u);
     }
+    return fr;
+}
+template <int NC, int S, bool Q81>
+SYCL_ESIMD_FUNCTION inline void sub_iq4(simd<float, 128>& acc, simd<uint32_t, 128> fr, simd<uint32_t, 16> h0, simd<uint32_t, 16> h1,
+                                        simd<float, 16> d, const int* xi, Acts& ac, const simd<float, 64>& dxv) {
     simd<uint32_t, 16> ls = ((h1 >> (4 * S)) & 0xfu) | (((h0 >> (16 + 2 * S)) & 3u) << 4);
     simd<float, 16> dl = d * simd<float, 16>(simd<int, 16>(ls) - 32);
     sub_block<NC, S, false, Q81>(acc, fr, xi, ac, dl, dl, dxv, dxv);
@@ -299,14 +304,21 @@ void launch(sycl::queue& q, const uint8_t* W, const int* Xi, const float* S, flo
                     simd<uint32_t, 16> h0 = cur.h.template select<16, 1>(0), h1 = cur.h.template select<16, 1>(16);
                     if constexpr (F == T_IQ4XS) {
                         simd<float, 16> d = half_of(h0 & 0xffffu);
-                        sub_iq4<NC, 0, Q81>(acc, cur.q0, h0, h1, d, xi, ac, dxv);
-                        sub_iq4<NC, 1, Q81>(acc, cur.q0, h0, h1, d, xi, ac, dxv);
-                        sub_iq4<NC, 2, Q81>(acc, cur.q1, h0, h1, d, xi, ac, dxv);
-                        sub_iq4<NC, 3, Q81>(acc, cur.q1, h0, h1, d, xi, ac, dxv);
-                        sub_iq4<NC, 4, Q81>(acc, cur.q2, h0, h1, d, xi, ac, dxv);
-                        sub_iq4<NC, 5, Q81>(acc, cur.q2, h0, h1, d, xi, ac, dxv);
-                        sub_iq4<NC, 6, Q81>(acc, cur.q3, h0, h1, d, xi, ac, dxv);
-                        sub_iq4<NC, 7, Q81>(acc, cur.q3, h0, h1, d, xi, ac, dxv);
+                        simd<uint32_t, 128> fa = iq4_fr<0>(cur.q0), fb = iq4_fr<1>(cur.q0);
+                        sub_iq4<NC, 0, Q81>(acc, fa, h0, h1, d, xi, ac, dxv);
+                        fa = iq4_fr<2>(cur.q1);
+                        sub_iq4<NC, 1, Q81>(acc, fb, h0, h1, d, xi, ac, dxv);
+                        fb = iq4_fr<3>(cur.q1);
+                        sub_iq4<NC, 2, Q81>(acc, fa, h0, h1, d, xi, ac, dxv);
+                        fa = iq4_fr<4>(cur.q2);
+                        sub_iq4<NC, 3, Q81>(acc, fb, h0, h1, d, xi, ac, dxv);
+                        fb = iq4_fr<5>(cur.q2);
+                        sub_iq4<NC, 4, Q81>(acc, fa, h0, h1, d, xi, ac, dxv);
+                        fa = iq4_fr<6>(cur.q3);
+                        sub_iq4<NC, 5, Q81>(acc, fb, h0, h1, d, xi, ac, dxv);
+                        fb = iq4_fr<7>(cur.q3);
+                        sub_iq4<NC, 6, Q81>(acc, fa, h0, h1, d, xi, ac, dxv);
+                        sub_iq4<NC, 7, Q81>(acc, fb, h0, h1, d, xi, ac, dxv);
                     } else {
                         simd<uint32_t, 16> h2 = cur.h.template select<16, 1>(32), h3 = cur.h.template select<16, 1>(48);
                         simd<float, 16> d = half_of(h0 & 0xffffu), dmin = half_of(h0 >> 16);
