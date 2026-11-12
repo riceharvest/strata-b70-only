@@ -196,7 +196,7 @@ it and compare. Strata has not had an outside security audit yet.
 
 To report a security problem, use GitHub's private reporting (the repository's **Security** tab), as described in
 [SECURITY.md](../SECURITY.md). Ordinary questions and ideas can go to an
-[issue](https://github.com/Niko1221/Strata/issues).
+[issue](https://github.com/riceharvest/strata-b70-only/issues).
 
 ## Where to check this in the code
 

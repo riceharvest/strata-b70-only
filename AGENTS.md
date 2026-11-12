@@ -4,6 +4,10 @@ This is a fork of [Strata](https://github.com/Niko1221/Strata) for exactly one s
 `bmg-g31`) on Linux with the `xe` driver, serving Qwen3.8-Flash-Next from the SYCL engine in `sycl/`. Work that does not help
 this setup is out of scope. The NVIDIA, AMD and Apple runtimes, the desktop app and the Windows and macOS packages are not part of it.
 
+Issues, pull requests and benchmark reports for this fork belong to `riceharvest/strata-b70-only`, never to upstream
+Strata: upstream has no B70 and cannot reproduce a report made here. The maintainer answers fastest on X as
+`@imdariotoo`, otherwise at dev@darioa.nl.
+
 A second model exists: the dense Qwen3.8-27B, on its own optional binary `strata-q36` (`sycl/src/qwen35`, [docs/Q36.md](docs/Q36.md)).
 It is off by default (`Q36=ON` for `sycl/tools/build.sh`) and `strata` does not depend on it.
 

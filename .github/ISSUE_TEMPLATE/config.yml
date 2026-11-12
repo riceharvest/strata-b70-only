@@ -1,5 +1,11 @@
 blank_issues_enabled: true
 contact_links:
   - name: Troubleshooting and known issues
-    url: https://github.com/Niko1221/Strata/blob/main/docs/TROUBLESHOOTING.md
+    url: https://github.com/riceharvest/strata-b70-only/blob/b70/docs/TROUBLESHOOTING.md
     about: Symptom-to-fix table for crashes, out of memory, hangs, and port problems.
+  - name: The maintainer on X
+    url: https://x.com/imdariotoo
+    about: One person maintains this fork, and this is the fastest way to reach them.
+  - name: Mail
+    url: https://darioa.nl
+    about: dev@darioa.nl - use mail for anything that should not be a public issue.

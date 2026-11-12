@@ -234,9 +234,12 @@ successes. A needle test measures recall on those inputs, not overall model qual
    per-run JSON or CSV and small scripts or prompts needed to repeat it. Use your
    own data format and document its fields and units. Keep large model files and
    generated packs out of the PR.
-4. Open a pull request against `Niko1221/Strata:main`. Summarize the hardware,
-   model, configurations tested, and limitations. Keep a results-only submission
-   separate from engine changes so reviewers can assess the measurements directly.
+4. Open a pull request against `riceharvest/strata-b70-only:b70`. B70 numbers
+   belong to this fork: upstream `Niko1221/Strata` has no B70, cannot run the
+   SYCL engine and cannot take a report it cannot reproduce. Summarize the
+   hardware, model, configurations tested, and limitations. Keep a results-only
+   submission separate from engine changes so reviewers can assess the
+   measurements directly.
 
 Maintainers can review the report and decide where to include it. Adding a report
 does not require changing the README's headline performance claims. For a failed

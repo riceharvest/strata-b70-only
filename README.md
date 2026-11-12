@@ -9,6 +9,14 @@ The NVIDIA (CUDA), AMD (HIP/ROCm) and Apple (Metal) runtimes are removed. What's
 
 Not affiliated with Intel or with upstream Strata.
 
+## Who maintains this and where to ask
+
+One person, on one B70: [riceharvest](https://github.com/riceharvest), on X as
+[@imdariotoo](https://x.com/imdariotoo). Ping me on X - that is the fastest way to reach me. Otherwise open an
+[issue here](https://github.com/riceharvest/strata-b70-only/issues), or mail
+[dev@darioa.nl](mailto:dev@darioa.nl). Anything about B70 behaviour belongs to this repository, not to upstream's
+issue tracker: upstream has no B70 and cannot reproduce it.
+
 ## What runs
 
 | Model | Status on one B70 |
@@ -211,7 +219,8 @@ under [Speed](#speed); sessions past 118K tokens are not measured yet.
 <a id="something-went-wrong"></a>
 
 - The engine and server are [Strata](https://github.com/Niko1221/Strata) by Niko1221 and its contributors. Several B70
-  changes here are community pull requests to upstream, credited in [docs/B70.md](docs/B70.md).
+  changes here are community pull requests to upstream, credited in [docs/B70.md](docs/B70.md). The B70 port, the SYCL
+  kernels and the tuning are mine ([@imdariotoo](https://x.com/imdariotoo), [dev@darioa.nl](mailto:dev@darioa.nl)).
 - The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. The quantized sets
   are by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab), who also made the DeepSeek V4.1-Flash sets.
 - Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). The optional 27B engine's long-prompt attention is

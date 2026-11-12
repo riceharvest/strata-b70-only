@@ -367,6 +367,6 @@ overwrite local branches or edits just to make `git pull` succeed.
 
 Look through a log before you send it, and never send an API key. Include model and quantization, OS, GPU/VRAM, RAM,
 driver, install route (app, Terminal or the installer), Strata and engine versions, exact command, expected result and
-actual error. Open an [issue](https://github.com/Niko1221/Strata/issues) and attach the log. Follow
+actual error. Open an [issue](https://github.com/riceharvest/strata-b70-only/issues) and attach the log. Follow
 [CONTRIBUTING.md](../CONTRIBUTING.md). The full table of error messages, with the older engine fixes, is in the
 [details](DETAILS.md#troubleshooting).

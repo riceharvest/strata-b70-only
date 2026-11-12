@@ -148,7 +148,7 @@ class Computer:
         for c in gpu_fit.usable_cards(gpu_fit.for_vendor(self.gpus, self.engine_vendor)[0])[0]:
             if c.get("vendor") == "intel" and re.search(r"Arc (?:Pro )?B\d", str(c.get("name", ""))):
                 return (f"The {str(c['name']).replace('Intel ', '')} is a B-series Arc card. It is new to Strata and we have not tested it ourselves, so pictures or long answers may fail on it.",
-                        "If something fails, start again with --vision off to turn pictures off, and tell us at https://github.com/Niko1221/Strata/issues (say it is a B-series card and attach the engine log).")
+                        "If something fails, start again with --vision off to turn pictures off, and tell us at https://github.com/riceharvest/strata-b70-only/issues (say it is a B-series card and attach the engine log).")
         return None
 
     @property

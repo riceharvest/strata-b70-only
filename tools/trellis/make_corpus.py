@@ -39,7 +39,7 @@ def load_tokenizer(path):
 def wiki_article(lang: str, seed: int):
     url = ("https://%s.wikipedia.org/w/api.php?action=query&format=json&generator=random&grnnamespace=0&grnlimit=1"
            "&prop=extracts&explaintext=1&redirects=1&grnfilterredir=nonredirects" % lang)
-    req = urllib.request.Request(url + "&_=%d" % seed, headers={"User-Agent": "strata-research/1.0 (research corpus; contact via GitHub Niko1221)"})
+    req = urllib.request.Request(url + "&_=%d" % seed, headers={"User-Agent": "strata-research/1.0 (research corpus; contact via GitHub riceharvest or dev@darioa.nl)"})
     d = {}
     for attempt in range(8):
         try:

@@ -5,11 +5,17 @@
 These rules apply to issues, pull requests, benchmark reports, and the agents helping prepare them.
 You should be able to explain every changed line and answer review questions about it.
 
+**This is the B70-only fork. Issues and pull requests go to
+[riceharvest/strata-b70-only](https://github.com/riceharvest/strata-b70-only), not to upstream Strata: upstream has
+no B70 and cannot reproduce anything reported there.** Upstream's [CONTRIBUTING.md](https://github.com/Niko1221/Strata/blob/main/CONTRIBUTING.md)
+and its [tracker](https://github.com/Niko1221/Strata/issues) stay the right place for the CUDA, HIP and Metal
+runtimes this fork removed.
+
 ## Before starting
 
-1. Search [issues](https://github.com/Niko1221/Strata/issues) and
-   [pull requests](https://github.com/Niko1221/Strata/pulls), including closed discussions. Add new evidence to an
-   existing thread when it covers your problem.
+1. Search [issues](https://github.com/riceharvest/strata-b70-only/issues) and
+   [pull requests](https://github.com/riceharvest/strata-b70-only/pulls), including closed discussions. Add new
+   evidence to an existing thread when it covers your problem.
 2. Read [AGENTS.md](AGENTS.md) and the documentation for the component you want to change.
 3. Get maintainer agreement on scope before substantial features, refactors, architecture changes, or changes to
    defaults. Describe the user problem, proposed behavior, and tradeoffs in an issue first. Agreement on scope
@@ -21,7 +27,7 @@ the situation, bring it to the original discussion and let a maintainer decide w
 
 ## Report a problem people can investigate
 
-Use the matching [issue form](https://github.com/Niko1221/Strata/issues/new/choose). A bug report should include:
+Use the matching [issue form](https://github.com/riceharvest/strata-b70-only/issues/new/choose). A bug report should include:
 
 - The smallest steps or command that reproduce the problem, and the expected and actual behavior.
 - Strata version or commit, OS, GPU and VRAM, and relevant model, quantization, and configuration.

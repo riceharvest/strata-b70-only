@@ -4,13 +4,17 @@
 
 Please report anything that should not be public until it is fixed **privately**, through GitHub's private
 vulnerability reporting: the repository's **Security** tab, **Report a vulnerability**
-([direct link](https://github.com/Niko1221/Strata/security/advisories/new)). Say what you found, how to reproduce it
-(the request, the config keys involved, the Strata version), and what an attacker gains. We answer there, fix it in
-a release, and credit you in the advisory unless you ask us not to.
+([direct link](https://github.com/riceharvest/strata-b70-only/security/advisories/new)), or by mailing
+[dev@darioa.nl](mailto:dev@darioa.nl) if private reporting is not enabled on this fork. Say what you found, how to
+reproduce it (the request, the config keys involved, the Strata version), and what an attacker gains. I answer
+there, fix it in a release, and credit you in the advisory unless you ask me not to.
+
+This fork is maintained by one person on one B70, not by a security team, and upstream's advisory process only
+covers `Niko1221/Strata`. Send anything that only happens on a B70 to this repository; upstream cannot reproduce it.
 
 Ordinary hardening ideas and findings that are safe to discuss in public are welcome as an
-[issue](https://github.com/Niko1221/Strata/issues) (#544 collects audit findings) or as a pull request, which we
-review like our own code.
+[issue](https://github.com/riceharvest/strata-b70-only/issues) or as a pull request, which I review like my own
+code. (Upstream keeps its own audit-findings thread, #544, in its tracker.)
 
 Supported: the latest release. Fixes go into the next release, not into older ones.
 

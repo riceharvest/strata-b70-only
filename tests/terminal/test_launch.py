@@ -390,7 +390,7 @@ class SetupArgs(unittest.TestCase):
                     text, nxt = comp.new_card_note
                     self.assertIn("new to Strata", text)
                     self.assertIn("--vision off", nxt)
-                    self.assertIn("github.com/Niko1221/Strata/issues", nxt)
+                    self.assertIn("github.com/riceharvest/strata-b70-only/issues", nxt)
 
     def test_a_model_that_cannot_read_pictures_stays_off_without_a_question(self):
         import dataclasses
