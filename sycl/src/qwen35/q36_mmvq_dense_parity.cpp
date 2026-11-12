@@ -797,7 +797,10 @@ int xatt_bench(const char* tl_s, int cells) {
             for (int d = 0; d < HD; ++d) mx = std::max(mx, std::fabs(qr[d]));
             const float qsc0 = mx / 127.0f, inv = qsc0 > 0.f ? 1.0f / qsc0 : 0.f, qsc = qsc0 * (1.0f / 16.0f);
             int8_t qc[256];
-            for (int d = 0; d < HD; ++d) qc[d] = (int8_t) std::max(-127, std::min(127, (int) std::nearbyint(qr[d] * inv)));
+            for (int d = 0; d < HD; ++d) {
+                const float y = qr[d] * inv;
+                qc[d] = (int8_t) std::max(-127, std::min(127, (int) (y + (y < 0.f ? -0.5f : 0.5f))));
+            }
             const int cs = chunk_cells(n), nc = (n + cs - 1) / cs;
             std::vector<double> cm(nc), cl(nc), cacc((size_t) nc * HD, 0.0);
             std::vector<double> sx(n);

@@ -51,6 +51,7 @@ struct Call {
     float* pacc;               // out: the chunks' partial sums [row][nchk][256], max [row][nchk] and sum [row][nchk] with
     float* pm;                 //      row = (t - t0) * H + head: what k_attn_merge_gqa merges
     float* pl;
+    int dbg = 0;               // (STRATA_XATT_DBG, timing only: parts of the kernels left out)
 };
 /// Three kernels on `stream`'s queue: the queries as int8, the scores and each chunk's softmax, the value sums.
 /// false: the shape is not taken (the caller runs k_attn_gqa).
