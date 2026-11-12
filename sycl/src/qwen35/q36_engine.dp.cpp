@@ -3433,8 +3433,29 @@ struct Engine {
         pl = dalloc((size_t) att_rows * n_chunk);
         {
             namespace xa = strata::q36xatt;
+            // STRATA_Q36_XATT: 1 on, 0 off; unset: on with the int4 pack when the mirror fits beside the session's cache with
+            // 3 GiB of VRAM to spare (a card near its limit stalls)
             const char* xe = std::getenv("STRATA_Q36_XATT");
-            if (xe && xe[0] == '1' && n_sess == 1 && !attn_head && (int) g.head_dim == xa::kHD && (int) g.n_head == xa::kG * (int) g.n_head_kv) {
+            bool xwant = xe ? xe[0] == '1' : m->w4_mats > 0;
+            const bool xshape = n_sess == 1 && !attn_head && (int) g.head_dim == xa::kHD && (int) g.n_head == xa::kG * (int) g.n_head_kv;
+            if (xwant && xshape && !xe) {
+                const int hkv = (int) g.n_head_kv;
+                size_t nl = m->has_mtp ? 1 : 0;
+                for (const Layer& L : m->layers) nl += L.attn ? 1 : 0;
+                const int cxp = xa::ctx_pad(ctx), cap = xa::chunk_cap(ctx, n_chunk);
+                const size_t mir = nl * (xa::k8_dwords(hkv, cxp) + xa::v8t_dwords(hkv, cxp) + 2 * xa::sc_floats(hkv, cxp)) * 4 +
+                                   (xa::score_floats(hkv, n_chunk, cap) + xa::pb_dwords(hkv, n_chunk, cap)) * 4;
+                const double per = kv_q8 ? 1.04 : (kv_f32 ? 4.0 : 2.0);   // the cache's bytes a value
+                const size_t cache = (size_t) ((double) nl * 2.0 * hkv * (double) ctx * g.head_dim * per);
+                size_t vfr = 0, vtot = 0;
+                dpct::get_current_device().get_memory_info(vfr, vtot);
+                if (vfr < mir + cache + ((size_t) 3 << 30)) {
+                    xwant = false;
+                    std::fprintf(stderr, "strata-q36: decode attention stays on the FP32 kernel: its int8 mirror (%.2f GiB) does not fit beside the "
+                                         "cache at this context (%.2f GiB of VRAM free)\n", (double) mir / 1073741824.0, (double) vfr / 1073741824.0);
+                }
+            }
+            if (xwant && xshape) {
                 const int hkv = (int) g.n_head_kv;
                 if (const char* e = std::getenv("STRATA_Q36_XATT_MIN")) xatt_min = std::max(64, std::atoi(e));
                 xctxp = xa::ctx_pad(ctx);
