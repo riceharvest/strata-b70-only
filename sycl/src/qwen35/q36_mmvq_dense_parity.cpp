@@ -692,8 +692,9 @@ int floor_bench() {
 // against the same quantized math in float64 (the device's exp is a 1.2e-7 series: a 16-bit weight may differ by one),
 // reports how far the quantized result is from the plain FP attention, checks that a window's rows are bitwise the
 // one-row calls, and times a call (16 a graph: the 27B's attention layers).
-int xatt_bench(const char* tl_s, int cells) {
+int xatt_bench(const char* tl_s, int cells, int ns) {   // ns 4: K as the engine's 8-bit cache (a scale per 64 values)
     namespace xa = strata::q36xatt;
+    namespace FB = strata::kernels;
     const std::vector<int> tl = parse_list(tl_s);
     sycl::queue q(sycl::gpu_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()});
     const int HKV = 4, H = 24, HD = 256, NCHK = 96, TM = 16;
@@ -711,6 +712,7 @@ int xatt_bench(const char* tl_s, int cells) {
     }
     std::vector<uint32_t> hk8(xa::k8_dwords(HKV, ctxp), 0), hv8(xa::v8t_dwords(HKV, ctxp), 0);
     std::vector<float> hks(xa::sc_floats(HKV, ctxp), 0.f), hvs(hks.size(), 0.f);
+    std::vector<uint16_t> hk16((size_t) HKV * ctxp * 4, 0);
     auto* k8b = reinterpret_cast<int8_t*>(hk8.data());
     auto* v8b = reinterpret_cast<int8_t*>(hv8.data());
     auto code = [](float v, float sc) { int c = sc > 0.f ? (int) std::nearbyint(v / sc) : 0; return (int8_t) std::max(-127, std::min(127, c)); };
@@ -723,8 +725,16 @@ int xatt_bench(const char* tl_s, int cells) {
             const float sk = mk / 127.0f, sv = mv / 127.0f;
             hks[(size_t) h * ctxp + c] = sk;
             hvs[(size_t) h * ctxp + c] = sv;
+            float sg[4];
+            for (int g4 = 0; g4 < 4; ++g4) {
+                float mg = 0.f;
+                for (int d = 0; d < 64; ++d) mg = std::max(mg, std::fabs(k[64 * g4 + d]));
+                const uint16_t hb = FB::f16_from_f32(mg / 127.0f);
+                hk16[((size_t) h * ctxp + c) * 4 + g4] = hb;
+                sg[g4] = FB::f32_from_f16(hb);
+            }
             for (int d = 0; d < HD; ++d) {
-                k8b[((size_t) h * ctxp + c) * HD + d] = code(k[d], sk);
+                k8b[((size_t) h * ctxp + c) * HD + d] = ns == 4 ? code(k[d], sg[d / 64]) : code(k[d], sk);
                 v8b[(((size_t) h * (ctxp / 32) + c / 32) * 256 + d) * 32 + c % 32] = code(v[d], sv);
             }
         }
@@ -732,6 +742,8 @@ int xatt_bench(const char* tl_s, int cells) {
     auto* dk8 = (uint32_t*) dev(hk8.size() * 4); auto* dv8 = (uint32_t*) dev(hv8.size() * 4);
     auto* dks = (float*) dev(hks.size() * 4); auto* dvs = (float*) dev(hvs.size() * 4);
     auto* dq = (float*) dev(Q.size() * 4);
+    auto* dk16 = (uint16_t*) dev(hk16.size() * 2);
+    q.memcpy(dk16, hk16.data(), hk16.size() * 2);
     auto* dpos = (int32_t*) dev(64);
     auto* dqb = (uint32_t*) dev(xa::qb_dwords(HKV) * 4); auto* dqs = (float*) dev(xa::qs_floats(HKV) * 4);
     auto* dsc = (float*) dev(xa::score_floats(HKV, NCHK, capc) * 4);
@@ -743,13 +755,14 @@ int xatt_bench(const char* tl_s, int cells) {
     q.memcpy(dks, hks.data(), hks.size() * 4); q.memcpy(dvs, hvs.data(), hvs.size() * 4);
     q.memcpy(dq, Q.data(), Q.size() * 4);
     q.wait();
-    std::printf("xatt: %d cells, %d KV heads x %d query heads, %d chunks a row, a chunk's scratch %d cells; scratch %.0f MB\n", cells, HKV, H / HKV, NCHK,
+    std::printf("xatt (K scales a cell: %d): %d cells, %d KV heads x %d query heads, %d chunks a row, a chunk's scratch %d cells; scratch %.0f MB\n", ns, cells, HKV, H / HKV, NCHK,
                 capc, (double) (xa::score_floats(HKV, NCHK, capc) + xa::pb_dwords(HKV, NCHK, capc)) * 4 / 1048576.0);
     auto chunk_cells = [&](int n) { const int per = (n + NCHK - 1) / NCHK; const int cs = (per + 63) / 64 * 64; return cs > 64 ? cs : 64; };
     auto call_of = [&](const float* qrows, int t0, int nt) {
         xa::Call c{};
         c.q = qrows; c.pos0 = dpos; c.t0 = t0; c.nt = nt; c.H = H; c.HKV = HKV; c.nchk = NCHK; c.scale = 1.0f / 16.0f;
         c.k8 = dk8; c.ks = dks; c.v8t = dv8; c.vs = dvs; c.ctxp = ctxp;
+        c.ns = ns; c.ks16 = dk16; c.kstride = ctxp;
         c.qb = dqb; c.qs = dqs; c.sc = dsc; c.pb = dpb; c.srow = dsr; c.capc = capc;
         c.pacc = dpa; c.pm = dpm; c.pl = dpl;
         return c;
@@ -814,10 +827,20 @@ int xatt_bench(const char* tl_s, int cells) {
                 std::vector<float> s(b - a);
                 float m = -1e30f, vmx = 0.f;
                 for (int cc = a; cc < b; ++cc) {
-                    int dot = 0;
                     const int8_t* kk = &k8b[((size_t) kvh * ctxp + cc) * HD];
-                    for (int d = 0; d < HD; ++d) dot += (int) qc[d] * kk[d];
-                    s[cc - a] = (float) dot * (qsc * hks[(size_t) kvh * ctxp + cc]);
+                    if (ns == 4) {
+                        float o = 0.f;
+                        for (int g4 = 0; g4 < 4; ++g4) {
+                            int dot = 0;
+                            for (int d = 0; d < 64; ++d) dot += (int) qc[64 * g4 + d] * kk[64 * g4 + d];
+                            o += (float) dot * FB::f32_from_f16(hk16[((size_t) kvh * ctxp + cc) * 4 + g4]);
+                        }
+                        s[cc - a] = o * qsc;
+                    } else {
+                        int dot = 0;
+                        for (int d = 0; d < HD; ++d) dot += (int) qc[d] * kk[d];
+                        s[cc - a] = (float) dot * (qsc * hks[(size_t) kvh * ctxp + cc]);
+                    }
                     m = std::max(m, s[cc - a]);
                     vmx = std::max(vmx, hvs[(size_t) kvh * ctxp + cc]);
                 }
@@ -900,7 +923,7 @@ int main(int argc, char** argv) try {
     setenv("STRATA_MMVQ_KREG", "1", 1);   // the dense forms' latch (strata-q36 sets it for the 27B)
     bool selftest_flag = false;
     if (argc > 1 && std::string(argv[1]) == "--floor") return floor_bench();
-    if (argc > 1 && std::string(argv[1]) == "--xatt") return xatt_bench(argc > 2 ? argv[2] : "1,5,6,16", argc > 3 ? std::atoi(argv[3]) : 25120);
+    if (argc > 1 && std::string(argv[1]) == "--xatt") return xatt_bench(argc > 2 ? argv[2] : "1,5,6,16", argc > 3 ? std::atoi(argv[3]) : 25120, argc > 4 ? std::atoi(argv[4]) : 1);
     if (argc > 1 && std::string(argv[1]) == "--w4") return w4_bench(argc > 2 ? argv[2] : "1,4,5,6,8", argc > 3 ? argv[3] : "27");
     if (argc > 1 && std::string(argv[1]) == "--bench")
         return bench(argc > 2 ? argv[2] : "12,13,14,23", argc > 3 ? argv[3] : "1,2,3,4,6", argc > 4 ? argv[4] : "all");

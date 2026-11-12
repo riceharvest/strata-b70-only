@@ -146,11 +146,13 @@ template <int NLS> void launch_queries(sycl::queue& q, const Call c) {
 // shared local memory between the passes, the rows' sums after pass 2 (added in thread order: a fixed order per row).
 constexpr int kW = 4;
 constexpr auto kAl16 = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::alignment<16>};
-template <int NLS> struct TagXaS;
-template <int NLS> void launch_scores(sycl::queue& q, const Call c) {
+// NS: the K scales a cell (1: the mirror's; 4: the engine's 8-bit cache, a scale per 64 values - the integer dots are then
+// taken per 64 values and scaled before they are added)
+template <int NLS, int NS> struct TagXaS;
+template <int NLS, int NS> void launch_scores(sycl::queue& q, const Call c) {
     const float inv = 1.0f / (float) c.nchk;
     q.submit([&](sycl::handler& h) {
-        h.parallel_for<TagXaS<NLS>>(sycl::nd_range<3>(sycl::range<3>((size_t) c.HKV, (size_t) c.nchk, (size_t) kW), sycl::range<3>(1, 1, (size_t) kW)),
+        h.parallel_for<TagXaS<NLS, NS>>(sycl::nd_range<3>(sycl::range<3>((size_t) c.HKV, (size_t) c.nchk, (size_t) kW), sycl::range<3>(1, 1, (size_t) kW)),
                                     [=](sycl::nd_item<3> it) SYCL_ESIMD_KERNEL {
             slm_init<2 * kW * NLS * 3 * 64>();
             const int kvh = (int) it.get_global_id(0), ch = (int) it.get_global_id(1), w = (int) it.get_local_id(2);
@@ -158,8 +160,10 @@ template <int NLS> void launch_scores(sycl::queue& q, const Call c) {
             int csk[16];
 #pragma unroll
             for (int k = 0; k < 16; ++k) csk[k] = k < nt ? chunk_cells(n0 + k, nchk, inv) : 0;
-            const uint32_t* kb = c.k8 + (size_t) kvh * c.ctxp * 64;
-            const float* ksb = c.ks + (size_t) kvh * c.ctxp;
+            const int kst = c.kstride > 0 ? c.kstride : c.ctxp;
+            const uint32_t* kb = c.k8 + (size_t) kvh * kst * 64;
+            const float* ksb = NS == 1 ? c.ks + (size_t) kvh * kst : nullptr;
+            const uint32_t* ks16b = NS == 4 ? reinterpret_cast<const uint32_t*>(c.ks16) + (size_t) kvh * kst * 2 : nullptr;
             const float* vsb = c.vs + (size_t) kvh * c.ctxp;
             float* scb = c.sc + ((size_t) (kvh * nchk + ch) * c.capc) * (NLS * 16);
             const uint32_t* qbb = c.qb + (size_t) kvh * 8 * NLS * 128;
@@ -212,10 +216,24 @@ template <int NLS> void launch_scores(sycl::queue& q, const Call c) {
                     simd<uint32_t, 64> kc[8];
 #pragma unroll
                     for (int c8 = 0; c8 < 8; ++c8) kc[c8] = block_load<uint32_t, 64>(kb + (size_t) (p + c8) * 64);
-                    simd<float, 8> ks8 = block_load<float, 8>(ksb + p), vs8 = block_load<float, 8>(vsb + p);
+                    simd<float, 8> vs8 = block_load<float, 8>(vsb + p);
+                    simd<float, 8> ks8(1.0f);
+                    simd<float, 32> kf(0.f);   // NS == 4: [cell * 4 + group]
+                    if constexpr (NS == 1) {
+                        ks8 = block_load<float, 8>(ksb + p);
+                    } else {
+                        simd<uint32_t, 16> w16 = block_load<uint32_t, 16>(ks16b + (size_t) p * 2);
+                        simd<uint16_t, 32> u16 = w16.template bit_cast_view<uint16_t>();
+                        simd<sycl::half, 32> h16 = u16.template bit_cast_view<sycl::half>();
+                        kf = h16;
+                    }
                     simd<int, 128> acc[NLS];
+                    simd<float, 128> sf[NLS];
 #pragma unroll
-                    for (int ls = 0; ls < NLS; ++ls) acc[ls] = 0;
+                    for (int ls = 0; ls < NLS; ++ls) {
+                        acc[ls] = 0;
+                        sf[ls] = 0.f;
+                    }
                     if (!(dbg & 2))
 #pragma unroll
                     for (int s = 0; s < 8; ++s) {
@@ -240,16 +258,39 @@ template <int NLS> void launch_scores(sycl::queue& q, const Call c) {
                             }
                             acc[ls] = xmx::dpas<8, 8, int, int, int, int, xmx::dpas_argument_type::s8, xmx::dpas_argument_type::s8>(acc[ls], b, av);
                         }
+                        if constexpr (NS == 4) {
+                            if (s % 2 == 1) {   // 64 values done: their dots times the cells' scale of this group
+#pragma unroll
+                                for (int ls = 0; ls < NLS; ++ls) {
+#pragma unroll
+                                    for (int c8 = 0; c8 < 8; ++c8) {
+                                        simd<int, 16> ai = acc[ls].template select<16, 1>(16 * c8);
+                                        simd<float, 16> t = ai;
+                                        simd<float, 16> o = sf[ls].template select<16, 1>(16 * c8);
+                                        const float kg = kf[c8 * 4 + s / 2];
+                                        o += t * kg;
+                                        sf[ls].template select<16, 1>(16 * c8) = o;
+                                    }
+                                    acc[ls] = 0;
+                                }
+                            }
+                        }
                     }
 #pragma unroll
                     for (int ls = 0; ls < NLS; ++ls) {
                         simd<float, 128> out;
 #pragma unroll
                         for (int c8 = 0; c8 < 8; ++c8) {
-                            simd<int, 16> ai = acc[ls].template select<16, 1>(16 * c8);
-                            simd<float, 16> sv = ai;
+                            simd<float, 16> sv;
                             const float kc1 = ks8[c8], vc1 = vs8[c8];
-                            sv = sv * (qsc[ls] * kc1);
+                            if constexpr (NS == 1) {
+                                simd<int, 16> ai = acc[ls].template select<16, 1>(16 * c8);
+                                sv = ai;
+                                sv = sv * (qsc[ls] * kc1);
+                            } else {
+                                sv = sf[ls].template select<16, 1>(16 * c8);
+                                sv = sv * qsc[ls];
+                            }
                             simd<int, 16> pv(p + c8);
                             simd_mask<16> off = (lo[ls] > pv) | (hi[ls] <= pv);
                             sv.merge(simd<float, 16>(kNeg), off);
@@ -478,7 +519,10 @@ template <int NLS> void launch_values(sycl::queue& q, const Call c) {
 template <int NLS> void run(sycl::queue& q, const Call& c) {
     static const int parts = [] { const char* e = std::getenv("STRATA_XATT_PARTS"); return e && *e ? std::atoi(e) : 7; }();
     if (parts & 1) launch_queries<NLS>(q, c);
-    if (parts & 2) launch_scores<NLS>(q, c);
+    if (parts & 2) {
+        if (c.ns == 4) launch_scores<NLS, 4>(q, c);
+        else launch_scores<NLS, 1>(q, c);
+    }
     if (parts & 4) launch_values<NLS>(q, c);
 }
 }   // namespace
@@ -489,7 +533,7 @@ bool attend(const Call& c0, void* stream) {
     static const int dbg = [] { const char* e = std::getenv("STRATA_XATT_DBG"); return e && *e ? std::atoi(e) : 0; }();
     Call c = c0;
     c.dbg = dbg;
-    if (c.nt < 1 || c.nt > 16 || c.H != kG * c.HKV || c.nchk < 1) return false;
+    if (c.nt < 1 || c.nt > 16 || c.H != kG * c.HKV || c.nchk < 1 || (c.ns != 1 && c.ns != 4) || (c.nt * kG + 15) / 16 > c.max_ls) return false;
     sycl::queue& q = *strata::q_of(stream);
     switch ((c.nt * kG + 15) / 16) {
         case 1: run<1>(q, c); break;

@@ -1210,10 +1210,10 @@ void k_xatt_mirror(const KV* kc, const KV* vc, const int32_t* pos0, int HKV, int
         return (int8_t) c;
     };
     const size_t mc = (size_t) kh * ctxp + pos;
-    k8[mc * HD + d] = code(k, sk);
+    if (k8 != nullptr) k8[mc * HD + d] = code(k, sk);
     v8t[(((size_t) kh * (ctxp / 32) + pos / 32) * HD + d) * 32 + pos % 32] = code(v, sv);
     if (d == 0) {
-        ks[mc] = sk;
+        if (ks != nullptr) ks[mc] = sk;
         vs[mc] = sv;
     }
 }
@@ -2991,6 +2991,13 @@ struct Engine {
     int xatt_min = 4096, xctxp = 0, xcapc = 0;
     int64_t xmir_n = 0;
     int32_t* xpos_d = nullptr;
+    bool xatt_kq8 = false;   // the cache is 8-bit: the scores read its K (a scale per 64 values), no K copy
+    int xls_max = 6;         // the row sets of 16 a call's scratch holds
+    /// The drafts a lookup step may offer: every row of its window must fit the matrix-engine attention's scratch.
+    int lookup_depth() const {
+        if (xatt_ready && pos >= xatt_min) return std::min(mtp_d, xls_max * 16 / strata::q36xatt::kG - 1);
+        return mtp_d;
+    }
     std::vector<uint32_t*> xk8, xv8t;
     std::vector<float*> xks, xvs;
     uint32_t *xqb = nullptr, *xpb = nullptr;
@@ -3433,57 +3440,64 @@ struct Engine {
         pl = dalloc((size_t) att_rows * n_chunk);
         {
             namespace xa = strata::q36xatt;
-            // STRATA_Q36_XATT: 1 on, 0 off; unset: on with the int4 pack when the mirror fits beside the session's cache with
-            // 3 GiB of VRAM to spare (a card near its limit stalls)
+            // STRATA_Q36_XATT: 1 on, 0 off; unset: on with the int4 pack when what it needs fits beside the session's cache
+            // with 2 GiB of VRAM to spare (a card near its limit stalls).  What it needs: with the 8-bit cache only V's
+            // transposed copy (the scores read the cache's K as it is: 4.3 GiB at 262,144 cells), else K's and V's; and the
+            // scratch of a call, made for windows of 16, 8 or 5 tokens - the largest that fits (a larger window runs
+            // k_attn_gqa; the lookup drafts keep to it, lookup_depth()).
             const char* xe = std::getenv("STRATA_Q36_XATT");
             bool xwant = xe ? xe[0] == '1' : m->w4_mats > 0;
             const bool xshape = n_sess == 1 && !attn_head && (int) g.head_dim == xa::kHD && (int) g.n_head == xa::kG * (int) g.n_head_kv;
-            if (xwant && xshape && !xe) {
+            if (xwant && xshape) {
                 const int hkv = (int) g.n_head_kv;
                 size_t nl = m->has_mtp ? 1 : 0;
                 for (const Layer& L : m->layers) nl += L.attn ? 1 : 0;
-                const int cxp = xa::ctx_pad(ctx), cap = xa::chunk_cap(ctx, n_chunk);
-                const size_t mir = nl * (xa::k8_dwords(hkv, cxp) + xa::v8t_dwords(hkv, cxp) + 2 * xa::sc_floats(hkv, cxp)) * 4 +
-                                   (xa::score_floats(hkv, n_chunk, cap) + xa::pb_dwords(hkv, n_chunk, cap)) * 4;
+                xctxp = xa::ctx_pad(ctx);
+                xcapc = xa::chunk_cap(ctx, n_chunk);
+                xatt_kq8 = kv_q8;
+                const size_t per_layer = ((xatt_kq8 ? 0 : xa::k8_dwords(hkv, xctxp) + xa::sc_floats(hkv, xctxp)) + xa::v8t_dwords(hkv, xctxp) +
+                                          xa::sc_floats(hkv, xctxp)) * 4;
                 const double per = kv_q8 ? 1.04 : (kv_f32 ? 4.0 : 2.0);   // the cache's bytes a value
                 const size_t cache = (size_t) ((double) nl * 2.0 * hkv * (double) ctx * g.head_dim * per);
                 size_t vfr = 0, vtot = 0;
                 dpct::get_current_device().get_memory_info(vfr, vtot);
-                if (vfr < mir + cache + ((size_t) 3 << 30)) {
-                    xwant = false;
-                    std::fprintf(stderr, "strata-q36: decode attention stays on the FP32 kernel: its int8 mirror (%.2f GiB) does not fit beside the "
-                                         "cache at this context (%.2f GiB of VRAM free)\n", (double) mir / 1073741824.0, (double) vfr / 1073741824.0);
+                int ls = 0;
+                size_t scratch = 0;
+                for (const int t : {6, 3, 2}) {
+                    scratch = (xa::score_floats(hkv, n_chunk, xcapc, t) + xa::pb_dwords(hkv, n_chunk, xcapc, t)) * 4;
+                    if (xe || vfr >= nl * per_layer + scratch + cache + ((size_t) 2 << 30)) { ls = t; break; }
                 }
-            }
-            if (xwant && xshape) {
-                const int hkv = (int) g.n_head_kv;
-                if (const char* e = std::getenv("STRATA_Q36_XATT_MIN")) xatt_min = std::max(64, std::atoi(e));
-                xctxp = xa::ctx_pad(ctx);
-                xcapc = xa::chunk_cap(ctx, n_chunk);
-                xk8.assign(m->layers.size() + 1, nullptr);
-                xv8t.assign(m->layers.size() + 1, nullptr);
-                xks.assign(m->layers.size() + 1, nullptr);
-                xvs.assign(m->layers.size() + 1, nullptr);
-                size_t bytes = 0;
-                for (size_t li = 0; li <= m->layers.size(); ++li)   // (index n_layers: the MTP block's cache)
-                    if (li < m->layers.size() ? m->layers[li].attn : m->has_mtp) {
-                        xk8[li] = reinterpret_cast<uint32_t*>(dalloc(xa::k8_dwords(hkv, xctxp)));
-                        xv8t[li] = reinterpret_cast<uint32_t*>(dalloc(xa::v8t_dwords(hkv, xctxp)));
-                        xks[li] = dalloc(xa::sc_floats(hkv, xctxp));
-                        xvs[li] = dalloc(xa::sc_floats(hkv, xctxp));
-                        bytes += (xa::k8_dwords(hkv, xctxp) + xa::v8t_dwords(hkv, xctxp) + 2 * xa::sc_floats(hkv, xctxp)) * 4;
-                    }
-                xqb = reinterpret_cast<uint32_t*>(dalloc(xa::qb_dwords(hkv)));
-                xqs = dalloc(xa::qs_floats(hkv));
-                xsc = dalloc(xa::score_floats(hkv, n_chunk, xcapc));
-                xpb = reinterpret_cast<uint32_t*>(dalloc(xa::pb_dwords(hkv, n_chunk, xcapc)));
-                xsrow = dalloc(xa::srow_floats(hkv, n_chunk));
-                xpos_d = reinterpret_cast<int32_t*>(dalloc(4));
-                bytes += (xa::qb_dwords(hkv) + xa::qs_floats(hkv) + xa::score_floats(hkv, n_chunk, xcapc) + xa::pb_dwords(hkv, n_chunk, xcapc) +
-                          xa::srow_floats(hkv, n_chunk)) * 4;
-                xatt_ready = true;
-                std::fprintf(stderr, "strata-q36: decode attention on the matrix engine from %d cells on (int8 K, transposed int8 V: %.2f GiB of VRAM)\n",
-                             xatt_min, (double) bytes / 1073741824.0);
+                if (ls == 0) {
+                    std::fprintf(stderr, "strata-q36: decode attention stays on the FP32 kernel: the matrix engine's copy (%.2f GiB) does not fit "
+                                         "beside the cache at this context (%.2f GiB of VRAM free)\n",
+                                 (double) (nl * per_layer + scratch) / 1073741824.0, (double) vfr / 1073741824.0);
+                } else {
+                    if (const char* e = std::getenv("STRATA_Q36_XATT_MIN")) xatt_min = std::max(64, std::atoi(e));
+                    xls_max = ls;
+                    xk8.assign(m->layers.size() + 1, nullptr);
+                    xv8t.assign(m->layers.size() + 1, nullptr);
+                    xks.assign(m->layers.size() + 1, nullptr);
+                    xvs.assign(m->layers.size() + 1, nullptr);
+                    for (size_t li = 0; li <= m->layers.size(); ++li)   // (index n_layers: the MTP block's cache)
+                        if (li < m->layers.size() ? m->layers[li].attn : m->has_mtp) {
+                            if (!xatt_kq8) {
+                                xk8[li] = reinterpret_cast<uint32_t*>(dalloc(xa::k8_dwords(hkv, xctxp)));
+                                xks[li] = dalloc(xa::sc_floats(hkv, xctxp));
+                            }
+                            xv8t[li] = reinterpret_cast<uint32_t*>(dalloc(xa::v8t_dwords(hkv, xctxp)));
+                            xvs[li] = dalloc(xa::sc_floats(hkv, xctxp));
+                        }
+                    xqb = reinterpret_cast<uint32_t*>(dalloc(xa::qb_dwords(hkv)));
+                    xqs = dalloc(xa::qs_floats(hkv));
+                    xsc = dalloc(xa::score_floats(hkv, n_chunk, xcapc, ls));
+                    xpb = reinterpret_cast<uint32_t*>(dalloc(xa::pb_dwords(hkv, n_chunk, xcapc, ls)));
+                    xsrow = dalloc(xa::srow_floats(hkv, n_chunk));
+                    xpos_d = reinterpret_cast<int32_t*>(dalloc(4));
+                    xatt_ready = true;
+                    std::fprintf(stderr, "strata-q36: decode attention on the matrix engine from %d cells on (%s, transposed int8 V; windows of up "
+                                         "to %d tokens): %.2f GiB of VRAM\n", xatt_min, xatt_kq8 ? "the 8-bit cache's K" : "int8 K", ls * 16 / xa::kG,
+                                 (double) (nl * per_layer + scratch) / 1073741824.0);
+                }
             }
         }
         for (const Layer& L : m->layers) {   // the verify windows' GDN inputs (one set, whichever session runs)
@@ -4542,7 +4556,7 @@ work-group size if needed.
         const int n = (int) (pos - a);
         st->memcpy(xpos_d, &a, 4).wait();
         for (size_t li = 0; li < xk8.size(); ++li) {
-            if (xk8[li] == nullptr || li >= kc.size() || kc[li] == nullptr) continue;
+            if (xv8t[li] == nullptr || li >= kc.size() || kc[li] == nullptr) continue;
             if (kv_f32) xmirror<float>(li, n, xpos_d);
             else if (kv_q8) xmirror<int8_t>(li, n, xpos_d);
             else xmirror<sycl::half>(li, n, xpos_d);
@@ -4597,7 +4611,7 @@ work-group size if needed.
                     });
             });
         }
-        const bool xmir = xatt_ready && xatt_now && !rows_mode && li < xk8.size() && xk8[li] != nullptr;
+        const bool xmir = xatt_ready && xatt_now && !rows_mode && li < xv8t.size() && xv8t[li] != nullptr;
         if (xmir) xmirror<KV>(li, T, dpos);   // the stored cells into the layer's mirror
         else if (xatt_ready) xmir_n = std::min<int64_t>(xmir_n, p0);   // (cells written past the mirror)
         if (T > kGemmT) {
@@ -4840,7 +4854,17 @@ work-group size if needed.
             if (xmir && xatt_now && nt <= 16) {   // the matrix engine: every row of the window in one pass over the mirror
                 strata::q36xatt::Call xc{};
                 xc.q = qq; xc.pos0 = dpos; xc.t0 = t0; xc.nt = nt; xc.H = H; xc.HKV = HKV; xc.nchk = nch; xc.scale = scale;
-                xc.k8 = xk8[li]; xc.ks = xks[li]; xc.v8t = xv8t[li]; xc.vs = xvs[li]; xc.ctxp = xctxp;
+                if (xatt_kq8) {   // the 8-bit cache's own K: its codes, then an FP16 scale per 64 values
+                    xc.k8 = reinterpret_cast<const uint32_t*>(kcl);
+                    xc.ks16 = reinterpret_cast<const uint16_t*>(reinterpret_cast<const int8_t*>(kcl) + (size_t) HKV * ctx * HD);
+                    xc.ns = 4;
+                    xc.kstride = ctx;
+                } else {
+                    xc.k8 = xk8[li];
+                    xc.ks = xks[li];
+                }
+                xc.max_ls = xls_max;
+                xc.v8t = xv8t[li]; xc.vs = xvs[li]; xc.ctxp = xctxp;
                 xc.qb = xqb; xc.qs = xqs; xc.sc = xsc; xc.pb = xpb; xc.srow = xsrow; xc.capc = xcapc;
                 xc.pacc = pa; xc.pm = pmx; xc.pl = psum;
                 xdone = strata::q36xatt::attend(xc, st);
@@ -6168,7 +6192,7 @@ work-group size if needed.
                 // (STRATA_Q36_XATT_ALL=1, a test switch: the plain decode step takes the matrix-engine attention too, at any
                 // depth - a teacher-forced logit dump then measures it)
                 static const bool xall = [] { const char* e = std::getenv("STRATA_Q36_XATT_ALL"); return e && e[0] == '1'; }();
-                xatt_now = xatt_ready && xall;
+                xatt_now = xatt_ready && xall && pos + kVerify + 8 <= ctx;
                 if (xatt_now) xatt_catch_up();
                 graph_run(gs().g1, [&] { forward(1, pos, 1, use_graph, false); });
                 xatt_now = false;
@@ -6278,7 +6302,9 @@ work-group size if needed.
     int rows_G_last = 0;   // groups of the window run last (commit_rows takes their keep counts)
 
     void run_graph_key(int key, const std::function<void()>& body) {
-        xatt_now = xatt_ready && pos >= xatt_min;   // (the window's attention kernel: a graph of its own)
+        // (the window's attention kernel: a graph of its own.  Not in the context's last cells: a tile of 8 cells may read
+        // past a row's last cell, and the 8-bit cache has no spare cells)
+        xatt_now = xatt_ready && pos >= xatt_min && pos + kVerify + 8 <= ctx;
         if (xatt_now) xatt_catch_up();
         else if (xatt_ready) xmir_n = std::min<int64_t>(xmir_n, std::max<int64_t>(0, pos - kVerify));   // (a replayed graph's cells)
         if (!use_graph) body();
@@ -8208,7 +8234,7 @@ struct Serve {
             if (spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
                 int D = 0, a = 0;
                 look.sync(ss.live);
-                look.propose(nx, E.mtp_d, given);   // (every row of a copy stands: the full depth at any context length)
+                look.propose(nx, E.lookup_depth(), given);   // (every row of a copy stands: the full depth at any context length)
                 if (!given.empty() && E.given_ok((int) given.size())) {   // a lookup step: the drafts cost no draft call
                     D = (int) given.size();
                     a = E.spec_step(nx, fix, D, drafts, picks, &stop, plan.ok ? &sel : nullptr, &given);
@@ -8216,7 +8242,7 @@ struct Serve {
                     looked += D;
                     look_ok += a;
                 } else {
-                    D = q36_depth_at(E.pos, std::min(E.mtp_d, depth_cap));
+                    D = std::min(q36_depth_at(E.pos, std::min(E.mtp_d, depth_cap)), E.lookup_depth());   // (the window fits the attention's scratch)
                     a = E.spec_step(nx, fix, D, drafts, picks, &stop, plan.ok ? &sel : nullptr);
                     depth_cap = q36_next_cap(D, a, E.mtp_d);
                     look.observe(drafts, a, picks[a]);
