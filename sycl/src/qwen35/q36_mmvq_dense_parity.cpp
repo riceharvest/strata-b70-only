@@ -562,7 +562,8 @@ int w4_bench(const char* ncols_s, const std::string& ssel) {
     float* dx = sycl::malloc_device<float>(hx.size(), q);
     const size_t xq_bytes = k::native_q8_1_bytes(maxin, maxc) + 256;
     void* xq = sycl::malloc_device(xq_bytes, q);
-    if (!dpool || !y || !dx || !xq) { std::printf("w4: could not allocate the buffers\n"); return 1; }
+    uint16_t* df = sycl::malloc_device<uint16_t>((size_t) 17408 * 5120, q);   // the FP16 image of the largest matrix
+    if (!dpool || !y || !dx || !xq || !df) { std::printf("w4: could not allocate the buffers\n"); return 1; }
     std::mt19937 rng(4242);
     std::normal_distribution<float> nd(0.f, 1.f);
     for (auto& v : hx) v = nd(rng);
@@ -576,6 +577,39 @@ int w4_bench(const char* ncols_s, const std::string& ssel) {
         const size_t wb = strata::q36xr::w4_bytes(sh.n_in, sh.n_out), wdw = wb / 4;
         const int ndist = (int) std::max<size_t>(1, std::min<size_t>(128, POOL_DW / wdw)), nmat = std::max(ndist, 16);
         const int bpr = sh.n_in / 256, nb = sh.n_in / 32;
+        {   // the prompt path's dequantize: us per matrix, GB/s of FP16 written, the last matrix's first and last 16 rows bit for bit
+            const double ud = time_graph(q, nmat, [&](int m) {
+                strata::q36xr::w4_dequant_f16(dpool + (size_t) (m % ndist) * wdw, df, sh.n_in, sh.n_out, &q);
+            }, 7);
+            q.wait();
+            const uint32_t* base = hpool.data() + (size_t) ((nmat - 1) % ndist) * wdw;
+            std::vector<uint16_t> hf((size_t) sh.n_in * sh.n_out);
+            q.memcpy(hf.data(), df, hf.size() * 2).wait();
+            long long wrong = 0, seen = 0;
+            for (int o = 0; o < sh.n_out; ++o) {
+                if (!(o < 16 || o >= sh.n_out - 16)) continue;
+                const int t = o / 16, i = o % 16;
+                for (int c = 0; c < bpr; ++c) {
+                    const uint32_t* rec = base + ((size_t) t * bpr + c) * REC;
+                    for (int sb = 0; sb < 8; ++sb) {
+                        const uint32_t meta = rec[512 + 16 * (sb >> 2) + i];
+                        const float sc = (float) sycl::bit_cast<sycl::half>((uint16_t) (meta & 0xffff));
+                        const int zero = (int) (meta >> 16);
+                        for (int l = 0; l < 32; ++l) {
+                            const uint32_t by = (rec[128 * (sb >> 1) + 16 * (l >> 2) + i] >> (8 * (l & 3))) & 0xff;
+                            const int qv = (sb & 1) ? (int) (by >> 4) : (int) (by & 15);
+                            const sycl::half want = (sycl::half) (sc * (float) (qv - zero));
+                            ++seen;
+                            if (sycl::bit_cast<uint16_t>(want) != hf[(size_t) o * sh.n_in + c * 256 + sb * 32 + l]) ++wrong;
+                        }
+                    }
+                }
+            }
+            if (wrong) ++bad;
+            std::printf("W4     %-6s %5d x %6d dequantize to FP16  %8.2f us %5.1f GB/s written  %lld of %lld values differ%s\n", sh.name,
+                        sh.n_in, sh.n_out, ud, (double) sh.n_in * sh.n_out * 2 / ud / 1e3, wrong, seen, wrong ? "  FAIL" : "");
+            std::fflush(stdout);
+        }
         for (const int nc : ncl) {
             if (nc < 1 || nc > maxc) continue;
             k::native_quantize_q8_1(dx, xq, sh.n_in, nc, &q);
@@ -631,7 +665,7 @@ int w4_bench(const char* ncols_s, const std::string& ssel) {
             std::fflush(stdout);
         }
     }
-    sycl::free(dpool, q); sycl::free(y, q); sycl::free(dx, q); sycl::free(xq, q);
+    sycl::free(dpool, q); sycl::free(y, q); sycl::free(dx, q); sycl::free(xq, q); sycl::free(df, q);
     return bad ? 1 : 0;
 }
 

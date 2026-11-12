@@ -2427,7 +2427,8 @@ bool load(const std::string &path, Model &m, std::string &err, bool want_mtp) {
                 std::exit(1);
             }
             uint8_t* d = nullptr;
-            CK(DPCT_CHECK_ERROR(d = (uint8_t *)sycl::aligned_alloc_device(4096, blob.size(), q_ct1)));
+            // (2 MiB alignment: the card can map the matrix with large pages)
+            CK(DPCT_CHECK_ERROR(d = (uint8_t *)sycl::aligned_alloc_device((size_t) 2 << 20, blob.size(), q_ct1)));
             CK(DPCT_CHECK_ERROR(q_ct1.memcpy(d, blob.data(), blob.size()).wait()));
             bytes += blob.size();
             w.type = kW4Type;
