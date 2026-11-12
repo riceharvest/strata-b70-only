@@ -3569,7 +3569,7 @@ struct Engine {
             meaningful in the migrated code and was removed or replaced with 0.
             You may need to check the migrated code.
             */
-            CK(DPCT_CHECK_ERROR(hrow = sycl::malloc_host<int32_t>(128, q_ct1)));
+            CK(DPCT_CHECK_ERROR(hrow = sycl::malloc_host<int32_t>(256, q_ct1)));   // (8 fields of 32: kHr*)
         }
         if (vision) {
             d_mtab = dalloc_t<int32_t>((size_t) ctx * 3);
@@ -6271,9 +6271,9 @@ work-group size if needed.
     long long win_count = 0;
     std::map<int, dpct::experimental::command_graph_exec_ptr>
         row_graphs; // by (rows, groups, kind): graphs of the batch windows
-    /// A slot's rows of one window: `n` consecutive cells from the session's position (1: the next token; 2: also an MTP
-    /// proposal the window verifies).
-    struct Group { int slot; int n; int32_t tok[2]; };
+    /// A slot's rows of one window: `n` consecutive cells from the session's position (the next token, then the MTP
+    /// drafts the window verifies after it).
+    struct Group { int slot; int n; int32_t tok[kVerify]; };
     int32_t rows_pick[kVerify] = {};
     int rows_G_last = 0;   // groups of the window run last (commit_rows takes their keep counts)
 
@@ -6296,14 +6296,14 @@ work-group size if needed.
         int T = 0;
         for (int g = 0; g < G; ++g) {
             const Sess& ss = sess[(size_t) gr[g].slot];
-            hrow[40 + g] = gr[g].slot;
-            hrow[48 + g] = T;
-            hrow[56 + g] = gr[g].n;
+            hrow[160 + g] = gr[g].slot;
+            hrow[192 + g] = T;
+            hrow[224 + g] = gr[g].n;
             for (int j = 0; j < gr[g].n; ++j) {
                 hrow[T] = gr[g].tok[j];
-                hrow[8 + T] = (int32_t) (ss.pos + j);
-                hrow[16 + T] = gr[g].slot;
-                hrow[24 + T] = ss.rdelta;
+                hrow[32 + T] = (int32_t) (ss.pos + j);
+                hrow[64 + T] = gr[g].slot;
+                hrow[96 + T] = ss.rdelta;
                 ++T;
             }
             pmax = std::max<int64_t>(pmax, ss.pos + gr[g].n - 1);
@@ -6321,48 +6321,48 @@ work-group size if needed.
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
-        CK(DPCT_CHECK_ERROR(st->memcpy(d_rcell, hrow + 8, (size_t)T * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(d_rcell, hrow + 32, (size_t)T * 4)));
         /*
         DPCT1124:117: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
-        CK(DPCT_CHECK_ERROR(st->memcpy(d_rslot, hrow + 16, (size_t)T * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(d_rslot, hrow + 64, (size_t)T * 4)));
         /*
         DPCT1124:118: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
-        CK(DPCT_CHECK_ERROR(st->memcpy(d_rdelta, hrow + 24, (size_t)T * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(d_rdelta, hrow + 96, (size_t)T * 4)));
         /*
         DPCT1124:119: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
-        CK(DPCT_CHECK_ERROR(st->memcpy(d_gslot, hrow + 40, (size_t)G * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(d_gslot, hrow + 160, (size_t)G * 4)));
         /*
         DPCT1124:120: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
-        CK(DPCT_CHECK_ERROR(st->memcpy(d_grow0, hrow + 48, (size_t)G * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(d_grow0, hrow + 192, (size_t)G * 4)));
         /*
         DPCT1124:121: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
-        CK(DPCT_CHECK_ERROR(st->memcpy(d_gcnt, hrow + 56, (size_t)G * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(d_gcnt, hrow + 224, (size_t)G * 4)));
         mtab_now = nullptr;
         map_on = false;
         rows_mode = true;
         rows_G = G;
         rows_deferred = true;
-        run_graph_key((verify ? 1000 : 0) + G * 10 + (T - G), [&] { forward(T, pmax, T, use_graph, verify); });
+        run_graph_key((verify ? 400000 : 300000) + G * 64 + T, [&] { forward(T, pmax, T, use_graph, verify); });
         rows_deferred = false;
         rows_mode = false;
         /*
@@ -6371,9 +6371,9 @@ work-group size if needed.
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
-        CK(DPCT_CHECK_ERROR(st->memcpy(hrow + 32, pick, (size_t)T * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(hrow + 128, pick, (size_t)T * 4)));
         CK(DPCT_CHECK_ERROR(st->wait()));
-        for (int r = 0; r < T; ++r) rows_pick[r] = hrow[32 + r];
+        for (int r = 0; r < T; ++r) rows_pick[r] = hrow[128 + r];
         if (!verify)
             for (int g = 0; g < G; ++g) sess[(size_t) gr[g].slot].pos += gr[g].n;
         pos = sess[(size_t) cur].pos;
@@ -6386,7 +6386,11 @@ work-group size if needed.
     /// One window for the next token of each of the rows' sessions (no proposals): the greedy picks in rows_pick.
     void step_rows(const Row* rows, int nb) {
         Group gr[kVerify];
-        for (int r = 0; r < nb; ++r) gr[r] = {rows[r].slot, 1, {rows[r].tok, 0}};
+        for (int r = 0; r < nb; ++r) {
+            gr[r].slot = rows[r].slot;
+            gr[r].n = 1;
+            gr[r].tok[0] = rows[r].tok;
+        }
         run_rows(gr, nb, false);
     }
     /// After run_rows(.., verify = true): the GDN state of group g takes its first keep[g] rows (the conv history and the
@@ -6395,14 +6399,14 @@ work-group size if needed.
         const auto& g = m->g;
         const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, C = (int) g.ssm_conv_channels;
         sess[(size_t) cur].pos = pos;
-        for (int i = 0; i < G; ++i) hrow[56 + i] = keep[i];   // (hrow's slot / first-row words are the window's, unchanged)
+        for (int i = 0; i < G; ++i) hrow[224 + i] = keep[i];   // (hrow's slot / first-row words are the window's, unchanged)
         /*
         DPCT1124:123: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
-        CK(DPCT_CHECK_ERROR(st->memcpy(d_gcnt, hrow + 56, (size_t)G * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(d_gcnt, hrow + 224, (size_t)G * 4)));
         rows_mode = true;
         rows_G = G;
         run_graph_key(2000 + G, [&] {
@@ -6506,9 +6510,9 @@ work-group size if needed.
         int64_t pmax = 0;
         for (int r = 0; r < T; ++r) {
             hrow[r] = rows[r].tok;
-            hrow[8 + r] = (int32_t) rows[r].cell;
-            hrow[16 + r] = rows[r].slot;
-            hrow[24 + r] = sess[(size_t) rows[r].slot].rdelta;
+            hrow[32 + r] = (int32_t) rows[r].cell;
+            hrow[64 + r] = rows[r].slot;
+            hrow[96 + r] = sess[(size_t) rows[r].slot].rdelta;
             pmax = std::max<int64_t>(pmax, rows[r].cell);
             /*
             DPCT1124:124: cudaMemcpyAsync is migrated to asynchronous memcpy
@@ -6532,21 +6536,21 @@ work-group size if needed.
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
-        CK(DPCT_CHECK_ERROR(st->memcpy(d_rcell, hrow + 8, (size_t)T * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(d_rcell, hrow + 32, (size_t)T * 4)));
         /*
         DPCT1124:127: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
-        CK(DPCT_CHECK_ERROR(st->memcpy(d_rslot, hrow + 16, (size_t)T * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(d_rslot, hrow + 64, (size_t)T * 4)));
         /*
         DPCT1124:128: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
-        CK(DPCT_CHECK_ERROR(st->memcpy(d_rdelta, hrow + 24, (size_t)T * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(d_rdelta, hrow + 96, (size_t)T * 4)));
         mtab_now = nullptr;
         map_on = false;
         rows_mode = true;
@@ -6615,7 +6619,10 @@ work-group size if needed.
                 });
             }
             layer(m->mtp, m->layers.size(), T, pmax, pos0_m, use_graph, false, m->mtp_shnorm, hmtp);
-            mm(m->head, hmtp, logits_mr, T);
+            // (the draft head when there is one: its rows of the head, 64K of 248K, as the one-request drafts take)
+            const bool dh = head_d.d != nullptr;
+            const int nv = dh ? head_d.n_out : (int) g.n_vocab;
+            mm(dh ? head_d : m->head, hmtp, logits_mr, T);
             {
                 auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
@@ -6630,7 +6637,7 @@ work-group size if needed.
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
                         exp_props, [=](sycl::nd_item<3> item_ct1) {
-                            k_argmax(logits_mr_ct0, (int)g.n_vocab, pick_mr_ct2,
+                            k_argmax(logits_mr_ct0, nv, pick_mr_ct2,
                                      amv_ct3, ami_ct4, false);
                         });
                 });
@@ -6655,6 +6662,11 @@ work-group size if needed.
                         });
                 });
             }
+            if (dh) {
+                int32_t* const pk = pick_mr;
+                const int32_t* const idv = d_draft_ids;
+                st->parallel_for<class q36_mtp_rows_map>(sycl::range<1>((size_t) T), [=](sycl::id<1> i) { pk[i[0]] = idv[pk[i[0]]]; });
+            }
         });
         rows_deferred = false;
         rows_mode = false;
@@ -6664,9 +6676,9 @@ work-group size if needed.
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
-        CK(DPCT_CHECK_ERROR(st->memcpy(hrow + 32, pick_mr, (size_t)T * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(hrow + 128, pick_mr, (size_t)T * 4)));
         CK(DPCT_CHECK_ERROR(st->wait()));
-        for (int r = 0; r < T; ++r) mtp_pick[r] = hrow[32 + r];
+        for (int r = 0; r < T; ++r) mtp_pick[r] = hrow[128 + r];
     }
     /// Row r's logits of the last step_rows, on the host.
     void host_logits_row(int r, std::vector<float> &out) try {
@@ -7593,8 +7605,8 @@ struct Slot {
     std::mt19937_64 rng;
     std::vector<int32_t> hist;
     Clock::time_point t0;
-    int32_t draft = 0;            // --batch-mtp: the MTP block's proposal for the token after `x`
-    bool draft_ready = false;
+    std::vector<int32_t> drafts;  // --batch-mtp: the MTP block's chained proposals for the tokens after `x`
+    int depth = 2;                // ... how many the next window takes (follows what was accepted)
     long long offered = 0, accepted = 0;
 };
 
@@ -7638,57 +7650,120 @@ struct Serve {
         }
     }
 
-    /// One decode window with MTP proposals (--batch-mtp): every active slot's next token, and for up to kVerify - S of the
-    /// slots (the greedy ones, in turn) also the proposal its MTP block made: the window verifies both at once.  A slot whose
-    /// proposal the main model confirms moves two tokens in the window.  The proposals for the next window come right after
-    /// it, from the hidden states the window just produced (the first one of a slot from the state its prompt left).
+    /// One decode window with MTP drafts (--batch-mtp): every active slot's next token and, for the slots that decode
+    /// greedily, the chain of drafts its MTP block made after it; the window verifies them all at once.  A slot keeps its
+    /// next token and every draft the main model confirms in a row.  A slot's depth follows what it got accepted (one
+    /// more after a window that took them all, accepted + 1 after a miss); the rows of all slots fit kVerify (the deepest
+    /// slots give way first).  The drafts for the next window come right after this one: the block reads the kept rows
+    /// (their hidden states from the window), its pick after the last is the first draft, each further draft is one more
+    /// call over the slots that still want one, seeded by the block's own output.
     int mtp_turn = 0;
+    // (STRATA_Q36_BATCH_TIME=1: the wall time of a window's parts, printed when a slot ends)
+    double bt_ms[6] = {};
+    long long bt_n = 0;
+    std::chrono::time_point<std::chrono::steady_clock> bt_end{};
+    int bdepth_max = [] { const char* e = std::getenv("STRATA_Q36_BATCH_DEPTH"); return e && *e ? std::max(1, std::atoi(e)) : 15; }();
+    /// The rows a window can give to drafts, shared: want[i] cut down (the largest first, from the turn's slot on) until
+    /// one row a slot plus the drafts fit.
+    void fit_depths(std::vector<int>& want) {
+        const int S = (int) want.size();
+        int total = S;
+        for (int v : want) total += v;
+        while (total > Engine::kVerify) {
+            int best = -1;
+            for (int k = 0; k < S; ++k) {
+                const int i = (mtp_turn + k) % S;
+                if (want[(size_t) i] > 0 && (best < 0 || want[(size_t) i] > want[(size_t) best])) best = i;
+            }
+            if (best < 0) break;
+            --want[(size_t) best];
+            --total;
+        }
+    }
+    /// Chains the drafts of the slots in `who` (each holds at least one; row[k] = its row of the last mtp_rows call) up to
+    /// want[k]: one mtp_rows call a level.
+    void chain_drafts(const std::vector<int>& who, const std::vector<int>& want, std::vector<int>& row) {
+        const int N = (int) E.m->g.n_embd;
+        for (;;) {
+            std::vector<Engine::MtpRow> rows;
+            std::vector<int> of;
+            for (size_t k = 0; k < who.size(); ++k) {
+                Slot& sl = slots[(size_t) who[k]];
+                const Engine::Sess& ss = E.sess[(size_t) who[k]];
+                const int have = (int) sl.drafts.size();
+                if (have >= want[k] || ss.pos + have + 2 > E.ctx) continue;
+                rows.push_back({who[k], sl.drafts.back(), ss.pos + have, E.hmtp + (size_t) row[k] * N});
+                of.push_back((int) k);
+            }
+            if (rows.empty()) return;
+            E.mtp_rows(rows.data(), (int) rows.size());
+            for (size_t r = 0; r < rows.size(); ++r) {
+                slots[(size_t) who[(size_t) of[r]]].drafts.push_back(E.mtp_pick[r]);
+                row[(size_t) of[r]] = (int) r;
+            }
+        }
+    }
     void window_mtp() try {
+        static const bool btime = [] { const char* e = std::getenv("STRATA_Q36_BATCH_TIME"); return e && e[0] == '1'; }();
+        auto bt0 = Clock::now();
+        if (btime && bt_n > 0) bt_ms[5] += std::chrono::duration<double, std::milli>(bt0 - bt_end).count();
+        auto lap = [&](int i) { if (btime) { E.st->wait(); const auto t = Clock::now(); bt_ms[i] += std::chrono::duration<double, std::milli>(t - bt0).count(); bt0 = t; } };
         poll_control();
         const int N = (int) E.m->g.n_embd;
+        const int maxd = std::min({E.mtp_d, bdepth_max, Engine::kVerify - 1});
         std::vector<int> act;
         for (int b = 0; b < E.n_sess; ++b)
             if (slots[(size_t) b].active) act.push_back(b);
         const int S = (int) act.size();
         if (S == 0) return;
-        // who verifies a proposal this window: the greedy slots in turn, as many as fit beside one row per slot
-        const int room = Engine::kVerify - S;
-        std::vector<char> cand((size_t) S, 0);
-        int nc = 0;
-        for (int k = 0; k < S && nc < room; ++k) {
-            const int i = (mtp_turn + k) % S;
-            if (!slots[(size_t) act[(size_t) i]].smp.needs_logits()) { cand[(size_t) i] = 1; ++nc; }
-        }
-        ++mtp_turn;
-        // a candidate without a proposal gets its first one from the state its last row left
-        std::vector<Engine::MtpRow> first;
-        std::vector<int> first_of;
+        // the depths of this window: what each greedy slot wants, cut to the rows there are
+        std::vector<int> want((size_t) S, 0);
         for (int i = 0; i < S; ++i) {
-            Slot& sl = slots[(size_t) act[(size_t) i]];
-            if (cand[(size_t) i] && !sl.draft_ready) {
-                Engine::Sess& ss = E.sess[(size_t) act[(size_t) i]];
-                first.push_back({act[(size_t) i], sl.x, ss.pos, ss.hlast});
-                first_of.push_back(i);
+            const Slot& sl = slots[(size_t) act[(size_t) i]];
+            if (!sl.smp.needs_logits()) want[(size_t) i] = std::max(1, std::min(sl.depth, maxd));
+        }
+        fit_depths(want);
+        ++mtp_turn;
+        // a slot without drafts (its first window, or one that had no row to spare) gets its first from the state its last
+        // row left, then both kinds are chained to their depth; a slot with more than its share drops the rest
+        {
+            std::vector<Engine::MtpRow> first;
+            std::vector<int> who, wn, row;
+            for (int i = 0; i < S; ++i) {
+                Slot& sl = slots[(size_t) act[(size_t) i]];
+                if ((int) sl.drafts.size() > want[(size_t) i]) sl.drafts.resize((size_t) want[(size_t) i]);
+                if (want[(size_t) i] > 0 && sl.drafts.empty()) {
+                    const Engine::Sess& ss = E.sess[(size_t) act[(size_t) i]];
+                    first.push_back({act[(size_t) i], sl.x, ss.pos, ss.hlast});
+                    who.push_back(act[(size_t) i]);
+                    wn.push_back(want[(size_t) i]);
+                }
+            }
+            if (!first.empty()) {
+                E.mtp_rows(first.data(), (int) first.size());
+                for (size_t k = 0; k < first.size(); ++k) {
+                    slots[(size_t) who[k]].drafts.assign(1, E.mtp_pick[k]);
+                    row.push_back((int) k);
+                }
+                chain_drafts(who, wn, row);
             }
         }
-        if (!first.empty()) {
-            E.mtp_rows(first.data(), (int) first.size());
-            for (size_t k = 0; k < first.size(); ++k) {
-                Slot& sl = slots[(size_t) act[(size_t) first_of[k]]];
-                sl.draft = E.mtp_pick[k];
-                sl.draft_ready = true;
-            }
-        }
+        lap(0);
         std::vector<Engine::Group> gr((size_t) S);
         std::vector<int> row0((size_t) S);
         int T = 0;
         for (int i = 0; i < S; ++i) {
             const Slot& sl = slots[(size_t) act[(size_t) i]];
-            gr[(size_t) i] = {act[(size_t) i], cand[(size_t) i] ? 2 : 1, {sl.x, sl.draft}};
+            Engine::Group& g = gr[(size_t) i];
+            g.slot = act[(size_t) i];
+            g.n = 1 + (int) sl.drafts.size();
+            g.tok[0] = sl.x;
+            for (size_t j = 0; j < sl.drafts.size(); ++j) g.tok[1 + j] = sl.drafts[j];
             row0[(size_t) i] = T;
-            T += gr[(size_t) i].n;
+            T += g.n;
         }
         E.run_rows(gr.data(), S, true);
+        lap(1);
         // the picks: emit, decide how many rows each slot keeps
         std::vector<int> keep((size_t) S, 1);
         std::vector<int32_t> last((size_t) S, 0);
@@ -7697,33 +7772,41 @@ struct Serve {
             const int b = act[(size_t) i];
             Slot& sl = slots[(size_t) b];
             Engine::Sess& ss = E.sess[(size_t) b];
-            const int n = gr[(size_t) i].n, r0 = row0[(size_t) i];
+            const int D = gr[(size_t) i].n - 1, r0 = row0[(size_t) i];
             int y0 = E.rows_pick[r0];
             if (sl.smp.needs_logits()) {
                 E.host_logits_row(r0, lg);
                 y0 = sample(lg, sl.smp, sl.hist, sl.rng);
             }
-            bool two = n == 2 && y0 == sl.draft && !is_eos(y0) && !sl.stop && sl.produced + 2 <= sl.max_new &&
-                       ss.pos + 3 <= E.ctx;   // (ss.pos: the position of the slot's next token: the window did not move it)
-            if (n == 2) { ++sl.offered; if (two) ++sl.accepted; }
-            const int rows_kept = two ? 2 : 1;
+            // draft a + 1 stands when the pick before it is that draft (ss.pos: the position of the slot's next token: the
+            // window did not move it)
+            int a = 0;
+            for (int y = y0; a < D && y == sl.drafts[(size_t) a] && !is_eos(y) && !sl.stop && sl.produced + a + 2 <= sl.max_new &&
+                             ss.pos + a + 3 <= E.ctx; y = E.rows_pick[r0 + a])
+                ++a;
+            sl.offered += D;
+            sl.accepted += a;
+            if (D > 0) sl.depth = a >= D ? std::min(maxd, D + 1) : std::max(1, a + 1);
+            const int rows_kept = 1 + a;
             keep[(size_t) i] = rows_kept;
-            const int32_t fed[2] = {sl.x, sl.draft};
             bool done = false;
             int y = y0;
             for (int j = 0; j < rows_kept; ++j) {
-                if (j == 1) y = E.rows_pick[r0 + 1];
-                ss.live.push_back(fed[j]);
+                if (j > 0) y = E.rows_pick[r0 + j];
+                ss.live.push_back(gr[(size_t) i].tok[j]);
                 std::printf("BT %d %d\n", b, y);
                 ++sl.produced;
                 sl.hist.push_back(y);
                 const char* fin = is_eos(y) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
                                   : ss.pos + j + 2 > E.ctx ? "length" : nullptr;
                 if (fin) {
+                    if (btime && bt_n > 0)
+                        std::fprintf(stderr, "strata batch: %lld windows: first drafts %.2f, window %.2f, picks %.2f, commit %.2f, next drafts %.2f, "
+                                             "between %.2f ms each\n", bt_n, bt_ms[0] / bt_n, bt_ms[1] / bt_n, bt_ms[2] / bt_n, bt_ms[3] / bt_n,
+                                     bt_ms[4] / bt_n, bt_ms[5] / bt_n);
                     std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms_since(sl.t0));
                     if (sl.offered > 0)
-                        std::fprintf(stderr, "strata batch: slot %d: %lld of %lld MTP proposals accepted\n", b, sl.accepted,
-                                     sl.offered);
+                        std::fprintf(stderr, "strata batch: slot %d: %lld of %lld MTP drafts accepted\n", b, sl.accepted, sl.offered);
                     sl.active = false;
                     ss.active = false;
                     --n_active;
@@ -7735,10 +7818,12 @@ struct Serve {
             alive[(size_t) i] = !done;
             if (!done) sl.x = y;
         }
+        lap(2);
         E.commit_rows(gr.data(), keep.data(), S);
-        // the hidden state after each slot's last kept row (the seed of a later first proposal), and the next proposals
-        std::vector<Engine::MtpRow> nx;
-        std::vector<int> nx_of, nx_last;
+        lap(3);
+        // the hidden state after each slot's last kept row (the seed of a later first draft), then the next window's
+        // drafts: its depths are fixed here, among the slots still decoding
+        std::vector<int> nwant, nidx;
         for (int i = 0; i < S; ++i) {
             const int b = act[(size_t) i];
             Engine::Sess& ss = E.sess[(size_t) b];
@@ -7753,34 +7838,36 @@ struct Serve {
                 ss.hlast, E.hmain + (size_t)(r0 + keep[(size_t)i] - 1) * N,
                 (size_t)N * 4)));
             Slot& sl = slots[(size_t) b];
-            sl.draft_ready = false;
-            if (!alive[(size_t) i] || !cand[(size_t) i]) continue;
-            const int64_t p_new = ss.pos;   // commit_rows moved it: the cell of the token the next window feeds
-            if (keep[(size_t) i] == 2) {
-                nx.push_back({b, sl.draft, p_new - 1, E.hmain + (size_t) r0 * N});
-                nx.push_back({b, last[(size_t) i], p_new, E.hmain + (size_t) (r0 + 1) * N});
-                nx_last.push_back((int) nx.size() - 1);
-            } else {
-                nx.push_back({b, last[(size_t) i], p_new, E.hmain + (size_t) r0 * N});
-                nx_last.push_back((int) nx.size() - 1);
-            }
-            nx_of.push_back(i);
+            if (!alive[(size_t) i]) { sl.drafts.clear(); continue; }
+            nidx.push_back(i);
+            nwant.push_back(sl.smp.needs_logits() ? 0 : std::max(1, std::min(sl.depth, maxd)));
         }
         std::fflush(stdout);
-        if (!nx.empty()) {
-            // (more rows than the window holds: the proposals come in two calls)
-            for (size_t at = 0, k = 0; at < nx.size();) {
-                size_t take = std::min<size_t>(nx.size() - at, Engine::kVerify);
-                while (take > 0 && at + take < nx.size() && nx[at + take].slot == nx[at + take - 1].slot) --take;   // a slot's rows together
-                E.mtp_rows(nx.data() + at, (int) take);
-                for (; k < nx_last.size() && (size_t) nx_last[k] < at + take; ++k) {
-                    Slot& sl = slots[(size_t) act[(size_t) nx_of[k]]];
-                    sl.draft = E.mtp_pick[(size_t) nx_last[k] - at];
-                    sl.draft_ready = true;
-                }
-                at += take;
-            }
+        fit_depths(nwant);
+        std::vector<Engine::MtpRow> nx;
+        std::vector<int> who, wn, row;
+        for (size_t k = 0; k < nidx.size(); ++k) {
+            const int i = nidx[k], b = act[(size_t) i], r0 = row0[(size_t) i], kept = keep[(size_t) i];
+            Slot& sl = slots[(size_t) b];
+            const Engine::Sess& ss = E.sess[(size_t) b];
+            const std::vector<int32_t> old = sl.drafts;
+            sl.drafts.clear();
+            if (nwant[k] <= 0) continue;
+            const int64_t p_new = ss.pos;   // commit_rows moved it: the cell of the token the next window feeds
+            // the kept drafts' rows (the block's cache takes them), then the row of the next token: its pick is the first draft
+            for (int j = 1; j < kept; ++j) nx.push_back({b, old[(size_t) j - 1], p_new - kept + j, E.hmain + (size_t) (r0 + j - 1) * N});
+            nx.push_back({b, last[(size_t) i], p_new, E.hmain + (size_t) (r0 + kept - 1) * N});
+            who.push_back(b);
+            wn.push_back(nwant[k]);
+            row.push_back((int) nx.size() - 1);
         }
+        if (!nx.empty()) {
+            E.mtp_rows(nx.data(), (int) nx.size());
+            for (size_t k = 0; k < who.size(); ++k) slots[(size_t) who[k]].drafts.assign(1, E.mtp_pick[(size_t) row[k]]);
+            chain_drafts(who, wn, row);
+        }
+        lap(4);
+        if (btime) { ++bt_n; bt_end = Clock::now(); }
     }
     catch (sycl::exception const &exc) {
       std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -7821,7 +7908,7 @@ struct Serve {
                 */
                 CK(DPCT_CHECK_ERROR(E.st->memcpy(
                     ss.hlast, E.hmain + r * (size_t)E.m->g.n_embd, Nb)));
-            sl.draft_ready = false;
+            sl.drafts.clear();
             ss.live.push_back(sl.x);
             int y;
             if (sl.smp.needs_logits()) {
