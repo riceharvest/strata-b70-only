@@ -34,6 +34,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "q36_mmvq_dense.hpp"
 #include "q36_xr_dense.hpp"
+#include "q36_xatt.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -69,6 +70,7 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <thread>
 #include <tuple>
 #include <type_traits>
@@ -88,6 +90,55 @@ bool requant(int type, const void* src, int64_t n_in, int64_t n_out, int dst_typ
 namespace {
 
 namespace K = strata::kernels;
+
+// --w4 FILE: a B70W4 pack (tools/qwen35/b70w4_pack.py: a GPTQ int4 checkpoint of the same model, packed for the B70's matrix
+// engine).  A matrix the pack names is loaded from it and not from the GGUF; everything else (norms, embeddings, the head, the
+// MTP block, the small GDN tensors) is the GGUF's.  Decode: the W4 form of q36_xr_dense.dp.cpp.  A prompt chunk: the pack
+// dequantized to FP16, then the FP16 GEMM.
+constexpr int kW4Type = 1004;   // (not a ggml type id)
+struct W4Ent { uint64_t off = 0, bytes = 0; int n_in = 0, n_out = 0; };
+struct W4Pack {
+    std::string path;
+    uint64_t blobs = 0;   // the file offset of the blob area
+    std::unordered_map<std::string, W4Ent> t;
+    bool open(const std::string& p, std::string& err) {
+        FILE* f = std::fopen(p.c_str(), "rb");
+        if (!f) { err = "cannot open " + p; return false; }
+        char magic[8];
+        uint64_t n = 0;
+        if (std::fread(magic, 1, 8, f) != 8 || std::memcmp(magic, "B70W4\0\0\1", 8) != 0 || std::fread(&n, 8, 1, f) != 1 || n > (64u << 20)) {
+            std::fclose(f);
+            err = p + " is not a B70W4 pack";
+            return false;
+        }
+        std::string js((size_t) n, '\0');
+        const bool ok = std::fread(js.data(), 1, (size_t) n, f) == (size_t) n;
+        std::fclose(f);
+        if (!ok) { err = p + ": short index"; return false; }
+        blobs = (16 + n + 4095) / 4096 * 4096;
+        size_t at = js.find("\"tensors\"");
+        if (at == std::string::npos) { err = p + ": no tensor index"; return false; }
+        at = js.find('{', at);
+        for (;;) {
+            const size_t q0 = js.find('"', at + 1);
+            if (q0 == std::string::npos) break;
+            const size_t q1 = js.find('"', q0 + 1);
+            if (q1 == std::string::npos) break;
+            W4Ent e;
+            unsigned long long off = 0, bytes = 0;
+            if (std::sscanf(js.c_str() + q1 + 1, ": {\"off\": %llu, \"bytes\": %llu, \"n_in\": %d, \"n_out\": %d}", &off, &bytes, &e.n_in, &e.n_out) != 4) break;
+            e.off = off;
+            e.bytes = bytes;
+            t[js.substr(q0 + 1, q1 - q0 - 1)] = e;
+            at = js.find('}', q1);
+            if (at == std::string::npos) break;
+        }
+        path = p;
+        return !t.empty();
+    }
+};
+std::string g_w4_path;   // --w4
+W4Pack g_w4;
 
 // The 27B's decode forms (q36_mmvq_dense.dp.cpp, built into this binary only) take the dense model's products; every other
 // call, and any that they decline, is the shared native_mmvq's.
@@ -112,6 +163,264 @@ inline int q36_depth_at(int64_t cells, int mtp_d) {
     }();
     return cells < lim.first ? mtp_d : cells < lim.second ? std::min(mtp_d, 4) : std::min(mtp_d, 3);
 }
+// Drafts beyond the base depth only on a run of accepted drafts.  A step offers kDraftBase drafts (or --mtp's, when that
+// is less); after a step whose drafts were all accepted the next offers one more, up to --mtp; after a miss it is back at
+// the base.  Text that the draft block predicts almost fully (an edit that repeats a file: 1,227 of 1,255 accepted) then
+// runs at the full depth (15 with the pack: a window of 16 rows), text it predicts half of stays at the base (the int4
+// pack, depth 5 / 7 fixed: 83.7 / 79.6 tok/s
+// on code-v1, 147.7 / 174.0 on a whole-file edit).  STRATA_Q36_MTP_BASE=N: another base (N >= --mtp: always --mtp).
+constexpr int kDraftBase = 5;
+inline int q36_draft_base(int mtp_d) {
+    static const int e = [] { const char* v = std::getenv("STRATA_Q36_MTP_BASE"); const int n = v ? std::atoi(v) : 0; return n > 0 ? n : kDraftBase; }();
+    return std::min(e, mtp_d);
+}
+inline int q36_next_cap(int offered, int accepted, int mtp_d) {
+    // every draft accepted: one more (two from 8 on); a miss: one more than was accepted, the base at least (a long accepted run that
+    // ends in one miss stays deep: a whole-file edit accepts 93% of its drafts and still misses once in most deep steps)
+    // (measured, int4 pack: +2 at every depth cost code-v1 3.3 tok/s, a reset to the base after a miss cost the edit 22)
+    if (accepted >= offered) return std::min(mtp_d, offered + (offered < 8 ? 1 : 2));
+    return std::min(mtp_d, std::max(q36_draft_base(mtp_d), accepted + 1));
+}
+// Lookup drafts (STRATA_Q36_NGRAM=0: off; STRATA_Q36_NGRAM_LOG=1: a line an event).  A draft the host can guess costs no
+// draft call, and a window row more costs a column of each product.  When the model is copying - the tokens it just
+// produced are the tokens that followed an earlier place of the conversation (prompt or answer) - the next step's drafts
+// are the tokens that follow there, up to the window's depth, and the MTP block drafts nothing that step (it still reads
+// the rows, so its own cache stays whole).  The verify window decides as for any draft: the text is the plain text.
+//   - A match alone is not enough: on new text a three-token match is right about one time in thirty (short_code.py: 8
+//     of 270 lookup drafts accepted, 122 -> 107 tok/s when every match was tried).  A copy starts only after
+//     kLookupProof tokens of an MTP step were the place's continuation.
+//   - A running copy keeps a cursor in its source and walks it in order.  (Finding the place again each step by its last
+//     three tokens jumps to the latest line that looks the same: a test file's `res = server.make_request(`.)
+//   - A copy that breaks (the model wrote another token than the source's) takes one MTP step, then lines up what the
+//     model wrote with the source after the break: up to 4 tokens written for up to 3 of the source's.  One source token
+//     that became 1-4 others is remembered and written that way in later drafts (an edit that renames a name everywhere);
+//     a remembered replacement the model does not make twice is forgotten.
+//   - A lookup step offers 8 drafts at first and the full depth after a fully accepted one.
+constexpr int kLookupProof = 5;
+inline bool q36_ngram() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_Q36_NGRAM"); return !(e && e[0] == '0'); }();
+    return v;
+}
+// STRATA_Q36_NGRAM_WARM=1: a lookup step's graphs (8 drafts and the full depth, every redo count) are recorded at load.
+// Off: each is recorded at its first use (about 60 ms, once).  Recorded at load they made every other request about 1.8%
+// slower (prose after 25K 51.4 -> 50.5 tok/s with no lookup step in it; why is not known), so the default is off.
+inline bool q36_ngram_warm() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_Q36_NGRAM_WARM"); return e && e[0] == '1'; }();
+    return v;
+}
+inline bool q36_ngram_log() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_Q36_NGRAM_LOG"); return e && e[0] == '1'; }();
+    return v;
+}
+struct Lookup {
+    struct Pos { int32_t i = -1; int off = 0; };     // the source token t[i]; `off` tokens of its replacement are written
+    std::vector<int32_t> t;                          // the conversation's tokens, as the session holds them
+    std::unordered_map<uint64_t, int32_t> last;      // (a, b, c) -> the index after its latest occurrence
+    std::unordered_map<int32_t, std::vector<int32_t>> subst;   // a source token -> what the model writes for it
+    std::unordered_map<int32_t, int> bad;            // ... and how often it did not
+    int32_t place = -1;                              // no copy: where this step's last three tokens stand earlier (t[place ..] followed)
+    Pos cur;                                         // a copy: the source's token for the one after x (i < 0: no copy)
+    std::vector<Pos> pos;                            // this step's drafts: the source position of each, and the one after them
+    int32_t mend = -1, near = -1;                    // a broken copy: the source token not written; where a dropped copy stood
+    std::vector<int32_t> wrote;                      // ... and what the model wrote from there
+    int depth = 8;                                   // the drafts the next lookup step offers
+    int32_t want = -1;                               // the tokens the session holds after the last step, if it went as told
+    static uint64_t key(int32_t a, int32_t b, int32_t c) {
+        return ((uint64_t) (uint32_t) a * 0x9E3779B97F4A7C15ull) ^ ((uint64_t) (uint32_t) b * 0xC2B2AE3D27D4EB4Full) ^ ((uint64_t) (uint32_t) c << 21);
+    }
+    void push(int32_t tok) {
+        t.push_back(tok);
+        const size_t n = t.size();
+        if (n >= 3) last[key(t[n - 3], t[n - 2], t[n - 1])] = (int32_t) n;
+    }
+    void idle() {
+        cur = Pos{};
+        mend = -1;
+        wrote.clear();
+        pos.clear();
+    }
+    /// The session's tokens grew (or are another conversation's): take the new ones.
+    void sync(const std::vector<int32_t>& live) {
+        const size_t n = t.size();
+        if (live.size() < n || (n > 0 && live[n - 1] != t[n - 1])) {
+            t.clear();
+            last.clear();
+            subst.clear();
+            bad.clear();
+            idle();
+            place = near = -1;
+            depth = 8;
+        }
+        for (size_t i = t.size(); i < live.size(); ++i) push(live[i]);
+    }
+    const std::vector<int32_t>* rep(int32_t tok) const {
+        const auto it = subst.find(tok);
+        return it == subst.end() ? nullptr : &it->second;
+    }
+    int32_t at(Pos p) const {
+        const auto* r = rep(t[(size_t) p.i]);
+        return r != nullptr && p.off < (int) r->size() ? (*r)[(size_t) p.off] : t[(size_t) p.i];
+    }
+    void step(Pos& p) const {
+        const auto* r = rep(t[(size_t) p.i]);
+        if (r != nullptr && p.off + 1 < (int) r->size()) { ++p.off; return; }
+        ++p.i;
+        p.off = 0;
+    }
+    /// How many of g[gi ..] are the source's tokens from `p` on (`p` moves past them).
+    int walk(const std::vector<int32_t>& g, size_t gi, Pos& p) const {
+        int m = 0;
+        const int32_t n = (int32_t) t.size();
+        while (gi < g.size() && p.i < n && at(p) == g[gi]) { step(p); ++gi; ++m; }
+        return m;
+    }
+    /// The drafts after `x` (the decided next token, not yet in t): up to `maxn` tokens; none unless a copy runs.
+    void propose(int32_t x, int maxn, std::vector<int32_t>& out) {
+        out.clear();
+        pos.clear();
+        place = -1;
+        const int32_t n = (int32_t) t.size();
+        if (!q36_ngram() || maxn <= 0 || n < 3) { idle(); return; }
+        if ((cur.i >= 0 || mend >= 0) && n != want) idle();   // (tokens came in another way: a step without drafts)
+        if (cur.i >= 0) {
+            Pos p = cur;
+            const int cap = std::min(maxn, depth);
+            while ((int) out.size() < cap && p.i < n) { out.push_back(at(p)); pos.push_back(p); step(p); }
+            pos.push_back(p);
+            if (out.empty()) { near = cur.i; idle(); }
+            return;
+        }
+        if (mend >= 0) return;   // (an MTP step: observe() lines the copy up again)
+        const int32_t a = t[(size_t) n - 2], b = t[(size_t) n - 1];
+        if (near >= 0)           // a dropped copy: the place closest after where it stood
+            for (int32_t j = std::max(3, near - 8); j < std::min(n, near + 96); ++j)
+                if (t[(size_t) j - 1] == x && t[(size_t) j - 2] == b && t[(size_t) j - 3] == a) { place = j; break; }
+        if (place < 0)
+            if (auto it = last.find(key(a, b, x)); it != last.end()) {
+                const int32_t e = it->second;   // t[e - 1] is that occurrence's last token (x's twin), t[e ..] what followed
+                if (e >= 3 && e < n && t[(size_t) e - 1] == x && t[(size_t) e - 2] == b && t[(size_t) e - 3] == a) place = e;
+            }
+    }
+    /// `j` tokens were written for `s` of the source's at `m`: one source token that became others is remembered.
+    void learn(int32_t m, int j, int s) {
+        const int32_t st = t[(size_t) m];
+        if (q36_ngram_log()) std::fprintf(stderr, "lookup: lined up at %d: %d written for %d (tok %d)\n", m, j, s, st);
+        if (s != 1 || j < 1) return;
+        if (j == 1 && wrote[0] == st) {                // the model wrote the source's token: the replacement did not hold
+            if (++bad[st] >= 2) subst.erase(st);
+            return;
+        }
+        subst[st].assign(wrote.begin(), wrote.begin() + j);
+        bad[st] = 0;
+    }
+    /// The copy broke at source token `mend`; `wrote` holds the model's tokens from there.  Line them up with the source:
+    /// the smallest change after which the rest of `wrote` is the source's.  When the rest breaks again further on (the
+    /// same name twice in a few tokens), the part that stood is taken and the rest lined up from the second break.
+    bool align(int level = 0) {
+        const int32_t n = (int32_t) t.size(), m = mend;
+        const int g = (int) wrote.size();
+        int bj = -1, bs = -1, bm = 0;
+        for (int sum = 0; sum <= 7; ++sum)
+            for (int j = 0; j <= std::min(4, sum); ++j) {   // j tokens written for s of the source's
+                const int s = sum - j;
+                if (s > 3 || g - j < 2 || m + s >= n) continue;
+                // one token that became others: the rest is walked with that replacement (`global server`, a line break,
+                // `server` again: the second one is two tokens on)
+                const int32_t st = t[(size_t) m];
+                const bool trial = s == 1 && j >= 1 && !(j == 1 && wrote[0] == st);
+                std::vector<int32_t> old;
+                bool had = false;
+                if (trial) {
+                    if (const auto it = subst.find(st); it != subst.end()) { had = true; old = it->second; }
+                    subst[st].assign(wrote.begin(), wrote.begin() + j);
+                }
+                Pos p{m + s, 0};
+                const int mm = walk(wrote, (size_t) j, p);
+                if (j + mm == g) {
+                    learn(m, j, s);
+                    idle();
+                    cur = p;
+                    depth = 8;
+                    return true;
+                }
+                if (trial) {
+                    if (had) subst[st] = old;
+                    else subst.erase(st);
+                }
+                if (mm >= 3 && mm > bm) { bm = mm; bj = j; bs = s; }
+            }
+        if (bj < 0 || level >= 3) return false;
+        learn(m, bj, bs);
+        Pos p{m + bs, 0};
+        const int mm = walk(wrote, (size_t) bj, p);   // (again: what was just learned may carry it further)
+        if (bj + mm == g) {
+            idle();
+            cur = p;
+            depth = 8;
+            return true;
+        }
+        if (p.i >= n) return false;
+        wrote.erase(wrote.begin(), wrote.begin() + bj + mm);
+        if (p.off > 0)
+            if (const auto* r = rep(t[(size_t) p.i]); r != nullptr)
+                wrote.insert(wrote.begin(), r->begin(), r->begin() + std::min<size_t>((size_t) p.off, r->size()));
+        mend = p.i;
+        return align(level + 1);
+    }
+    void broke(Pos p, int32_t next, int a, int d) {
+        if (q36_ngram_log()) std::fprintf(stderr, "lookup: break at %d.%d after %d of %d: source %d, model %d\n", p.i, p.off, a, d,
+                                          p.i < (int32_t) t.size() ? t[(size_t) p.i] : -1, next);
+        idle();
+        if (p.i >= (int32_t) t.size()) { near = p.i; return; }
+        mend = p.i;
+        if (const auto* r = rep(t[(size_t) p.i]); r != nullptr) {
+            wrote.assign(r->begin(), r->begin() + std::min<size_t>((size_t) p.off, r->size()));   // (the part of the replacement that stood)
+        }
+        wrote.push_back(next);
+    }
+    /// An MTP step's outcome (its `a` accepted drafts, then `next`).
+    void observe(const std::vector<int32_t>& drafts, int a, int32_t next) {
+        want = (int32_t) t.size() + 1 + a;
+        if (cur.i >= 0) { near = cur.i; idle(); return; }   // (a copy whose drafts the step did not take)
+        if (mend >= 0) {   // a broken copy: does what the model wrote meet the source again?
+            wrote.insert(wrote.end(), drafts.begin(), drafts.begin() + a);
+            wrote.push_back(next);
+            if (!align() && wrote.size() > 14) {
+                if (q36_ngram_log()) std::fprintf(stderr, "lookup: copy dropped at %d\n", mend);
+                near = mend;
+                idle();
+            }
+            return;
+        }
+        if (place < 0) return;
+        std::vector<int32_t> g(drafts.begin(), drafts.begin() + a);   // a copy starts when these are the place's continuation
+        g.push_back(next);
+        Pos p{place, 0};
+        const int m = walk(g, 0, p);
+        if (m < kLookupProof) return;
+        if (q36_ngram_log()) std::fprintf(stderr, "lookup: copy from %d (%d of %d)\n", place, m, (int) g.size());
+        if (m == (int) g.size()) { idle(); cur = p; depth = 8; return; }
+        idle();
+        if (p.i >= (int32_t) t.size()) return;
+        mend = p.i;
+        wrote.assign(g.begin() + m, g.end());
+        align();
+    }
+    /// A lookup step's outcome: `a` of the proposal's `d` drafts stood, `next` is the token after them.
+    void result(int a, int d, int32_t next) {
+        want = (int32_t) t.size() + 1 + a;
+        if (cur.i < 0 || (int) pos.size() != d + 1) { idle(); return; }
+        Pos p = pos[(size_t) a];
+        if (a >= d && p.i < (int32_t) t.size() && at(p) == next) {
+            step(p);
+            cur = p;
+            depth = 15;
+            return;
+        }
+        depth = 8;
+        broke(p, next, a, d);
+    }
+};
 // The XMX rows forms (STRATA_Q36_XR=0: off) (q36_xr_dense.dp.cpp: Q4_K, Q5_K, IQ4_XS; 1-8 columns for the price of one) take the
 // dense model's products before the KREG forms; they read the same q8_1 image.
 inline bool q36_xr_on() {
@@ -119,6 +428,13 @@ inline bool q36_xr_on() {
     return on;
 }
 inline void q36_mmvq(int type, const void* w, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream) {
+    if (type == kW4Type) {
+        if (!strata::q36xr::mmvq_w4(w, xq, y, n_in, n_out, ncols, stream)) {
+            std::fprintf(stderr, "strata-q36: a W4 product of %d x %d at %d columns was not taken\n", n_in, n_out, ncols);
+            std::exit(1);
+        }
+        return;
+    }
     if (g_q36_dense_forms && q36_xr_on() && strata::q36xr::mmvq(type, w, xq, y, n_in, n_out, ncols, stream, true)) return;
     if (g_q36_dense_forms && strata::q36dense::mmvq(type, w, xq, y, n_in, n_out, ncols, stream)) return;
     K::native_mmvq(type, w, xq, y, n_in, n_out, ncols, stream);
@@ -858,6 +1174,48 @@ __dpct_inline__ void k_attn_merge(const float *pacc, const float *pm,
     }
     const size_t gi = ((size_t) t * H + h) * HD + d;
     out[gi] = num / den * sigm(gate[gi]);
+}
+
+// ---- the mirror of a layer's cache that the matrix-engine decode attention reads (q36_xatt.hpp): the cells k_attn_prep
+// just stored, K as int8 codes with one scale a cell and KV head, V the same but transposed in blocks of 32 cells.
+// grid (T, HKV), block 256 (a work-item a dimension).
+template <typename KV>
+void k_xatt_mirror(const KV* kc, const KV* vc, const int32_t* pos0, int HKV, int ctx, int ctxp, int8_t* k8, float* ks, int8_t* v8t,
+                   float* vs) {
+    constexpr int HD = 256;
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int kh = (int) it.get_group(2), t = (int) it.get_group(1), d = (int) it.get_local_id(2);
+    const int pos = *pos0 + t;
+    const size_t cell = (size_t) kh * ctx + pos;
+    float k, v;
+    if constexpr (std::is_same_v<KV, int8_t>) {
+        const size_t nall = (size_t) HKV * ctx * HD;
+        const uint16_t sk = reinterpret_cast<const uint16_t*>(kc + nall)[cell * (HD / 64) + d / 64];
+        const uint16_t sv = reinterpret_cast<const uint16_t*>(vc + nall)[cell * (HD / 64) + d / 64];
+        k = (float) kc[cell * HD + d] * (float) sycl::bit_cast<sycl::half>(sk);
+        v = (float) vc[cell * HD + d] * (float) sycl::bit_cast<sycl::half>(sv);
+    } else {
+        k = (float) kc[cell * HD + d];
+        v = (float) vc[cell * HD + d];
+    }
+    const float mk = sycl::reduce_over_group(it.get_group(), sycl::fabs(k), sycl::maximum<float>());
+    const float mv = sycl::reduce_over_group(it.get_group(), sycl::fabs(v), sycl::maximum<float>());
+    const float sk = mk / 127.0f, sv = mv / 127.0f;
+    auto code = [](float x, float sc) {
+        int c = 0;
+        if (sc > 0.0f) {
+            c = sycl::vec<float, 1>{x / sc}.convert<int, sycl::rounding_mode::rte>()[0];
+            c = c < -127 ? -127 : (c > 127 ? 127 : c);
+        }
+        return (int8_t) c;
+    };
+    const size_t mc = (size_t) kh * ctxp + pos;
+    k8[mc * HD + d] = code(k, sk);
+    v8t[(((size_t) kh * (ctxp / 32) + pos / 32) * HD + d) * 32 + pos % 32] = code(v, sv);
+    if (d == 0) {
+        ks[mc] = sk;
+        vs[mc] = sv;
+    }
 }
 
 // ---- the KV-head-shared (GQA) split-K attention: the rows of T <= kGemmT (a decode step, a verify window, the MTP
@@ -1983,7 +2341,7 @@ may need to adjust the code.
 // forward takes).  These three kernels replace k_conv_seq / k_gdn_seq (+ the q8_1 quantizer of ssm_out's input) there, so a
 // decode step, a verify window's rows and the commit compute the same bits as one another (the MTP text is the plain text).
 // STRATA_Q36_GDN_DEC=0: the M2 kernels.  (The prompt chunks and the batch rows keep their own kernels.)
-constexpr int kDecT = 8;   // the most tokens (Engine::kGemmT, Engine::kVerify)
+constexpr int kDecT = 16;   // the most tokens (Engine::kGemmT, Engine::kVerify)
 
 /// The conv of T <= kDecT tokens: k_conv_seq's expressions per token, but a token's sum reads inputs only (the history and
 /// the tokens before it), so the tokens are independent, and the q/k heads' L2 norms of all T tokens share one barrier
@@ -2201,6 +2559,7 @@ struct Model {
     // the GGUF-native MTP block (blk.<n_layers>, loaded with --mtp): eh_proj over [enorm(e) | hnorm(h)], then an
     // attention + MoE layer, shared_head_norm, the main head
     bool has_mtp = false;
+    int w4_mats = 0;   // matrices loaded from a B70W4 pack (--w4)
     Layer mtp;
     Mat eh_proj;
     const float *mtp_enorm = nullptr, *mtp_hnorm = nullptr, *mtp_shnorm = nullptr;
@@ -2352,6 +2711,32 @@ bool load(const std::string &path, Model &m, std::string &err, bool want_mtp) {
         w.type = (int) t->type;
         w.n_in = (int) t->shape[0];
         w.n_out = (int) t->shape[1];
+        if (auto it = g_w4.t.find(name); it != g_w4.t.end()) {   // --w4: this matrix from the pack
+            const W4Ent& e = it->second;
+            if (e.n_in != w.n_in || e.n_out != w.n_out || e.bytes != strata::q36xr::w4_bytes(w.n_in, w.n_out)) {
+                std::fprintf(stderr, "strata-q36: --w4: %s is %d x %d in the pack, %d x %d in the GGUF\n", name.c_str(), e.n_in, e.n_out,
+                             w.n_in, w.n_out);
+                std::exit(1);
+            }
+            std::vector<uint8_t> blob((size_t) e.bytes);
+            FILE* f = std::fopen(g_w4.path.c_str(), "rb");
+            const bool ok = f != nullptr && fseeko(f, (off_t) (g_w4.blobs + e.off), SEEK_SET) == 0 &&
+                            std::fread(blob.data(), 1, blob.size(), f) == blob.size();
+            if (f) std::fclose(f);
+            if (!ok) {
+                std::fprintf(stderr, "strata-q36: --w4: cannot read %s from %s\n", name.c_str(), g_w4.path.c_str());
+                std::exit(1);
+            }
+            uint8_t* d = nullptr;
+            // (2 MiB alignment: the card can map the matrix with large pages)
+            CK(DPCT_CHECK_ERROR(d = (uint8_t *)sycl::aligned_alloc_device((size_t) 2 << 20, blob.size(), q_ct1)));
+            CK(DPCT_CHECK_ERROR(q_ct1.memcpy(d, blob.data(), blob.size()).wait()));
+            bytes += blob.size();
+            w.type = kW4Type;
+            w.d = d;
+            ++m.w4_mats;
+            return w;
+        }
         const uint8_t* src = gm.shard(s).tensor_data(*t);
         uint64_t nb = strata::tensor_payload_bytes(*t);
         std::vector<uint8_t> rq;   // a type the native MMVQ does not take, as Q8_0
@@ -2375,7 +2760,7 @@ bool load(const std::string &path, Model &m, std::string &err, bool want_mtp) {
             std::exit(1);
         }
         uint8_t* d = nullptr;
-        CK(DPCT_CHECK_ERROR(d = (uint8_t *)sycl::malloc_device(nb, q_ct1)));
+        CK(DPCT_CHECK_ERROR(d = (uint8_t *)sycl::aligned_alloc_device((size_t) 2 << 20, nb, q_ct1)));   // (large pages, as the pack's)
         /*
         DPCT1114:81: cudaMemcpy is migrated to asynchronization memcpy, assuming
         in the original code the source host memory is pageable memory. If the
@@ -2493,7 +2878,7 @@ bool load(const std::string &path, Model &m, std::string &err, bool want_mtp) {
         m.embd_row = row_bytes(m.embd_type, (int64_t) t->shape[0]);
         const uint64_t nb = strata::tensor_payload_bytes(*t);
         uint8_t* d = nullptr;
-        CK(DPCT_CHECK_ERROR(d = (uint8_t *)sycl::malloc_device(nb, q_ct1)));
+        CK(DPCT_CHECK_ERROR(d = (uint8_t *)sycl::aligned_alloc_device((size_t) 2 << 20, nb, q_ct1)));   // (large pages, as the pack's)
         /*
         DPCT1114:82: cudaMemcpy is migrated to asynchronization memcpy, assuming
         in the original code the source host memory is pageable memory. If the
@@ -2596,6 +2981,20 @@ struct Engine {
     int n_chunk = 0, att_rows = 0;   // attention partials: att_rows query rows x n_chunk chunks
     std::vector<float*> conv, S;   // per layer: the CURRENT session's (select)
     std::vector<void*> kc, vc;     // per layer, the MTP block's at index n_layers: the K / V cache (q36_kv_alloc_bytes)
+    // The matrix-engine decode attention (q36_xatt.dp.cpp; STRATA_Q36_XATT=1, one session): each attention layer's mirror
+    // (int8 K, transposed int8 V, a scale a cell), one set of scratch.  xatt_now: this window's rows take it (the cells
+    // reach STRATA_Q36_XATT_MIN, default 4096); its graphs are recorded apart (run_graph_key).
+    // The mirror is written only by the windows that read it: xmir_n = the cells [0, xmir_n) it holds (any other write of
+    // cells - a prompt chunk, a window below the threshold - lowers it); the first window past the threshold fills the
+    // cells up to its own first (xatt_catch_up), from then on each window writes its rows.
+    bool xatt_ready = false, xatt_now = false;
+    int xatt_min = 4096, xctxp = 0, xcapc = 0;
+    int64_t xmir_n = 0;
+    int32_t* xpos_d = nullptr;
+    std::vector<uint32_t*> xk8, xv8t;
+    std::vector<float*> xks, xvs;
+    uint32_t *xqb = nullptr, *xpb = nullptr;
+    float *xqs = nullptr, *xsc = nullptr, *xsrow = nullptr;
     bool kv_f32 = false;           // the cache in FP32 (STRATA_Q36_KV=f32)
     bool kv_q8 = false;            // the cache in int8 (q36_kv_set: past 131072 cells, STRATA_Q36_KV=q8, --kv int8), else FP16
     bool attn_head = false;        // STRATA_Q36_ATTN_HEAD=1: the rows' attention per query head (M1's k_attn_part)
@@ -2610,7 +3009,7 @@ struct Engine {
     q36pf::TlaBufs tla;
 #endif
     // verify windows (T <= kVerify): the GDN inputs of every row per layer, kept for the commit
-    static constexpr int kVerify = 8;
+    static constexpr int kVerify = 16;
     std::vector<float*> v_qkv, v_hc, v_alpha, v_beta;
     // the MTP block (when loaded)
     float *mtp_cat = nullptr, *hmtp = nullptr, *logits_m = nullptr;
@@ -2629,6 +3028,7 @@ struct Engine {
     std::vector<GSet> gsets;
     GSet& gs() { return gsets[(size_t) cur]; }
     strata::prefill::Gemm gemm;
+    uint16_t* w4_f16 = nullptr;   // --w4: the FP16 image of the pack's matrix a prompt chunk multiplies by
     dpct::blas::descriptor_ptr blas = nullptr;
     float* att_s = nullptr;            // the prompt attention's scores / probabilities, kAttScoreFloats floats
     static constexpr int kSplitK = 16;
@@ -2976,6 +3376,8 @@ struct Engine {
                 take(m->mtp);
                 big = std::max<int64_t>(big, (int64_t) m->eh_proj.n_in * m->eh_proj.n_out);
             }
+            if (m->w4_mats > 0)
+                CK(DPCT_CHECK_ERROR(w4_f16 = (uint16_t *)sycl::malloc_device((size_t) big * 2, q_ct1)));
             if (!gemm.init(st, big, gerr)) {
                 std::fprintf(stderr, "strata-q36: prompt GEMM: %s\n", gerr.c_str());
                 std::exit(1);
@@ -3018,7 +3420,7 @@ struct Engine {
         the migrated code and was removed or replaced with 0. You may need to
         check the migrated code.
         */
-        CK(DPCT_CHECK_ERROR(hpin = sycl::malloc_host<int32_t>(64, q_ct1)));
+        CK(DPCT_CHECK_ERROR(hpin = sycl::malloc_host<int32_t>(256, q_ct1)));   // ([64..] a window's picks, [96..] its tokens, [128..] its drafts, [160..] given drafts)
         // the rows' attention partials (T <= kGemmT rows take it): k_attn_gqa's chunks per row (STRATA_Q36_ATT_CHUNKS,
         // 8 .. kAttMaxChunks; 96 measured best on the B70 - k_attn_gqa + merge per layer at depth 2K / 12K: 32 48.5 /
         // 155.2 us, 64 42.0 / 178.6, 96 40.6 / 153.9, 128 41.8 / 159.4), or with STRATA_Q36_ATTN_HEAD k_attn_part's
@@ -3029,6 +3431,61 @@ struct Engine {
         pacc = dalloc((size_t) att_rows * n_chunk * g.head_dim);
         pm = dalloc((size_t) att_rows * n_chunk);
         pl = dalloc((size_t) att_rows * n_chunk);
+        {
+            namespace xa = strata::q36xatt;
+            // STRATA_Q36_XATT: 1 on, 0 off; unset: on with the int4 pack when the mirror fits beside the session's cache with
+            // 3 GiB of VRAM to spare (a card near its limit stalls)
+            const char* xe = std::getenv("STRATA_Q36_XATT");
+            bool xwant = xe ? xe[0] == '1' : m->w4_mats > 0;
+            const bool xshape = n_sess == 1 && !attn_head && (int) g.head_dim == xa::kHD && (int) g.n_head == xa::kG * (int) g.n_head_kv;
+            if (xwant && xshape && !xe) {
+                const int hkv = (int) g.n_head_kv;
+                size_t nl = m->has_mtp ? 1 : 0;
+                for (const Layer& L : m->layers) nl += L.attn ? 1 : 0;
+                const int cxp = xa::ctx_pad(ctx), cap = xa::chunk_cap(ctx, n_chunk);
+                const size_t mir = nl * (xa::k8_dwords(hkv, cxp) + xa::v8t_dwords(hkv, cxp) + 2 * xa::sc_floats(hkv, cxp)) * 4 +
+                                   (xa::score_floats(hkv, n_chunk, cap) + xa::pb_dwords(hkv, n_chunk, cap)) * 4;
+                const double per = kv_q8 ? 1.04 : (kv_f32 ? 4.0 : 2.0);   // the cache's bytes a value
+                const size_t cache = (size_t) ((double) nl * 2.0 * hkv * (double) ctx * g.head_dim * per);
+                size_t vfr = 0, vtot = 0;
+                dpct::get_current_device().get_memory_info(vfr, vtot);
+                if (vfr < mir + cache + ((size_t) 3 << 30)) {
+                    xwant = false;
+                    std::fprintf(stderr, "strata-q36: decode attention stays on the FP32 kernel: its int8 mirror (%.2f GiB) does not fit beside the "
+                                         "cache at this context (%.2f GiB of VRAM free)\n", (double) mir / 1073741824.0, (double) vfr / 1073741824.0);
+                }
+            }
+            if (xwant && xshape) {
+                const int hkv = (int) g.n_head_kv;
+                if (const char* e = std::getenv("STRATA_Q36_XATT_MIN")) xatt_min = std::max(64, std::atoi(e));
+                xctxp = xa::ctx_pad(ctx);
+                xcapc = xa::chunk_cap(ctx, n_chunk);
+                xk8.assign(m->layers.size() + 1, nullptr);
+                xv8t.assign(m->layers.size() + 1, nullptr);
+                xks.assign(m->layers.size() + 1, nullptr);
+                xvs.assign(m->layers.size() + 1, nullptr);
+                size_t bytes = 0;
+                for (size_t li = 0; li <= m->layers.size(); ++li)   // (index n_layers: the MTP block's cache)
+                    if (li < m->layers.size() ? m->layers[li].attn : m->has_mtp) {
+                        xk8[li] = reinterpret_cast<uint32_t*>(dalloc(xa::k8_dwords(hkv, xctxp)));
+                        xv8t[li] = reinterpret_cast<uint32_t*>(dalloc(xa::v8t_dwords(hkv, xctxp)));
+                        xks[li] = dalloc(xa::sc_floats(hkv, xctxp));
+                        xvs[li] = dalloc(xa::sc_floats(hkv, xctxp));
+                        bytes += (xa::k8_dwords(hkv, xctxp) + xa::v8t_dwords(hkv, xctxp) + 2 * xa::sc_floats(hkv, xctxp)) * 4;
+                    }
+                xqb = reinterpret_cast<uint32_t*>(dalloc(xa::qb_dwords(hkv)));
+                xqs = dalloc(xa::qs_floats(hkv));
+                xsc = dalloc(xa::score_floats(hkv, n_chunk, xcapc));
+                xpb = reinterpret_cast<uint32_t*>(dalloc(xa::pb_dwords(hkv, n_chunk, xcapc)));
+                xsrow = dalloc(xa::srow_floats(hkv, n_chunk));
+                xpos_d = reinterpret_cast<int32_t*>(dalloc(4));
+                bytes += (xa::qb_dwords(hkv) + xa::qs_floats(hkv) + xa::score_floats(hkv, n_chunk, xcapc) + xa::pb_dwords(hkv, n_chunk, xcapc) +
+                          xa::srow_floats(hkv, n_chunk)) * 4;
+                xatt_ready = true;
+                std::fprintf(stderr, "strata-q36: decode attention on the matrix engine from %d cells on (int8 K, transposed int8 V: %.2f GiB of VRAM)\n",
+                             xatt_min, (double) bytes / 1073741824.0);
+            }
+        }
         for (const Layer& L : m->layers) {   // the verify windows' GDN inputs (one set, whichever session runs)
             if (L.attn) {
                 for (auto* v : {&v_qkv, &v_hc, &v_alpha, &v_beta}) v->push_back(nullptr);
@@ -3268,7 +3725,7 @@ struct Engine {
 
     /// A batch above kGemmT tokens (a prompt chunk) runs its projections as GEMMs (prefill::Gemm::native: the GGUF
     /// blocks dequantized to FP16, the activations FP16); a decode batch on the native MMVQ (q8_1 activations).
-    static constexpr int kGemmT = 8;
+    static constexpr int kGemmT = 16;
     static_assert(kDecT >= kGemmT && kDecT >= kVerify, "the decode GDN kernels take every decode-side row count");
     void prep(const float* xin, int n, int T, void* q) {
         if (T > kGemmT) {
@@ -3290,8 +3747,14 @@ struct Engine {
             } else quant(xin, n, T, q);
     }
     void apply(const Mat& w, const void* q, float* out, int T) {
-        if (T > kGemmT) gemm.native((const uint16_t*) x16, w.type, w.d, out, T, w.n_out, w.n_in);
-        else mmq(w, q, out, T);
+        if (T > kGemmT) {
+            if (w.type == kW4Type) {   // the pack as FP16, then the FP16 GEMM
+                strata::q36xr::w4_dequant_f16(w.d, w4_f16, w.n_in, w.n_out, st);
+                gemm.f16((const uint16_t*) x16, w4_f16, out, T, w.n_out, w.n_in);
+            } else {
+                gemm.native((const uint16_t*) x16, w.type, w.d, out, T, w.n_out, w.n_in);
+            }
+        } else mmq(w, q, out, T);
     }
     /// x [T][n] -> its q8_1 image (T contiguous columns: one vector of T * n), for every matrix that reads x.
     void quant(const float* xin, int n, int T, void* q) { K::native_quantize_q8_1(xin, q, n * T, 1, st); }
@@ -3977,7 +4440,7 @@ work-group size if needed.
         if (q8_small(w, q, out, T)) return;
         // (M2: 8 columns a call everywhere; KREG itself runs a row wider than 16384 - the 27B's ffn_down - with its K split over
         // work-groups (M4: 4 parts, 5-8 columns in one pass).  A T-column call is bitwise T one-column calls.)
-        const int maxc = 8;
+        const int maxc = w.type == kW4Type ? 32 : 8;   // (the pack's form: up to 32 columns in one read of the weights)
         const size_t qb = K::native_q8_1_bytes(w.n_in, 1);
         for (int c0 = 0; c0 < T; c0 += maxc) {
             const int nc = std::min(maxc, T - c0);
@@ -3996,7 +4459,8 @@ work-group size if needed.
             if (!xq_post) quant(h, N, T, xq);
             mmq(L.ffn_gate, xq, sg, T);
             mmq(L.ffn_up, xq, su, T);
-            K::native_swiglu_quantize_q8_1(sg, su, q8, FF, T, st);
+            if (T <= 8) K::native_swiglu_quantize_q8_1(sg, su, q8, FF, T, st);
+            else K::native_swiglu_quantize_q8_1(sg, su, q8, FF * T, 1, st);   // (9+ columns: as one vector, the same blocks)
             mmq(L.ffn_down, q8, sy, T);
         } else {
             {
@@ -4059,6 +4523,32 @@ work-group size if needed.
     /// An attention layer's attention after its q / k / v products (qg, kx, vx), into att (gated): the rows' q and k
     /// prepared and their K / V appended to the cache (k_attn_prep), then a prompt chunk (T > kGemmT) as FP16 GEMMs over
     /// the cache's cells, or the rows (a decode step, a verify window, the MTP block's rows; batch rows in rows_mode) on
+    /// The cells [*dpos, *dpos + T) of layer li's cache into its mirror (k_xatt_mirror).
+    template <typename KV>
+    void xmirror(size_t li, int T, const int32_t* dpos) {
+        const KV *const kcm = static_cast<const KV*>(kc[li]), *const vcm = static_cast<const KV*>(vc[li]);
+        const int hkv = (int) m->g.n_head_kv, cxm = ctx, cxp = xctxp;
+        int8_t* const k8 = reinterpret_cast<int8_t*>(xk8[li]);
+        int8_t* const v8 = reinterpret_cast<int8_t*>(xv8t[li]);
+        float *const ksm = xks[li], *const vsm = xvs[li];
+        st->parallel_for<dpct_kernel_name<class k_xatt_mirror_91d2, KV>>(
+            sycl::nd_range<3>(sycl::range<3>(1, (size_t) T, (size_t) hkv * 256), sycl::range<3>(1, 1, 256)),
+            [=](sycl::nd_item<3>) { k_xatt_mirror<KV>(kcm, vcm, dpos, hkv, cxm, cxp, k8, ksm, v8, vsm); });
+    }
+    /// Before a window that reads the mirror: the cells it does not hold yet, up to the window's position.
+    void xatt_catch_up() {
+        if (xmir_n >= pos) { xmir_n = INT64_MAX / 4; return; }
+        const int32_t a = (int32_t) std::max<int64_t>(0, xmir_n);
+        const int n = (int) (pos - a);
+        st->memcpy(xpos_d, &a, 4).wait();
+        for (size_t li = 0; li < xk8.size(); ++li) {
+            if (xk8[li] == nullptr || li >= kc.size() || kc[li] == nullptr) continue;
+            if (kv_f32) xmirror<float>(li, n, xpos_d);
+            else if (kv_q8) xmirror<int8_t>(li, n, xpos_d);
+            else xmirror<sycl::half>(li, n, xpos_d);
+        }
+        xmir_n = INT64_MAX / 4;   // (the windows keep it whole from here)
+    }
     /// k_attn_gqa + k_attn_merge_gqa (STRATA_Q36_ATTN_HEAD=1: k_attn_part + k_attn_merge).  KV: the cache's element type.
     template <typename KV>
     void attn_core(size_t li, const Layer &L, int T, int64_t p0, const int32_t *dpos, bool graph_mode) try {
@@ -4107,6 +4597,9 @@ work-group size if needed.
                     });
             });
         }
+        const bool xmir = xatt_ready && xatt_now && !rows_mode && li < xk8.size() && xk8[li] != nullptr;
+        if (xmir) xmirror<KV>(li, T, dpos);   // the stored cells into the layer's mirror
+        else if (xatt_ready) xmir_n = std::min<int64_t>(xmir_n, p0);   // (cells written past the mirror)
         if (T > kGemmT) {
             // M4b: the flash kernel (q36_prefill.dp.hpp) on the FP16 cache unless STRATA_Q36_PATTN=gemm or the shape is not
             // its: q -> q16 below, then flash_prompt_attn instead of the slices, then the gate as before.  The 8-bit cache
@@ -4343,7 +4836,17 @@ work-group size if needed.
             // summed them in another order, and the MTP answer on code-v1 left the plain one at token 70 (44 at 6+
             // drafts).  A window of 3+ tokens at G = 6 takes ceil(T / 2) row groups, each reading the K / V once.)
             (void) slm64;
-            if (need <= 8) run(std::integral_constant<int, 8>());
+            bool xdone = false;
+            if (xmir && xatt_now && nt <= 16) {   // the matrix engine: every row of the window in one pass over the mirror
+                strata::q36xatt::Call xc{};
+                xc.q = qq; xc.pos0 = dpos; xc.t0 = t0; xc.nt = nt; xc.H = H; xc.HKV = HKV; xc.nchk = nch; xc.scale = scale;
+                xc.k8 = xk8[li]; xc.ks = xks[li]; xc.v8t = xv8t[li]; xc.vs = xvs[li]; xc.ctxp = xctxp;
+                xc.qb = xqb; xc.qs = xqs; xc.sc = xsc; xc.pb = xpb; xc.srow = xsrow; xc.capc = xcapc;
+                xc.pacc = pa; xc.pm = pmx; xc.pl = psum;
+                xdone = strata::q36xatt::attend(xc, st);
+            }
+            if (xdone) {}
+            else if (need <= 8) run(std::integral_constant<int, 8>());
             else run(std::integral_constant<int, 16>());
             st->parallel_for<dpct_kernel_name<class k_attn_merge_gqa_5e2b91, KV>>(
                 sycl::nd_range<3>(sycl::range(1, 1, nt * H) * sycl::range(1, 1, HD), sycl::range(1, 1, HD)),
@@ -4915,7 +5418,7 @@ work-group size if needed.
         const size_t rb = row_bytes(hd.type, hd.n_in);
         if (ids.empty() || rb == 0 || rb % 4 != 0) return;
         const int n = (int) ids.size();
-        uint8_t* dst = (uint8_t*) sycl::malloc_device(rb * (size_t) n, *st);
+        uint8_t* dst = (uint8_t*) sycl::aligned_alloc_device((size_t) 2 << 20, rb * (size_t) n, *st);
         d_draft_ids = (int32_t*) sycl::malloc_device(sizeof(int32_t) * (size_t) n, *st);
         st->memcpy(d_draft_ids, ids.data(), sizeof(int32_t) * (size_t) n).wait();
         const uint32_t* src = (const uint32_t*) hd.d;
@@ -4931,7 +5434,7 @@ work-group size if needed.
             std::vector<uint8_t> hrows(rb * (size_t) n), rq;
             st->memcpy(hrows.data(), dst, hrows.size()).wait();
             if (strata::qwen35::requant(hd.type, hrows.data(), hd.n_in, n, 12, rq)) {
-                uint8_t* d4 = (uint8_t*) sycl::malloc_device(rq.size(), *st);
+                uint8_t* d4 = (uint8_t*) sycl::aligned_alloc_device((size_t) 2 << 20, rq.size(), *st);
                 st->memcpy(d4, rq.data(), rq.size()).wait();
                 sycl::free(dst, *st);
                 head_d.d = d4;
@@ -5520,6 +6023,8 @@ work-group size if needed.
 
     template <class F>
     void graph_run(dpct::experimental::command_graph_exec_ptr &gx, F body) try {
+        // (a graph that does not write the mirror, replayed: its cells are no longer in it)
+        if (xatt_ready && !xatt_now) xmir_n = std::min<int64_t>(xmir_n, std::max<int64_t>(0, pos - kVerify));
         if (!use_graph) { body(); return; }
         if (!gx) {
             dpct::experimental::command_graph_ptr graph = nullptr;
@@ -5659,7 +6164,15 @@ work-group size if needed.
             rows_deferred = true;
             // a prompt cell of a picture request (its rotary position is in the table, its row a picture's) runs eagerly
             if (mtab_now || map_on) forward(1, pos, 1, false, false);
-            else graph_run(gs().g1, [&] { forward(1, pos, 1, use_graph, false); });
+            else {
+                // (STRATA_Q36_XATT_ALL=1, a test switch: the plain decode step takes the matrix-engine attention too, at any
+                // depth - a teacher-forced logit dump then measures it)
+                static const bool xall = [] { const char* e = std::getenv("STRATA_Q36_XATT_ALL"); return e && e[0] == '1'; }();
+                xatt_now = xatt_ready && xall;
+                if (xatt_now) xatt_catch_up();
+                graph_run(gs().g1, [&] { forward(1, pos, 1, use_graph, false); });
+                xatt_now = false;
+            }
             mtab_now = nullptr;
             map_on = false;
             rows_deferred = false;
@@ -5765,8 +6278,12 @@ work-group size if needed.
     int rows_G_last = 0;   // groups of the window run last (commit_rows takes their keep counts)
 
     void run_graph_key(int key, const std::function<void()>& body) {
-        if (!use_graph) { body(); return; }
-        graph_run(row_graphs[key], body);
+        xatt_now = xatt_ready && pos >= xatt_min;   // (the window's attention kernel: a graph of its own)
+        if (xatt_now) xatt_catch_up();
+        else if (xatt_ready) xmir_n = std::min<int64_t>(xmir_n, std::max<int64_t>(0, pos - kVerify));   // (a replayed graph's cells)
+        if (!use_graph) body();
+        else graph_run(row_graphs[key + (xatt_now ? 1000000 : 0)], body);
+        xatt_now = false;
     }
 
     /// One window over the groups' rows.  `verify`: a verify window - the GDN state is read, not written (commit_rows writes
@@ -6378,17 +6895,18 @@ work-group size if needed.
             CK(DPCT_CHECK_ERROR(st->memcpy(hlast, hmain + (size_t) (n_keep - 1) * N, (size_t) N * 4)));
         });
     }
+    /// `given` (D tokens): the step's drafts are these (a lookup's), the MTP block reads its rows and drafts nothing.
     int spec_step_g(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
-                    const std::atomic<bool>* cancel, const SpecSel* sel = nullptr) {
+                    const std::atomic<bool>* cancel, const SpecSel* sel = nullptr, const std::vector<int32_t>* given = nullptr) {
         const int N = (int) m->g.n_embd;
         const int T0 = (int) fix.size() + 1, T = D + 1;
         CK(DPCT_CHECK_ERROR(st->wait()));
-        for (int i = 0; i < (int) fix.size(); ++i) hpin[16 + i] = fix[(size_t) i];
-        hpin[16 + fix.size()] = x_tok;
+        for (int i = 0; i < (int) fix.size(); ++i) hpin[96 + i] = fix[(size_t) i];
+        hpin[96 + fix.size()] = x_tok;
         hpin[1] = (int32_t) (pos - (int64_t) fix.size());
         hpin[40] = (int32_t) pos;
         hpin[41] = x_tok;
-        CK(DPCT_CHECK_ERROR(st->memcpy(tok_m, hpin + 16, (size_t) T0 * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(tok_m, hpin + 96, (size_t) T0 * 4)));
         CK(DPCT_CHECK_ERROR(st->memcpy(pos0_m, hpin + 1, 4)));
         CK(DPCT_CHECK_ERROR(st->memcpy(pos0, hpin + 40, 4)));
         CK(DPCT_CHECK_ERROR(st->memcpy(tok, hpin + 41, 4)));
@@ -6399,7 +6917,15 @@ work-group size if needed.
             sp_h[0] = sel->M;
             CK(DPCT_CHECK_ERROR(st->memcpy(sp_m, sp_h, 4)));
         }
+        if (given != nullptr) {   // the window's tokens after x, from the host
+            for (int d = 0; d < D; ++d) hpin[160 + d] = (*given)[(size_t) d];
+            CK(DPCT_CHECK_ERROR(st->memcpy(tok + 1, hpin + 160, (size_t) D * 4)));
+        }
         rows_deferred = true;
+        const auto body_given = [&] {
+            forward_mtp(T0, pos - (int64_t) fix.size(), seeds, false, true);   // (its cache takes the rows; no draft head)
+            forward(T, pos, T, true, true);
+        };
         const auto body = [&] {
             forward_mtp(T0, pos - (int64_t) fix.size(), seeds, true, true);
             int last_row = T0 - 1;
@@ -6419,20 +6945,23 @@ work-group size if needed.
             }
             forward(T, pos, T, true, true);
         };
-        if (sel == nullptr) run_graph_key(50000 + T0 * 16 + D, body);   // (greedy: the graph as before)
+        if (given != nullptr) {
+            if (sel == nullptr) run_graph_key(80000 + T0 * 16 + D, body_given);
+            else run_graph_key(90000 + T0 * 16 + D, [&] { body_given(); sp_topm(T); });
+        } else if (sel == nullptr) run_graph_key(50000 + T0 * 16 + D, body);   // (greedy: the graph as before)
         else run_graph_key(70000 + T0 * 16 + D, [&] { body(); sp_topm(T); });
         rows_deferred = false;
-        if (sel == nullptr) CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 2, pick, (size_t) T * 4)));
+        if (sel == nullptr) CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 64, pick, (size_t) T * 4)));
         else CK(DPCT_CHECK_ERROR(st->memcpy(sp_h + 1, sp_rows, (size_t) T * kSpecRowWords * 4)));   // one copy: every row's candidates
-        CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 48, tok + 1, (size_t) D * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 128, tok + 1, (size_t) D * 4)));
         CK(DPCT_CHECK_ERROR(st->wait()));
         drafts.assign((size_t) D, 0);
-        for (int d = 0; d < D; ++d) drafts[(size_t) d] = hpin[48 + d];
+        for (int d = 0; d < D; ++d) drafts[(size_t) d] = hpin[128 + d];
         int a = 0;
         if (sel == nullptr) {
-            while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+            while (a < D && hpin[64 + a] == drafts[(size_t) a]) ++a;
             if (cancel != nullptr && cancel->load()) a = 0;
-            for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+            for (int i = 0; i <= a; ++i) picks[i] = hpin[64 + i];
         } else {
             if (q36_spec_check_on()) sp_check(T);
             // the host draws row 0, then row 1 only if row 0 gave draft 0, and so on: picks[0 .. a], one draw a row, as the plain path
@@ -6444,16 +6973,18 @@ work-group size if needed.
         after_rows(a + 1);
         return a;
     }
+    /// Whether a step may take its drafts from the host (spec_step's `given`): the graph form of the window.
+    bool given_ok(int D) const { return D >= 1 && D + 1 <= kGemmT && spec_graphs() && !main_hybrid; }
     int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
-                  const std::atomic<bool>* cancel = nullptr, const SpecSel* sel = nullptr) {
+                  const std::atomic<bool>* cancel = nullptr, const SpecSel* sel = nullptr, const std::vector<int32_t>* given = nullptr) {
         const int N = (int) m->g.n_embd;
         if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
-        if (D >= 1 && D + 1 <= kGemmT && spec_graphs()) return spec_step_g(x_tok, fix, D, drafts, picks, cancel, sel);   // (T0 <= kGemmT: no host position in a grid; a sel only with sp_window_ok())
+        if (D >= 1 && D + 1 <= kGemmT && spec_graphs()) return spec_step_g(x_tok, fix, D, drafts, picks, cancel, sel, given);   // (T0 <= kGemmT: no host position in a grid; a sel only with sp_window_ok())
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
         CK(DPCT_CHECK_ERROR(st->wait()));
         // rows of the first MTP call: (hmain row i, fix[i]) at positions pos - fix.size() + i, then (hlast, x) at pos
-        for (int i = 0; i < (int) fix.size(); ++i) hpin[16 + i] = fix[(size_t) i];
-        hpin[16 + fix.size()] = x_tok;
+        for (int i = 0; i < (int) fix.size(); ++i) hpin[96 + i] = fix[(size_t) i];
+        hpin[96 + fix.size()] = x_tok;
         hpin[1] = (int32_t) (pos - (int64_t) fix.size());
         /*
         DPCT1124:136: cudaMemcpyAsync is migrated to asynchronous memcpy API.
@@ -6461,7 +6992,7 @@ work-group size if needed.
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
-        CK(DPCT_CHECK_ERROR(st->memcpy(tok_m, hpin + 16, (size_t)T0 * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(tok_m, hpin + 96, (size_t)T0 * 4)));
         /*
         DPCT1124:137: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
@@ -6542,8 +7073,8 @@ work-group size if needed.
         }
         // the verify window
         const int T = D + 1;
-        hpin[16] = x_tok;
-        for (int d = 0; d < D; ++d) hpin[17 + d] = drafts[(size_t) d];
+        hpin[96] = x_tok;
+        for (int d = 0; d < D; ++d) hpin[97 + d] = drafts[(size_t) d];
         hpin[1] = (int32_t) pos;
         /*
         DPCT1124:145: cudaMemcpyAsync is migrated to asynchronous memcpy API.
@@ -6551,7 +7082,7 @@ work-group size if needed.
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
-        CK(DPCT_CHECK_ERROR(st->memcpy(tok, hpin + 16, (size_t)T * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(tok, hpin + 96, (size_t)T * 4)));
         /*
         DPCT1124:146: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
@@ -6568,12 +7099,12 @@ work-group size if needed.
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
-        CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 2, pick, (size_t)T * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 64, pick, (size_t)T * 4)));
         CK(DPCT_CHECK_ERROR(st->wait()));
         int a = 0;
-        while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+        while (a < D && hpin[64 + a] == drafts[(size_t) a]) ++a;
         if (cancel != nullptr && cancel->load()) a = 0;
-        for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+        for (int i = 0; i <= a; ++i) picks[i] = hpin[64 + i];
         commit(a + 1);
         /*
         DPCT1124:148: cudaMemcpyAsync is migrated to asynchronous memcpy API.
@@ -6630,10 +7161,19 @@ work-group size if needed.
                     }
                 }
                 // the long-context depths' graphs (q36_depth_at: 4 and 3 below --mtp), every redo count
-                for (int D = std::min(mtp_d, 4); D >= 3 && D < mtp_d; --D)
+                for (int D = std::min(mtp_d - 1, 7); D >= 3; --D)   // (deeper ones are recorded at their first use)
                     for (int f = 0; f <= mtp_d && pos + (int64_t) 2 * (mtp_d + 2) < ctx; ++f) {
                         fix.assign((size_t) f, filler);
                         spec_step(filler, fix, D, drafts, picks);
+                    }
+                // a lookup step's graphs (its drafts come from the host): 8 drafts and the full depth, every redo count
+                if (q36_ngram() && q36_ngram_warm())
+                    for (const int D : {std::min(8, mtp_d), mtp_d}) {
+                        const std::vector<int32_t> gv((size_t) D, filler);
+                        for (int f = 0; f <= mtp_d && given_ok(D) && pos + (int64_t) 2 * (mtp_d + 2) < ctx; ++f) {
+                            fix.assign((size_t) f, filler);
+                            spec_step(filler, fix, D, drafts, picks, nullptr, nullptr, &gv);
+                        }
                     }
                 for (int n = 1; n <= mtp_d + 1; ++n) commit_graph(n);
             }
@@ -7065,6 +7605,7 @@ struct Slot {
 /// control lines.
 struct Serve {
     Engine& E;
+    std::unordered_map<int, Lookup> looks;   // a session's lookup table (q36_ngram)
     std::mutex mu;
     std::condition_variable cv;
     std::deque<std::string> lines;
@@ -7499,6 +8040,10 @@ struct Serve {
         std::vector<int32_t> hist = ids;
         const auto d0 = Clock::now();
         long long produced = 0, offered = 0, accepted = 0;
+        int depth_cap = q36_draft_base(E.mtp_d);   // (the next step's drafts: q36_next_cap)
+        std::vector<int32_t> given;                // a lookup's drafts
+        long long looked = 0, look_ok = 0;
+        Lookup& look = looks[s];
         const char* finish = "length";
         // greedy requests alone with the MTP block: speculative steps of mtp_d drafts (verified, so the text is the greedy
         // text); requests beside others, one token at a time.  A request that the device argmax cannot serve (a penalty, a
@@ -7574,8 +8119,21 @@ struct Serve {
             if (!emit(nx)) break;
             if (n_active > 0) window();
             if (spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
-                const int D = q36_depth_at(E.pos, E.mtp_d);
-                const int a = E.spec_step(nx, fix, D, drafts, picks, &stop, plan.ok ? &sel : nullptr);
+                int D = 0, a = 0;
+                look.sync(ss.live);
+                look.propose(nx, E.mtp_d, given);   // (every row of a copy stands: the full depth at any context length)
+                if (!given.empty() && E.given_ok((int) given.size())) {   // a lookup step: the drafts cost no draft call
+                    D = (int) given.size();
+                    a = E.spec_step(nx, fix, D, drafts, picks, &stop, plan.ok ? &sel : nullptr, &given);
+                    look.result(a, D, picks[a]);
+                    looked += D;
+                    look_ok += a;
+                } else {
+                    D = q36_depth_at(E.pos, std::min(E.mtp_d, depth_cap));
+                    a = E.spec_step(nx, fix, D, drafts, picks, &stop, plan.ok ? &sel : nullptr);
+                    depth_cap = q36_next_cap(D, a, E.mtp_d);
+                    look.observe(drafts, a, picks[a]);
+                }
                 offered += D;
                 accepted += a;
                 // the state now holds x and every accepted draft, whether or not the answer ends inside them (an end of
@@ -7606,9 +8164,9 @@ struct Serve {
                     decode_ms, finish, accepted, offered, reuse, (long long) fresh);
         std::fflush(stdout);
         std::fprintf(stderr, "strata serve: session %d: prompt %zu tokens = %zu reused + %lld read in %.0f ms (%.1f tok/s), "
-                     "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld (%s)\n", s, ids.size(), reuse,
+                     "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld, of them lookups %lld of %lld (%s)\n", s, ids.size(), reuse,
                      (long long) fresh, prompt_ms, prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, produced,
-                     decode_ms, decode_ms > 0 ? 1000.0 * (double) produced / decode_ms : 0.0, accepted, offered, finish);
+                     decode_ms, decode_ms > 0 ? 1000.0 * (double) produced / decode_ms : 0.0, accepted, offered, look_ok, looked, finish);
     }
 
     int run() {
@@ -7710,6 +8268,7 @@ int strata::qwen35::run(int argc, char** argv) {
                                       "drafts)\n", v.c_str());
         }
         else if (a == "--draft-vocab") draft_vocab = std::atoi(next().c_str());   // the MTP drafts pick among N token ids (0: all)
+        else if (a == "--w4") g_w4_path = next();                                 // a B70W4 pack of the model's matrices
         else if (a == "--draft-tokens") draft_tokens = next();                     // ... the first ones of this list (M2), then the lowest ids
         else if (a == "--vision") vision = true;                                  // pictures (GENI): the encoder is strata-vision's
         else if (a == "--batch" || a == "--slots") batch = std::atoi(next().c_str());   // sessions decoding together
@@ -7743,13 +8302,20 @@ int strata::qwen35::run(int argc, char** argv) {
     if (std::getenv("STRATA_Q8_PACKED") == nullptr) _putenv_s("STRATA_Q8_PACKED", "1");   // as on Linux (it was missing here)
     if (std::getenv("CUDA_MODULE_LOADING") == nullptr) _putenv_s("CUDA_MODULE_LOADING", "EAGER");
 #endif
-    if (mtp_d < -1 || mtp_d > 7) { std::fprintf(stderr, "strata-q36: --mtp takes 0 .. 7 drafts\n"); return 2; }
+    if (mtp_d < -1 || mtp_d > 15) { std::fprintf(stderr, "strata-q36: --mtp takes 0 .. 15 drafts\n"); return 2; }
     if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "strata-q36: bad --chunk / --max-context\n"); return 2; }
     q36_kv_set(kv_cli, ctx);   // (before anything sizes the cache)
     Model m;
     std::string err;
     try {
+        if (!g_w4_path.empty()) {
+            std::string werr;
+            if (!g_w4.open(g_w4_path, werr)) { std::fprintf(stderr, "strata-q36: --w4: %s\n", werr.c_str()); return 1; }
+        }
         if (!load(model, m, err, mtp_d > 0)) { std::fprintf(stderr, "strata-q36: %s\n", err.c_str()); return 1; }
+        if (!g_w4_path.empty())
+            std::fprintf(stderr, "strata-q36: --w4 %s: %d of the pack's %zu matrices loaded (int4, the XMX W4 form)\n", g_w4_path.c_str(),
+                         m.w4_mats, g_w4.t.size());
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata-q36: %s\n", e.what());
         return 1;
@@ -7874,7 +8440,7 @@ int strata::qwen35::run(int argc, char** argv) {
     // the answer is the plain greedy one), the best combined number on the two localmaxxing prompts on the B70; --mtp 0: off.  Other
     // families keep MTP off unless asked.
     constexpr int kDenseMtp = 5;
-    if (mtp_d < 0) mtp_d = m.dense && m.has_mtp ? kDenseMtp : 0;
+    if (mtp_d < 0) mtp_d = m.dense && m.has_mtp ? (m.w4_mats > 0 ? 15 : kDenseMtp) : 0;   // (the pack: up to 7 on a run of accepted drafts)
     E.mtp_d = m.has_mtp ? mtp_d : 0;
     if (draft_vocab < 0 && std::getenv("STRATA_Q36_DRAFT_VOCAB") != nullptr) draft_vocab = std::atoi(std::getenv("STRATA_Q36_DRAFT_VOCAB"));
     E.draft_n = std::max(0, draft_vocab);
@@ -7981,6 +8547,7 @@ int strata::qwen35::run(int argc, char** argv) {
         int32_t picks[16];
         int nx = E.greedy();
         int dumped = 0;
+        int cli_cap = q36_draft_base(E.mtp_d);
         if (ff) {
             E.host_logits(lg);
             std::fwrite(lg.data(), 4, lg.size(), ff);
@@ -7991,8 +8558,9 @@ int strata::qwen35::run(int argc, char** argv) {
             if ((int) gen.size() >= n_gen) break;
             // (a verify window whose rows' chunk sizes differ: the case M3b's per-row chunking makes bitwise the decode steps)
             straddled += att_chunk_cells((int) E.pos + 1, E.n_chunk) != att_chunk_cells((int) E.pos + E.mtp_d + 1, E.n_chunk);
-            const int D = q36_depth_at(E.pos, E.mtp_d);
+            const int D = q36_depth_at(E.pos, std::min(E.mtp_d, cli_cap));
             const int a = E.spec_step(nx, fix, D, drafts, picks);
+            cli_cap = q36_next_cap(D, a, E.mtp_d);
             for (int i = 0; ff && i <= a && dumped < n_gen; ++i, ++dumped) {
                 E.host_logits_row(i, lg);
                 std::fwrite(lg.data(), 4, lg.size(), ff);

@@ -82,8 +82,14 @@ if(STRATA_SYCL_AOT)
   else()
     set(_aot_opts "-cl-fp32-correctly-rounded-divide-sqrt")
   endif()
-  set(_sycl_link -fsycl -fsycl-targets=spir64_gen -Xsycl-target-backend=spir64_gen
-      "-device ${STRATA_SYCL_AOT} -options \"${_aot_opts}\"")
+  # The AOT link compiles every kernel's device image with its own ocloc run (about 1,500 for strata-q36), one at a time
+  # unless told otherwise: 8 minutes on one core of 32.  STRATA_SYCL_LINK_JOBS (default: the logical cores) runs them in
+  # parallel.
+  if(NOT DEFINED STRATA_SYCL_LINK_JOBS)
+    cmake_host_system_information(RESULT STRATA_SYCL_LINK_JOBS QUERY NUMBER_OF_LOGICAL_CORES)
+  endif()
+  set(_sycl_link -fsycl -fsycl-targets=spir64_gen -fsycl-max-parallel-link-jobs=${STRATA_SYCL_LINK_JOBS}
+      -Xsycl-target-backend=spir64_gen "-device ${STRATA_SYCL_AOT} -options \"${_aot_opts}\"")
 else()
   set(_sycl_link -fsycl)
 endif()
@@ -660,6 +666,30 @@ if(STRATA_BUILD_Q36)
     ${STRATA_ROOT}/src/qwen35/q36_main.cpp
     ${STRATA_ROOT}/src/qwen35/q36_requant.cpp)
   target_compile_definitions(strata-q36 PRIVATE STRATA_Q36_PORT=1 STRATA_Q36_BUILD=1)
+  # B70W4 (the int4 pack's kernels, q36_w4.dp.cpp) as a library of its own: a change there recompiles its kernels alone (the
+  # executable's AOT link compiles about 1,500), and they take their own register-file size (STRATA_Q36_W4_GRF=128 at
+  # configure time: without -doubleGRF).
+  add_library(q36_w4 SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4.dp.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xatt.dp.cpp)
+  target_include_directories(q36_w4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35 ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  set_target_properties(q36_w4 PROPERTIES CXX_EXTENSIONS ON)
+  if(STRATA_SYCL_AOT)
+    set(_q36_w4_grf " -doubleGRF")   # (256 registers: 5120 x 17408 at 1 / 6 / 8 columns 82.9 / 90.0 / 93.8 us; 128: 83.8 / 92.2 / 97.1)
+    if("$ENV{STRATA_Q36_W4_GRF}" STREQUAL "128")
+      set(_q36_w4_grf "")
+    endif()
+    set_property(TARGET q36_w4 PROPERTY COMPILE_OPTIONS -fsycl -fsycl-targets=spir64_gen -O3 -Wno-unused-command-line-argument
+                 -fno-sycl-instrument-device-code)
+    set_property(TARGET q36_w4 PROPERTY LINK_OPTIONS -fsycl -fsycl-targets=spir64_gen -Wno-unused-command-line-argument
+                 -fsycl-max-parallel-link-jobs=${STRATA_SYCL_LINK_JOBS}
+                 "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${STRATA_SYCL_AOT} -options \\\"-cl-fp32-correctly-rounded-divide-sqrt${_q36_w4_grf}\\\"\"")
+  else()
+    set_property(TARGET q36_w4 PROPERTY COMPILE_OPTIONS -fsycl -O3 -Wno-unused-command-line-argument -fno-sycl-instrument-device-code)
+    set_property(TARGET q36_w4 PROPERTY LINK_OPTIONS -fsycl)
+  endif()
+  # the attention kernels: a row's result must not depend on the window's size (a kernel per row count), so no fast-math
+  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xatt.dp.cpp PROPERTIES COMPILE_OPTIONS -fp-model=precise)
+  target_link_libraries(strata-q36 PRIVATE q36_w4)
+  set_target_properties(strata-q36 PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
   target_include_directories(strata-q36 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35 ${STRATA_ROOT}/third_party/ggml)
   target_link_libraries(strata-q36 PRIVATE strata_prefill strata_engine strata_kernels strata_kernels_cpu Threads::Threads)
   # LP3: the 8-bit cache's prompt attention on vllm-xpu-kernels' Xe2 chunk_prefill (on sycl-tla), a shared library of its own
@@ -695,6 +725,7 @@ if(STRATA_BUILD_Q36)
                                ${_q36_tla_dir}/sycl-tla/applications)
     set_property(TARGET q36_tla PROPERTY LINK_OPTIONS
                  -fsycl -fsycl-targets=spir64_gen -Wno-unused-command-line-argument
+                 -fsycl-max-parallel-link-jobs=${STRATA_SYCL_LINK_JOBS}
                  "SHELL:-Xspirv-translator -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate"
                  "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${STRATA_SYCL_AOT} -internal_options -cl-intel-256-GRF-per-thread\"")
     target_link_libraries(strata-q36 PRIVATE q36_tla)
@@ -708,7 +739,8 @@ if(STRATA_BUILD_Q36)
                    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense.dp.cpp
                    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xr_dense.dp.cpp)
     target_include_directories(q36_mmvq_dense_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
-    target_link_libraries(q36_mmvq_dense_parity PRIVATE strata_kernels)
+    target_link_libraries(q36_mmvq_dense_parity PRIVATE strata_kernels q36_w4)
+    set_target_properties(q36_mmvq_dense_parity PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
     add_test(NAME q36_mmvq_dense_parity COMMAND q36_mmvq_dense_parity --selftest)
   endif()
 endif()
