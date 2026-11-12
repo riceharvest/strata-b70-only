@@ -17,4 +17,11 @@ void quantize(const float* x, int n_in, int ncols, void* act, void* stream);
 /// q81 = false: `act` is quantize()'s block.  q81 = true: `act` is the q8_1 image native_quantize_q8_1 writes (ncols columns
 /// of n_in / 32 blocks of 36 bytes), with at least 28 readable bytes after its last block.
 bool mmvq(int ggml_type, const void* weights, const void* act, float* y, int n_in, int n_out, int ncols, void* stream, bool q81 = false);
+/// B70W4 (tools/qwen35/b70w4_pack.py): the bytes of a packed n_out x n_in matrix (n_in a multiple of 256, n_out of 16).
+std::size_t w4_bytes(int n_in, int n_out);
+/// y[col * n_out + row] = W4 weights . the q8_1 image `xq` (with 28 readable bytes after its last block) for 1-8 columns.
+/// `weights`: the pack's records, 64-byte aligned.  false: not taken, nothing launched.
+bool mmvq_w4(const void* weights, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream);
+/// The pack as FP16 [n_out][n_in] (a prompt chunk's GEMM operand): n_out x n_in halves at `out`.
+void w4_dequant_f16(const void* weights, uint16_t* out, int n_in, int n_out, void* stream);
 }   // namespace strata::q36xr

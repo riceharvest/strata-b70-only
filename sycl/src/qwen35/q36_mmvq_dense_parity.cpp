@@ -534,6 +534,107 @@ int bench(const char* types_s, const char* ncols_s, const std::string& ssel) {
 
 }  // namespace
 
+// --w4 [ncols] [shape]: the B70W4 form (q36_xr_dense.dp.cpp, tools/qwen35/b70w4_pack.py's records) on random packs: us per
+// call and GB/s of pack bytes as --bench times them, and the output of the last launch against a float64 reference on the
+// host for the first 32 and the last 16 rows (the pack's nibbles, scales and zeros x the q8_1 image's values).
+int w4_bench(const char* ncols_s, const std::string& ssel) {
+    const std::vector<int> ncl = parse_list(ncols_s);
+    sycl::queue q(sycl::gpu_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()});
+    struct BShape { int n_in, n_out; const char* name; };
+    const BShape shapes[] = {{5120, 10240, "27qkv"}, {5120, 6144, "27gate"}, {6144, 5120, "27out"}, {5120, 12288, "27q"},
+                             {5120, 17408, "27gu"}, {17408, 5120, "27down"}, {5120, 1024, "27kv"}};
+    const size_t REC = 544, POOL_DW = ((size_t) 640 << 20) / 4 / REC * REC;
+    std::vector<uint32_t> hpool(POOL_DW);
+    {
+        uint64_t st = 0x9E3779B97F4A7C15ull;
+        auto xr = [&] { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
+        for (size_t i = 0; i < POOL_DW; i += 2) { const uint64_t v = xr(); hpool[i] = (uint32_t) v; hpool[i + 1] = (uint32_t) (v >> 32); }
+        for (size_t r = 0; r < POOL_DW / REC; ++r)
+            for (int k = 0; k < 32; ++k) {
+                const uint64_t v = xr();
+                hpool[r * REC + 512 + k] = (0x1400u | (uint32_t) (v & 0x3ff)) | ((1u + (uint32_t) ((v >> 20) & 15)) << 16);
+            }
+    }
+    uint32_t* dpool = (uint32_t*) sycl::aligned_alloc_device(4096, POOL_DW * 4, q);
+    const int maxc = 8, maxout = 17408, maxin = 17408;
+    float* y = sycl::malloc_device<float>((size_t) maxc * maxout, q);
+    std::vector<float> hx((size_t) maxc * maxin);
+    float* dx = sycl::malloc_device<float>(hx.size(), q);
+    const size_t xq_bytes = k::native_q8_1_bytes(maxin, maxc) + 256;
+    void* xq = sycl::malloc_device(xq_bytes, q);
+    if (!dpool || !y || !dx || !xq) { std::printf("w4: could not allocate the buffers\n"); return 1; }
+    std::mt19937 rng(4242);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (auto& v : hx) v = nd(rng);
+    q.memcpy(dx, hx.data(), hx.size() * 4).wait();
+    q.memcpy(dpool, hpool.data(), POOL_DW * 4).wait();
+    std::printf("q36_mmvq_dense_parity --w4 on %s: us per call (median), GB/s of pack bytes, the distance to a float64 reference\n",
+                q.get_device().get_info<sycl::info::device::name>().c_str());
+    int bad = 0;
+    for (const BShape& sh : shapes) {
+        if (!(ssel == "27" || ssel == "all" || ssel == sh.name)) continue;
+        const size_t wb = strata::q36xr::w4_bytes(sh.n_in, sh.n_out), wdw = wb / 4;
+        const int ndist = (int) std::max<size_t>(1, std::min<size_t>(128, POOL_DW / wdw)), nmat = std::max(ndist, 16);
+        const int bpr = sh.n_in / 256, nb = sh.n_in / 32;
+        for (const int nc : ncl) {
+            if (nc < 1 || nc > maxc) continue;
+            k::native_quantize_q8_1(dx, xq, sh.n_in, nc, &q);
+            q.wait();
+            const double us = time_graph(q, nmat, [&](int m) {
+                if (!strata::q36xr::mmvq_w4(dpool + (size_t) (m % ndist) * wdw, xq, y, sh.n_in, sh.n_out, nc, &q))
+                    throw std::runtime_error("the W4 form declined a bench call");
+            }, wb > (100u << 20) ? 7 : 11);
+            q.wait();
+            std::vector<float> hy((size_t) nc * sh.n_out);
+            std::vector<uint8_t> hq(k::native_q8_1_bytes(sh.n_in, nc));
+            q.memcpy(hy.data(), y, hy.size() * 4).wait();
+            q.memcpy(hq.data(), xq, hq.size()).wait();
+            const uint32_t* base = hpool.data() + (size_t) ((nmat - 1) % ndist) * wdw;
+            std::vector<double> xd((size_t) nc * sh.n_in);
+            for (int j = 0; j < nc; ++j)
+                for (int b = 0; b < nb; ++b) {
+                    const uint8_t* blk = hq.data() + ((size_t) j * nb + b) * 36;
+                    uint16_t dh;
+                    std::memcpy(&dh, blk, 2);
+                    const double d = (double) (float) sycl::bit_cast<sycl::half>(dh);
+                    for (int l = 0; l < 32; ++l) xd[(size_t) j * sh.n_in + b * 32 + l] = d * (double) (int8_t) blk[4 + l];
+                }
+            double ss = 0, sd = 0;
+            for (int o = 0; o < sh.n_out; ++o) {
+                if (!(o < 32 || o >= sh.n_out - 16)) continue;
+                const int t = o / 16, i = o % 16;
+                for (int j = 0; j < nc; ++j) {
+                    double acc = 0;
+                    for (int c = 0; c < bpr; ++c) {
+                        const uint32_t* rec = base + ((size_t) t * bpr + c) * REC;
+                        for (int sb = 0; sb < 8; ++sb) {
+                            const int pr = sb >> 1, g = sb >> 2;
+                            const uint32_t meta = rec[512 + 16 * g + i];
+                            const double sc = (double) (float) sycl::bit_cast<sycl::half>((uint16_t) (meta & 0xffff));
+                            const int zero = (int) (meta >> 16);
+                            for (int l = 0; l < 32; ++l) {
+                                const uint32_t by = (rec[128 * pr + 16 * (l >> 2) + i] >> (8 * (l & 3))) & 0xff;
+                                const int qv = (sb & 1) ? (int) (by >> 4) : (int) (by & 15);
+                                acc += sc * (double) (qv - zero) * xd[(size_t) j * sh.n_in + c * 256 + sb * 32 + l];
+                            }
+                        }
+                    }
+                    const double got = hy[(size_t) j * sh.n_out + o];
+                    ss += acc * acc;
+                    sd += (got - acc) * (got - acc);
+                }
+            }
+            const double rel = std::sqrt(sd / std::max(ss, 1e-30));
+            if (!(rel < 1e-4)) ++bad;
+            std::printf("W4     %-6s %5d x %6d nc %d  %8.2f us %5.1f GB/s  rms diff / rms %.2e%s\n", sh.name, sh.n_in, sh.n_out, nc, us,
+                        wb / us / 1e3, rel, rel < 1e-4 ? "" : "  FAIL");
+            std::fflush(stdout);
+        }
+    }
+    sycl::free(dpool, q); sycl::free(y, q); sycl::free(dx, q); sycl::free(xq, q);
+    return bad ? 1 : 0;
+}
+
 // --floor: us per launch of a kernel that does nothing but one store, in the same graph replay as --bench
 int floor_bench() {
     sycl::queue q(sycl::gpu_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()});
@@ -556,6 +657,7 @@ int main(int argc, char** argv) try {
     setenv("STRATA_MMVQ_KREG", "1", 1);   // the dense forms' latch (strata-q36 sets it for the 27B)
     bool selftest_flag = false;
     if (argc > 1 && std::string(argv[1]) == "--floor") return floor_bench();
+    if (argc > 1 && std::string(argv[1]) == "--w4") return w4_bench(argc > 2 ? argv[2] : "1,4,5,6,8", argc > 3 ? argv[3] : "27");
     if (argc > 1 && std::string(argv[1]) == "--bench")
         return bench(argc > 2 ? argv[2] : "12,13,14,23", argc > 3 ? argv[3] : "1,2,3,4,6", argc > 4 ? argv[4] : "all");
     for (int i = 1; i < argc; ++i) {

@@ -69,6 +69,7 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <thread>
 #include <tuple>
 #include <type_traits>
@@ -88,6 +89,55 @@ bool requant(int type, const void* src, int64_t n_in, int64_t n_out, int dst_typ
 namespace {
 
 namespace K = strata::kernels;
+
+// --w4 FILE: a B70W4 pack (tools/qwen35/b70w4_pack.py: a GPTQ int4 checkpoint of the same model, packed for the B70's matrix
+// engine).  A matrix the pack names is loaded from it and not from the GGUF; everything else (norms, embeddings, the head, the
+// MTP block, the small GDN tensors) is the GGUF's.  Decode: the W4 form of q36_xr_dense.dp.cpp.  A prompt chunk: the pack
+// dequantized to FP16, then the FP16 GEMM.
+constexpr int kW4Type = 1004;   // (not a ggml type id)
+struct W4Ent { uint64_t off = 0, bytes = 0; int n_in = 0, n_out = 0; };
+struct W4Pack {
+    std::string path;
+    uint64_t blobs = 0;   // the file offset of the blob area
+    std::unordered_map<std::string, W4Ent> t;
+    bool open(const std::string& p, std::string& err) {
+        FILE* f = std::fopen(p.c_str(), "rb");
+        if (!f) { err = "cannot open " + p; return false; }
+        char magic[8];
+        uint64_t n = 0;
+        if (std::fread(magic, 1, 8, f) != 8 || std::memcmp(magic, "B70W4\0\0\1", 8) != 0 || std::fread(&n, 8, 1, f) != 1 || n > (64u << 20)) {
+            std::fclose(f);
+            err = p + " is not a B70W4 pack";
+            return false;
+        }
+        std::string js((size_t) n, '\0');
+        const bool ok = std::fread(js.data(), 1, (size_t) n, f) == (size_t) n;
+        std::fclose(f);
+        if (!ok) { err = p + ": short index"; return false; }
+        blobs = (16 + n + 4095) / 4096 * 4096;
+        size_t at = js.find("\"tensors\"");
+        if (at == std::string::npos) { err = p + ": no tensor index"; return false; }
+        at = js.find('{', at);
+        for (;;) {
+            const size_t q0 = js.find('"', at + 1);
+            if (q0 == std::string::npos) break;
+            const size_t q1 = js.find('"', q0 + 1);
+            if (q1 == std::string::npos) break;
+            W4Ent e;
+            unsigned long long off = 0, bytes = 0;
+            if (std::sscanf(js.c_str() + q1 + 1, ": {\"off\": %llu, \"bytes\": %llu, \"n_in\": %d, \"n_out\": %d}", &off, &bytes, &e.n_in, &e.n_out) != 4) break;
+            e.off = off;
+            e.bytes = bytes;
+            t[js.substr(q0 + 1, q1 - q0 - 1)] = e;
+            at = js.find('}', q1);
+            if (at == std::string::npos) break;
+        }
+        path = p;
+        return !t.empty();
+    }
+};
+std::string g_w4_path;   // --w4
+W4Pack g_w4;
 
 // The 27B's decode forms (q36_mmvq_dense.dp.cpp, built into this binary only) take the dense model's products; every other
 // call, and any that they decline, is the shared native_mmvq's.
@@ -119,6 +169,13 @@ inline bool q36_xr_on() {
     return on;
 }
 inline void q36_mmvq(int type, const void* w, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream) {
+    if (type == kW4Type) {
+        if (!strata::q36xr::mmvq_w4(w, xq, y, n_in, n_out, ncols, stream)) {
+            std::fprintf(stderr, "strata-q36: a W4 product of %d x %d at %d columns was not taken\n", n_in, n_out, ncols);
+            std::exit(1);
+        }
+        return;
+    }
     if (g_q36_dense_forms && q36_xr_on() && strata::q36xr::mmvq(type, w, xq, y, n_in, n_out, ncols, stream, true)) return;
     if (g_q36_dense_forms && strata::q36dense::mmvq(type, w, xq, y, n_in, n_out, ncols, stream)) return;
     K::native_mmvq(type, w, xq, y, n_in, n_out, ncols, stream);
@@ -2201,6 +2258,7 @@ struct Model {
     // the GGUF-native MTP block (blk.<n_layers>, loaded with --mtp): eh_proj over [enorm(e) | hnorm(h)], then an
     // attention + MoE layer, shared_head_norm, the main head
     bool has_mtp = false;
+    int w4_mats = 0;   // matrices loaded from a B70W4 pack (--w4)
     Layer mtp;
     Mat eh_proj;
     const float *mtp_enorm = nullptr, *mtp_hnorm = nullptr, *mtp_shnorm = nullptr;
@@ -2352,6 +2410,31 @@ bool load(const std::string &path, Model &m, std::string &err, bool want_mtp) {
         w.type = (int) t->type;
         w.n_in = (int) t->shape[0];
         w.n_out = (int) t->shape[1];
+        if (auto it = g_w4.t.find(name); it != g_w4.t.end()) {   // --w4: this matrix from the pack
+            const W4Ent& e = it->second;
+            if (e.n_in != w.n_in || e.n_out != w.n_out || e.bytes != strata::q36xr::w4_bytes(w.n_in, w.n_out)) {
+                std::fprintf(stderr, "strata-q36: --w4: %s is %d x %d in the pack, %d x %d in the GGUF\n", name.c_str(), e.n_in, e.n_out,
+                             w.n_in, w.n_out);
+                std::exit(1);
+            }
+            std::vector<uint8_t> blob((size_t) e.bytes);
+            FILE* f = std::fopen(g_w4.path.c_str(), "rb");
+            const bool ok = f != nullptr && fseeko(f, (off_t) (g_w4.blobs + e.off), SEEK_SET) == 0 &&
+                            std::fread(blob.data(), 1, blob.size(), f) == blob.size();
+            if (f) std::fclose(f);
+            if (!ok) {
+                std::fprintf(stderr, "strata-q36: --w4: cannot read %s from %s\n", name.c_str(), g_w4.path.c_str());
+                std::exit(1);
+            }
+            uint8_t* d = nullptr;
+            CK(DPCT_CHECK_ERROR(d = (uint8_t *)sycl::aligned_alloc_device(4096, blob.size(), q_ct1)));
+            CK(DPCT_CHECK_ERROR(q_ct1.memcpy(d, blob.data(), blob.size()).wait()));
+            bytes += blob.size();
+            w.type = kW4Type;
+            w.d = d;
+            ++m.w4_mats;
+            return w;
+        }
         const uint8_t* src = gm.shard(s).tensor_data(*t);
         uint64_t nb = strata::tensor_payload_bytes(*t);
         std::vector<uint8_t> rq;   // a type the native MMVQ does not take, as Q8_0
@@ -2629,6 +2712,7 @@ struct Engine {
     std::vector<GSet> gsets;
     GSet& gs() { return gsets[(size_t) cur]; }
     strata::prefill::Gemm gemm;
+    uint16_t* w4_f16 = nullptr;   // --w4: the FP16 image of the pack's matrix a prompt chunk multiplies by
     dpct::blas::descriptor_ptr blas = nullptr;
     float* att_s = nullptr;            // the prompt attention's scores / probabilities, kAttScoreFloats floats
     static constexpr int kSplitK = 16;
@@ -2976,6 +3060,8 @@ struct Engine {
                 take(m->mtp);
                 big = std::max<int64_t>(big, (int64_t) m->eh_proj.n_in * m->eh_proj.n_out);
             }
+            if (m->w4_mats > 0)
+                CK(DPCT_CHECK_ERROR(w4_f16 = (uint16_t *)sycl::malloc_device((size_t) big * 2, q_ct1)));
             if (!gemm.init(st, big, gerr)) {
                 std::fprintf(stderr, "strata-q36: prompt GEMM: %s\n", gerr.c_str());
                 std::exit(1);
@@ -3290,8 +3376,14 @@ struct Engine {
             } else quant(xin, n, T, q);
     }
     void apply(const Mat& w, const void* q, float* out, int T) {
-        if (T > kGemmT) gemm.native((const uint16_t*) x16, w.type, w.d, out, T, w.n_out, w.n_in);
-        else mmq(w, q, out, T);
+        if (T > kGemmT) {
+            if (w.type == kW4Type) {   // the pack as FP16, then the FP16 GEMM
+                strata::q36xr::w4_dequant_f16(w.d, w4_f16, w.n_in, w.n_out, st);
+                gemm.f16((const uint16_t*) x16, w4_f16, out, T, w.n_out, w.n_in);
+            } else {
+                gemm.native((const uint16_t*) x16, w.type, w.d, out, T, w.n_out, w.n_in);
+            }
+        } else mmq(w, q, out, T);
     }
     /// x [T][n] -> its q8_1 image (T contiguous columns: one vector of T * n), for every matrix that reads x.
     void quant(const float* xin, int n, int T, void* q) { K::native_quantize_q8_1(xin, q, n * T, 1, st); }
@@ -7710,6 +7802,7 @@ int strata::qwen35::run(int argc, char** argv) {
                                       "drafts)\n", v.c_str());
         }
         else if (a == "--draft-vocab") draft_vocab = std::atoi(next().c_str());   // the MTP drafts pick among N token ids (0: all)
+        else if (a == "--w4") g_w4_path = next();                                 // a B70W4 pack of the model's matrices
         else if (a == "--draft-tokens") draft_tokens = next();                     // ... the first ones of this list (M2), then the lowest ids
         else if (a == "--vision") vision = true;                                  // pictures (GENI): the encoder is strata-vision's
         else if (a == "--batch" || a == "--slots") batch = std::atoi(next().c_str());   // sessions decoding together
@@ -7749,7 +7842,14 @@ int strata::qwen35::run(int argc, char** argv) {
     Model m;
     std::string err;
     try {
+        if (!g_w4_path.empty()) {
+            std::string werr;
+            if (!g_w4.open(g_w4_path, werr)) { std::fprintf(stderr, "strata-q36: --w4: %s\n", werr.c_str()); return 1; }
+        }
         if (!load(model, m, err, mtp_d > 0)) { std::fprintf(stderr, "strata-q36: %s\n", err.c_str()); return 1; }
+        if (!g_w4_path.empty())
+            std::fprintf(stderr, "strata-q36: --w4 %s: %d of the pack's %zu matrices loaded (int4, the XMX W4 form)\n", g_w4_path.c_str(),
+                         m.w4_mats, g_w4.t.size());
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata-q36: %s\n", e.what());
         return 1;

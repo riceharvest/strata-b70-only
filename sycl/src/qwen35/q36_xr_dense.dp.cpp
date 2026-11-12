@@ -361,6 +361,125 @@ void launch(sycl::queue& q, const uint8_t* W, const int* Xi, const float* S, flo
         });
     });
 }
+// ===== B70W4: the int4 pack (tools/qwen35/b70w4_pack.py).  A matrix is records of 16 rows x 256 inputs, tile after tile,
+// chunk after chunk: 4 x 128 dwords of nibbles (pair p of the chunk's 32-weight sub-blocks: 2p low, 2p + 1 high; dword d of
+// row i at [128 p + 16 d + i]) and 2 x 16 dwords (group g of 128 inputs, row i: fp16 scale | zero << 16).  A thread owns a
+// tile and reads its records in order with block loads: no gather, no lookup, one format.  Per row and 32 weights:
+// y += (scale x dx) x (dot - zero x sum), dot and sum the s8 DPAS of the nibbles (and of ones) with a column's activations:
+// the integer part is exact.  K in order, each column on its own: a T-column call is bitwise T one-column calls.
+constexpr int kW4Rec = 544;   // dwords a record
+template <int NC> SYCL_ESIMD_FUNCTION inline void w4_sub(simd<float, 128>& acc, simd<uint32_t, 128> fr, simd<int, 64> av, simd<float, 16> dxf,
+                                                        simd<float, 16> sc, simd<int, 16> z) {
+    simd<int, 128> bi = fr.template bit_cast_view<int>();
+    simd<int, 128> tf = xmx::dpas<8, 8, int, int, int, int, xmx::dpas_argument_type::s8, xmx::dpas_argument_type::s8>(simd<int, 128>(0), bi, av);
+    simd<int, 128> ts = xmx::dpas<8, 8, int, int, int, int, xmx::dpas_argument_type::s8, xmx::dpas_argument_type::s8>(simd<int, 128>(0), simd<int, 128>(0x01010101), av);
+#pragma unroll
+    for (int r = 0; r < NC; ++r) {
+        const float dxr = dxf[r];
+        simd<int, 16> ti = tf.template select<16, 1>(16 * r), si = ts.template select<16, 1>(16 * r);
+        simd<int, 16> u = ti - z * si;
+        simd<float, 16> t = u;
+        simd<float, 16> a = acc.template select<16, 1>(16 * r);
+        a += t * (sc * dxr);
+        acc.template select<16, 1>(16 * r) = a;
+    }
+}
+// sub-block S's activations of the call's columns out of the chunk's preloaded q8_1 blocks: the B... the A operand and the scales
+template <int NC, int S> SYCL_ESIMD_FUNCTION inline void w4_acts(Acts& ac, simd<int, 64>& av, simd<float, 16>& dxf) {
+    simd<uint32_t, 16> hd = 0u;
+    av = 0;
+#pragma unroll
+    for (int r = 0; r < NC; ++r) {
+        if constexpr (S < 7) {
+            av.template select<8, 1>(8 * r) = ac.A[r].template select<8, 1>(9 * S + 1);
+            hd[r] = (uint32_t) (int) ac.A[r][9 * S];
+        } else {
+            av.template select<8, 1>(8 * r) = ac.B[r].template select<8, 1>(1);
+            hd[r] = (uint32_t) (int) ac.B[r][0];
+        }
+    }
+    dxf = half_of(hd & 0xffffu);
+}
+// pair P of a chunk (sub-blocks 2P and 2P + 1, both of group P >> 1)
+template <int NC, int P> SYCL_ESIMD_FUNCTION inline void w4_pair(simd<float, 128>& acc, const uint32_t* rec, Acts& ac, simd<float, 16> sc,
+                                                                simd<int, 16> z) {
+    simd<uint32_t, 128> qd;
+    qd.template select<64, 1>(0) = block_load<uint32_t, 64>(rec + 128 * P);
+    qd.template select<64, 1>(64) = block_load<uint32_t, 64>(rec + 128 * P + 64);
+    simd<int, 64> av;
+    simd<float, 16> dxf;
+    w4_acts<NC, 2 * P>(ac, av, dxf);
+    w4_sub<NC>(acc, qd & 0x0f0f0f0fu, av, dxf, sc, z);
+    w4_acts<NC, 2 * P + 1>(ac, av, dxf);
+    w4_sub<NC>(acc, (qd >> 4) & 0x0f0f0f0fu, av, dxf, sc, z);
+}
+template <int NC, int C> struct TagW4;
+template <int NC, int C>
+void launch_w4(sycl::queue& q, const uint32_t* W, const int* Xi, float* Y, int bpr, int n_out, int threads) {
+    const int tiles = n_out / 16, cb = (bpr + C - 1) / C;
+    const int G = std::max(1, std::min(tiles, threads / C));
+    const int xs9 = bpr * 8 * 9;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for<TagW4<NC, C>>(sycl::nd_range<2>(sycl::range<2>((size_t) G, (size_t) C), sycl::range<2>(1, (size_t) C)),
+                                     [=](sycl::nd_item<2> it) SYCL_ESIMD_KERNEL {
+            if constexpr (C > 1) slm_init<2 * C * 512>();
+            const int g = (int) it.get_group(0), c = (int) it.get_local_id(1);
+            const int kb0 = c * cb, kb1 = (kb0 + cb) < bpr ? (kb0 + cb) : bpr;
+            uint32_t buf = 0;
+            for (int t = g; t < tiles; t += G) {
+                const uint32_t* tile = W + (size_t) t * (size_t) bpr * kW4Rec;
+                simd<float, 128> acc = 0.f;
+                for (int kb = kb0; kb < kb1; ++kb) {
+                    const uint32_t* rec = tile + (size_t) kb * kW4Rec;
+                    simd<uint32_t, 32> m = block_load<uint32_t, 32>(rec + 512);
+                    if (kb + 1 < kb1) {   // the next record: its 34 cache lines
+                        prefetch<uint32_t, 16>(rec + kW4Rec, simd<uint32_t, 16>(0, 64), kPf);
+                        prefetch<uint32_t, 16>(rec + kW4Rec + 256, simd<uint32_t, 16>(0, 64), kPf);
+                        prefetch<uint32_t, 2>(rec + kW4Rec + 512, simd<uint32_t, 2>(0, 64), kPf);
+                    }
+                    Acts ac;
+                    load_acts<NC>(ac, Xi + (size_t) kb * 72, xs9);
+                    simd<uint32_t, 16> m0 = m.template select<16, 1>(0), m1 = m.template select<16, 1>(16);
+                    simd<float, 16> sc0 = half_of(m0 & 0xffffu), sc1 = half_of(m1 & 0xffffu);
+                    simd<int, 16> z0 = simd<int, 16>(m0 >> 16), z1 = simd<int, 16>(m1 >> 16);
+                    w4_pair<NC, 0>(acc, rec, ac, sc0, z0);
+                    w4_pair<NC, 1>(acc, rec, ac, sc0, z0);
+                    w4_pair<NC, 2>(acc, rec, ac, sc1, z1);
+                    w4_pair<NC, 3>(acc, rec, ac, sc1, z1);
+                }
+                if constexpr (C > 1) {
+                    if (c != 0) {
+                        slm_block_store<float, 64>(buf + (uint32_t) c * 512u, acc.template select<64, 1>(0), kAl16);
+                        if constexpr (NC > 4) slm_block_store<float, 64>(buf + (uint32_t) c * 512u + 256u, acc.template select<64, 1>(64), kAl16);
+                    }
+                    barrier();
+                    if (c == 0) {
+#pragma unroll
+                        for (int cc = 1; cc < C; ++cc) {
+                            simd<float, 64> p0 = slm_block_load<float, 64>(buf + (uint32_t) cc * 512u, kAl16);
+                            simd<float, 64> a0 = acc.template select<64, 1>(0);
+                            a0 += p0;
+                            acc.template select<64, 1>(0) = a0;
+                            if constexpr (NC > 4) {
+                                simd<float, 64> p1 = slm_block_load<float, 64>(buf + (uint32_t) cc * 512u + 256u, kAl16);
+                                simd<float, 64> a1 = acc.template select<64, 1>(64);
+                                a1 += p1;
+                                acc.template select<64, 1>(64) = a1;
+                            }
+                        }
+                    }
+                    buf = buf == 0u ? (uint32_t) (C * 512) : 0u;
+                }
+                if (c == 0) {
+#pragma unroll
+                    for (int r = 0; r < NC; ++r)
+                        block_store<float, 16>(Y + (size_t) r * n_out + 16 * (size_t) t, acc.template select<16, 1>(16 * r));
+                }
+            }
+        });
+    });
+}
+
 // STRATA_Q36_XR_THREADS (1024): the pool's hardware threads.  STRATA_Q36_XR_C (1, 2, 4; unset: by the row count): threads a tile.
 inline int pool_threads() {
     static const int v = [] { const char* e = std::getenv("STRATA_Q36_XR_THREADS"); const int n = e ? std::atoi(e) : 0; return n >= 16 ? n : 1024; }();
@@ -400,7 +519,64 @@ void by_cols(sycl::queue& q, const uint8_t* W, const int* Xi, const float* S, fl
         default: dispatch<F, 8>(q, W, Xi, S, Y, bpr, n_out, q81); break;
     }
 }
+// STRATA_Q36_W4_C (1, 2, 4; unset: 4, a row wider than 16384 2): the W4 form's threads a tile
+inline int w4_chunks(int n_in) {
+    static const int e = [] { const char* v = std::getenv("STRATA_Q36_W4_C"); const int n = v ? std::atoi(v) : 0; return n == 1 || n == 2 || n == 4 ? n : 0; }();
+    return e ? e : n_in > 16384 ? 2 : 4;
+}
+template <int NC>
+void dispatch_w4(sycl::queue& q, const uint32_t* W, const int* Xi, float* Y, int bpr, int n_out) {
+    const int c = w4_chunks(bpr * 256), nt = pool_threads();
+    if (c == 4) launch_w4<NC, 4>(q, W, Xi, Y, bpr, n_out, nt);
+    else if (c == 2) launch_w4<NC, 2>(q, W, Xi, Y, bpr, n_out, nt);
+    else launch_w4<NC, 1>(q, W, Xi, Y, bpr, n_out, nt);
+}
 }   // namespace
+
+std::size_t w4_bytes(int n_in, int n_out) { return (std::size_t) (n_out / 16) * (n_in / 256) * kW4Rec * 4; }
+bool mmvq_w4(const void* weights, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream) {
+    if (ncols < 1 || ncols > 8 || n_in <= 0 || n_in % 256 != 0 || n_out <= 0 || n_out % 16 != 0) return false;
+    if (!weights || !xq || !y || (reinterpret_cast<uintptr_t>(weights) & 63u) != 0 || (reinterpret_cast<uintptr_t>(xq) & 3u) != 0) return false;
+    sycl::queue& q = *strata::q_of(stream);
+    const auto* W = static_cast<const uint32_t*>(weights);
+    const int* Xi = static_cast<const int*>(xq);
+    const int bpr = n_in / 256;
+    switch (ncols) {
+        case 1: dispatch_w4<1>(q, W, Xi, y, bpr, n_out); break;
+        case 2: dispatch_w4<2>(q, W, Xi, y, bpr, n_out); break;
+        case 3: dispatch_w4<3>(q, W, Xi, y, bpr, n_out); break;
+        case 4: dispatch_w4<4>(q, W, Xi, y, bpr, n_out); break;
+        case 5: dispatch_w4<5>(q, W, Xi, y, bpr, n_out); break;
+        case 6: dispatch_w4<6>(q, W, Xi, y, bpr, n_out); break;
+        case 7: dispatch_w4<7>(q, W, Xi, y, bpr, n_out); break;
+        default: dispatch_w4<8>(q, W, Xi, y, bpr, n_out); break;
+    }
+    return true;
+}
+
+// A prompt chunk's product is an FP16 GEMM: the pack as FP16 [n_out][n_in] (scale x (q - zero), rounded to FP16).
+void w4_dequant_f16(const void* weights, uint16_t* out, int n_in, int n_out, void* stream) {
+    sycl::queue& q = *strata::q_of(stream);
+    const auto* W = static_cast<const uint32_t*>(weights);
+    const int bpr = n_in / 256, tiles = n_out / 16;
+    q.parallel_for<class q36xr_w4_dequant>(sycl::range<3>((size_t) tiles, (size_t) bpr, 128), [=](sycl::id<3> id) {
+        const int t = (int) id[0], c = (int) id[1], k = (int) id[2];
+        const int i = k & 15, sb = k >> 4, pr = sb >> 1, g = sb >> 2;
+        const uint32_t* rec = W + ((size_t) t * bpr + c) * kW4Rec;
+        const uint32_t meta = rec[512 + 16 * g + i];
+        const float sc = (float) sycl::bit_cast<sycl::half>((uint16_t) (meta & 0xffffu));
+        const int zero = (int) (meta >> 16);
+        sycl::half* o = reinterpret_cast<sycl::half*>(out) + (size_t) (16 * t + i) * n_in + (size_t) c * 256 + sb * 32;
+        for (int d = 0; d < 8; ++d) {
+            const uint32_t w = rec[128 * pr + 16 * d + i];
+            for (int b = 0; b < 4; ++b) {
+                const uint32_t by = (w >> (8 * b)) & 0xffu;
+                const int qv = (sb & 1) ? (int) (by >> 4) : (int) (by & 15u);
+                o[4 * d + b] = (sycl::half) (sc * (float) (qv - zero));
+            }
+        }
+    });
+}
 
 void init(void* stream) { (void) iq4_table(*strata::q_of(stream)); }
 bool handles(int t) { return t == T_Q4K || t == T_Q5K || t == T_IQ4XS; }
