@@ -162,6 +162,19 @@ inline int q36_depth_at(int64_t cells, int mtp_d) {
     }();
     return cells < lim.first ? mtp_d : cells < lim.second ? std::min(mtp_d, 4) : std::min(mtp_d, 3);
 }
+// Drafts beyond the base depth only on a run of accepted drafts.  A step offers kDraftBase drafts (or --mtp's, when that
+// is less); after a step whose drafts were all accepted the next offers one more, up to --mtp; after a miss it is back at
+// the base.  Text that the draft block predicts almost fully (an edit that repeats a file: 1,227 of 1,255 accepted) then
+// runs at the full depth, text it predicts half of stays at the base (the int4 pack, depth 5 / 7 fixed: 83.7 / 79.6 tok/s
+// on code-v1, 147.7 / 174.0 on a whole-file edit).  STRATA_Q36_MTP_BASE=N: another base (N >= --mtp: always --mtp).
+constexpr int kDraftBase = 5;
+inline int q36_draft_base(int mtp_d) {
+    static const int e = [] { const char* v = std::getenv("STRATA_Q36_MTP_BASE"); const int n = v ? std::atoi(v) : 0; return n > 0 ? n : kDraftBase; }();
+    return std::min(e, mtp_d);
+}
+inline int q36_next_cap(int offered, int accepted, int mtp_d) {
+    return accepted >= offered ? std::min(mtp_d, offered + 1) : q36_draft_base(mtp_d);
+}
 // The XMX rows forms (STRATA_Q36_XR=0: off) (q36_xr_dense.dp.cpp: Q4_K, Q5_K, IQ4_XS; 1-8 columns for the price of one) take the
 // dense model's products before the KREG forms; they read the same q8_1 image.
 inline bool q36_xr_on() {
@@ -2459,7 +2472,7 @@ bool load(const std::string &path, Model &m, std::string &err, bool want_mtp) {
             std::exit(1);
         }
         uint8_t* d = nullptr;
-        CK(DPCT_CHECK_ERROR(d = (uint8_t *)sycl::malloc_device(nb, q_ct1)));
+        CK(DPCT_CHECK_ERROR(d = (uint8_t *)sycl::aligned_alloc_device((size_t) 2 << 20, nb, q_ct1)));   // (large pages, as the pack's)
         /*
         DPCT1114:81: cudaMemcpy is migrated to asynchronization memcpy, assuming
         in the original code the source host memory is pageable memory. If the
@@ -2577,7 +2590,7 @@ bool load(const std::string &path, Model &m, std::string &err, bool want_mtp) {
         m.embd_row = row_bytes(m.embd_type, (int64_t) t->shape[0]);
         const uint64_t nb = strata::tensor_payload_bytes(*t);
         uint8_t* d = nullptr;
-        CK(DPCT_CHECK_ERROR(d = (uint8_t *)sycl::malloc_device(nb, q_ct1)));
+        CK(DPCT_CHECK_ERROR(d = (uint8_t *)sycl::aligned_alloc_device((size_t) 2 << 20, nb, q_ct1)));   // (large pages, as the pack's)
         /*
         DPCT1114:82: cudaMemcpy is migrated to asynchronization memcpy, assuming
         in the original code the source host memory is pageable memory. If the
@@ -5008,7 +5021,7 @@ work-group size if needed.
         const size_t rb = row_bytes(hd.type, hd.n_in);
         if (ids.empty() || rb == 0 || rb % 4 != 0) return;
         const int n = (int) ids.size();
-        uint8_t* dst = (uint8_t*) sycl::malloc_device(rb * (size_t) n, *st);
+        uint8_t* dst = (uint8_t*) sycl::aligned_alloc_device((size_t) 2 << 20, rb * (size_t) n, *st);
         d_draft_ids = (int32_t*) sycl::malloc_device(sizeof(int32_t) * (size_t) n, *st);
         st->memcpy(d_draft_ids, ids.data(), sizeof(int32_t) * (size_t) n).wait();
         const uint32_t* src = (const uint32_t*) hd.d;
@@ -5024,7 +5037,7 @@ work-group size if needed.
             std::vector<uint8_t> hrows(rb * (size_t) n), rq;
             st->memcpy(hrows.data(), dst, hrows.size()).wait();
             if (strata::qwen35::requant(hd.type, hrows.data(), hd.n_in, n, 12, rq)) {
-                uint8_t* d4 = (uint8_t*) sycl::malloc_device(rq.size(), *st);
+                uint8_t* d4 = (uint8_t*) sycl::aligned_alloc_device((size_t) 2 << 20, rq.size(), *st);
                 st->memcpy(d4, rq.data(), rq.size()).wait();
                 sycl::free(dst, *st);
                 head_d.d = d4;
@@ -6723,7 +6736,7 @@ work-group size if needed.
                     }
                 }
                 // the long-context depths' graphs (q36_depth_at: 4 and 3 below --mtp), every redo count
-                for (int D = std::min(mtp_d, 4); D >= 3 && D < mtp_d; --D)
+                for (int D = mtp_d - 1; D >= 3; --D)
                     for (int f = 0; f <= mtp_d && pos + (int64_t) 2 * (mtp_d + 2) < ctx; ++f) {
                         fix.assign((size_t) f, filler);
                         spec_step(filler, fix, D, drafts, picks);
@@ -7592,6 +7605,7 @@ struct Serve {
         std::vector<int32_t> hist = ids;
         const auto d0 = Clock::now();
         long long produced = 0, offered = 0, accepted = 0;
+        int depth_cap = q36_draft_base(E.mtp_d);   // (the next step's drafts: q36_next_cap)
         const char* finish = "length";
         // greedy requests alone with the MTP block: speculative steps of mtp_d drafts (verified, so the text is the greedy
         // text); requests beside others, one token at a time.  A request that the device argmax cannot serve (a penalty, a
@@ -7667,8 +7681,9 @@ struct Serve {
             if (!emit(nx)) break;
             if (n_active > 0) window();
             if (spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
-                const int D = q36_depth_at(E.pos, E.mtp_d);
+                const int D = q36_depth_at(E.pos, std::min(E.mtp_d, depth_cap));
                 const int a = E.spec_step(nx, fix, D, drafts, picks, &stop, plan.ok ? &sel : nullptr);
+                depth_cap = q36_next_cap(D, a, E.mtp_d);
                 offered += D;
                 accepted += a;
                 // the state now holds x and every accepted draft, whether or not the answer ends inside them (an end of
@@ -7975,7 +7990,7 @@ int strata::qwen35::run(int argc, char** argv) {
     // the answer is the plain greedy one), the best combined number on the two localmaxxing prompts on the B70; --mtp 0: off.  Other
     // families keep MTP off unless asked.
     constexpr int kDenseMtp = 5;
-    if (mtp_d < 0) mtp_d = m.dense && m.has_mtp ? kDenseMtp : 0;
+    if (mtp_d < 0) mtp_d = m.dense && m.has_mtp ? (m.w4_mats > 0 ? 7 : kDenseMtp) : 0;   // (the pack: up to 7 on a run of accepted drafts)
     E.mtp_d = m.has_mtp ? mtp_d : 0;
     if (draft_vocab < 0 && std::getenv("STRATA_Q36_DRAFT_VOCAB") != nullptr) draft_vocab = std::atoi(std::getenv("STRATA_Q36_DRAFT_VOCAB"));
     E.draft_n = std::max(0, draft_vocab);
@@ -8082,6 +8097,7 @@ int strata::qwen35::run(int argc, char** argv) {
         int32_t picks[16];
         int nx = E.greedy();
         int dumped = 0;
+        int cli_cap = q36_draft_base(E.mtp_d);
         if (ff) {
             E.host_logits(lg);
             std::fwrite(lg.data(), 4, lg.size(), ff);
@@ -8092,8 +8108,9 @@ int strata::qwen35::run(int argc, char** argv) {
             if ((int) gen.size() >= n_gen) break;
             // (a verify window whose rows' chunk sizes differ: the case M3b's per-row chunking makes bitwise the decode steps)
             straddled += att_chunk_cells((int) E.pos + 1, E.n_chunk) != att_chunk_cells((int) E.pos + E.mtp_d + 1, E.n_chunk);
-            const int D = q36_depth_at(E.pos, E.mtp_d);
+            const int D = q36_depth_at(E.pos, std::min(E.mtp_d, cli_cap));
             const int a = E.spec_step(nx, fix, D, drafts, picks);
+            cli_cap = q36_next_cap(D, a, E.mtp_d);
             for (int i = 0; ff && i <= a && dumped < n_gen; ++i, ++dumped) {
                 E.host_logits_row(i, lg);
                 std::fwrite(lg.data(), 4, lg.size(), ff);
