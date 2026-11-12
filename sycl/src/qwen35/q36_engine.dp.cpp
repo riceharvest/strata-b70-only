@@ -3496,6 +3496,19 @@ struct Engine {
         pm = dalloc((size_t) att_rows * n_chunk);
         pl = dalloc((size_t) att_rows * n_chunk);
         {
+            const char* e = std::getenv("STRATA_Q36_W4A16");
+            // on for a batch engine (its windows are many rows); a single session: off unless STRATA_Q36_W4A16=1 - its usual 6
+            // rows gain nothing and the images cost 3 launches a layer (8 requests: 104.0 -> 100.3 tok/s; an edit's 16-row
+            // windows 287 -> 317)
+            w4a16 = m->w4_mats > 0 && (e ? e[0] == '1' : n_sess > 1);
+            if (w4a16) {
+                const size_t nh = strata::q36xr::w4h_act_halfs((int) std::max<int64_t>(g.n_embd, g.n_ff) + 255, 32);
+                xa16 = reinterpret_cast<uint16_t*>(dalloc(nh / 2 + 16));
+                xb16 = reinterpret_cast<uint16_t*>(dalloc(nh / 2 + 16));
+                std::fprintf(stderr, "strata-q36: the pack's decode-side products read FP16 activations (W4A16)\n");
+            }
+        }
+        {
             namespace xa = strata::q36xatt;
             // STRATA_Q36_XATT: 1 on, 0 off; unset: on with the int4 pack when what it needs fits beside the session's cache
             // with 2 GiB of VRAM to spare (a card near its limit stalls).  What it needs: with the 8-bit cache only V's
@@ -3697,7 +3710,38 @@ struct Engine {
     }
 
     /// y [T][n_out] = W x [T][n_in] on the native MMVQ, 8 columns per launch.
+    // W4A16 (q36_w4h.dp.cpp; STRATA_Q36_W4A16=0: off): a decode-side product of a pack matrix reads FP16 activations - the
+    // rows interleaved by 16 inputs - instead of the q8_1 image, at every row count (so a row's result does not depend on
+    // its window).  xa16: the image of the layer's input h; xb16: of an inner activation.
+    bool w4a16 = false;
+    uint16_t *xa16 = nullptr, *xb16 = nullptr;
+    bool a16(const Mat& w, int T) const { return w4a16 && w.type == kW4Type && T <= kGemmT; }
+    void pack16(const float* x, int n, int T, uint16_t* d) { strata::q36xr::w4h_pack(x, n, d, n, T, st); }
+    void mmh(const Mat& w, const uint16_t* x16v, float* out, int T) {
+        if (!strata::q36xr::mmvq_w4h(w.d, x16v, out, w.n_in, w.n_out, T, st)) {
+            std::fprintf(stderr, "strata-q36: a W4A16 product of %d x %d at %d columns was not taken\n", w.n_in, w.n_out, T);
+            std::exit(1);
+        }
+    }
+    /// W x for a matrix that reads the rows xf (their q8_1 image in q): the W4A16 form on xf's FP16 image (made once for
+    /// the matrices that share it: `packed`), else apply().
+    void apply2(const Mat& w, const void* q, const float* xf, bool& packed, float* out, int T) {
+        if (a16(w, T)) {
+            if (!packed) {
+                pack16(xf, w.n_in, T, xa16);
+                packed = true;
+            }
+            mmh(w, xa16, out, T);
+        } else {
+            apply(w, q, out, T);
+        }
+    }
     void mm(const Mat& w, const float* xin, float* out, int T) {
+        if (a16(w, T)) {
+            pack16(xin, w.n_in, T, xb16);
+            mmh(w, xb16, out, T);
+            return;
+        }
         prep(xin, w.n_in, T, q8);
         apply(w, q8, out, T);
     }
@@ -4529,12 +4573,20 @@ work-group size if needed.
     void dense_ffn(const Layer& L, int T, const float* wn, float* hout) {
         const int N = (int) m->g.n_embd, FF = (int) m->g.n_ff;
         if (T <= kGemmT) {
+            if (a16(L.ffn_gate, T) && a16(L.ffn_up, T) && a16(L.ffn_down, T)) {   // W4A16: h and silu(gate) * up as FP16 images
+                pack16(h, N, T, xa16);
+                mmh(L.ffn_gate, xa16, sg, T);
+                mmh(L.ffn_up, xa16, su, T);
+                strata::q36xr::w4h_swiglu_pack(sg, su, xb16, FF, T, st);
+                mmh(L.ffn_down, xb16, sy, T);
+            } else {
             if (!xq_post) quant(h, N, T, xq);
             mmq(L.ffn_gate, xq, sg, T);
             mmq(L.ffn_up, xq, su, T);
             if (T <= 8) K::native_swiglu_quantize_q8_1(sg, su, q8, FF, T, st);
             else K::native_swiglu_quantize_q8_1(sg, su, q8, FF * T, 1, st);   // (9+ columns: as one vector, the same blocks)
             mmq(L.ffn_down, q8, sy, T);
+            }
         } else {
             {
                 auto exp_props = sycl::ext::oneapi::experimental::properties{};
@@ -5033,8 +5085,9 @@ work-group size if needed.
             float* al_b = verify ? v_alpha[li] : alpha;
             float* be_b = verify ? v_beta[li] : beta;
             prep_in(T);
-            apply(L.qkv, xq, qkv_b, T);
-            apply(L.zg, xq, z, T);
+            bool pk16 = false;
+            apply2(L.qkv, xq, h, pk16, qkv_b, T);
+            apply2(L.zg, xq, h, pk16, z, T);
             static const bool ab2 = [] { const char* e = std::getenv("STRATA_Q36_GDN_AB2"); return !(e && e[0] == '0'); }();
             if (T <= kGemmT && !ab2) {   // (STRATA_Q36_GDN_AB2=0: the warp-an-output kernel)
                 const float *h_ct2 = h;
@@ -5269,13 +5322,14 @@ work-group size if needed.
                     });
                 }
             }
-            if (dec) apply(L.ssm_out, q8, y, T);   // (q8: gdn_y's q8_1 image, from k_gdn_norm_q8)
+            if (dec && !a16(L.ssm_out, T)) apply(L.ssm_out, q8, y, T);   // (q8: gdn_y's q8_1 image, from k_gdn_norm_q8)
             else mm(L.ssm_out, gdn_y, y, T);
         } else {
             prep_in(T);
-            apply(L.wq, xq, qg, T);
-            apply(L.wk, xq, kx, T);
-            apply(L.wv, xq, vx, T);
+            bool pk16 = false;
+            apply2(L.wq, xq, h, pk16, qg, T);
+            apply2(L.wk, xq, h, pk16, kx, T);
+            apply2(L.wv, xq, h, pk16, vx, T);
             if (kv_f32) attn_core<float>(li, L, T, p0, dpos, graph_mode);
             else if (kv_q8) attn_core<int8_t>(li, L, T, p0, dpos, graph_mode);
             else attn_core<sycl::half>(li, L, T, p0, dpos, graph_mode);
@@ -7758,6 +7812,9 @@ struct Serve {
     long long bt_n = 0;
     std::chrono::time_point<std::chrono::steady_clock> bt_end{};
     int bdepth_max = [] { const char* e = std::getenv("STRATA_Q36_BATCH_DEPTH"); return e && *e ? std::max(1, std::atoi(e)) : 15; }();
+    // the depth a slot falls back to after a miss (STRATA_Q36_BATCH_BASE, default 3: 4 requests 168.6 tok/s at 1, 182.2
+    // at 3; the one-request steps use 5)
+    int bdepth_base = [] { const char* e = std::getenv("STRATA_Q36_BATCH_BASE"); return e && *e ? std::max(1, std::atoi(e)) : 3; }();
     /// The rows a window can give to drafts, shared: want[i] cut down (the largest first, from the turn's slot on) until
     /// one row a slot plus the drafts fit.
     void fit_depths(std::vector<int>& want) {
@@ -7815,7 +7872,7 @@ struct Serve {
         std::vector<int> want((size_t) S, 0);
         for (int i = 0; i < S; ++i) {
             const Slot& sl = slots[(size_t) act[(size_t) i]];
-            if (!sl.smp.needs_logits()) want[(size_t) i] = std::max(1, std::min(sl.depth, maxd));
+            if (!sl.smp.needs_logits()) want[(size_t) i] = std::max(1, std::min(std::max(sl.depth, bdepth_base), maxd));
         }
         fit_depths(want);
         ++mtp_turn;
@@ -7881,7 +7938,7 @@ struct Serve {
                 ++a;
             sl.offered += D;
             sl.accepted += a;
-            if (D > 0) sl.depth = a >= D ? std::min(maxd, D + 1) : std::max(1, a + 1);
+            if (D > 0) sl.depth = a >= D ? std::min(maxd, D + (D < 8 ? 1 : 2)) : std::max(bdepth_base, a + 1);
             const int rows_kept = 1 + a;
             keep[(size_t) i] = rows_kept;
             bool done = false;
@@ -7935,7 +7992,7 @@ struct Serve {
             Slot& sl = slots[(size_t) b];
             if (!alive[(size_t) i]) { sl.drafts.clear(); continue; }
             nidx.push_back(i);
-            nwant.push_back(sl.smp.needs_logits() ? 0 : std::max(1, std::min(sl.depth, maxd)));
+            nwant.push_back(sl.smp.needs_logits() ? 0 : std::max(1, std::min(std::max(sl.depth, bdepth_base), maxd)));
         }
         std::fflush(stdout);
         fit_depths(nwant);

@@ -24,5 +24,14 @@ std::size_t w4_bytes(int n_in, int n_out);
 /// `weights`: the pack's records, 64-byte aligned.  false: not taken, nothing launched.
 bool mmvq_w4(const void* weights, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream);
 /// The pack as FP16 [n_out][n_in] (a prompt chunk's GEMM operand): n_out x n_in halves at `out`.
+/// The int4 pack against FP16 activations (W4A16, what vLLM runs): the weights as half floats (q - zero, exact), the
+/// DPAS of half floats (16 inputs an instruction), a row's scale once per 128 inputs.  No per-column float work per 32
+/// weights: a column more costs its share of a DPAS.  x16: the columns interleaved by 16 inputs, [n_in / 16][columns
+/// rounded up to 8][16] halfs (w4h_act_halfs of them).  1 .. 32 columns.
+std::size_t w4h_act_halfs(int n_in, int ncols);
+bool mmvq_w4h(const void* weights, const uint16_t* x16, float* y, int n_in, int n_out, int ncols, void* stream);
+/// x [ncols][n_in] floats (rows ldx apart) as x16; the FFN's silu(g) * u as x16.
+void w4h_pack(const float* x, int ldx, uint16_t* x16, int n_in, int ncols, void* stream);
+void w4h_swiglu_pack(const float* g, const float* u, uint16_t* x16, int n, int ncols, void* stream);
 void w4_dequant_f16(const void* weights, uint16_t* out, int n_in, int n_out, void* stream);
 }   // namespace strata::q36xr

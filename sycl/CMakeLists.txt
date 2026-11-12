@@ -669,7 +669,8 @@ if(STRATA_BUILD_Q36)
   # B70W4 (the int4 pack's kernels, q36_w4.dp.cpp) as a library of its own: a change there recompiles its kernels alone (the
   # executable's AOT link compiles about 1,500), and they take their own register-file size (STRATA_Q36_W4_GRF=128 at
   # configure time: without -doubleGRF).
-  add_library(q36_w4 SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4.dp.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xatt.dp.cpp)
+  add_library(q36_w4 SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4.dp.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xatt.dp.cpp
+              ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4h.dp.cpp)
   target_include_directories(q36_w4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35 ${CMAKE_CURRENT_SOURCE_DIR}/include)
   set_target_properties(q36_w4 PROPERTIES CXX_EXTENSIONS ON)
   if(STRATA_SYCL_AOT)
@@ -688,6 +689,7 @@ if(STRATA_BUILD_Q36)
   endif()
   # the attention kernels: a row's result must not depend on the window's size (a kernel per row count), so no fast-math
   set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xatt.dp.cpp PROPERTIES COMPILE_OPTIONS -fp-model=precise)
+  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4h.dp.cpp PROPERTIES COMPILE_OPTIONS -fp-model=precise)
   target_link_libraries(strata-q36 PRIVATE q36_w4)
   set_target_properties(strata-q36 PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
   target_include_directories(strata-q36 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35 ${STRATA_ROOT}/third_party/ggml)

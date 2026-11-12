@@ -564,6 +564,8 @@ int w4_bench(const char* ncols_s, const std::string& ssel) {
     const size_t xq_bytes = k::native_q8_1_bytes(maxin * maxc, 1) + 256;   // (the columns as one vector, as the engine quantizes them)
     void* xq = sycl::malloc_device(xq_bytes, q);
     uint16_t* df = sycl::malloc_device<uint16_t>((size_t) 17408 * 5120, q);   // the FP16 image of the largest matrix
+    namespace FB16 = strata::kernels;
+    uint16_t* dx16 = (uint16_t*) sycl::aligned_alloc_device(4096, strata::q36xr::w4h_act_halfs(maxin, maxc) * 2, q);
     if (!dpool || !y || !dx || !xq || !df) { std::printf("w4: could not allocate the buffers\n"); return 1; }
     std::mt19937 rng(4242);
     std::normal_distribution<float> nd(0.f, 1.f);
@@ -662,6 +664,58 @@ int w4_bench(const char* ncols_s, const std::string& ssel) {
             const double rel = std::sqrt(sd / std::max(ss, 1e-30));
             if (!(rel < 1e-4)) ++bad;
             std::printf("W4     %-6s %5d x %6d nc %d  %8.2f us %5.1f GB/s  rms diff / rms %.2e%s\n", sh.name, sh.n_in, sh.n_out, nc, us,
+                        wb / us / 1e3, rel, rel < 1e-4 ? "" : "  FAIL");
+            std::fflush(stdout);
+        }
+        // W4A16: the same matrices against FP16 activations (mmvq_w4h)
+        for (const int nc : ncl) {
+            if (nc < 1 || nc > maxc) continue;
+            const int ncp = (nc + 7) / 8 * 8;
+            std::vector<uint16_t> hx16(strata::q36xr::w4h_act_halfs(sh.n_in, nc), 0);
+            std::vector<double> xd((size_t) nc * sh.n_in);
+            for (int j = 0; j < nc; ++j)
+                for (int kx = 0; kx < sh.n_in; ++kx) {
+                    const uint16_t hb = FB16::f16_from_f32(hx[(size_t) j * sh.n_in + kx]);
+                    hx16[((size_t) (kx / 16) * ncp + j) * 16 + kx % 16] = hb;
+                    xd[(size_t) j * sh.n_in + kx] = (double) FB16::f32_from_f16(hb);
+                }
+            q.memcpy(dx16, hx16.data(), hx16.size() * 2).wait();
+            const double us = time_graph(q, nmat, [&](int m) {
+                if (!strata::q36xr::mmvq_w4h(dpool + (size_t) (m % ndist) * wdw, dx16, y, sh.n_in, sh.n_out, nc, &q))
+                    throw std::runtime_error("the W4A16 form declined a bench call");
+            }, wb > (100u << 20) ? 7 : 11);
+            q.wait();
+            std::vector<float> hy((size_t) nc * sh.n_out);
+            q.memcpy(hy.data(), y, hy.size() * 4).wait();
+            const uint32_t* base = hpool.data() + (size_t) ((nmat - 1) % ndist) * wdw;
+            double ss = 0, sd = 0;
+            for (int o = 0; o < sh.n_out; ++o) {
+                if (!(o < 32 || o >= sh.n_out - 16)) continue;
+                const int t = o / 16, i = o % 16;
+                for (int j = 0; j < nc; ++j) {
+                    double acc = 0;
+                    for (int c = 0; c < bpr; ++c) {
+                        const uint32_t* rec = base + ((size_t) t * bpr + c) * REC;
+                        for (int sb = 0; sb < 8; ++sb) {
+                            const int pr = sb >> 1, g = sb >> 2;
+                            const uint32_t meta = rec[512 + 16 * g + i];
+                            const double sc = (double) (float) sycl::bit_cast<sycl::half>((uint16_t) (meta & 0xffff));
+                            const int zero = (int) (meta >> 16);
+                            for (int l = 0; l < 32; ++l) {
+                                const uint32_t by = (rec[128 * pr + 16 * (l >> 2) + i] >> (8 * (l & 3))) & 0xff;
+                                const int qv = (sb & 1) ? (int) (by >> 4) : (int) (by & 15);
+                                acc += sc * (double) (qv - zero) * xd[(size_t) j * sh.n_in + c * 256 + sb * 32 + l];
+                            }
+                        }
+                    }
+                    const double got = hy[(size_t) j * sh.n_out + o];
+                    ss += acc * acc;
+                    sd += (got - acc) * (got - acc);
+                }
+            }
+            const double rel = std::sqrt(sd / std::max(ss, 1e-30));
+            if (!(rel < 1e-4)) ++bad;
+            std::printf("W4A16  %-6s %5d x %6d nc %d  %8.2f us %5.1f GB/s  rms diff / rms %.2e%s\n", sh.name, sh.n_in, sh.n_out, nc, us,
                         wb / us / 1e3, rel, rel < 1e-4 ? "" : "  FAIL");
             std::fflush(stdout);
         }
