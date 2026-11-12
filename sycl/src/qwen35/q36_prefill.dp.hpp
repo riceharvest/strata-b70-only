@@ -92,6 +92,7 @@ struct FaArgs {
     const sycl::half* k;   // the layer's K cache, [HKV][ctx][256] FP16
     const sycl::half* v;   // its V cache, same layout
     const int8_t* k8 = nullptr;   // the 8-bit cache instead (k / v unused): the layer's K codes [HKV][ctx][256], its FP16
+    int vt = 0;                   // > 0: the 8-bit cache's V is transposed (q36_xatt.hpp's v8t; the padded cell count)
     const int8_t* v8 = nullptr;   // scales [HKV][ctx][4] right after them (byte HKV * ctx * 256 of the allocation); V alike
     float* o;              // [T][H][256]: softmax(Q K^T / 16) V per row, causal (row t sees cells [0, p0 + t])
     int T = 0, p0 = 0, H = 0, HKV = 0, G = 0, ctx = 0, ntiles = 0;   // ntiles: of kFaTok tokens
@@ -150,9 +151,11 @@ __attribute__((always_inline)) inline uint32_t fa_h2(float x0, float x1) {
 // 16-byte load; a sub-group: 16 cells of one tile, 8 rows of 64 contiguous bytes stored).  Step x of V: tile x / 16, its
 // row (x % 16) / 2 (a cell pair), dims 8 (x % 2) + [0, 8) of the tile's 16 (two 8-byte loads; a sub-group: one whole
 // tile, 32 contiguous bytes a lane).
+// vt > 0: V transposed in blocks of 32 cells (a dimension's 32 cells side by side: byte ((cell / 32) * 256 + dim) * 32 +
+// cell % 32 of the KV head's part at vq) with one FP32 scale a cell (vsf): a cell's 8 values are 8 loads 32 bytes apart.
 __attribute__((always_inline)) inline void fa_stage_q8(int lid, int nwi, const int8_t* kq, const uint16_t* ksc,
                                                        const int8_t* vq, const uint16_t* vsc, int c0, uint32_t* kst,
-                                                       uint32_t* vst) {
+                                                       uint32_t* vst, int vt = 0, const float* vsf = nullptr) {
     constexpr int SPC = kFaHD / 64;   // scales per cell
     for (int x0 = lid; x0 < kFaStageItems; x0 += kFaStageU * nwi) {
         sycl::vec<int8_t, 16> kcode[kFaStageU];
@@ -169,10 +172,22 @@ __attribute__((always_inline)) inline void fa_stage_q8(int lid, int nwi, const i
                 const int tl = x / 16, l = x % 16;
                 const size_t vcell = (size_t) (c0 + (tl / kFaDT) * 16 + (l / 2) * 2);
                 const int vd = (tl % kFaDT) * 16 + (l % 2) * 8;
-                va[u] = *reinterpret_cast<const sycl::vec<int8_t, 8>*>(vq + vcell * kFaHD + vd);
-                vb[u] = *reinterpret_cast<const sycl::vec<int8_t, 8>*>(vq + (vcell + 1) * kFaHD + vd);
-                vsa[u] = (float) sycl::bit_cast<sycl::half>(vsc[vcell * SPC + vd / 64]);
-                vsb[u] = (float) sycl::bit_cast<sycl::half>(vsc[(vcell + 1) * SPC + vd / 64]);
+                if (vt > 0) {
+                    const int8_t* const pa = vq + ((vcell >> 5) * kFaHD + vd) * 32 + (vcell & 31);
+                    const int8_t* const pb2 = vq + (((vcell + 1) >> 5) * kFaHD + vd) * 32 + ((vcell + 1) & 31);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        va[u][j] = pa[j * 32];
+                        vb[u][j] = pb2[j * 32];
+                    }
+                    vsa[u] = vsf[vcell];
+                    vsb[u] = vsf[vcell + 1];
+                } else {
+                    va[u] = *reinterpret_cast<const sycl::vec<int8_t, 8>*>(vq + vcell * kFaHD + vd);
+                    vb[u] = *reinterpret_cast<const sycl::vec<int8_t, 8>*>(vq + (vcell + 1) * kFaHD + vd);
+                    vsa[u] = (float) sycl::bit_cast<sycl::half>(vsc[vcell * SPC + vd / 64]);
+                    vsb[u] = (float) sycl::bit_cast<sycl::half>(vsc[(vcell + 1) * SPC + vd / 64]);
+                }
             }
         }
 #pragma unroll
@@ -215,11 +230,13 @@ __attribute__((always_inline)) inline void fa_body(sycl::nd_item<3> it, const Fa
     const sycl::half* const vb = Q8 ? nullptr : a.v + (size_t) kvh * a.ctx * kFaHD;
     // the 8-bit cache: the KV head's codes and scales, the work-group's staging tiles
     const int8_t* const kq = Q8 ? a.k8 + (size_t) kvh * a.ctx * kFaHD : nullptr;
-    const int8_t* const vq = Q8 ? a.v8 + (size_t) kvh * a.ctx * kFaHD : nullptr;
+    const size_t vtb = (size_t) (a.vt / 32) * kFaHD * 32;   // bytes of a KV head's transposed V
+    const int8_t* const vq = !Q8 ? nullptr : a.vt > 0 ? a.v8 + (size_t) kvh * vtb : a.v8 + (size_t) kvh * a.ctx * kFaHD;
+    const float* const vsf = Q8 && a.vt > 0 ? reinterpret_cast<const float*>(a.v8 + (size_t) a.HKV * vtb) + (size_t) kvh * a.vt : nullptr;
     const uint16_t* const ksc =
         Q8 ? reinterpret_cast<const uint16_t*>(a.k8 + (size_t) a.HKV * a.ctx * kFaHD) + (size_t) kvh * a.ctx * (kFaHD / 64) : nullptr;
-    const uint16_t* const vsc =
-        Q8 ? reinterpret_cast<const uint16_t*>(a.v8 + (size_t) a.HKV * a.ctx * kFaHD) + (size_t) kvh * a.ctx * (kFaHD / 64) : nullptr;
+    const uint16_t* const vsc = Q8 && a.vt == 0
+        ? reinterpret_cast<const uint16_t*>(a.v8 + (size_t) a.HKV * a.ctx * kFaHD) + (size_t) kvh * a.ctx * (kFaHD / 64) : nullptr;
     const int nsg = a.G * kFaSlices;
     uint32_t* const kst = reinterpret_cast<uint32_t*>(smem + (size_t) nsg * kFaSgBytes);
     uint32_t* const vst = kst + kFaStageKBytes / 4;
@@ -242,7 +259,7 @@ __attribute__((always_inline)) inline void fa_body(sycl::nd_item<3> it, const Fa
         const int c0 = b * kFaBC;
         if constexpr (Q8) {   // the block's K^T and V into the staging tiles (every sub-group read the last block's)
             it.barrier(sycl::access::fence_space::local_space);
-            fa_stage_q8(lid, nwi, kq, ksc, vq, vsc, c0, kst, vst);
+            fa_stage_q8(lid, nwi, kq, ksc, vq, vsc, c0, kst, vst, a.vt, vsf);
             it.barrier(sycl::access::fence_space::local_space);
         }
         if (b >= nblk) continue;   // past the slice's cells (sub-group uniform; the staged kernel's next barrier follows)
@@ -399,11 +416,11 @@ inline void flash_prompt_attn(sycl::queue& q, const sycl::half* q16, const sycl:
 #endif
 }
 /// The same over the 8-bit cache (kc / vc: a layer's K / V allocation, codes then scales; flash_q8_ok).
-inline void flash_prompt_attn_q8(sycl::queue& q, const sycl::half* q16, const int8_t* kc, const int8_t* vc, float* out,
+inline void flash_prompt_attn_q8(sycl::queue& q, int vt, const sycl::half* q16, const int8_t* kc, const int8_t* vc, float* out,
                                  int T, int p0, int H, int HKV, int ctx) {
 #ifdef STRATA_XMX_SG16
     FaArgs a;
-    a.q = q16; a.k = nullptr; a.v = nullptr; a.k8 = kc; a.v8 = vc; a.o = out;
+    a.q = q16; a.k = nullptr; a.v = nullptr; a.k8 = kc; a.v8 = vc; a.o = out; a.vt = vt;
     a.T = T; a.p0 = p0; a.H = H; a.HKV = HKV; a.G = H / HKV; a.ctx = ctx;
     a.ntiles = (T + kFaTok - 1) / kFaTok;
     a.scale_log2 = 1.4426950408889634f / std::sqrt((float) kFaHD);
@@ -445,6 +462,7 @@ constexpr int kTlaSeg = 32768;   // cells of a segment (STRATA_Q36_TLA_SEG; at l
 
 /// The segment buffers (one set, every attention layer in turn).  seg: cells of a segment; T: the chunk's most queries.
 struct TlaBufs {
+    int vt = 0;                  // > 0: the 8-bit cache's V is transposed (the padded cell count)
     sycl::half* k16 = nullptr;   // [seg][HKV][256] FP16
     sycl::half* v16 = nullptr;   // [seg][HKV][256] FP16
     sycl::half* o16 = nullptr;   // [T][H][256]: a segment's output (normalised over its cells)
@@ -472,7 +490,7 @@ class q36_tla_merge_k;
 /// k16 / v16 [L][HKV][256] FP16: x' = fp16((float) code * scale), as fa_stage_q8.  A work-item: 16 values of one cell
 /// of one KV head, its K and its V.
 inline void tla_kv16(sycl::queue& q, const int8_t* kc, const int8_t* vc, sycl::half* k16, sycl::half* v16, int c0, int L,
-                     int HKV, int ctx) {
+                     int HKV, int ctx, int vt = 0) {   // (vt > 0: V transposed, a scale a cell - fa_stage_q8)
     constexpr int G = kFaHD / 16;   // 16-value groups of a cell
     const size_t n = (size_t) HKV * L * G;
     const size_t wg = 256;
@@ -487,9 +505,19 @@ inline void tla_kv16(sycl::queue& q, const int8_t* kc, const int8_t* vc, sycl::h
         const uint16_t* const ks = reinterpret_cast<const uint16_t*>(kc + (size_t) HKV * ctx * kFaHD);
         const uint16_t* const vs = reinterpret_cast<const uint16_t*>(vc + (size_t) HKV * ctx * kFaHD);
         const float sk = (float) sycl::bit_cast<sycl::half>(ks[sidx]);
-        const float sv = (float) sycl::bit_cast<sycl::half>(vs[sidx]);
+        float sv;
         const sycl::vec<int8_t, 16> a = *reinterpret_cast<const sycl::vec<int8_t, 16>*>(kc + cell * kFaHD + gi * 16);
-        const sycl::vec<int8_t, 16> b = *reinterpret_cast<const sycl::vec<int8_t, 16>*>(vc + cell * kFaHD + gi * 16);
+        sycl::vec<int8_t, 16> b;
+        if (vt > 0) {
+            const size_t cc = (size_t) (c0 + c), vtb = (size_t) (vt / 32) * kFaHD * 32;
+            const int8_t* const pv = vc + (size_t) h * vtb + ((cc >> 5) * kFaHD + (size_t) gi * 16) * 32 + (cc & 31);
+#pragma unroll
+            for (int j = 0; j < 16; ++j) b[j] = pv[j * 32];
+            sv = reinterpret_cast<const float*>(vc + (size_t) HKV * vtb)[(size_t) h * vt + cc];
+        } else {
+            sv = (float) sycl::bit_cast<sycl::half>(vs[sidx]);
+            b = *reinterpret_cast<const sycl::vec<int8_t, 16>*>(vc + cell * kFaHD + gi * 16);
+        }
         sycl::vec<sycl::half, 16> ka, va;
 #pragma unroll
         for (int j = 0; j < 16; ++j) {
@@ -556,7 +584,7 @@ inline void tla_prompt_attn_q8(sycl::queue& q, const TlaBufs& b, const sycl::hal
     f.scale = 1.0f / std::sqrt((float) kFaHD);
     const size_t n = (size_t) T * H * kFaHD;
     // the chunk's own segment, causal: straight into out
-    tla_kv16(q, kc, vc, b.k16, b.v16, K - Lc, Lc, HKV, ctx);
+    tla_kv16(q, kc, vc, b.k16, b.v16, K - Lc, Lc, HKV, ctx, b.vt);
     f.L = Lc; f.cu_k = cu + 2; f.lse = b.lse[0]; f.causal = true;
     q36tla::fmha(q, f);
     tla_h2f(q, b.o16, out, n);
@@ -565,7 +593,7 @@ inline void tla_prompt_attn_q8(sycl::queue& q, const TlaBufs& b, const sycl::hal
     float* nxt = b.lse[2];
     for (int s0 = 0; s0 < nrest; s0 += seg) {
         const int L = std::min(seg, nrest - s0);
-        tla_kv16(q, kc, vc, b.k16, b.v16, s0, L, HKV, ctx);
+        tla_kv16(q, kc, vc, b.k16, b.v16, s0, L, HKV, ctx, b.vt);
         f.L = L; f.cu_k = L == seg ? cu + 4 : cu + 6; f.lse = b.lse[1]; f.causal = false;
         q36tla::fmha(q, f);
         tla_h2f(q, b.o16, b.of, n);

@@ -863,6 +863,10 @@ struct RowSel {
     const int32_t* delta = nullptr;  // device [T]
     void* const* kc = nullptr;       // device [n_sessions]: this layer's K / V base of each session (KvIO's element type)
     void* const* vc = nullptr;
+    // > 0: the 8-bit cache's V is transposed (the engine's kv_vt; the value: its padded cell count).  The V part of a
+    // layer is then q36_xatt.hpp's v8t - [HKV][cells / 32][256 dims][32 cells] codes - and after it [HKV][cells] FP32
+    // scales, one a cell: what the matrix-engine decode attention reads, with no second copy.
+    int32_t vt = 0;
 };
 
 /// The K / V cache's element type: FP16 by default up to a context of 131072 (llama.cpp's f16 cache: half the bytes of
@@ -1080,7 +1084,20 @@ auto &sh =
                 if ((i & 63) == 0) reinterpret_cast<uint16_t*>(base + nall)[cell * (HD / 64) + i / 64] = sb;
             };
             put(kc, v, mk);
-            put(vc, x, mv);
+            if (rs.vt > 0) {   // V transposed, one scale a cell
+                const float mva = sycl::reduce_over_group(item_ct1.get_group(), sycl::fabs(x), sycl::maximum<float>());
+                const float sv = mva / 127.0f;
+                int qv = 0;
+                if (sv > 0.0f) {
+                    qv = sycl::vec<float, 1>{x / sv}.convert<int, sycl::rounding_mode::rte>()[0];
+                    qv = qv < -127 ? -127 : (qv > 127 ? 127 : qv);
+                }
+                const size_t vtb = (size_t) (rs.vt / 32) * HD * 32;   // bytes of a KV head's codes
+                reinterpret_cast<int8_t*>(vc)[(size_t) kh * vtb + ((size_t) (pos / 32) * HD + i) * 32 + pos % 32] = (int8_t) qv;
+                if (i == 0) reinterpret_cast<float*>(reinterpret_cast<int8_t*>(vc) + (size_t) HKV * vtb)[(size_t) kh * rs.vt + pos] = sv;
+            } else {
+                put(vc, x, mv);
+            }
         } else {
             KvIO<KV>::st(kc + ((size_t) kh * ctx + pos) * HD + i, v);
             KvIO<KV>::st(vc + ((size_t) kh * ctx + pos) * HD + i, vx[((size_t) t * HKV + kh) * HD + i]);
@@ -1322,6 +1339,11 @@ void k_attn_gqa(const float* q, const KV* kc, const KV* vc, const int32_t* pos0,
         ksb = reinterpret_cast<const uint16_t*>(kc + (size_t) HKV * ctx * HD) + (size_t) kvh * ctx * NS;
         vsb = reinterpret_cast<const uint16_t*>(vc + (size_t) HKV * ctx * HD) + (size_t) kvh * ctx * NS;
     }
+    // (the 8-bit cache with V transposed, RowSel::vt: this KV head's codes and its cells' scales)
+    const int vt = rs.vt;
+    const size_t vtb = (size_t) (vt / 32) * HD * 32;
+    const int8_t* const v8t = reinterpret_cast<const int8_t*>(vc) + (size_t) kvh * vtb;
+    const float* const vsf = reinterpret_cast<const float*>(reinterpret_cast<const int8_t*>(vc) + (size_t) HKV * vtb) + (size_t) kvh * vt;
     for (int x = tid; x < R * HD; x += NT) {
         const int r = x / HD, d = x % HD;
         float v = 0.f;
@@ -1445,16 +1467,30 @@ void k_attn_gqa(const float* q, const KV* kc, const KV* vc, const int32_t* pos0,
                     for (int k = 0; k < DPT; ++k) acc[r][k] = sycl::fma(pr, v[k], acc[r][k]);
                 }
         };
+        // (transposed V: a cell's DPT values are 32 bytes apart)
+        const auto vt_ld = [&](int p, float* o) {
+            const float sc = vsf[p];
+            const int8_t* const b = v8t + ((size_t) (p >> 5) * HD + d0) * 32 + (p & 31);
+#pragma unroll
+            for (int k = 0; k < DPT; ++k) o[k] = (float) b[k * 32] * sc;
+        };
         int cc = vcg;
         for (; cc + 3 * NCG < nb; cc += 4 * NCG) {
             const KV* vp = vb + (size_t) (pb + cc) * HD + d0;
             float v0[DPT], v1[DPT], v2[DPT], v3[DPT];
             if constexpr (Q8) {
+                if (vt > 0) {
+                    vt_ld(pb + cc, v0);
+                    vt_ld(pb + cc + NCG, v1);
+                    vt_ld(pb + cc + 2 * NCG, v2);
+                    vt_ld(pb + cc + 3 * NCG, v3);
+                } else {
                 const uint16_t* vs = vsb + (size_t) (pb + cc) * NS + d0 / 64;
                 KvIO<KV>::template ld<DPT>(vp, vs[0], v0);
                 KvIO<KV>::template ld<DPT>(vp + (size_t) NCG * HD, vs[(size_t) NCG * NS], v1);
                 KvIO<KV>::template ld<DPT>(vp + (size_t) 2 * NCG * HD, vs[(size_t) 2 * NCG * NS], v2);
                 KvIO<KV>::template ld<DPT>(vp + (size_t) 3 * NCG * HD, vs[(size_t) 3 * NCG * NS], v3);
+                }
             } else {
                 KvIO<KV>::template ld<DPT>(vp, v0);
                 KvIO<KV>::template ld<DPT>(vp + (size_t) NCG * HD, v1);
@@ -1468,9 +1504,10 @@ void k_attn_gqa(const float* q, const KV* kc, const KV* vc, const int32_t* pos0,
         }
         for (; cc < nb; cc += NCG) {
             float v0[DPT];
-            if constexpr (Q8)
-                KvIO<KV>::template ld<DPT>(vb + (size_t) (pb + cc) * HD + d0, vsb[(size_t) (pb + cc) * NS + d0 / 64], v0);
-            else
+            if constexpr (Q8) {
+                if (vt > 0) vt_ld(pb + cc, v0);
+                else KvIO<KV>::template ld<DPT>(vb + (size_t) (pb + cc) * HD + d0, vsb[(size_t) (pb + cc) * NS + d0 / 64], v0);
+            } else
                 KvIO<KV>::template ld<DPT>(vb + (size_t) (pb + cc) * HD + d0, v0);
             fold(cc, v0);
         }
@@ -2992,6 +3029,12 @@ struct Engine {
     int64_t xmir_n = 0;
     int32_t* xpos_d = nullptr;
     bool xatt_kq8 = false;   // the cache is 8-bit: the scores read its K (a scale per 64 values), no K copy
+    // The 8-bit cache's V stored transposed (RowSel::vt) when the matrix-engine attention will read it: then that
+    // attention needs no copy at all (STRATA_Q36_KV_VT=0: V cell by cell and a transposed copy beside it, 4.3 GiB at
+    // 262,144 cells).  Its other readers take the layout: k_attn_prep (the store), k_attn_gqa, the prompt path's
+    // staging (flash_prompt_attn_q8) and dequantize (tla_kv16).
+    bool kv_vt = false;
+    int vt_ctxp = 0;
     int xls_max = 6;         // the row sets of 16 a call's scratch holds
     /// The drafts a lookup step may offer: every row of its window must fit the matrix-engine attention's scratch.
     int lookup_depth() const {
@@ -3163,6 +3206,11 @@ struct Engine {
       std::exit(1);
     }
 
+    void* kv_alloc_v(size_t n) const {   // a layer's V: as kv_alloc, or transposed (kv_vt: the codes, then a scale a cell)
+        if (!kv_vt) return kv_alloc(n);
+        const int hkv = (int) m->g.n_head_kv;
+        return (void*) dalloc_t<int8_t>(strata::q36xatt::v8t_dwords(hkv, vt_ctxp) * 4 + (size_t) hkv * vt_ctxp * 4);
+    }
     void* kv_alloc(size_t n) const {   // n cache elements of the cache's type (int8: the codes, then their scales; zeroed)
         if (kv_q8) return (void*) dalloc_t<int8_t>(q36_kv_alloc_bytes(n));
         return kv_f32 ? (void*) dalloc(n) : (void*) dalloc_t<sycl::half>(n);
@@ -3175,7 +3223,7 @@ struct Engine {
                 ss.conv.push_back(nullptr);
                 ss.S.push_back(nullptr);
                 ss.kc.push_back(kv_alloc((size_t) g.n_head_kv * ctx * g.head_dim));
-                ss.vc.push_back(kv_alloc((size_t) g.n_head_kv * ctx * g.head_dim));
+                ss.vc.push_back(kv_alloc_v((size_t) g.n_head_kv * ctx * g.head_dim));
             } else {
                 ss.conv.push_back(dalloc(C * (g.ssm_d_conv - 1)));
                 ss.S.push_back(dalloc((size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size));
@@ -3187,7 +3235,7 @@ struct Engine {
             ss.conv.push_back(nullptr);
             ss.S.push_back(nullptr);
             ss.kc.push_back(kv_alloc((size_t) g.n_head_kv * ctx * g.head_dim));
-            ss.vc.push_back(kv_alloc((size_t) g.n_head_kv * ctx * g.head_dim));
+            ss.vc.push_back(kv_alloc_v((size_t) g.n_head_kv * ctx * g.head_dim));
         }
         ss.hlast = dalloc((size_t) g.n_embd);
     }
@@ -3243,6 +3291,14 @@ struct Engine {
             std::exit(1);
         }
         n_sess = std::max(1, std::min(n_sessions, kVerify));
+        {
+            const char* xe = std::getenv("STRATA_Q36_XATT");
+            const char* ve = std::getenv("STRATA_Q36_KV_VT");
+            const bool xw = xe ? xe[0] == '1' : model.w4_mats > 0;
+            kv_vt = kv_q8 && xw && n_sess == 1 && !(ve && ve[0] == '0') && (int) model.g.head_dim == strata::q36xatt::kHD &&
+                    (int) model.g.n_head == strata::q36xatt::kG * (int) model.g.n_head_kv;
+            vt_ctxp = kv_vt ? strata::q36xatt::ctx_pad(ctx) : 0;
+        }
         vision = vision_;
         tmax = std::max(tmax_, kVerify);
         const auto& g = m->g;
@@ -3297,6 +3353,7 @@ struct Engine {
                 pattn_tla = q36pf::tla_shape_ok((int) g.n_head, (int) g.n_head_kv, (int) g.head_dim, seg, (int) T);
                 if (pattn_tla) {
                     const size_t HKV_ = (size_t) g.n_head_kv, H_ = (size_t) g.n_head, HD_ = (size_t) g.head_dim;
+                    tla.vt = kv_vt ? vt_ctxp : 0;
                     tla.seg = seg; tla.T = (int) T; tla.H = (int) H_; tla.HKV = (int) HKV_;
                     tla.k16 = dalloc_t<sycl::half>((size_t) seg * HKV_ * HD_);
                     tla.v16 = dalloc_t<sycl::half>((size_t) seg * HKV_ * HD_);
@@ -3455,8 +3512,8 @@ struct Engine {
                 xctxp = xa::ctx_pad(ctx);
                 xcapc = xa::chunk_cap(ctx, n_chunk);
                 xatt_kq8 = kv_q8;
-                const size_t per_layer = ((xatt_kq8 ? 0 : xa::k8_dwords(hkv, xctxp) + xa::sc_floats(hkv, xctxp)) + xa::v8t_dwords(hkv, xctxp) +
-                                          xa::sc_floats(hkv, xctxp)) * 4;
+                const size_t per_layer = kv_vt ? 0 : ((xatt_kq8 ? 0 : xa::k8_dwords(hkv, xctxp) + xa::sc_floats(hkv, xctxp)) +
+                                                      xa::v8t_dwords(hkv, xctxp) + xa::sc_floats(hkv, xctxp)) * 4;
                 const double per = kv_q8 ? 1.04 : (kv_f32 ? 4.0 : 2.0);   // the cache's bytes a value
                 const size_t cache = (size_t) ((double) nl * 2.0 * hkv * (double) ctx * g.head_dim * per);
                 size_t vfr = 0, vtot = 0;
@@ -3484,8 +3541,10 @@ struct Engine {
                                 xk8[li] = reinterpret_cast<uint32_t*>(dalloc(xa::k8_dwords(hkv, xctxp)));
                                 xks[li] = dalloc(xa::sc_floats(hkv, xctxp));
                             }
-                            xv8t[li] = reinterpret_cast<uint32_t*>(dalloc(xa::v8t_dwords(hkv, xctxp)));
-                            xvs[li] = dalloc(xa::sc_floats(hkv, xctxp));
+                            if (!kv_vt) {
+                                xv8t[li] = reinterpret_cast<uint32_t*>(dalloc(xa::v8t_dwords(hkv, xctxp)));
+                                xvs[li] = dalloc(xa::sc_floats(hkv, xctxp));
+                            }
                         }
                     xqb = reinterpret_cast<uint32_t*>(dalloc(xa::qb_dwords(hkv)));
                     xqs = dalloc(xa::qs_floats(hkv));
@@ -3495,7 +3554,7 @@ struct Engine {
                     xpos_d = reinterpret_cast<int32_t*>(dalloc(4));
                     xatt_ready = true;
                     std::fprintf(stderr, "strata-q36: decode attention on the matrix engine from %d cells on (%s, transposed int8 V; windows of up "
-                                         "to %d tokens): %.2f GiB of VRAM\n", xatt_min, xatt_kq8 ? "the 8-bit cache's K" : "int8 K", ls * 16 / xa::kG,
+                                         "to %d tokens): %.2f GiB of VRAM\n", xatt_min, kv_vt ? "the 8-bit cache as it is: its K" : xatt_kq8 ? "the 8-bit cache's K" : "int8 K", ls * 16 / xa::kG,
                                  (double) (nl * per_layer + scratch) / 1073741824.0);
                 }
             }
@@ -4551,7 +4610,7 @@ work-group size if needed.
     }
     /// Before a window that reads the mirror: the cells it does not hold yet, up to the window's position.
     void xatt_catch_up() {
-        if (xmir_n >= pos) { xmir_n = INT64_MAX / 4; return; }
+        if (kv_vt || xmir_n >= pos) { xmir_n = INT64_MAX / 4; return; }
         const int32_t a = (int32_t) std::max<int64_t>(0, xmir_n);
         const int n = (int) (pos - a);
         st->memcpy(xpos_d, &a, 4).wait();
@@ -4576,6 +4635,7 @@ work-group size if needed.
             rs.kc = reinterpret_cast<void* const*>(d_kc_tab + li * n_sess);
             rs.vc = reinterpret_cast<void* const*>(d_vc_tab + li * n_sess);
         }
+        rs.vt = kv_vt ? vt_ctxp : 0;
         KV* const kcl = static_cast<KV*>(kc[li]);
         KV* const vcl = static_cast<KV*>(vc[li]);
         {
@@ -4611,9 +4671,11 @@ work-group size if needed.
                     });
             });
         }
-        const bool xmir = xatt_ready && xatt_now && !rows_mode && li < xv8t.size() && xv8t[li] != nullptr;
-        if (xmir) xmirror<KV>(li, T, dpos);   // the stored cells into the layer's mirror
-        else if (xatt_ready) xmir_n = std::min<int64_t>(xmir_n, p0);   // (cells written past the mirror)
+        // (the layer has what the matrix-engine attention reads: the cache itself with V transposed, else its mirror)
+        const bool xlay = xatt_ready && !rows_mode && (kv_vt || (li < xv8t.size() && xv8t[li] != nullptr));
+        const bool xmir = xlay && xatt_now;
+        if (xmir && !kv_vt) xmirror<KV>(li, T, dpos);   // the stored cells into the layer's mirror
+        else if (xatt_ready && !kv_vt) xmir_n = std::min<int64_t>(xmir_n, p0);   // (cells written past the mirror)
         if (T > kGemmT) {
             // M4b: the flash kernel (q36_prefill.dp.hpp) on the FP16 cache unless STRATA_Q36_PATTN=gemm or the shape is not
             // its: q -> q16 below, then flash_prompt_attn instead of the slices, then the gate as before.  The 8-bit cache
@@ -4699,7 +4761,7 @@ work-group size if needed.
                         q36pf::tla_prompt_attn_q8(*st, tla, q16, kcl, vcl, att, T, (int) p0, H, HKV, ctx);
                     else
 #endif
-                        q36pf::flash_prompt_attn_q8(*st, q16, kcl, vcl, att, T, (int) p0, H, HKV, ctx);
+                        q36pf::flash_prompt_attn_q8(*st, kv_vt ? vt_ctxp : 0, q16, kcl, vcl, att, T, (int) p0, H, HKV, ctx);
                 }
             } else
             for (int t0 = 0; t0 < T; t0 += tq) {
@@ -4864,7 +4926,14 @@ work-group size if needed.
                     xc.ks = xks[li];
                 }
                 xc.max_ls = xls_max;
-                xc.v8t = xv8t[li]; xc.vs = xvs[li]; xc.ctxp = xctxp;
+                if (kv_vt) {   // V is the cache's
+                    xc.v8t = reinterpret_cast<const uint32_t*>(vcl);
+                    xc.vs = reinterpret_cast<const float*>(reinterpret_cast<const int8_t*>(vcl) + strata::q36xatt::v8t_dwords(HKV, xctxp) * 4);
+                } else {
+                    xc.v8t = xv8t[li];
+                    xc.vs = xvs[li];
+                }
+                xc.ctxp = xctxp;
                 xc.qb = xqb; xc.qs = xqs; xc.sc = xsc; xc.pb = xpb; xc.srow = xsrow; xc.capc = xcapc;
                 xc.pacc = pa; xc.pm = pmx; xc.pl = psum;
                 xdone = strata::q36xatt::attend(xc, st);
