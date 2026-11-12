@@ -39,6 +39,7 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "q36_mmvq_dense.hpp"
+#include "q36_xr_dense.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -442,7 +443,8 @@ int bench(const char* types_s, const char* ncols_s, const std::string& ssel) {
     std::vector<float> hx((size_t) maxc * 17408);
     float* dx = sycl::malloc_device<float>(hx.size(), q);
     void* xq = sycl::malloc_device(xq_bytes, q);
-    if (!dpool || !y || !dx || !xq) {
+    void* xact = sycl::malloc_device(strata::q36xr::act_bytes(17408) + 256, q);   // the XMX form's activation block
+    if (!dpool || !y || !dx || !xq || !xact) {
         std::printf("bench: could not allocate the buffers (weight pool %.0f MiB): stopping before any launch\n", POOL / 1048576.0);
         return 1;
     }
@@ -484,6 +486,31 @@ int bench(const char* types_s, const char* ncols_s, const std::string& ssel) {
                         call(mode != 0, t, dpool + (size_t) (m % ndist) * slot, xq, y, sh.n_in, sh.n_out, nc, &q);
                     }, wb > (100u << 20) ? 7 : 11);
                 };
+                if (std::getenv("STRATA_BENCH_XR") && strata::q36xr::handles(t)) {   // the XMX form against KREG: us, GB/s, the outputs' distance
+                    const bool xr_q81 = true;   // the form reads the q8_1 image itself
+                    const double uk = timed(1);
+                    q.wait();
+                    std::vector<float> hk((size_t) nc * sh.n_out), hx_((size_t) nc * sh.n_out);
+                    q.memcpy(hk.data(), y, hk.size() * 4).wait();
+                    strata::q36xr::quantize(dx, sh.n_in, nc, xact, &q);
+                    q.wait();
+                    const double ux = time_graph(q, nmat, [&](int m) {
+                        if (!strata::q36xr::mmvq(t, dpool + (size_t) (m % ndist) * slot, xr_q81 ? xq : xact, y, sh.n_in, sh.n_out, nc, &q, xr_q81))
+                            throw std::runtime_error("the XMX form declined a bench call");
+                    }, wb > (100u << 20) ? 7 : 11);
+                    q.wait();
+                    q.memcpy(hx_.data(), y, hx_.size() * 4).wait();
+                    double ss = 0, sd = 0, md = 0;
+                    for (size_t i = 0; i < hk.size(); ++i) {
+                        const double dlt = (double) hx_[i] - hk[i];
+                        ss += (double) hk[i] * hk[i]; sd += dlt * dlt; md = std::max(md, std::fabs(dlt));
+                    }
+                    std::printf("%-6s %-6s %5d x %6d nc %d  kreg %8.2f us %5.1f GB/s  xr %8.2f us %5.1f GB/s  x%.2f  rms diff / rms %.2e\n",
+                                f->name, sh.name, sh.n_in, sh.n_out, nc, uk, wb / uk / 1e3, ux, wb / ux / 1e3, uk / ux,
+                                std::sqrt(sd / std::max(ss, 1e-30)));
+                    std::fflush(stdout);
+                    continue;
+                }
                 if (std::getenv("STRATA_BENCH_KREG_ONLY")) {   // (M2) KREG alone: us, GB/s, and us per column
                     const double u = timed(1);
                     std::printf("%-6s %-6s %5d x %6d nc %d  kreg %8.2f us %5.1f GB/s  %7.2f us/col\n", f->name, sh.name,

@@ -663,8 +663,13 @@ struct KregRG { int r, g; };
 // columns 147 us at R 2 / 128, 146 at R 8 / 256).
 template <typename F, int NCOLS>
 KregRG kreg_default_rg(int n_in) {
-    if constexpr (std::is_same_v<F, KregIQ4XS>) return NCOLS == 1 ? KregRG{8, 128} : NCOLS <= 6 ? KregRG{4, 128} : KregRG{2, 128};
+    // (2026-11-12, B70, 5120 x 10240, us at 5 / 6 columns: IQ4_XS R 4 / 128 69.5 / 78.7, R 2 / 128 70.3 / 70.8; Q3_K R 8 / 256
+    // 138.4 / 141.7, R 4 / 128 103.7 / 115.8, R 2 / 128 105.7 / 108.5; IQ4_NL R 8 / 256 78.8 / 80.9, R 2 / 128 71.8 / 75.4)
+    if constexpr (std::is_same_v<F, KregIQ4XS>) return NCOLS == 1 ? KregRG{8, 128} : NCOLS <= 5 ? KregRG{4, 128} : KregRG{2, 128};
     else if constexpr (std::is_same_v<F, KregQ6K>) return NCOLS <= 3 ? KregRG{4, 128} : KregRG{2, 128};
+    else if constexpr (std::is_same_v<F, KregQ3K> && NCOLS == 5) return {4, 128};
+    else if constexpr (std::is_same_v<F, KregQ3K> && NCOLS == 6) return {2, 128};
+    else if constexpr (std::is_same_v<F, KregIQ4NL> && (NCOLS == 5 || NCOLS == 6)) return {2, 128};
     else {
         if constexpr (NCOLS == 1) return {4, 128};
         else if constexpr (NCOLS == 2) return n_in <= 4096 ? KregRG{8, 256} : KregRG{4, 128};
