@@ -19,7 +19,8 @@ void quantize(const float* x, int n_in, int ncols, void* act, void* stream);
 bool mmvq(int ggml_type, const void* weights, const void* act, float* y, int n_in, int n_out, int ncols, void* stream, bool q81 = false);
 /// B70W4 (tools/qwen35/b70w4_pack.py): the bytes of a packed n_out x n_in matrix (n_in a multiple of 256, n_out of 16).
 std::size_t w4_bytes(int n_in, int n_out);
-/// y[col * n_out + row] = W4 weights . the q8_1 image `xq` (with 28 readable bytes after its last block) for 1-8 columns.
+/// y[col * n_out + row] = W4 weights . the q8_1 image `xq` (with 28 readable bytes after its last block) for 1-32 columns
+/// (one read of the weights at any count; the columns run as groups of 8).
 /// `weights`: the pack's records, 64-byte aligned.  false: not taken, nothing launched.
 bool mmvq_w4(const void* weights, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream);
 /// The pack as FP16 [n_out][n_in] (a prompt chunk's GEMM operand): n_out x n_in halves at `out`.

@@ -556,11 +556,11 @@ int w4_bench(const char* ncols_s, const std::string& ssel) {
             }
     }
     uint32_t* dpool = (uint32_t*) sycl::aligned_alloc_device(4096, POOL_DW * 4, q);
-    const int maxc = 8, maxout = 17408, maxin = 17408;
+    const int maxc = 32, maxout = 17408, maxin = 17408;
     float* y = sycl::malloc_device<float>((size_t) maxc * maxout, q);
     std::vector<float> hx((size_t) maxc * maxin);
     float* dx = sycl::malloc_device<float>(hx.size(), q);
-    const size_t xq_bytes = k::native_q8_1_bytes(maxin, maxc) + 256;
+    const size_t xq_bytes = k::native_q8_1_bytes(maxin * maxc, 1) + 256;   // (the columns as one vector, as the engine quantizes them)
     void* xq = sycl::malloc_device(xq_bytes, q);
     uint16_t* df = sycl::malloc_device<uint16_t>((size_t) 17408 * 5120, q);   // the FP16 image of the largest matrix
     if (!dpool || !y || !dx || !xq || !df) { std::printf("w4: could not allocate the buffers\n"); return 1; }
@@ -612,7 +612,7 @@ int w4_bench(const char* ncols_s, const std::string& ssel) {
         }
         for (const int nc : ncl) {
             if (nc < 1 || nc > maxc) continue;
-            k::native_quantize_q8_1(dx, xq, sh.n_in, nc, &q);
+            k::native_quantize_q8_1(dx, xq, sh.n_in * nc, 1, &q);
             q.wait();
             const double us = time_graph(q, nmat, [&](int m) {
                 if (!strata::q36xr::mmvq_w4(dpool + (size_t) (m % ndist) * wdw, xq, y, sh.n_in, sh.n_out, nc, &q))
@@ -620,7 +620,7 @@ int w4_bench(const char* ncols_s, const std::string& ssel) {
             }, wb > (100u << 20) ? 7 : 11);
             q.wait();
             std::vector<float> hy((size_t) nc * sh.n_out);
-            std::vector<uint8_t> hq(k::native_q8_1_bytes(sh.n_in, nc));
+            std::vector<uint8_t> hq(k::native_q8_1_bytes(sh.n_in * nc, 1));
             q.memcpy(hy.data(), y, hy.size() * 4).wait();
             q.memcpy(hq.data(), xq, hq.size()).wait();
             const uint32_t* base = hpool.data() + (size_t) ((nmat - 1) % ndist) * wdw;
