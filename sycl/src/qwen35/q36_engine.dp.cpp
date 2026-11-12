@@ -180,6 +180,246 @@ inline int q36_next_cap(int offered, int accepted, int mtp_d) {
     if (accepted >= offered) return std::min(mtp_d, offered + (offered < 8 ? 1 : 2));
     return std::min(mtp_d, std::max(q36_draft_base(mtp_d), accepted + 1));
 }
+// Lookup drafts (STRATA_Q36_NGRAM=0: off; STRATA_Q36_NGRAM_LOG=1: a line an event).  A draft the host can guess costs no
+// draft call, and a window row more costs a column of each product.  When the model is copying - the tokens it just
+// produced are the tokens that followed an earlier place of the conversation (prompt or answer) - the next step's drafts
+// are the tokens that follow there, up to the window's depth, and the MTP block drafts nothing that step (it still reads
+// the rows, so its own cache stays whole).  The verify window decides as for any draft: the text is the plain text.
+//   - A match alone is not enough: on new text a three-token match is right about one time in thirty (short_code.py: 8
+//     of 270 lookup drafts accepted, 122 -> 107 tok/s when every match was tried).  A copy starts only after
+//     kLookupProof tokens of an MTP step were the place's continuation.
+//   - A running copy keeps a cursor in its source and walks it in order.  (Finding the place again each step by its last
+//     three tokens jumps to the latest line that looks the same: a test file's `res = server.make_request(`.)
+//   - A copy that breaks (the model wrote another token than the source's) takes one MTP step, then lines up what the
+//     model wrote with the source after the break: up to 4 tokens written for up to 3 of the source's.  One source token
+//     that became 1-4 others is remembered and written that way in later drafts (an edit that renames a name everywhere);
+//     a remembered replacement the model does not make twice is forgotten.
+//   - A lookup step offers 8 drafts at first and the full depth after a fully accepted one.
+constexpr int kLookupProof = 5;
+inline bool q36_ngram() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_Q36_NGRAM"); return !(e && e[0] == '0'); }();
+    return v;
+}
+// STRATA_Q36_NGRAM_WARM=1: a lookup step's graphs (8 drafts and the full depth, every redo count) are recorded at load.
+// Off: each is recorded at its first use (about 60 ms, once).  Recorded at load they made every other request about 1.8%
+// slower (prose after 25K 51.4 -> 50.5 tok/s with no lookup step in it; why is not known), so the default is off.
+inline bool q36_ngram_warm() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_Q36_NGRAM_WARM"); return e && e[0] == '1'; }();
+    return v;
+}
+inline bool q36_ngram_log() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_Q36_NGRAM_LOG"); return e && e[0] == '1'; }();
+    return v;
+}
+struct Lookup {
+    struct Pos { int32_t i = -1; int off = 0; };     // the source token t[i]; `off` tokens of its replacement are written
+    std::vector<int32_t> t;                          // the conversation's tokens, as the session holds them
+    std::unordered_map<uint64_t, int32_t> last;      // (a, b, c) -> the index after its latest occurrence
+    std::unordered_map<int32_t, std::vector<int32_t>> subst;   // a source token -> what the model writes for it
+    std::unordered_map<int32_t, int> bad;            // ... and how often it did not
+    int32_t place = -1;                              // no copy: where this step's last three tokens stand earlier (t[place ..] followed)
+    Pos cur;                                         // a copy: the source's token for the one after x (i < 0: no copy)
+    std::vector<Pos> pos;                            // this step's drafts: the source position of each, and the one after them
+    int32_t mend = -1, near = -1;                    // a broken copy: the source token not written; where a dropped copy stood
+    std::vector<int32_t> wrote;                      // ... and what the model wrote from there
+    int depth = 8;                                   // the drafts the next lookup step offers
+    int32_t want = -1;                               // the tokens the session holds after the last step, if it went as told
+    static uint64_t key(int32_t a, int32_t b, int32_t c) {
+        return ((uint64_t) (uint32_t) a * 0x9E3779B97F4A7C15ull) ^ ((uint64_t) (uint32_t) b * 0xC2B2AE3D27D4EB4Full) ^ ((uint64_t) (uint32_t) c << 21);
+    }
+    void push(int32_t tok) {
+        t.push_back(tok);
+        const size_t n = t.size();
+        if (n >= 3) last[key(t[n - 3], t[n - 2], t[n - 1])] = (int32_t) n;
+    }
+    void idle() {
+        cur = Pos{};
+        mend = -1;
+        wrote.clear();
+        pos.clear();
+    }
+    /// The session's tokens grew (or are another conversation's): take the new ones.
+    void sync(const std::vector<int32_t>& live) {
+        const size_t n = t.size();
+        if (live.size() < n || (n > 0 && live[n - 1] != t[n - 1])) {
+            t.clear();
+            last.clear();
+            subst.clear();
+            bad.clear();
+            idle();
+            place = near = -1;
+            depth = 8;
+        }
+        for (size_t i = t.size(); i < live.size(); ++i) push(live[i]);
+    }
+    const std::vector<int32_t>* rep(int32_t tok) const {
+        const auto it = subst.find(tok);
+        return it == subst.end() ? nullptr : &it->second;
+    }
+    int32_t at(Pos p) const {
+        const auto* r = rep(t[(size_t) p.i]);
+        return r != nullptr && p.off < (int) r->size() ? (*r)[(size_t) p.off] : t[(size_t) p.i];
+    }
+    void step(Pos& p) const {
+        const auto* r = rep(t[(size_t) p.i]);
+        if (r != nullptr && p.off + 1 < (int) r->size()) { ++p.off; return; }
+        ++p.i;
+        p.off = 0;
+    }
+    /// How many of g[gi ..] are the source's tokens from `p` on (`p` moves past them).
+    int walk(const std::vector<int32_t>& g, size_t gi, Pos& p) const {
+        int m = 0;
+        const int32_t n = (int32_t) t.size();
+        while (gi < g.size() && p.i < n && at(p) == g[gi]) { step(p); ++gi; ++m; }
+        return m;
+    }
+    /// The drafts after `x` (the decided next token, not yet in t): up to `maxn` tokens; none unless a copy runs.
+    void propose(int32_t x, int maxn, std::vector<int32_t>& out) {
+        out.clear();
+        pos.clear();
+        place = -1;
+        const int32_t n = (int32_t) t.size();
+        if (!q36_ngram() || maxn <= 0 || n < 3) { idle(); return; }
+        if ((cur.i >= 0 || mend >= 0) && n != want) idle();   // (tokens came in another way: a step without drafts)
+        if (cur.i >= 0) {
+            Pos p = cur;
+            const int cap = std::min(maxn, depth);
+            while ((int) out.size() < cap && p.i < n) { out.push_back(at(p)); pos.push_back(p); step(p); }
+            pos.push_back(p);
+            if (out.empty()) { near = cur.i; idle(); }
+            return;
+        }
+        if (mend >= 0) return;   // (an MTP step: observe() lines the copy up again)
+        const int32_t a = t[(size_t) n - 2], b = t[(size_t) n - 1];
+        if (near >= 0)           // a dropped copy: the place closest after where it stood
+            for (int32_t j = std::max(3, near - 8); j < std::min(n, near + 96); ++j)
+                if (t[(size_t) j - 1] == x && t[(size_t) j - 2] == b && t[(size_t) j - 3] == a) { place = j; break; }
+        if (place < 0)
+            if (auto it = last.find(key(a, b, x)); it != last.end()) {
+                const int32_t e = it->second;   // t[e - 1] is that occurrence's last token (x's twin), t[e ..] what followed
+                if (e >= 3 && e < n && t[(size_t) e - 1] == x && t[(size_t) e - 2] == b && t[(size_t) e - 3] == a) place = e;
+            }
+    }
+    /// `j` tokens were written for `s` of the source's at `m`: one source token that became others is remembered.
+    void learn(int32_t m, int j, int s) {
+        const int32_t st = t[(size_t) m];
+        if (q36_ngram_log()) std::fprintf(stderr, "lookup: lined up at %d: %d written for %d (tok %d)\n", m, j, s, st);
+        if (s != 1 || j < 1) return;
+        if (j == 1 && wrote[0] == st) {                // the model wrote the source's token: the replacement did not hold
+            if (++bad[st] >= 2) subst.erase(st);
+            return;
+        }
+        subst[st].assign(wrote.begin(), wrote.begin() + j);
+        bad[st] = 0;
+    }
+    /// The copy broke at source token `mend`; `wrote` holds the model's tokens from there.  Line them up with the source:
+    /// the smallest change after which the rest of `wrote` is the source's.  When the rest breaks again further on (the
+    /// same name twice in a few tokens), the part that stood is taken and the rest lined up from the second break.
+    bool align(int level = 0) {
+        const int32_t n = (int32_t) t.size(), m = mend;
+        const int g = (int) wrote.size();
+        int bj = -1, bs = -1, bm = 0;
+        for (int sum = 0; sum <= 7; ++sum)
+            for (int j = 0; j <= std::min(4, sum); ++j) {   // j tokens written for s of the source's
+                const int s = sum - j;
+                if (s > 3 || g - j < 2 || m + s >= n) continue;
+                // one token that became others: the rest is walked with that replacement (`global server`, a line break,
+                // `server` again: the second one is two tokens on)
+                const int32_t st = t[(size_t) m];
+                const bool trial = s == 1 && j >= 1 && !(j == 1 && wrote[0] == st);
+                std::vector<int32_t> old;
+                bool had = false;
+                if (trial) {
+                    if (const auto it = subst.find(st); it != subst.end()) { had = true; old = it->second; }
+                    subst[st].assign(wrote.begin(), wrote.begin() + j);
+                }
+                Pos p{m + s, 0};
+                const int mm = walk(wrote, (size_t) j, p);
+                if (j + mm == g) {
+                    learn(m, j, s);
+                    idle();
+                    cur = p;
+                    depth = 8;
+                    return true;
+                }
+                if (trial) {
+                    if (had) subst[st] = old;
+                    else subst.erase(st);
+                }
+                if (mm >= 3 && mm > bm) { bm = mm; bj = j; bs = s; }
+            }
+        if (bj < 0 || level >= 3) return false;
+        learn(m, bj, bs);
+        Pos p{m + bs, 0};
+        const int mm = walk(wrote, (size_t) bj, p);   // (again: what was just learned may carry it further)
+        if (bj + mm == g) {
+            idle();
+            cur = p;
+            depth = 8;
+            return true;
+        }
+        if (p.i >= n) return false;
+        wrote.erase(wrote.begin(), wrote.begin() + bj + mm);
+        if (p.off > 0)
+            if (const auto* r = rep(t[(size_t) p.i]); r != nullptr)
+                wrote.insert(wrote.begin(), r->begin(), r->begin() + std::min<size_t>((size_t) p.off, r->size()));
+        mend = p.i;
+        return align(level + 1);
+    }
+    void broke(Pos p, int32_t next, int a, int d) {
+        if (q36_ngram_log()) std::fprintf(stderr, "lookup: break at %d.%d after %d of %d: source %d, model %d\n", p.i, p.off, a, d,
+                                          p.i < (int32_t) t.size() ? t[(size_t) p.i] : -1, next);
+        idle();
+        if (p.i >= (int32_t) t.size()) { near = p.i; return; }
+        mend = p.i;
+        if (const auto* r = rep(t[(size_t) p.i]); r != nullptr) {
+            wrote.assign(r->begin(), r->begin() + std::min<size_t>((size_t) p.off, r->size()));   // (the part of the replacement that stood)
+        }
+        wrote.push_back(next);
+    }
+    /// An MTP step's outcome (its `a` accepted drafts, then `next`).
+    void observe(const std::vector<int32_t>& drafts, int a, int32_t next) {
+        want = (int32_t) t.size() + 1 + a;
+        if (cur.i >= 0) { near = cur.i; idle(); return; }   // (a copy whose drafts the step did not take)
+        if (mend >= 0) {   // a broken copy: does what the model wrote meet the source again?
+            wrote.insert(wrote.end(), drafts.begin(), drafts.begin() + a);
+            wrote.push_back(next);
+            if (!align() && wrote.size() > 14) {
+                if (q36_ngram_log()) std::fprintf(stderr, "lookup: copy dropped at %d\n", mend);
+                near = mend;
+                idle();
+            }
+            return;
+        }
+        if (place < 0) return;
+        std::vector<int32_t> g(drafts.begin(), drafts.begin() + a);   // a copy starts when these are the place's continuation
+        g.push_back(next);
+        Pos p{place, 0};
+        const int m = walk(g, 0, p);
+        if (m < kLookupProof) return;
+        if (q36_ngram_log()) std::fprintf(stderr, "lookup: copy from %d (%d of %d)\n", place, m, (int) g.size());
+        if (m == (int) g.size()) { idle(); cur = p; depth = 8; return; }
+        idle();
+        if (p.i >= (int32_t) t.size()) return;
+        mend = p.i;
+        wrote.assign(g.begin() + m, g.end());
+        align();
+    }
+    /// A lookup step's outcome: `a` of the proposal's `d` drafts stood, `next` is the token after them.
+    void result(int a, int d, int32_t next) {
+        want = (int32_t) t.size() + 1 + a;
+        if (cur.i < 0 || (int) pos.size() != d + 1) { idle(); return; }
+        Pos p = pos[(size_t) a];
+        if (a >= d && p.i < (int32_t) t.size() && at(p) == next) {
+            step(p);
+            cur = p;
+            depth = 15;
+            return;
+        }
+        depth = 8;
+        broke(p, next, a, d);
+    }
+};
 // The XMX rows forms (STRATA_Q36_XR=0: off) (q36_xr_dense.dp.cpp: Q4_K, Q5_K, IQ4_XS; 1-8 columns for the price of one) take the
 // dense model's products before the KREG forms; they read the same q8_1 image.
 inline bool q36_xr_on() {
@@ -3123,7 +3363,7 @@ struct Engine {
         the migrated code and was removed or replaced with 0. You may need to
         check the migrated code.
         */
-        CK(DPCT_CHECK_ERROR(hpin = sycl::malloc_host<int32_t>(256, q_ct1)));   // ([64..] a window's picks, [96..] its tokens, [128..] its drafts)
+        CK(DPCT_CHECK_ERROR(hpin = sycl::malloc_host<int32_t>(256, q_ct1)));   // ([64..] a window's picks, [96..] its tokens, [128..] its drafts, [160..] given drafts)
         // the rows' attention partials (T <= kGemmT rows take it): k_attn_gqa's chunks per row (STRATA_Q36_ATT_CHUNKS,
         // 8 .. kAttMaxChunks; 96 measured best on the B70 - k_attn_gqa + merge per layer at depth 2K / 12K: 32 48.5 /
         // 155.2 us, 64 42.0 / 178.6, 96 40.6 / 153.9, 128 41.8 / 159.4), or with STRATA_Q36_ATTN_HEAD k_attn_part's
@@ -6490,8 +6730,9 @@ work-group size if needed.
             CK(DPCT_CHECK_ERROR(st->memcpy(hlast, hmain + (size_t) (n_keep - 1) * N, (size_t) N * 4)));
         });
     }
+    /// `given` (D tokens): the step's drafts are these (a lookup's), the MTP block reads its rows and drafts nothing.
     int spec_step_g(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
-                    const std::atomic<bool>* cancel, const SpecSel* sel = nullptr) {
+                    const std::atomic<bool>* cancel, const SpecSel* sel = nullptr, const std::vector<int32_t>* given = nullptr) {
         const int N = (int) m->g.n_embd;
         const int T0 = (int) fix.size() + 1, T = D + 1;
         CK(DPCT_CHECK_ERROR(st->wait()));
@@ -6511,7 +6752,15 @@ work-group size if needed.
             sp_h[0] = sel->M;
             CK(DPCT_CHECK_ERROR(st->memcpy(sp_m, sp_h, 4)));
         }
+        if (given != nullptr) {   // the window's tokens after x, from the host
+            for (int d = 0; d < D; ++d) hpin[160 + d] = (*given)[(size_t) d];
+            CK(DPCT_CHECK_ERROR(st->memcpy(tok + 1, hpin + 160, (size_t) D * 4)));
+        }
         rows_deferred = true;
+        const auto body_given = [&] {
+            forward_mtp(T0, pos - (int64_t) fix.size(), seeds, false, true);   // (its cache takes the rows; no draft head)
+            forward(T, pos, T, true, true);
+        };
         const auto body = [&] {
             forward_mtp(T0, pos - (int64_t) fix.size(), seeds, true, true);
             int last_row = T0 - 1;
@@ -6531,7 +6780,10 @@ work-group size if needed.
             }
             forward(T, pos, T, true, true);
         };
-        if (sel == nullptr) run_graph_key(50000 + T0 * 16 + D, body);   // (greedy: the graph as before)
+        if (given != nullptr) {
+            if (sel == nullptr) run_graph_key(80000 + T0 * 16 + D, body_given);
+            else run_graph_key(90000 + T0 * 16 + D, [&] { body_given(); sp_topm(T); });
+        } else if (sel == nullptr) run_graph_key(50000 + T0 * 16 + D, body);   // (greedy: the graph as before)
         else run_graph_key(70000 + T0 * 16 + D, [&] { body(); sp_topm(T); });
         rows_deferred = false;
         if (sel == nullptr) CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 64, pick, (size_t) T * 4)));
@@ -6556,11 +6808,13 @@ work-group size if needed.
         after_rows(a + 1);
         return a;
     }
+    /// Whether a step may take its drafts from the host (spec_step's `given`): the graph form of the window.
+    bool given_ok(int D) const { return D >= 1 && D + 1 <= kGemmT && spec_graphs() && !main_hybrid; }
     int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
-                  const std::atomic<bool>* cancel = nullptr, const SpecSel* sel = nullptr) {
+                  const std::atomic<bool>* cancel = nullptr, const SpecSel* sel = nullptr, const std::vector<int32_t>* given = nullptr) {
         const int N = (int) m->g.n_embd;
         if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
-        if (D >= 1 && D + 1 <= kGemmT && spec_graphs()) return spec_step_g(x_tok, fix, D, drafts, picks, cancel, sel);   // (T0 <= kGemmT: no host position in a grid; a sel only with sp_window_ok())
+        if (D >= 1 && D + 1 <= kGemmT && spec_graphs()) return spec_step_g(x_tok, fix, D, drafts, picks, cancel, sel, given);   // (T0 <= kGemmT: no host position in a grid; a sel only with sp_window_ok())
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
         CK(DPCT_CHECK_ERROR(st->wait()));
         // rows of the first MTP call: (hmain row i, fix[i]) at positions pos - fix.size() + i, then (hlast, x) at pos
@@ -6746,6 +7000,15 @@ work-group size if needed.
                     for (int f = 0; f <= mtp_d && pos + (int64_t) 2 * (mtp_d + 2) < ctx; ++f) {
                         fix.assign((size_t) f, filler);
                         spec_step(filler, fix, D, drafts, picks);
+                    }
+                // a lookup step's graphs (its drafts come from the host): 8 drafts and the full depth, every redo count
+                if (q36_ngram() && q36_ngram_warm())
+                    for (const int D : {std::min(8, mtp_d), mtp_d}) {
+                        const std::vector<int32_t> gv((size_t) D, filler);
+                        for (int f = 0; f <= mtp_d && given_ok(D) && pos + (int64_t) 2 * (mtp_d + 2) < ctx; ++f) {
+                            fix.assign((size_t) f, filler);
+                            spec_step(filler, fix, D, drafts, picks, nullptr, nullptr, &gv);
+                        }
                     }
                 for (int n = 1; n <= mtp_d + 1; ++n) commit_graph(n);
             }
@@ -7177,6 +7440,7 @@ struct Slot {
 /// control lines.
 struct Serve {
     Engine& E;
+    std::unordered_map<int, Lookup> looks;   // a session's lookup table (q36_ngram)
     std::mutex mu;
     std::condition_variable cv;
     std::deque<std::string> lines;
@@ -7612,6 +7876,9 @@ struct Serve {
         const auto d0 = Clock::now();
         long long produced = 0, offered = 0, accepted = 0;
         int depth_cap = q36_draft_base(E.mtp_d);   // (the next step's drafts: q36_next_cap)
+        std::vector<int32_t> given;                // a lookup's drafts
+        long long looked = 0, look_ok = 0;
+        Lookup& look = looks[s];
         const char* finish = "length";
         // greedy requests alone with the MTP block: speculative steps of mtp_d drafts (verified, so the text is the greedy
         // text); requests beside others, one token at a time.  A request that the device argmax cannot serve (a penalty, a
@@ -7687,9 +7954,21 @@ struct Serve {
             if (!emit(nx)) break;
             if (n_active > 0) window();
             if (spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
-                const int D = q36_depth_at(E.pos, std::min(E.mtp_d, depth_cap));
-                const int a = E.spec_step(nx, fix, D, drafts, picks, &stop, plan.ok ? &sel : nullptr);
-                depth_cap = q36_next_cap(D, a, E.mtp_d);
+                int D = 0, a = 0;
+                look.sync(ss.live);
+                look.propose(nx, E.mtp_d, given);   // (every row of a copy stands: the full depth at any context length)
+                if (!given.empty() && E.given_ok((int) given.size())) {   // a lookup step: the drafts cost no draft call
+                    D = (int) given.size();
+                    a = E.spec_step(nx, fix, D, drafts, picks, &stop, plan.ok ? &sel : nullptr, &given);
+                    look.result(a, D, picks[a]);
+                    looked += D;
+                    look_ok += a;
+                } else {
+                    D = q36_depth_at(E.pos, std::min(E.mtp_d, depth_cap));
+                    a = E.spec_step(nx, fix, D, drafts, picks, &stop, plan.ok ? &sel : nullptr);
+                    depth_cap = q36_next_cap(D, a, E.mtp_d);
+                    look.observe(drafts, a, picks[a]);
+                }
                 offered += D;
                 accepted += a;
                 // the state now holds x and every accepted draft, whether or not the answer ends inside them (an end of
@@ -7720,9 +7999,9 @@ struct Serve {
                     decode_ms, finish, accepted, offered, reuse, (long long) fresh);
         std::fflush(stdout);
         std::fprintf(stderr, "strata serve: session %d: prompt %zu tokens = %zu reused + %lld read in %.0f ms (%.1f tok/s), "
-                     "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld (%s)\n", s, ids.size(), reuse,
+                     "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld, of them lookups %lld of %lld (%s)\n", s, ids.size(), reuse,
                      (long long) fresh, prompt_ms, prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, produced,
-                     decode_ms, decode_ms > 0 ? 1000.0 * (double) produced / decode_ms : 0.0, accepted, offered, finish);
+                     decode_ms, decode_ms > 0 ? 1000.0 * (double) produced / decode_ms : 0.0, accepted, offered, look_ok, looked, finish);
     }
 
     int run() {
