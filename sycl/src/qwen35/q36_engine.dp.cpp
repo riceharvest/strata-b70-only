@@ -33,6 +33,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "q36_mmvq_dense.hpp"
+#include "q36_xr_dense.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -89,7 +90,14 @@ namespace K = strata::kernels;
 // The 27B's decode forms (q36_mmvq_dense.dp.cpp, built into this binary only) take the dense model's products; every other
 // call, and any that they decline, is the shared native_mmvq's.
 bool g_q36_dense_forms = false;
+// STRATA_Q36_XR=1: the XMX rows forms (q36_xr_dense.dp.cpp: Q4_K, Q5_K, IQ4_XS; 1-8 columns for the price of one) take the
+// dense model's products before the KREG forms; they read the same q8_1 image.
+inline bool q36_xr_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_XR"); return e && e[0] == '1'; }();
+    return on;
+}
 inline void q36_mmvq(int type, const void* w, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream) {
+    if (g_q36_dense_forms && q36_xr_on() && strata::q36xr::mmvq(type, w, xq, y, n_in, n_out, ncols, stream, true)) return;
     if (g_q36_dense_forms && strata::q36dense::mmvq(type, w, xq, y, n_in, n_out, ncols, stream)) return;
     K::native_mmvq(type, w, xq, y, n_in, n_out, ncols, stream);
 }
@@ -2820,10 +2828,12 @@ struct Engine {
         sgate = dalloc(T); ewts = dalloc(T * Kp); logits = dalloc((size_t) kVerify * g.n_vocab);
         const int max_in = (int) std::max<int64_t>({2 * g.n_embd, g.ssm_value_dim, g.n_head * g.head_dim, g.n_ff_shexp,
                                                     m->dense ? g.n_ff : 0});
+        // (+ 64 bytes: the XMX forms load a q8_1 block as 16 dwords, 28 bytes past the last block's end)
         CK(DPCT_CHECK_ERROR(q8 = (void *)sycl::malloc_device(
-                                K::native_q8_1_bytes(max_in, 1) * T, q_ct1)));
+                                K::native_q8_1_bytes(max_in, 1) * T + 64, q_ct1)));
         CK(DPCT_CHECK_ERROR(xq = (void *)sycl::malloc_device(
-                                K::native_q8_1_bytes((int)N, 1) * T, q_ct1)));
+                                K::native_q8_1_bytes((int)N, 1) * T + 64, q_ct1)));
+        if (m->dense && q36_xr_on()) strata::q36xr::init(&q_ct1);   // its table, before any graph is recorded
         x16 = dalloc_t<sycl::half>(T * (size_t)max_in);
         if (DPCT_CHECK_ERROR(blas = new dpct::blas::descriptor()) != 0 ||
             DPCT_CHECK_ERROR((blas)->set_queue(st)) != 0) {

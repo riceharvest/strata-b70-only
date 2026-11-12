@@ -656,6 +656,7 @@ if(STRATA_BUILD_Q36)
   add_executable(strata-q36
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_engine.dp.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense.dp.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xr_dense.dp.cpp
     ${STRATA_ROOT}/src/qwen35/q36_main.cpp
     ${STRATA_ROOT}/src/qwen35/q36_requant.cpp)
   target_compile_definitions(strata-q36 PRIVATE STRATA_Q36_PORT=1 STRATA_Q36_BUILD=1)
@@ -704,7 +705,8 @@ if(STRATA_BUILD_Q36)
   # the 27B's decode forms against a float64 reference and against native_mmvq on the card (PARITY=ON; docs/Q36.md)
   if(STRATA_SYCL_PARITY)
     add_executable(q36_mmvq_dense_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense_parity.cpp
-                   ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense.dp.cpp)
+                   ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense.dp.cpp
+                   ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xr_dense.dp.cpp)
     target_include_directories(q36_mmvq_dense_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
     target_link_libraries(q36_mmvq_dense_parity PRIVATE strata_kernels)
     add_test(NAME q36_mmvq_dense_parity COMMAND q36_mmvq_dense_parity --selftest)
