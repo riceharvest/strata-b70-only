@@ -22,7 +22,7 @@ issue tracker: upstream has no B70 and cannot reproduce it.
 | Model | Status on one B70 |
 | --- | --- |
 | [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), Unsloth's [UD-IQ1_S](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (the file set this fork serves, setup's choice on one B70 with 64 GB of RAM) | Usable at 128K-256K context, chats and coding agents included. The numbers under [Speed](#speed) were measured on the earlier IQ2_XS file ([ISTA-DASLab GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)); the UD-IQ1_S ones are in [docs/B70.md](docs/B70.md) |
-| [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) (dense), Unsloth's [UD-Q4_K_M and UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF), on a second engine, `strata-q36` (optional, off by default: `Q36=ON`) | **Experimental: ahead of llama.cpp for this model, not yet level with vLLM.** A request as a client sends it (sampled, thinking on) answers at about 82 tok/s, a greedy one at 67-86; llama.cpp's best runs on this card are 44-48 tok/s and vLLM 88-110. The whole model is in VRAM. It fits 262,144 tokens of context on the one card (8-bit K/V cache) and reads a 118K-token prompt at 1,097 tok/s. With a GPTQ int4 checkpoint packed for the card (`--w4`, the weights vLLM serves): 121 and 85 tok/s on the two greedy test prompts (vLLM on this card with that checkpoint: 110 and 88), a whole-file edit at 287, prose after a 25K-token prompt at 67, the answer after a 118K-token prompt at 49 (256K context); code generation (114) and several requests at once (182 tok/s over 4) are behind the fastest vLLM setups. Measured 2026-11-12. [docs/Q36.md](docs/Q36.md) |
+| [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) (dense), Unsloth's [UD-Q4_K_M and UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF), as a second model family of the same `strata` binary (`Q36=OFF` leaves it out) | **Experimental: ahead of llama.cpp for this model, not yet level with vLLM.** A request as a client sends it (sampled, thinking on) answers at about 82 tok/s, a greedy one at 67-86; llama.cpp's best runs on this card are 44-48 tok/s and vLLM 88-110. The whole model is in VRAM. It fits 262,144 tokens of context on the one card (8-bit K/V cache) and reads a 118K-token prompt at 1,097 tok/s. With a GPTQ int4 checkpoint packed for the card (`--w4`, the weights vLLM serves): 121 and 85 tok/s on the two greedy test prompts (vLLM on this card with that checkpoint: 110 and 88), a whole-file edit at 287, prose after a 25K-token prompt at 67, the answer after a 118K-token prompt at 49 (256K context); code generation (114) and several requests at once (182 tok/s over 4) are behind the fastest vLLM setups. Measured 2026-11-12. [docs/Q36.md](docs/Q36.md) |
 
 ## What counts as usable here
 
@@ -128,6 +128,10 @@ PCIe 4.0 x16 slot. Treat them as a floor; on a newer platform expect more, but n
            -e BUILD_DIR=/work/$H/build-sycl-aot strata-sycl-dev "cd /work/$H && bash sycl/tools/build.sh strata"
 
    The build ends with `BUILD EXIT 0` and `errors: 0`.
+   That one `strata` binary serves two model families and picks the engine from the GGUF's architecture at start: Flash-Next
+   (the served setup below) and the dense Qwen3.8-27B ([docs/Q36.md](docs/Q36.md): its serve configs, its long-prompt attention
+   library, `Q36=OFF` for a Flash-Next-only build). The 27B's session, conversation cache and scheduler are still its own; only
+   the binary, the entry, the serve protocol, the kernel libraries and the build are shared.
    The image pins the device compiler (IGC 2.41.5, ocloc 26.35.39758.10): a newer one made answers 3-5% slower (docs/B70.md, "Build and run").
 
 3. Set up the model and serve it:

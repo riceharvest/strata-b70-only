@@ -1166,8 +1166,8 @@ pins the workers to exactly these logical processors, in this order. Use it to l
 or test a layout. The list is numbers, ranges and `first-last:step` (`0,2,4,6`, `2-14:2`), as Task Manager and `lscpu` show them.
 The worker count is the length of the list; `--pool-workers N` takes the first N entries. Nothing is refused. The engine warns
 when two entries are the hardware threads of one core, when an entry is the host thread's processor, and when one is not a
-processor the process may use (it is left out). The option moves threads only and never changes a result. The Qwen3.6 engine
-(`strata-q36`) keeps its own `--pool-workers` and default placement.
+processor the process may use (it is left out). The option moves threads only and never changes a result. The dense Qwen3.8-27B
+family (docs/Q36.md) keeps its own `--pool-workers` and default placement.
 
 ### Other threads (`--aux-cpus`, Linux, off by default)
 

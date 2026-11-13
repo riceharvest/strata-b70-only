@@ -1,12 +1,12 @@
-"""serve/test_q36_dense.py - the dense Qwen3.8-27B on strata-q36 (arch qwen35), no engine and no GPU: what the server
+"""serve/test_q36_dense.py - the dense Qwen3.8-27B on strata (family qwen35, the dense engine), no engine and no GPU: what the server
 hands the engine and what it reads back.
 
-  * the example configs (tools/qwen35/serve-27b*.json) name the SYCL launcher and strata-q36, give the family's API name,
+  * the example configs (tools/qwen35/serve-27b*.json) name the SYCL launcher and the one strata binary, give the family's API name,
     and carry placeholders, not paths of any machine;
-  * engine_args() passes the config's arguments through (strata-q36 reads --native, --max-context and --mtp);
-  * every sampling key the server puts on a GEN line is `key=value` (strata-q36's request parser takes the leading
+  * engine_args() passes the config's arguments through (the dense engine reads --native, --max-context and --mtp);
+  * every sampling key the server puts on a GEN line is `key=value` (the dense engine's request parser takes the leading
     `key=value` words and stops at the first word without a `=`: the prompt's ids);
-  * a DONE line in strata-q36's form (figures after the finish reason, no expert tiers) is read by the server.
+  * a DONE line in the dense engine's form (figures after the finish reason, no expert tiers) is read by the server.
 
     python -m unittest serve.test_q36_dense
 """
@@ -41,14 +41,15 @@ class ExampleConfigs(unittest.TestCase):
     def test_there_are_examples(self):
         self.assertEqual([p.name for p in CONFIGS], ["serve-27b-128k.json", "serve-27b-256k.json", "serve-27b.json"])
 
-    def test_each_one_serves_the_27b_on_strata_q36(self):
+    def test_each_one_serves_the_27b_on_the_one_strata_binary(self):
         for path in CONFIGS:
             cfg = json.loads(path.read_text(encoding="utf-8"))
             with self.subTest(path.name):
                 self.assertEqual(cfg["arch"], "qwen35")
                 self.assertEqual(default_model_name(cfg), "qwen3.8-27b")
                 self.assertEqual(cfg["exe"], "sycl/serve/strata-sycl.sh")
-                self.assertEqual(cfg["env"]["STRATA_SYCL_BIN"], "build-sycl-aot/strata-q36")
+                # one binary for both families: the launcher's default (build-sycl-aot/strata); the family switch reads the GGUF
+                self.assertNotIn("STRATA_SYCL_BIN", cfg["env"])
                 # the launcher removes a container of this name before it starts one: not the default name that the
                 # Flash-Next server's container has
                 self.assertNotIn(cfg["env"]["STRATA_SYCL_NAME"], ("", "strata-sycl-serve"))
@@ -99,7 +100,7 @@ class Sampling(unittest.TestCase):
 
 
 class GreedyKeepsDrafting(unittest.TestCase):
-    """strata-q36 drafts only for a greedy request with no penalty.  The instruct set (thinking off) carries presence_penalty
+    """The dense engine drafts only for a greedy request with no penalty.  The instruct set (thinking off) carries presence_penalty
     1.5: a request that asked for temperature 0 got `penalty_present=1.5` on its GEN line, the engine then read the logits on
     the host one token at a time and offered no draft (a 118K prompt answered at 21.5 tok/s, "drafts accepted 0 of 0")."""
 
@@ -152,7 +153,7 @@ class GreedyKeepsDrafting(unittest.TestCase):
 
 
 class Done(unittest.TestCase):
-    def test_strata_q36_done_line(self):
+    def test_dense_engine_done_line(self):
         # q36_engine.dp.cpp: "DONE <produced> <prompt tokens> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts
         # offered> <reused> 0 0 0 0 0.0 <prompt tokens read> 0"
         e = SimpleNamespace()

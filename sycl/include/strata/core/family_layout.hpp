@@ -63,7 +63,7 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
     num("ssm.inner_size", g.ssm_value_dim);
     num("full_attention_interval", g.qsa_interval);
     g.head_dim = key_length;
-#if defined(STRATA_Q36_BUILD)   // the dense qwen35 family (Qwen3.8-27B): only strata-q36 is compiled with this
+#if defined(STRATA_Q36_BUILD)   // the dense qwen35 family (Qwen3.8-27B): in every target of a build with the family (Q36=ON, the default)
     const bool dense = family == strata::ModelFamily::Qwen35;   // a dense SwiGLU FFN, no experts
     if (dense) {
         g.n_expert = 0;

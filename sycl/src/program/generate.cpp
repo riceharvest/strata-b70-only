@@ -127,6 +127,10 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #if defined(STRATA_HAVE_QWEN35)
 #include "strata/qwen35/engine.hpp"
 #endif
+#if defined(STRATA_Q36_BUILD)   // the dense qwen35 family (Qwen3.8-27B) is part of this binary (docs/Q36.md)
+#include "strata/qwen35/dispatch.hpp"
+#include "strata/qwen35/engine.hpp"
+#endif
 #if defined(_WIN32)
 #include <windows.h>
 #include <psapi.h>
@@ -3294,6 +3298,13 @@ static bool prepare_gated_window(strata::core::gated::Packet& packet,
 }
 
 int main(int argc, char **argv) try {
+#if defined(STRATA_Q36_BUILD)
+    // **THE FAMILY SWITCH, first.**  A dense Qwen3.8-27B file (GGUF architecture qwen35) runs on its own driver (sycl/src/qwen35),
+    // decided from the header of the file --native / --model names before anything of Flash-Next's engine exists: no stdout
+    // mode change, no environment change, no B70 defaults, so the dense family starts as its own binary started.  Every other
+    // file goes on below exactly as without the dense family.
+    if (strata::qwen35::serves_dense(argc, argv)) return strata::qwen35::run(argc, argv);
+#endif
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
@@ -3323,10 +3334,14 @@ int main(int argc, char **argv) try {
         }
         // `strata --families`: the GGUF architectures this build runs (setup asks before it installs one)
         if (std::strcmp(argv[i], "--families") == 0) {
+#if defined(STRATA_Q36_BUILD)
+            std::printf("qwen4exp qwen35\n");   // the dense family (Qwen3.8-27B) is part of this binary
+#else
 #if defined(STRATA_HAVE_QWEN35)
             std::printf("qwen4exp qwen35moe\n");
 #else
             std::printf("qwen4exp\n");
+#endif
 #endif
             return 0;
         }

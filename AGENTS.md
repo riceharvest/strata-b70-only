@@ -8,8 +8,8 @@ Issues, pull requests and benchmark reports for this fork belong to `riceharvest
 Strata: upstream has no B70 and cannot reproduce a report made here. The maintainer answers fastest on X as
 `@imdariotoo`, otherwise at dev@darioa.nl.
 
-A second model exists: the dense Qwen3.8-27B, on its own optional binary `strata-q36` (`sycl/src/qwen35`, [docs/Q36.md](docs/Q36.md)).
-It is off by default (`Q36=ON` for `sycl/tools/build.sh`) and `strata` does not depend on it.
+A second model family exists in the same binary: the dense Qwen3.8-27B (`sycl/src/qwen35`, [docs/Q36.md](docs/Q36.md)). `strata` reads the
+architecture of the GGUF at start and runs the dense engine for `qwen35`; `Q36=OFF` for `sycl/tools/build.sh` builds the Flash-Next-only `strata`.
 
 DeepSeek V4.1-Flash (`sycl/src/dsv41`) is not maintained since 2026-10-30 and its build is off by default.
 
@@ -34,8 +34,8 @@ The engine builds in the `strata-sycl-dev` image. From the repository folder (as
         -e BUILD_DIR=/work/$H/build-sycl-aot strata-sycl-dev "cd /work/$H && bash sycl/tools/build.sh strata"
 
 The build ends with `BUILD EXIT 0` and `errors: 0`. `sycl/tools/build.sh` with no target builds `strata` only. The kernel parity
-programs are built on request: `PARITY=ON bash sycl/tools/build.sh <target>`. The dense engine: `Q36=ON bash sycl/tools/build.sh
-strata-q36` (docs/Q36.md; for the long-prompt attention run `bash sycl/tools/get-q36-tla.sh` once first). Other variables of `build.sh` (`AOT`, `I8_ESIMD`,
+programs are built on request: `PARITY=ON bash sycl/tools/build.sh <target>`. The dense family is in that binary (docs/Q36.md; for its
+long-prompt attention run `bash sycl/tools/get-q36-tla.sh` once first, else the build says it goes on without). Other variables of `build.sh` (`AOT`, `I8_ESIMD`,
 `IQ_DECODE_FAST`, `HOST_MARCH`, `BUILD_DIR`, `JOBS`) are listed at the top of the script. Without `AOT` the first start compiles every
 kernel (about 47 s).
 
@@ -52,11 +52,11 @@ are in docs/B70.md.
 
 ## Working rules for agents here
 
-- One configuration: the one in docs/B70.md (Flash-Next, `strata`). `strata-q36` (the dense Qwen3.8-27B, docs/Q36.md) is the one
-  optional second model; it stays off by default and apart from `strata`. Do not add a third model, another quant, or a second GPU
-  path. What `strata-q36` needs differently from a shared kernel or header goes into sources of its own (`sycl/src/qwen35`, as
-  `q36_mmvq_dense.dp.cpp` does) or behind `STRATA_Q36_BUILD`, which only the `strata-q36` target defines, so `strata` compiles the
-  same sources as without it; a change that moves `strata` needs a measurement on `strata`.
+- One configuration: the one in docs/B70.md (Flash-Next, `strata`). The dense Qwen3.8-27B (docs/Q36.md) is the one
+  optional second family of the same `strata` binary. Do not add a third model, another quant, or a second GPU path. What the dense
+  family needs differently from a shared kernel or header goes into sources of its own (`sycl/src/qwen35`, as
+  `q36_mmvq_dense.dp.cpp` does) or behind `STRATA_Q36_BUILD`; with `Q36=OFF` `strata` compiles the same sources as before the merge
+  (`tools/check_q36_isolation.py` checks it); a change that moves the Flash-Next path needs a measurement on it.
 - One stream. The served setup is single-stream (`parallel` unset). Two streams were measured on the B70 and did not beat one:
   102-118 tok/s solo against 81-102 together, and a prompt read and a decode take turns. `parallel` stays an opt-in setting;
   work goes into the single stream unless parallel is asked for.

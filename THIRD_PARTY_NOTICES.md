@@ -12,9 +12,9 @@ What this repository carries or builds from other projects, and under which lice
 | SYCLomatic (dpct) helper headers, [oneapi-src/SYCLomatic](https://github.com/oneapi-src/SYCLomatic) | the CUDA to SYCL helper headers the migrated sources include | Apache-2.0 WITH LLVM-exception | [sycl/include/dpct/LICENSE.TXT](sycl/include/dpct/LICENSE.TXT) |
 | vllm-xpu-kernels, [vllm-project/vllm-xpu-kernels](https://github.com/vllm-project/vllm-xpu-kernels) | `sycl/src/qwen35/merge_attn_states.hpp`: a **modified** copy of one file; `sycl/third_party/q36-tla/vllm-fmha_utils-no-torch.patch`: a patch to another (both for `strata-q36`, see below) | Apache-2.0 | [third_party/licenses/vllm-xpu-kernels-LICENSE](third_party/licenses/vllm-xpu-kernels-LICENSE) |
 
-## Not in the repository: fetched for `strata-q36` (optional)
+## Not in the repository: fetched for the dense family of `strata` (optional)
 
-`strata-q36`'s long-prompt attention (`libq36_tla.so`, [docs/Q36.md](docs/Q36.md)) is compiled against two projects.
+The dense family's long-prompt attention (`libq36_tla.so`, [docs/Q36.md](docs/Q36.md)) is compiled against two projects.
 `sycl/tools/get-q36-tla.sh` downloads them into `third_party/` (git-ignored) at these commits. Nothing of them is committed
 here except what the table above says.
 
@@ -36,7 +36,7 @@ If you hand someone a built `libq36_tla.so`, include the BSD-3-Clause notice of 
 
 ## Data
 
-- `tools/qwen35/q36_draft_vocab_64k.json` (and the 32k and 48k lists beside it): the token ids the MTP draft head of `strata-q36`
+- `tools/qwen35/q36_draft_vocab_64k.json` (and the 32k and 48k lists beside it): the token ids the MTP draft head of the dense family
   picks among. The 64K list is the one the vLLM Intel B70 cookbook publishes (a list of token ids built from public text), with its
   ids checked against the Qwen3.8-27B GGUF. No licence statement came with that list when it was copied; check it before you pass
   the file on.

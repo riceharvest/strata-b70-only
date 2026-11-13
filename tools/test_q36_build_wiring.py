@@ -1,5 +1,6 @@
-"""strata-q36 is optional: off unless asked for, and nothing of it in the default build's graph.  No compiler, no GPU: a fake cmake
-stands in for the oneAPI image, and the CMake file is read as text.  Skipped without bash.
+"""The dense Qwen3.8-27B is a family of the one `strata` binary: built in by default (Q36=OFF builds the Flash-Next-only strata),
+its long-prompt attention (LP3) optional, and nothing of it before its section of sycl/CMakeLists.txt.  No compiler, no GPU: a
+fake cmake stands in for the oneAPI image, and the CMake file is read as text.  Skipped without bash.
 
     python3 -m pytest tools/test_q36_build_wiring.py -q
 """
@@ -52,25 +53,36 @@ class BuildScript(unittest.TestCase):
         merged.update(env)
         return subprocess.run([BASH, BUILD_SH.as_posix(), *targets], env=merged, capture_output=True, text=True, timeout=120)
 
-    def test_off_by_default(self):
+    def test_on_by_default_and_the_target_is_strata(self):
         r = self.run_build()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        log = self.log.read_text()
+        self.assertIn("-DSTRATA_BUILD_Q36=ON", log)
+        self.assertIn("-DSTRATA_Q36_TLA=AUTO", log)
+        self.assertNotIn("-DSTRATA_BUILD_Q36=OFF", log)
+        self.assertIn("--target strata ", log + " ")
+        self.assertNotIn("strata-q36", log)
+        self.assertIn("dense Qwen3.8-27B family in strata", r.stdout)
+
+    def test_q36_off_reaches_cmake(self):
+        r = self.run_build("strata", Q36="OFF")
         self.assertEqual(r.returncode, 0, r.stderr)
         log = self.log.read_text()
         self.assertIn("-DSTRATA_BUILD_Q36=OFF", log)
         self.assertNotIn("-DSTRATA_BUILD_Q36=ON", log)
-        self.assertIn("--target strata ", log + " ")
 
-    def test_q36_on_reaches_cmake_and_names_its_target(self):
-        r = self.run_build("strata-q36", Q36="ON")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        log = self.log.read_text()
-        self.assertIn("-DSTRATA_BUILD_Q36=ON", log)
-        self.assertIn("--target strata-q36", log)
-
-    def test_a_battlemage_build_without_the_fetched_projects_stops_before_cmake(self):
+    def test_a_battlemage_build_without_the_fetched_projects_goes_on_and_says_it_has_no_lp3(self):
         # (a REPO of its own: the checkout's third_party/ may hold the fetched folders)
         with tempfile.TemporaryDirectory() as repo:
-            r = self.run_build("strata-q36", Q36="ON", AOT="bmg-g31", REPO=repo)
+            r = self.run_build("strata", AOT="bmg-g31", REPO=repo)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("WITHOUT LP3", r.stderr)
+            self.assertIn("get-q36-tla.sh", r.stderr)
+            self.assertTrue(self.log.exists(), "cmake started")
+
+    def test_q36_tla_on_stops_before_cmake_without_the_fetched_projects(self):
+        with tempfile.TemporaryDirectory() as repo:
+            r = self.run_build("strata", Q36_TLA="ON", AOT="bmg-g31", REPO=repo)
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("get-q36-tla.sh", r.stderr)
             self.assertFalse(self.log.exists(), "cmake never started")
@@ -78,22 +90,26 @@ class BuildScript(unittest.TestCase):
             (third / "sycl-tla" / "include" / "cutlass").mkdir(parents=True)
             (third / "vllm-xpu-kernels" / "csrc" / "xpu" / "attn" / "xe_2").mkdir(parents=True)
             (third / "vllm-xpu-kernels" / "csrc" / "xpu" / "attn" / "xe_2" / "chunk_prefill.hpp").write_text("", encoding="utf-8")
-            r = self.run_build("strata-q36", Q36="ON", AOT="bmg-g31", REPO=repo)
+            r = self.run_build("strata", Q36_TLA="ON", AOT="bmg-g31", REPO=repo)
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertIn("-DSTRATA_BUILD_Q36=ON", self.log.read_text())
+            self.assertNotIn("WITHOUT LP3", r.stderr)
+            self.assertIn("-DSTRATA_Q36_TLA=ON", self.log.read_text())
 
-    def test_without_an_aot_target_there_is_nothing_to_fetch(self):
+    def test_where_there_is_nothing_to_fetch_nothing_is_said(self):
         with tempfile.TemporaryDirectory() as repo:
-            self.assertEqual(self.run_build("strata-q36", Q36="ON", REPO=repo).returncode, 0)
-            self.assertEqual(self.run_build("strata", AOT="bmg-g31", REPO=repo).returncode, 0)    # Q36 off: not asked for
+            for env in ({}, {"Q36_TLA": "ON"}, {"AOT": "bmg-g31", "Q36": "OFF"}, {"AOT": "bmg-g31", "Q36_TLA": "OFF"}):
+                with self.subTest(env):
+                    r = self.run_build("strata", REPO=repo, **env)
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertNotIn("LP3", r.stderr)
 
     def test_an_existing_build_folder_takes_the_switch(self):
         self.build.mkdir()
         (self.build / "build.ninja").write_text("", encoding="utf-8")
-        r = self.run_build("strata-q36", Q36="ON")
+        r = self.run_build("strata", Q36="OFF")
         self.assertEqual(r.returncode, 0, r.stderr)
         log = self.log.read_text()
-        self.assertEqual(log.count("-DSTRATA_BUILD_Q36=ON"), 1)       # the reconfigure only: no fresh configure of a folder that has one
+        self.assertEqual(log.count("-DSTRATA_BUILD_Q36=OFF"), 1)       # the reconfigure only: no fresh configure of a folder that has one
         self.assertNotIn("-G Ninja", log)
 
 
@@ -101,8 +117,11 @@ class CMakeFile(unittest.TestCase):
     def setUp(self):
         self.text = CMAKE.read_text(encoding="utf-8")
 
-    def test_the_option_is_off(self):
-        self.assertRegex(self.text, r'option\(STRATA_BUILD_Q36 "[^"]*" OFF\)')
+    def test_the_option_is_on(self):
+        self.assertRegex(self.text, r'option\(STRATA_BUILD_Q36 "[^"]*" ON\)')
+
+    def test_lp3_is_auto_unless_told(self):
+        self.assertRegex(self.text, r'set\(STRATA_Q36_TLA "AUTO" CACHE STRING')
 
     def test_nothing_of_it_before_its_section(self):
         # the section is the last thing in the file: its banner, the option and the block
@@ -116,7 +135,8 @@ class CMakeFile(unittest.TestCase):
     def test_the_fetch_is_named_where_the_third_party_code_is_missing(self):
         block = q36_block(self.text)
         self.assertIn("get-q36-tla.sh", block)
-        self.assertIn("FATAL_ERROR", block)
+        self.assertIn("FATAL_ERROR", block)   # STRATA_Q36_TLA=ON
+        self.assertIn("WARNING", block)       # AUTO: goes on without LP3 and says so
         self.assertTrue((ROOT / "sycl" / "tools" / "get-q36-tla.sh").is_file())
 
     def test_every_source_of_the_target_exists(self):
@@ -153,13 +173,13 @@ def without_q36_branches(text: str) -> str:
 
 
 class StrataIsKeptAsItWas(unittest.TestCase):
-    """`strata` compiles the same kernel sources and headers as before: the 27B's forms are sources of strata-q36 only, and the
-    few lines of shared headers that know the dense family are behind STRATA_Q36_BUILD, which only strata-q36 defines."""
+    """The Flash-Next family is kept as it was: the kernel sources say nothing of the dense family, the few lines of shared headers
+    and of main() that know it are behind STRATA_Q36_BUILD, and the 27B's forms are sources of `strata` only through the dense
+    section of the CMake file (tools/check_q36_isolation.py reads all of it against the commit before the merge)."""
 
     def test_the_kernel_files_say_nothing_of_it(self):
         for rel in ("sycl/src/kernels/cuda/native_mmvq.dp.cpp", "sycl/src/kernels/cuda/dequant_bf16.dp.cpp",
-                    "sycl/include/strata/kernels/native_mmvq.hpp", "include/strata/kernels/dequant_bf16.hpp",
-                    "sycl/src/program/generate.cpp"):
+                    "sycl/include/strata/kernels/native_mmvq.hpp", "include/strata/kernels/dequant_bf16.hpp"):
             text = (ROOT / rel).read_text(encoding="utf-8")
             for word in ("q36", "STRATA_Q36", "dense_mode", "Qwen35)"):
                 self.assertNotIn(word, text, f"{rel}: {word}")
@@ -171,11 +191,22 @@ class StrataIsKeptAsItWas(unittest.TestCase):
             self.assertIn("STRATA_Q36_BUILD", text, rel)
             self.assertNotRegex(without_q36_branches(text), r"\bQwen35\b(?!Moe)", rel)
 
-    def test_only_strata_q36_defines_it(self):
+    def test_main_knows_the_dense_family_only_behind_the_definition(self):
+        text = (ROOT / "sycl/src/program/generate.cpp").read_text(encoding="utf-8")
+        self.assertIn("serves_dense(argc, argv)", text)
+        rest = without_q36_branches(text)
+        for word in ("q36", "STRATA_Q36", "serves_dense", "dispatch.hpp"):
+            self.assertNotIn(word, rest, word)
+        # BASE's own call under STRATA_HAVE_QWEN35 (a macro nothing defines) is the one that is left; the switch's is behind the guard
+        self.assertEqual(rest.count("qwen35::run"), 1)
+
+    def test_the_definition_is_made_once_for_every_target(self):
         text = CMAKE.read_text(encoding="utf-8")
         self.assertEqual(len(re.findall(r"STRATA_Q36_BUILD=1", text)), 1)
         block = q36_block(text)
-        self.assertRegex(block, r"target_compile_definitions\(strata-q36 PRIVATE [^)]*STRATA_Q36_BUILD=1")
+        self.assertIn("add_compile_definitions(STRATA_Q36_BUILD=1)", block)
+        self.assertRegex(block, r"target_sources\(strata PRIVATE[^)]*src/qwen35/q36_engine\.dp\.cpp")
+        self.assertNotIn("add_executable(strata-q36", text)
         self.assertIn("src/qwen35/q36_mmvq_dense.dp.cpp", block)
         self.assertNotIn("q36_mmvq_dense", text.replace(block, ""), "the dense forms are not a source of any other target")
 

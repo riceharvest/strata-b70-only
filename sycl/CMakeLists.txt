@@ -82,7 +82,7 @@ if(STRATA_SYCL_AOT)
   else()
     set(_aot_opts "-cl-fp32-correctly-rounded-divide-sqrt")
   endif()
-  # The AOT link compiles every kernel's device image with its own ocloc run (about 1,500 for strata-q36), one at a time
+  # The AOT link compiles every kernel's device image with its own ocloc run (about 1,500 with the dense family), one at a time
   # unless told otherwise: 8 minutes on one core of 32.  STRATA_SYCL_LINK_JOBS (default: the logical cores) runs them in
   # parallel.
   if(NOT DEFINED STRATA_SYCL_LINK_JOBS)
@@ -646,26 +646,40 @@ if(STRATA_BUILD_DSV41)
 endif()
 
 # -----------------------------------------------------------------------------
-# Qwen3.8-27B (dense, GGUF architecture qwen35) SYCL engine path (strata-q36), optional (docs/Q36.md)
+# Qwen3.8-27B (dense, GGUF architecture qwen35): a model family of the one `strata` binary (docs/Q36.md)
 # -----------------------------------------------------------------------------
-# The binary `strata` does not need it and is built the same with it off.  Q36=ON bash sycl/tools/build.sh strata-q36
+# `strata` serves two families.  main() (src/program/generate.cpp) reads the architecture of the GGUF it is given and hands a
+# `qwen35` file to strata::qwen35::run() (sycl/src/qwen35/q36_engine.dp.cpp); every other file takes the Flash-Next path, which
+# is unchanged.  STRATA_BUILD_Q36=OFF (build.sh: Q36=OFF) leaves the dense family out: `strata` is then the Flash-Next-only
+# binary, compiled from the sources of tools/check_q36_isolation.py's base.  Everything the dense family adds to the build is
+# inside this if() block (that tool reads the file without it).
 # q36_engine.dp.cpp began as SYCLomatic's migration of a CUDA engine and has been edited by hand since (nothing is migrated
-# again); the dense qwen35 path (Qwen3.8-27B) is what this build runs.
-option(STRATA_BUILD_Q36 "Build the dense Qwen3.8-27B SYCL engine (strata-q36), optional" OFF)
+# again); the dense qwen35 path (Qwen3.8-27B) is what this build runs.  The 27B's decode kernels stay in their own sources
+# and libraries (libq36_w4.so, libq36_tla.so).
+option(STRATA_BUILD_Q36 "Build the dense Qwen3.8-27B family into strata (OFF: the Flash-Next-only strata)" ON)
+# LP3 (libq36_tla.so, the 27B's long-prompt attention on sycl-tla / vllm-xpu-kernels, AOT for Battlemage / Lunar Lake only):
+# AUTO builds it when the two projects are fetched (sycl/tools/get-q36-tla.sh) and says so when it does not; ON stops without them.
+set(STRATA_Q36_TLA "AUTO" CACHE STRING "LP3, the dense family's long-prompt attention library: AUTO, ON or OFF")
+set_property(CACHE STRATA_Q36_TLA PROPERTY STRINGS AUTO ON OFF)
+if(NOT STRATA_Q36_TLA MATCHES "^(AUTO|ON|OFF)$")
+  message(FATAL_ERROR "STRATA_Q36_TLA must be AUTO, ON or OFF (got '${STRATA_Q36_TLA}')")
+endif()
 if(STRATA_BUILD_Q36)
   if(NOT STRATA_NATIVE_EXPERTS)
-    message(FATAL_ERROR "strata-q36 needs STRATA_NATIVE_EXPERTS=ON (ggml's CPU dequantizer for q36_requant.cpp)")
+    message(FATAL_ERROR "the dense family of strata needs STRATA_NATIVE_EXPERTS=ON (ggml's CPU dequantizer for q36_requant.cpp); STRATA_BUILD_Q36=OFF builds strata without it")
   endif()
-  # STRATA_Q36_BUILD is set on this target only: the few lines of shared headers that know the dense family
-  # (include/strata/artifact/model_family.hpp, include/strata/core/family_layout.hpp and its sycl/ copy) sit behind it, so every
-  # other target compiles them as before.  The 27B's decode forms are q36_mmvq_dense.dp.cpp, a source of this target only.
-  add_executable(strata-q36
+  # STRATA_Q36_BUILD is set for EVERY target here: the few lines of shared headers that know the dense family
+  # (include/strata/artifact/model_family.hpp, include/strata/core/family_layout.hpp and its sycl/ copy, gguf_reader.hpp) and the
+  # family switch (include/strata/qwen35/dispatch.hpp) sit behind it, and an inline function must have one definition in every
+  # object of the binary.  A Flash-Next file takes the same code as without it (the switch only sends a `qwen35` file away).
+  # The 27B's decode forms are q36_mmvq_dense.dp.cpp and q36_xr_dense.dp.cpp, sources of `strata` only through this block.
+  add_compile_definitions(STRATA_Q36_BUILD=1)
+  target_sources(strata PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_engine.dp.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense.dp.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xr_dense.dp.cpp
-    ${STRATA_ROOT}/src/qwen35/q36_main.cpp
     ${STRATA_ROOT}/src/qwen35/q36_requant.cpp)
-  target_compile_definitions(strata-q36 PRIVATE STRATA_Q36_PORT=1 STRATA_Q36_BUILD=1)
+  target_compile_definitions(strata PRIVATE STRATA_Q36_PORT=1)
   # B70W4 (the int4 pack's kernels, q36_w4.dp.cpp) as a library of its own: a change there recompiles its kernels alone (the
   # executable's AOT link compiles about 1,500), and they take their own register-file size (STRATA_Q36_W4_GRF=128 at
   # configure time: without -doubleGRF).
@@ -690,24 +704,36 @@ if(STRATA_BUILD_Q36)
   # the attention kernels: a row's result must not depend on the window's size (a kernel per row count), so no fast-math
   set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xatt.dp.cpp PROPERTIES COMPILE_OPTIONS -fp-model=precise)
   set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4h.dp.cpp PROPERTIES COMPILE_OPTIONS -fp-model=precise)
-  target_link_libraries(strata-q36 PRIVATE q36_w4)
-  set_target_properties(strata-q36 PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
-  target_include_directories(strata-q36 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35 ${STRATA_ROOT}/third_party/ggml)
-  target_link_libraries(strata-q36 PRIVATE strata_prefill strata_engine strata_kernels strata_kernels_cpu Threads::Threads)
+  target_link_libraries(strata PRIVATE q36_w4)
+  set_target_properties(strata PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
+  target_include_directories(strata PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35 ${STRATA_ROOT}/third_party/ggml)
+  target_link_libraries(strata PRIVATE strata_prefill strata_engine strata_kernels strata_kernels_cpu Threads::Threads)
   # LP3: the 8-bit cache's prompt attention on vllm-xpu-kernels' Xe2 chunk_prefill (on sycl-tla), a shared library of its own
   # built the way vllm-xpu-kernels builds libattn_kernels_xe_2 (cmake/utils.cmake add_xe2_kernel_library): its defines, -O3
   # without strata's -fp-model=precise and sub-group 32, gnu++20, and at the AOT link the 2D-block / split-barrier / DPAS
-  # SPIR-V extensions and 256 registers a thread - those link options on this library only, strata-q36's own link keeps its
+  # SPIR-V extensions and 256 registers a thread - those link options on this library only, strata's own link keeps its
   # options.  Those two projects are not in this repository: sycl/tools/get-q36-tla.sh fetches them into third_party/ (pinned
   # commits, licences in THIRD_PARTY_NOTICES.md).  Without an AOT target for Battlemage / Lunar Lake there is no LP3 (the
-  # chunks take the engine's own attention) and nothing to fetch.
-  if(STRATA_SYCL_AOT MATCHES "^(bmg|lnl)")
-    set(_q36_tla_dir ${STRATA_ROOT}/third_party)
+  # chunks take the engine's own attention) and nothing to fetch.  STRATA_Q36_TLA=AUTO (the default) goes on without LP3 and
+  # says so when the projects are not fetched (the 8-bit cache's prompts then take the engine's own attention, slower);
+  # =ON stops instead; =OFF never builds it.
+  set(_q36_tla_dir ${STRATA_ROOT}/third_party)
+  set(_q36_tla_ok OFF)
+  if(STRATA_SYCL_AOT MATCHES "^(bmg|lnl)" AND NOT STRATA_Q36_TLA STREQUAL "OFF")
     if(NOT EXISTS ${_q36_tla_dir}/sycl-tla/include/cutlass OR
        NOT EXISTS ${_q36_tla_dir}/vllm-xpu-kernels/csrc/xpu/attn/xe_2/chunk_prefill.hpp)
-      message(FATAL_ERROR "strata-q36 with AOT=${STRATA_SYCL_AOT} needs third_party/sycl-tla and third_party/vllm-xpu-kernels "
-                          "(its long-prompt attention).  Run once:  bash sycl/tools/get-q36-tla.sh")
+      if(STRATA_Q36_TLA STREQUAL "ON")
+        message(FATAL_ERROR "strata with the dense family and AOT=${STRATA_SYCL_AOT} needs third_party/sycl-tla and third_party/vllm-xpu-kernels "
+                            "(its long-prompt attention, STRATA_Q36_TLA=ON).  Run once:  bash sycl/tools/get-q36-tla.sh")
+      endif()
+      message(WARNING "the dense family is built WITHOUT LP3 (its long-prompt attention): third_party/sycl-tla and third_party/vllm-xpu-kernels "
+                      "are not fetched.  The Qwen3.8-27B's 8-bit-cache prompts take the engine's own attention (slower).  "
+                      "Run bash sycl/tools/get-q36-tla.sh and build again for LP3.")
+    else()
+      set(_q36_tla_ok ON)
     endif()
+  endif()
+  if(_q36_tla_ok)
     file(STRINGS ${_q36_tla_dir}/vllm-xpu-kernels/csrc/xpu/attn/fmha_utils.hpp _q36_torch REGEX "^[ \t]*#[ \t]*include[ \t]*[<\"]torch/all\\.h")   # an include line, not the header's own note about it
     if(_q36_torch)
       message(FATAL_ERROR "third_party/vllm-xpu-kernels is not patched (fmha_utils.hpp still includes torch).  "
@@ -730,10 +756,10 @@ if(STRATA_BUILD_Q36)
                  -fsycl-max-parallel-link-jobs=${STRATA_SYCL_LINK_JOBS}
                  "SHELL:-Xspirv-translator -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate"
                  "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${STRATA_SYCL_AOT} -internal_options -cl-intel-256-GRF-per-thread\"")
-    target_link_libraries(strata-q36 PRIVATE q36_tla)
+    target_link_libraries(strata PRIVATE q36_tla)
     # $ORIGIN, not the build tree's absolute path: the serve wrapper mounts the repo at /work/<repo name>.
-    set_target_properties(strata-q36 PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
-    target_compile_definitions(strata-q36 PRIVATE STRATA_Q36_TLA=1)
+    set_target_properties(strata PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
+    target_compile_definitions(strata PRIVATE STRATA_Q36_TLA=1)
   endif()
   # the 27B's decode forms against a float64 reference and against native_mmvq on the card (PARITY=ON; docs/Q36.md)
   if(STRATA_SYCL_PARITY)

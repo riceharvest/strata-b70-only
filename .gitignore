@@ -29,7 +29,7 @@ td.log
 /.venv/
 /build/
 /third_party/llama.cpp
-# strata-q36's long-prompt attention builds against these; sycl/tools/get-q36-tla.sh fetches them (pinned commits)
+# the dense family's long-prompt attention builds against these; sycl/tools/get-q36-tla.sh fetches them (pinned commits)
 /third_party/sycl-tla/
 /third_party/vllm-xpu-kernels/
 /third_party/*.part/

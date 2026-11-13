@@ -16,7 +16,7 @@ enum class ModelFamily {
     Unknown = 0,
     Qwen4Exp,    ///< Qwen3.8-Flash-Next and its fine-tunes / pruned variants (Swift 1.5, the Coder)
     Qwen35Moe,   ///< Qwen3.6-35B-A3B (Unsloth's MTP GGUFs): plain pre-norm residual, dense attention, nextn MTP block
-#if defined(STRATA_Q36_BUILD)   // (only strata-q36 is compiled with this; `strata` does not know the dense family)
+#if defined(STRATA_Q36_BUILD)   // (in every target of a build with the dense family, Q36=ON, the default; Q36=OFF: `strata` does not know it)
     Qwen35,      ///< the dense members (Qwen3.8-27B, GGUF architecture qwen35): qwen35moe's layers with a dense SwiGLU FFN
 #endif
 };

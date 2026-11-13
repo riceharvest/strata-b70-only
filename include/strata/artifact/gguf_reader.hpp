@@ -664,7 +664,7 @@ inline std::string check_architecture_qwen35moe(const GgufFile& g) {
     return {};
 }
 
-#if defined(STRATA_Q36_BUILD)   // the dense qwen35 family (Qwen3.8-27B): only strata-q36 is compiled with this
+#if defined(STRATA_Q36_BUILD)   // the dense qwen35 family (Qwen3.8-27B): in every target of a build with the family (Q36=ON, the default)
 /// The dense qwen35 guard (Qwen3.8-27B): qwen35moe's keys with a dense FFN (feed_forward_length) and no experts.  The MTP block
 /// (nextn_predict_layers) is optional.
 inline std::string check_architecture_qwen35(const GgufFile& g) {

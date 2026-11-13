@@ -8571,8 +8571,8 @@ def check_request_sampling(req) -> None:
 
 
 # the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none.
-# "qwen35" is the dense Qwen3.8-27B, served by strata-q36 (the config's exe; on an Intel Arc sycl/serve/strata-sycl.sh with
-# STRATA_SYCL_BIN=build-sycl-aot/strata-q36 in its "env": tools/qwen35/serve-27b.json)
+# "qwen35" is the dense Qwen3.8-27B, served by the same `strata` binary as Flash-Next: its family switch sends a qwen35 --native
+# file to the dense engine (the config's exe on an Intel Arc is sycl/serve/strata-sycl.sh; tools/qwen35/serve-27b.json)
 FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b", "qwen35": "qwen3.8-27b",
                       "deepseek41": "deepseek-v4.1-flash"}
 
@@ -8601,7 +8601,7 @@ def model_card_sampling(arch, thinking) -> dict:
     return dict(sets["thinking" if thinking else "instruct"]) if sets else {}
 
 
-# strata-q36 drafts with its MTP block only for a greedy request: temperature 0 and no penalty (a penalty needs the logits on
+# the dense family of strata drafts with its MTP block only for a greedy request: temperature 0 and no penalty (a penalty needs the logits on
 # the host one token at a time).  The dense family's instruct set (thinking off) carries presence_penalty 1.5, so a request that
 # asked for temperature 0 was not greedy any more: no draft was offered (0 of 0) and a 118K-token prompt was answered at 21.5
 # tok/s.  For these families a temperature of 0 (or none) now keeps the answer greedy: the card's penalties are left out.  A
