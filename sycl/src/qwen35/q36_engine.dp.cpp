@@ -978,6 +978,22 @@ inline void q36_kv_set(const std::string& cli, int ctx) {
 inline const char* q36_kv_name() {
     return q36_kv() == kKvF32 ? "FP32" : q36_kv() == kKvQ8 ? "int8 (an FP16 scale per 64 values)" : "FP16";
 }
+
+/// The matrix-engine decode attention's two switches, read in ONE place (Engine::init decides both the attention and the
+/// cache's V layout from them, so they cannot disagree).  STRATA_Q36_XATT: `1` on, `0` off; unset: wanted for every
+/// weight source (the GGUF path and the --w4 pack alike), and then Engine::init turns it on only when the shape is the
+/// 27B's (one session, head_dim 256, 6 query heads a KV head) and its VRAM fits beside the cache.  An explicit `1`
+/// skips the fit test, never the shape test.  STRATA_Q36_KV_VT=0: the 8-bit cache keeps V cell by cell (a copy).
+struct Q36XattSwitch {
+    bool want;     // the attention is asked for (explicitly, or by default)
+    bool explicit_on;   // STRATA_Q36_XATT is set (the fit test is skipped)
+    bool vt_ok;    // STRATA_Q36_KV_VT is not 0
+};
+inline Q36XattSwitch q36_xatt_switch() {
+    const char* xe = std::getenv("STRATA_Q36_XATT");
+    const char* ve = std::getenv("STRATA_Q36_KV_VT");
+    return {xe ? xe[0] == '1' : true, xe != nullptr, !(ve && ve[0] == '0')};
+}
 /// Bytes of one cache allocation (one layer's K, or its V) of n = HKV * ctx * HD values: the codes and their scales.
 inline size_t q36_kv_alloc_bytes(size_t n) {
     return q36_kv() == kKvF32 ? n * 4 : q36_kv() == kKvQ8 ? n + n / 64 * 2 : n * 2;
@@ -3018,7 +3034,7 @@ struct Engine {
     int n_chunk = 0, att_rows = 0;   // attention partials: att_rows query rows x n_chunk chunks
     std::vector<float*> conv, S;   // per layer: the CURRENT session's (select)
     std::vector<void*> kc, vc;     // per layer, the MTP block's at index n_layers: the K / V cache (q36_kv_alloc_bytes)
-    // The matrix-engine decode attention (q36_xatt.dp.cpp; STRATA_Q36_XATT=1, one session): each attention layer's mirror
+    // The matrix-engine decode attention (q36_xatt.dp.cpp; on by default when it fits - q36_xatt_switch(); one session): each attention layer's mirror
     // (int8 K, transposed int8 V, a scale a cell), one set of scratch.  xatt_now: this window's rows take it (the cells
     // reach STRATA_Q36_XATT_MIN, default 4096); its graphs are recorded apart (run_graph_key).
     // The mirror is written only by the windows that read it: xmir_n = the cells [0, xmir_n) it holds (any other write of
@@ -3291,14 +3307,10 @@ struct Engine {
             std::exit(1);
         }
         n_sess = std::max(1, std::min(n_sessions, kVerify));
-        {
-            const char* xe = std::getenv("STRATA_Q36_XATT");
-            const char* ve = std::getenv("STRATA_Q36_KV_VT");
-            const bool xw = xe ? xe[0] == '1' : model.w4_mats > 0;
-            kv_vt = kv_q8 && xw && n_sess == 1 && !(ve && ve[0] == '0') && (int) model.g.head_dim == strata::q36xatt::kHD &&
-                    (int) model.g.n_head == strata::q36xatt::kG * (int) model.g.n_head_kv;
-            vt_ctxp = kv_vt ? strata::q36xatt::ctx_pad(ctx) : 0;
-        }
+        // (kv_vt and the matrix-engine attention are decided together, after the sizes they depend on are known: see the
+        // block with q36_xatt_switch() below.  Until then V is the plain layout.)
+        kv_vt = false;
+        vt_ctxp = 0;
         vision = vision_;
         tmax = std::max(tmax_, kVerify);
         const auto& g = m->g;
@@ -3353,7 +3365,7 @@ struct Engine {
                 pattn_tla = q36pf::tla_shape_ok((int) g.n_head, (int) g.n_head_kv, (int) g.head_dim, seg, (int) T);
                 if (pattn_tla) {
                     const size_t HKV_ = (size_t) g.n_head_kv, H_ = (size_t) g.n_head, HD_ = (size_t) g.head_dim;
-                    tla.vt = kv_vt ? vt_ctxp : 0;
+                    tla.vt = 0;   // (set once kv_vt is decided, below)
                     tla.seg = seg; tla.T = (int) T; tla.H = (int) H_; tla.HKV = (int) HKV_;
                     tla.k16 = dalloc_t<sycl::half>((size_t) seg * HKV_ * HD_);
                     tla.v16 = dalloc_t<sycl::half>((size_t) seg * HKV_ * HD_);
@@ -3510,15 +3522,20 @@ struct Engine {
         }
         {
             namespace xa = strata::q36xatt;
-            // STRATA_Q36_XATT: 1 on, 0 off; unset: on with the int4 pack when what it needs fits beside the session's cache
-            // with 2 GiB of VRAM to spare (a card near its limit stalls).  What it needs: with the 8-bit cache only V's
+            // STRATA_Q36_XATT: 1 on, 0 off; unset: on (GGUF path and int4 pack) when what it needs fits beside the session's
+            // cache with 2 GiB of VRAM to spare (a card near its limit stalls).  What it needs: with the 8-bit cache only V's
             // transposed copy (the scores read the cache's K as it is: 4.3 GiB at 262,144 cells), else K's and V's; and the
             // scratch of a call, made for windows of 16, 8 or 5 tokens - the largest that fits (a larger window runs
             // k_attn_gqa; the lookup drafts keep to it, lookup_depth()).
-            const char* xe = std::getenv("STRATA_Q36_XATT");
-            bool xwant = xe ? xe[0] == '1' : m->w4_mats > 0;
+            const Q36XattSwitch xsw = q36_xatt_switch();
+            const bool xe = xsw.explicit_on;   // (an explicit 1 skips the fit test below)
+            const bool xwant = xsw.want;
             const bool xshape = n_sess == 1 && !attn_head && (int) g.head_dim == xa::kHD && (int) g.n_head == xa::kG * (int) g.n_head_kv;
             if (xwant && xshape) {
+                // the 8-bit cache then stores V transposed (kv_vt) and needs no copy; if the fit fails below it goes back to
+                // the plain layout (kv_vt = false), so V is transposed only when the attention that reads it is on
+                kv_vt = kv_q8 && xsw.vt_ok;
+                vt_ctxp = kv_vt ? xa::ctx_pad(ctx) : 0;
                 const int hkv = (int) g.n_head_kv;
                 size_t nl = m->has_mtp ? 1 : 0;
                 for (const Layer& L : m->layers) nl += L.attn ? 1 : 0;
@@ -3538,6 +3555,8 @@ struct Engine {
                     if (xe || vfr >= nl * per_layer + scratch + cache + ((size_t) 2 << 30)) { ls = t; break; }
                 }
                 if (ls == 0) {
+                    kv_vt = false;   // (no attention reads a transposed V: the cache keeps the plain layout)
+                    vt_ctxp = 0;
                     std::fprintf(stderr, "strata-q36: decode attention stays on the FP32 kernel: the matrix engine's copy (%.2f GiB) does not fit "
                                          "beside the cache at this context (%.2f GiB of VRAM free)\n",
                                  (double) (nl * per_layer + scratch) / 1073741824.0, (double) vfr / 1073741824.0);
@@ -3571,6 +3590,9 @@ struct Engine {
                                  (double) (nl * per_layer + scratch) / 1073741824.0);
                 }
             }
+#ifdef STRATA_Q36_TLA
+            tla.vt = kv_vt ? vt_ctxp : 0;   // (the prompt path's dequantize follows the layout that was decided)
+#endif
         }
         for (const Layer& L : m->layers) {   // the verify windows' GDN inputs (one set, whichever session runs)
             if (L.attn) {
