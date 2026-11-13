@@ -412,6 +412,186 @@ void test_answers() {
     check(a1.out == a4.out, "the same seed gives the same tokens at another window size and with another drafter");
 }
 
+
+// ------------------------------------------------------------------------------- 4b. several slots in one window (--batch-mtp)
+// The host side of the engine's window_mtp for a batch: every slot has its own sampler, history and random stream; a window
+// gives each slot 1 + D rows (D chosen per window and slot, the rows being shared, as fit_depths does); a slot that draws on
+// the host takes its picks from the rows' candidates (batch_slot_step, the list as long as the longest any slot needs), a greedy
+// slot from the argmax of its rows, a request the candidates cannot serve (spec_plan not ok) from the whole row, with no drafts.
+// Every slot's answer must be the answer of the same request alone, one token a step, whatever else shares the window.
+struct BSlot {
+    Sampling s;
+    SpecPlan plan;
+    uint64_t seed = 0;
+    int max_new = 0;
+    std::mt19937_64 rng;
+    std::mt19937_64 dr;
+    std::vector<int32_t> hist, out;
+    bool active = false;
+    long long offered = 0, accepted = 0;
+    bool drafts_ok() const { return !s.needs_logits() || plan.ok; }
+};
+
+bool b_eos(int t) { return t == 1; }
+
+std::vector<std::vector<int32_t>> run_batch(const std::vector<BSlot>& init, int V, bool reverse_order, uint64_t plan_seed, long long* off,
+                                            long long* acc, long long* mixed_windows, long long* cand_rows) {
+    std::vector<BSlot> sl = init;
+    uint64_t ps = plan_seed;
+    for (BSlot& b : sl) {   // admission: the first token drawn as the plain path does
+        b.rng.seed(b.seed);
+        b.dr.seed(b.seed + 1);
+        std::vector<float> lg = model_row(b.hist, V);
+        int nx = sample_row(lg, b.s, b.hist, b.rng);
+        b.out.push_back(nx);
+        b.hist.push_back(nx);
+        b.active = !(b_eos(nx) || b.max_new <= 1);
+    }
+    for (int guard = 0; guard < 100000; ++guard) {
+        std::vector<int> act;
+        for (int i = 0; i < (int) sl.size(); ++i) {
+            const int k = reverse_order ? (int) sl.size() - 1 - i : i;
+            if (sl[(size_t) k].active) act.push_back(k);
+        }
+        if (act.empty()) break;
+        const int S = (int) act.size();
+        // the depths: what each slot that drafts wants (0 .. 6), cut to the 16 rows the window has (the largest first)
+        std::vector<int> want((size_t) S, 0);
+        for (int i = 0; i < S; ++i)
+            if (sl[(size_t) act[(size_t) i]].drafts_ok()) want[(size_t) i] = 1 + (int) (splitmix(ps) % 6);
+        int total = S;
+        for (int v : want) total += v;
+        while (total > 16) {
+            int best = -1;
+            for (int i = 0; i < S; ++i)
+                if (want[(size_t) i] > 0 && (best < 0 || want[(size_t) i] > want[(size_t) best])) best = i;
+            if (best < 0) break;
+            --want[(size_t) best];
+            --total;
+        }
+        // the window's candidate list length: the largest M of the slots that draw on the host
+        int Mwin = 0;
+        bool has_cand = false, has_greedy = false;
+        for (int i = 0; i < S; ++i) {
+            const BSlot& b = sl[(size_t) act[(size_t) i]];
+            if (b.s.needs_logits() && b.plan.ok) { Mwin = std::max(Mwin, b.plan.M); has_cand = true; }
+            if (!b.s.needs_logits()) has_greedy = true;
+        }
+        if (has_cand && has_greedy) ++*mixed_windows;
+        for (int i = 0; i < S; ++i) {
+            BSlot& b = sl[(size_t) act[(size_t) i]];
+            const int D = want[(size_t) i];
+            const int drafter = (int) (splitmix(ps) % 4);
+            std::vector<int32_t> drafts((size_t) D), ctx = b.hist;
+            for (int t = 0; t < D; ++t) {
+                const auto r = model_row(ctx, V);
+                int d = (int) (std::max_element(r.begin(), r.end()) - r.begin());
+                if (drafter == 1) d = (int) (b.dr() % (uint64_t) V);
+                if (drafter == 2 && b.dr() % 4 == 0) d = (int) (b.dr() % (uint64_t) V);
+                if (drafter == 3) d = (int) (std::min_element(r.begin(), r.end()) - r.begin());
+                drafts[(size_t) t] = d;
+                ctx.push_back(d);
+            }
+            // this slot's rows as the window hands them over
+            const bool cand = b.s.needs_logits() && b.plan.ok;
+            int32_t picks[16] = {};
+            int y0 = 0, a = 0;
+            const int64_t produced = (int64_t) b.out.size();
+            if (cand) {
+                std::vector<int32_t> words;
+                ctx = b.hist;
+                for (int t = 0; t <= D; ++t) {
+                    const auto w = pack_row(model_row(ctx, V), Mwin);
+                    words.insert(words.end(), w.begin(), w.end());
+                    if (t < D) ctx.push_back(drafts[(size_t) t]);
+                }
+                a = batch_slot_step(b.s, b.plan, b.hist, drafts, words.data(), b.rng, picks, false, produced, b.max_new, 1000, 1 << 30,
+                                    b_eos);
+                y0 = picks[0];
+                ++*cand_rows;
+            } else if (b.s.needs_logits()) {   // (the whole row to the host, no drafts)
+                std::vector<float> lg = model_row(b.hist, V);
+                y0 = sample_row(lg, b.s, b.hist, b.rng);
+                picks[0] = y0;
+            } else {   // a greedy slot: the argmax of its rows, and the engine's own loop
+                ctx = b.hist;
+                for (int t = 0; t <= D; ++t) {
+                    const auto r = model_row(ctx, V);
+                    picks[t] = (int) (std::max_element(r.begin(), r.end()) - r.begin());
+                    if (t < D) ctx.push_back(drafts[(size_t) t]);
+                }
+                y0 = picks[0];
+                for (int y = y0; a < D && y == drafts[(size_t) a] && !b_eos(y) && produced + a + 2 <= b.max_new; y = picks[a]) ++a;
+            }
+            b.offered += D;
+            b.accepted += a;
+            int y = y0;
+            for (int j = 0; j <= a; ++j) {
+                if (j > 0) y = picks[j];
+                b.out.push_back(y);
+                b.hist.push_back(y);
+                if (b_eos(y) || (int) b.out.size() >= b.max_new) { b.active = false; break; }
+            }
+        }
+    }
+    std::vector<std::vector<int32_t>> outs;
+    for (const BSlot& b : sl) {
+        outs.push_back(b.out);
+        *off += b.offered;
+        *acc += b.accepted;
+    }
+    return outs;
+}
+
+void test_batch_slots() {
+    std::printf("slots of one batch window against the same request alone\n");
+    std::vector<Setting> st = settings();
+    {   // two requests the candidates cannot serve: they run the whole-row path, with no drafts, beside the others
+        Sampling a;
+        a.temperature = 0.8f; a.top_p = 0.9f; a.top_k = 100;   // a cap above 64
+        st.push_back({a, "t 0.8 k 100 (not drafted)"});
+        Sampling b;
+        b.temperature = 0.f; b.repeat = 0.8f; b.last_n = 8;    // a penalty that raises a logit
+        st.push_back({b, "greedy repeat 0.8 (not drafted)"});
+    }
+    uint64_t rs = 99;
+    long long runs = 0, bad = 0, off = 0, acc = 0, mixed = 0, cand_rows = 0, orderbad = 0;
+    for (int trial = 0; trial < 40; ++trial) {
+        const int V = 400 + (int) (splitmix(rs) % 300);
+        const int S = 2 + (int) (splitmix(rs) % 7);   // 2 .. 8 slots
+        std::vector<BSlot> init((size_t) S);
+        for (int i = 0; i < S; ++i) {
+            BSlot& b = init[(size_t) i];
+            const Setting& se = st[(size_t) ((trial * 3 + i * 5 + (int) (splitmix(rs) % 4)) % (int) st.size())];
+            b.s = se.s;
+            b.plan = spec_plan(b.s, V);
+            b.seed = splitmix(rs);
+            b.max_new = (i + trial) % 4 == 0 ? 3 + (int) (splitmix(rs) % 8) : 50 + (int) (splitmix(rs) % 70);
+            b.hist.resize((size_t) (1 + splitmix(rs) % 40));
+            for (auto& t : b.hist) t = 2 + (int32_t) (splitmix(rs) % (uint64_t) (V - 2));
+        }
+        const uint64_t plan_seed = splitmix(rs);
+        const auto o1 = run_batch(init, V, false, plan_seed, &off, &acc, &mixed, &cand_rows);
+        long long o2n = 0, a2n = 0, m2 = 0, c2 = 0;
+        const auto o2 = run_batch(init, V, true, plan_seed + 1, &o2n, &a2n, &m2, &c2);   // another order and other depths
+        for (int i = 0; i < S; ++i) {
+            const BSlot& b = init[(size_t) i];
+            const Result p = gen_plain(b.s, b.seed, b.hist, b.max_new, V);
+            ++runs;
+            if (o1[(size_t) i] != p.out) {
+                ++bad;
+                if (bad < 5) std::printf("  differs: trial %d slot %d of %d, %zu / %zu tokens\n", trial, i, S, p.out.size(), o1[(size_t) i].size());
+            }
+            if (o2[(size_t) i] != p.out) ++orderbad;
+        }
+    }
+    check(bad == 0, "every slot's answer equals the same request alone, one token a step: " + std::to_string(runs) + " answers");
+    check(orderbad == 0, "the same with the slots in the other order and other depths");
+    check(acc > 0 && off > 0, "drafts were accepted in those windows (" + std::to_string(acc) + " of " + std::to_string(off) + ")");
+    check(mixed > 0, "windows with greedy and host-drawn slots together: " + std::to_string(mixed));
+    check(cand_rows > 0, "slots drew from the rows' candidates: " + std::to_string(cand_rows));
+}
+
 // ------------------------------------------------------------------------------- 5. the rule reproduces the target
 // A Markov model over V = 8 tokens: the row depends on the last token only, so each row is a known distribution.
 constexpr int kV = 8;
@@ -714,6 +894,7 @@ int main() {
     test_topm_algorithm();
     test_row_vs_plain();
     test_answers();
+    test_batch_slots();
     test_statistics();
     test_flash_next_point_mass();
     test_plain_unchanged();

@@ -208,6 +208,38 @@ inline int decide_window(const Sampling& s, int kk, int M, int D, const std::vec
     return D;
 }
 
+// --------------------------------------------------------------------------------------------- a slot of a batch window
+/// How many of a batch slot's D drafts stand, given the picks of its rows (picks[t]: the token the row t gives; picks[0 .. a]
+/// are the tokens the slot emits).  Draft a stands when the pick before it is that draft and the request can still take it:
+/// the pick is not an end-of-answer token, no stop was asked for, max_new and the context have room.  Same rule as the greedy
+/// slot's loop in the engine's window_mtp (`produced`: tokens the slot has emitted; `pos`: the cell of its next token).
+template <class IsEos>
+inline int batch_accept_count(const int32_t* picks, const int32_t* drafts, int D, bool stop, int64_t produced, int64_t max_new,
+                              int64_t pos, int64_t ctx, IsEos is_eos) {
+    int a = 0;
+    for (int y = picks[0]; a < D && y == drafts[a] && !is_eos(y) && !stop && produced + a + 2 <= max_new && pos + a + 3 <= ctx;
+         y = picks[a])
+        ++a;
+    return a;
+}
+
+/// One batch slot's part of a verify window for a request that needs the host's draw (a temperature above 0, or a penalty):
+/// the slot's own sampler, history and random stream, its rows' candidates (`rows`: the slot's first row, kSpecRowWords words
+/// a row, as the engine copies them; the list may be longer than the slot's M: the first M of it are the slot's, the list is a
+/// total order), and the drafts it offered.  `hist` ends with the slot's next token (the window's token 0), as decide_window
+/// wants it.  Writes picks[0 .. a] and returns a, the drafts that stand.  Exactly the single-session path's decision
+/// (decide_window), then the batch loop's limits.  decide_window draws one row after the last matching one, so a stop, max_new,
+/// an end-of-answer token or the context can end the slot a few rows before the draws did; each of those ends the request,
+/// whose random stream is not used again.
+template <class IsEos>
+inline int batch_slot_step(const Sampling& s, const SpecPlan& p, const std::vector<int32_t>& hist, const std::vector<int32_t>& drafts,
+                           const int32_t* rows, std::mt19937_64& rng, int32_t* picks, bool stop, int64_t produced, int64_t max_new,
+                           int64_t pos, int64_t ctx, IsEos is_eos) {
+    const int D = (int) drafts.size();
+    decide_window(s, p.kk, p.M, D, hist, drafts.data(), rows, rng, picks);
+    return batch_accept_count(picks, drafts.data(), D, stop, produced, max_new, pos, ctx, is_eos);
+}
+
 /// The M highest raw logits of a row as the device returns them: ranked by (logit, lowest id), ids then bits, padded with
 /// -1 and 0.  The reference for the kernels (STRATA_Q36_SPEC_CHECK compares them) and for the host test.
 inline void spec_topm_ref(const float* row, int vocab, int M, int32_t* ids, int32_t* bits) {

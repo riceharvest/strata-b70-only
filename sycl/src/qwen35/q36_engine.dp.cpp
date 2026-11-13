@@ -1899,6 +1899,10 @@ bool q36_spec_sample_on() {   // STRATA_Q36_SPEC_SAMPLE: a request with a temper
     static const bool on = [] { const char* e = std::getenv("STRATA_Q36_SPEC_SAMPLE"); return !(e && e[0] == '0'); }();
     return on;
 }
+bool q36_batch_sample_on() {   // STRATA_Q36_BATCH_SAMPLE=1: in a --batch --batch-mtp window a sampled / penalised slot drafts too
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_BATCH_SAMPLE"); return !(e && e[0] == '0'); }();   // (default on; 0: the old one-row step)
+    return on;
+}
 bool q36_spec_check_on() {   // STRATA_Q36_SPEC_CHECK=1: compare each window's rows with the host's top M (a debug aid)
     static const bool on = [] { const char* e = std::getenv("STRATA_Q36_SPEC_CHECK"); return e && e[0] != '0' && e[0] != '\0'; }();
     return on;
@@ -3515,7 +3519,7 @@ struct Engine {
         pick = dalloc_t<int32_t>(kVerify);
         amv = dalloc((size_t) kArgBlocks * kVerify);
         ami = dalloc_t<int32_t>((size_t) kArgBlocks * kVerify);
-        if (q36_spec_pen_on() || q36_spec_sample_on()) {   // (about 0.5 MB of the card and 8 KB of pinned memory)
+        if (q36_spec_pen_on() || q36_spec_sample_on() || q36_batch_sample_on()) {   // (about 0.5 MB of the card and 8 KB of pinned memory)
             sp_nch = (int) ((g.n_vocab + kSpecChunk - 1) / kSpecChunk);
             if (sp_nch >= 1 && sp_nch <= kThreads) {   // (the second stage gives each chunk a work-item)
                 sp_cand = dalloc_t<uint64_t>((size_t) kVerify * (size_t) sp_nch * kSpecTopM);
@@ -6564,9 +6568,16 @@ work-group size if needed.
     /// One window over the groups' rows.  `verify`: a verify window - the GDN state is read, not written (commit_rows writes
     /// it for the kept rows) and the sessions' positions stay.  The greedy picks end up in rows_pick (one per row), every
     /// row's logits in `logits`.  Without verify the sessions' positions advance by their rows.
-    void run_rows(const Group* gr, int G, bool verify) {
+    /// `sp_M` > 0 (STRATA_Q36_BATCH_SAMPLE): the window also returns every row's `sp_M` highest raw logits (sp_topm, as the
+    /// one-session verify window does), one more copy in the same wait: row r's list is at sp_h + 1 + r * kSpecRowWords
+    /// (rows_cand(r)).  Its own graph key: the window without it is not touched.
+    void run_rows(const Group* gr, int G, bool verify, int sp_M = 0) {
         sess[(size_t) cur].pos = pos;
         CK(DPCT_CHECK_ERROR(st->wait())); // the pinned staging is free again
+        if (sp_M > 0) {   // (sp_h is pinned and free after that wait; the kernels read sp_m)
+            sp_h[0] = sp_M;
+            CK(DPCT_CHECK_ERROR(st->memcpy(sp_m, sp_h, 4)));
+        }
         int64_t pmax = 0;
         int T = 0;
         xbatch_slots.clear();
@@ -6640,7 +6651,10 @@ work-group size if needed.
         rows_mode = true;
         rows_G = G;
         rows_deferred = true;
-        run_rows_graph(verify ? 400000 : 300000, G, T, [&] { forward(T, pmax, T, use_graph, verify); });
+        run_rows_graph((verify ? 400000 : 300000) + (sp_M > 0 ? 10000 : 0), G, T, [&] {
+            forward(T, pmax, T, use_graph, verify);
+            if (sp_M > 0) sp_topm(T);
+        });
         rows_deferred = false;
         rows_mode = false;
         /*
@@ -6650,8 +6664,10 @@ work-group size if needed.
         API to ensure synchronization behavior.
         */
         CK(DPCT_CHECK_ERROR(st->memcpy(hrow + 128, pick, (size_t)T * 4)));
+        if (sp_M > 0) CK(DPCT_CHECK_ERROR(st->memcpy(sp_h + 1, sp_rows, (size_t) T * kSpecRowWords * 4)));   // one copy: every row's candidates
         CK(DPCT_CHECK_ERROR(st->wait()));
         for (int r = 0; r < T; ++r) rows_pick[r] = hrow[128 + r];
+        if (sp_M > 0 && q36_spec_check_on()) sp_check(T);
         if (!verify)
             for (int g = 0; g < G; ++g) sess[(size_t) gr[g].slot].pos += gr[g].n;
         pos = sess[(size_t) cur].pos;
@@ -6661,6 +6677,8 @@ work-group size if needed.
             if (++win_count % kRebalanceEvery == 0) rebalance(8);
         }
     }
+    /// The candidates of window row r after run_rows(.., sp_M > 0): sp_M ids, then their logits' bits (kSpecTopM apart).
+    const int32_t* rows_cand(int r) const { return sp_h + 1 + (size_t) r * kSpecRowWords; }
     /// One window for the next token of each of the rows' sessions (no proposals): the greedy picks in rows_pick.
     void step_rows(const Row* rows, int nb) {
         Group gr[kVerify];
@@ -7113,6 +7131,9 @@ work-group size if needed.
     bool spec_graphs() const { return use_graph && mtp_graph && n_sess == 1 && !main_hybrid; }
     /// Whether a window may return its rows' top candidates for the host to draw (STRATA_Q36_SPEC_PEN / _SAMPLE): the
     /// graph form of the verify window only (one session, no hybrid experts, a window that fits kGemmT rows).
+    /// Whether a batch window (--batch N --batch-mtp) may return its rows' top candidates for the host to draw
+    /// (STRATA_Q36_BATCH_SAMPLE): the buffers exist and no layer runs on the host (a hybrid engine does not capture graphs).
+    bool sp_batch_ok() const { return sp_cand != nullptr && bmtp && n_sess > 1 && mtp_d >= 1 && !main_hybrid && q36_batch_sample_on(); }
     bool sp_window_ok() const { return sp_cand != nullptr && mtp_d >= 1 && mtp_d + 1 <= kGemmT && spec_graphs(); }
     /// The M highest raw logits of each of the first T rows of `logits` (M = *sp_m, at most kSpecTopM), ranked by (logit, then
     /// the lowest id), into sp_rows: a row's ids, then the logits' bits (ids -1 past the vocabulary).  Two kernels.  Stage 1:
@@ -7918,6 +7939,9 @@ struct Slot {
     std::vector<int32_t> drafts;  // --batch-mtp: the MTP block's chained proposals for the tokens after `x`
     int depth = 2;                // ... how many the next window takes (follows what was accepted)
     long long offered = 0, accepted = 0;
+    strata::qwen35::SpecPlan plan;   // STRATA_Q36_BATCH_SAMPLE: plan.ok = a request that needs the host's draw drafts through the window's top-M rows
+    /// Whether the slot takes drafts in a --batch-mtp window: it decodes greedily on the device, or its rows' candidates serve it.
+    bool drafts_ok() const { return !smp.needs_logits() || plan.ok; }
 };
 
 /// The engine protocol (serve/server.py).  One request at a time on the control lines: GEN / GENI (alone: speculative
@@ -8033,7 +8057,7 @@ struct Serve {
         std::vector<int> want((size_t) S, 0);
         for (int i = 0; i < S; ++i) {
             const Slot& sl = slots[(size_t) act[(size_t) i]];
-            if (!sl.smp.needs_logits()) want[(size_t) i] = std::max(1, std::min(std::max(sl.depth, bdepth_base), maxd));
+            if (sl.drafts_ok()) want[(size_t) i] = std::max(1, std::min(std::max(sl.depth, bdepth_base), maxd));
         }
         fit_depths(want);
         ++mtp_turn;
@@ -8075,7 +8099,14 @@ struct Serve {
             row0[(size_t) i] = T;
             T += g.n;
         }
-        E.run_rows(gr.data(), S, true);
+        // the rows' candidates for the slots that draw on the host (one M for the window: the largest any of them needs; a
+        // slot's own M is the first part of the list), copied back in the window's own wait
+        int sp_M = 0;
+        for (int i = 0; i < S; ++i) {
+            const Slot& sl = slots[(size_t) act[(size_t) i]];
+            if (sl.smp.needs_logits() && sl.plan.ok) sp_M = std::max(sp_M, sl.plan.M);
+        }
+        E.run_rows(gr.data(), S, true, sp_M);
         lap(1);
         // the picks: emit, decide how many rows each slot keeps
         std::vector<int> keep((size_t) S, 1);
@@ -8087,16 +8118,29 @@ struct Serve {
             Engine::Sess& ss = E.sess[(size_t) b];
             const int D = gr[(size_t) i].n - 1, r0 = row0[(size_t) i];
             int y0 = E.rows_pick[r0];
-            if (sl.smp.needs_logits()) {
-                E.host_logits_row(r0, lg);
-                y0 = sample(lg, sl.smp, sl.hist, sl.rng);
-            }
-            // draft a + 1 stands when the pick before it is that draft (ss.pos: the position of the slot's next token: the
-            // window did not move it)
+            // the picks of this slot's rows: the device's argmax (greedy), or, for a request drawn on the host, what
+            // batch_slot_step takes from the rows' candidates (the slot's own sampler and random stream, the draws of the
+            // single-session path); the rows after the first mismatch are not drawn
+            const bool cand = sl.smp.needs_logits() && sl.plan.ok;
+            int32_t cpicks[Engine::kVerify] = {};
+            const int32_t* pk = E.rows_pick + r0;
             int a = 0;
-            for (int y = y0; a < D && y == sl.drafts[(size_t) a] && !is_eos(y) && !sl.stop && sl.produced + a + 2 <= sl.max_new &&
-                             ss.pos + a + 3 <= E.ctx; y = E.rows_pick[r0 + a])
-                ++a;
+            if (cand) {
+                pk = cpicks;
+                a = strata::qwen35::batch_slot_step(sl.smp, sl.plan, sl.hist, sl.drafts, E.rows_cand(r0), sl.rng, cpicks, sl.stop,
+                                                    sl.produced, sl.max_new, ss.pos, E.ctx, [](int t) { return is_eos(t); });
+                y0 = cpicks[0];
+            } else {
+                if (sl.smp.needs_logits()) {   // (a request the candidates cannot serve: one row, the whole row to the host)
+                    E.host_logits_row(r0, lg);
+                    y0 = sample(lg, sl.smp, sl.hist, sl.rng);
+                }
+                // draft a + 1 stands when the pick before it is that draft (ss.pos: the position of the slot's next token: the
+                // window did not move it)
+                for (int y = y0; a < D && y == sl.drafts[(size_t) a] && !is_eos(y) && !sl.stop && sl.produced + a + 2 <= sl.max_new &&
+                                 ss.pos + a + 3 <= E.ctx; y = E.rows_pick[r0 + a])
+                    ++a;
+            }
             sl.offered += D;
             sl.accepted += a;
             if (D > 0) sl.depth = a >= D ? std::min(maxd, D + (D < 8 ? 1 : 2)) : std::max(bdepth_base, a + 1);
@@ -8105,7 +8149,7 @@ struct Serve {
             bool done = false;
             int y = y0;
             for (int j = 0; j < rows_kept; ++j) {
-                if (j > 0) y = E.rows_pick[r0 + j];
+                if (j > 0) y = pk[j];
                 ss.live.push_back(gr[(size_t) i].tok[j]);
                 std::printf("BT %d %d\n", b, y);
                 ++sl.produced;
@@ -8153,7 +8197,7 @@ struct Serve {
             Slot& sl = slots[(size_t) b];
             if (!alive[(size_t) i]) { sl.drafts.clear(); continue; }
             nidx.push_back(i);
-            nwant.push_back(sl.smp.needs_logits() ? 0 : std::max(1, std::min(std::max(sl.depth, bdepth_base), maxd)));
+            nwant.push_back(sl.drafts_ok() ? std::max(1, std::min(std::max(sl.depth, bdepth_base), maxd)) : 0);
         }
         std::fflush(stdout);
         fit_depths(nwant);
@@ -8194,7 +8238,7 @@ struct Serve {
         if (E.bmtp && E.mtp_d > 0) {   // proposals need a row to spare and a slot that decodes greedily
             int act = 0, greedy = 0;
             for (const Slot& sl : slots)
-                if (sl.active) { ++act; greedy += !sl.smp.needs_logits(); }
+                if (sl.active) { ++act; greedy += sl.drafts_ok(); }   // (a slot whose rows' candidates serve it drafts like a greedy one)
             if (greedy > 0 && Engine::kVerify - act > 0) { window_mtp(); return; }
         }
         window_plain();
@@ -8478,6 +8522,13 @@ struct Serve {
             if (cont) {
                 Slot& sl = slots[(size_t) slot];
                 sl = Slot{};
+                // a request that needs the host's draw drafts in a --batch-mtp window when the plan takes it (the single-session
+                // rule: a penalty that only lowers a logit with a window of 1 .. 64, a cap of at most 64) and the engine can
+                // return the rows' candidates; STRATA_Q36_SPEC_SAMPLE=0 / _SPEC_PEN=0 keep their classes out here too
+                if (smp.needs_logits() && E.mtp_d > 0 && E.sp_batch_ok()) {
+                    sl.plan = strata::qwen35::spec_plan(smp, (int) E.m->g.n_vocab);
+                    if (sl.plan.ok && !(sl.plan.sampled ? q36_spec_sample_on() : q36_spec_pen_on())) sl.plan.ok = false;
+                }
                 sl.active = true;
                 sl.x = nx;
                 sl.produced = 1;
