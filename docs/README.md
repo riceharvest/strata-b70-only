@@ -29,6 +29,7 @@ This fork builds only the Intel Arc (`sycl/`) engine on Linux for one Arc Pro B7
 | Guide | What it covers |
 | --- | --- |
 | [The `b70` branch](B70.md) | What the `b70` branch changes over upstream `main`, defaults, compiler pins, and B70 measurements |
+| [`b70-2026.11.11` release notes](release-notes-b70-2026.11.11.md) | What shipped in `b70-2026.11.11` and follow-up PRs `#27`–`#36`, compiler pin (`IGC 2.41.5`), and experimental notes |
 | [B70 model fit arithmetic](B70_MODELS.md) | Exact B70 VRAM and host RAM sums picking `UD-IQ1_S` (Flash-Next) and `UD-Q4_K_M` (27B dense) and why `--ple-io ram` needs 85 GB+ |
 | [The B70 served setup](B70.md#the-served-setup) | What `./setup.sh --backend sycl --family unsloth --model UD-IQ1_S` configures on one B70 (layer-18 graft, MTP, KV/experts, `--no-served-recipe`) |
 | [Intel Arc SYCL engine](INTEL.md) | Building and running the `sycl/` engine inside `strata-sycl-dev` and maintaining the port |
