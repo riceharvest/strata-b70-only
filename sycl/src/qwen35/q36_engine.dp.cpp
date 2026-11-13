@@ -2580,6 +2580,29 @@ __dpct_inline__ void k_gdn_norm_q8(float *o, const float *z, const float *gamma,
     q36k::q8_store(yq + (size_t) t * (h_v * 4), head * 128 + lid, ((volatile float *) &yv[0])[lid], lid & 31);
 }
 
+// ---- STRATA_Q36_FUSE: the same three decode-side GDN kernels for batch rows (Engine::rows_mode).  A work-group's group index is
+// grid dim 0: group g is session gslot[g]'s rows grow0[g] .. + gcnt[g] - 1, its conv history and state are that session's
+// (the tables the old rows kernels k_conv_seq / k_gdn_seq read too).  Each wrapper only moves the pointers and the row count
+// and calls the kernel above, so a group's arithmetic is the single-stream decode step's, token for token.
+__dpct_inline__ void k_conv_dec_rows(float *const *hist_tab, const int32_t *gslot, const int32_t *grow0, const int32_t *gcnt,
+                                     const float *qkv, const float *w, float *h, int C, int qk_heads, float eps, bool write) {
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int g = (int) it.get_group(0);
+    const size_t r0 = (size_t) grow0[g];
+    k_conv_dec(hist_tab[gslot[g]], qkv + r0 * (size_t) C, w, h + r0 * (size_t) C, C, qk_heads, eps, gcnt[g], write);
+}
+/// k_gdn_dec over the groups.  o_raw null and hist_tab / qkv_in set: the commit (state and conv history of the kept rows).
+__dpct_inline__ void k_gdn_dec_rows(float *const *state_tab, float *const *hist_tab, const int32_t *gslot, const int32_t *grow0,
+                                    const int32_t *gcnt, const float *h, int C, const float *gate, const float *beta, float *o_raw,
+                                    int h_k, int h_v, bool write, const float *qkv_in) {
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int g = (int) it.get_group(0);
+    const size_t r0 = (size_t) grow0[g];
+    k_gdn_dec(state_tab[gslot[g]], h + r0 * (size_t) C, C, gate + r0 * (size_t) h_v, beta + r0 * (size_t) h_v,
+              o_raw ? o_raw + r0 * (size_t) h_v * 128 : nullptr, h_k, h_v, gcnt[g], write, hist_tab ? hist_tab[gslot[g]] : nullptr,
+              qkv_in ? qkv_in + r0 * (size_t) C : nullptr);
+}
+
 // ------------------------------------------------------------------------------------------------ the model
 struct Mat {
     const uint8_t* d = nullptr;   // device, GGUF blocks
@@ -5129,6 +5152,24 @@ work-group size if needed.
         static const bool v = [] { const char* e = std::getenv("STRATA_Q36_GDN_DEC"); return !(e && e[0] == '0'); }();
         return v;
     }
+    /// STRATA_Q36_FUSE (default 1; 0: the earlier launches everywhere below): batch rows (--batch N) run the decode-side GDN
+    /// kernels too - the window's conv, delta rule and gated norm with its q8_1 image (was k_conv_seq + k_gdn_seq + the
+    /// quantizer) and the commit as one launch a layer (was k_conv_seq + k_gdn_seq).  STRATA_Q36_FUSE_GDN_ROWS=0 /
+    /// STRATA_Q36_FUSE_COMMIT=0 take back one of the two (to find which one moved a text).  Read once.
+    static bool fuse_gdn_rows() {
+        static const bool v = [] {
+            const char *a = std::getenv("STRATA_Q36_FUSE"), *b = std::getenv("STRATA_Q36_FUSE_GDN_ROWS");
+            return !(a && a[0] == '0') && !(b && b[0] == '0');
+        }();
+        return v;
+    }
+    static bool fuse_commit_rows() {
+        static const bool v = [] {
+            const char *a = std::getenv("STRATA_Q36_FUSE"), *b = std::getenv("STRATA_Q36_FUSE_COMMIT");
+            return !(a && a[0] == '0') && !(b && b[0] == '0');
+        }();
+        return v;
+    }
     /// The GDN mixer of T <= kGemmT rows (layer li) on the decode-side kernels: the conv of qkv_b into hc_b, the delta rule
     /// over the rows into gdn_y (raw), then the gated norm in place and its q8_1 image in q8 (ssm_out's input).  `verify`: the
     /// conv history and the state are read, not written (the commit writes them for the kept rows).
@@ -5147,6 +5188,27 @@ work-group size if needed.
         q36k::QB *const yq = (q36k::QB *) q8;
         const float eps = m->eps;
         const bool wr = !verify;
+        if (rows_mode) {   // batch rows: grid dim 0 = the session group (STRATA_Q36_FUSE)
+            const int G = rows_G;
+            float *const *const conv_tab = d_conv_tab + li * n_sess;
+            float *const *const s_tab = d_S_tab + li * n_sess;
+            const int32_t *const gsl = d_gslot, *const gr0 = d_grow0, *const gct = d_gcnt;
+            st->parallel_for<class q36_conv_dec_rows_m4>(
+                sycl::nd_range<3>(sycl::range<3>((size_t) G, 1, (size_t) (C / 128)) * sycl::range<3>(1, 1, 128), sycl::range<3>(1, 1, 128)),
+                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                    k_conv_dec_rows(conv_tab, gsl, gr0, gct, qkv_b, cw, hc_b, C, 2 * HK, eps, wr);
+                });
+            st->parallel_for<class q36_gdn_dec_rows_m4>(
+                sycl::nd_range<3>(sycl::range<3>((size_t) G, kGdnDecCG, (size_t) HV) * sycl::range<3>(1, 4, 128 / kGdnDecCG),
+                                  sycl::range<3>(1, 4, 128 / kGdnDecCG)),
+                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
+                    k_gdn_dec_rows(s_tab, nullptr, gsl, gr0, gct, hc_b, C, al_b, be_b, o, HK, HV, wr, nullptr);
+                });
+            st->parallel_for<class q36_gdn_norm_q8_rows_m4>(   // (a row's norm needs only the row: every row of the window, one launch)
+                sycl::nd_range<3>(sycl::range<3>(1, (size_t) T, (size_t) HV) * sycl::range<3>(1, 1, 128), sycl::range<3>(1, 1, 128)),
+                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { k_gdn_norm_q8(o, zb, gam, eps, yq, HV); });
+            return;
+        }
         st->parallel_for<class q36_conv_dec_m4>(
             sycl::nd_range<3>(sycl::range<3>(1, 1, (size_t) (C / 128)) * sycl::range<3>(1, 1, 128), sycl::range<3>(1, 1, 128)),
             [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { k_conv_dec(hist, qkv_b, cw, hc_b, C, 2 * HK, eps, T, wr); });
@@ -5227,7 +5289,8 @@ work-group size if needed.
                             });
                 }
             }
-            const bool dec = gdn_dec_on() && !rows_mode && T <= kGemmT;   // M4: k_conv_dec / k_gdn_dec / k_gdn_norm_q8
+            // M4: k_conv_dec / k_gdn_dec / k_gdn_norm_q8; batch rows too with STRATA_Q36_FUSE (their group tables, gdn_dec)
+            const bool dec = gdn_dec_on() && T <= kGemmT && (!rows_mode || fuse_gdn_rows());
             if (dec) {
                 gdn_dec(L, li, T, verify, qkv_b, hc_b, al_b, be_b);
             } else if (rows_mode) {   // batch rows: a slot's rows (one, or a verify window's two) in sequence on its own state
@@ -6709,6 +6772,19 @@ work-group size if needed.
             for (size_t l = 0; l < m->layers.size(); ++l) {
                 const Layer& L = m->layers[l];
                 if (L.attn) continue;
+                if (fuse_commit_rows() && gdn_dec_on()) {   // STRATA_Q36_FUSE: one launch a layer, as commit() does for one session
+                    float *const *const conv_tab = d_conv_tab + l * n_sess;
+                    float *const *const s_tab = d_S_tab + l * n_sess;
+                    const int32_t *const gsl = d_gslot, *const gr0 = d_grow0, *const gct = d_gcnt;
+                    const float *const hcl = v_hc[l], *const al = v_alpha[l], *const be = v_beta[l], *const qv = v_qkv[l];
+                    st->parallel_for<class q36_gdn_commit_rows_m4>(
+                        sycl::nd_range<3>(sycl::range<3>((size_t) G, kGdnDecCG, (size_t) HV) * sycl::range<3>(1, 4, 128 / kGdnDecCG),
+                                          sycl::range<3>(1, 4, 128 / kGdnDecCG)),
+                        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
+                            k_gdn_dec_rows(s_tab, conv_tab, gsl, gr0, gct, hcl, C, al, be, nullptr, HK, HV, true, qv);
+                        });
+                    continue;
+                }
                 {
                     auto exp_props =
                         sycl::ext::oneapi::experimental::properties{};
