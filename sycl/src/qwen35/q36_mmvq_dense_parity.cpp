@@ -260,6 +260,14 @@ void call(bool dense, int t, const void* w, const void* xq, float* y, int n_in, 
     if (!strata::q36dense::mmvq(t, w, xq, y, n_in, n_out, ncols, stream)) throw std::runtime_error("the dense forms declined a call of this check");
 }
 
+// Engine's <=8 dispatch: XR when it handles (t, shape, snc), else KREG (q36dense), else native_mmvq.
+void call_eng8(int t, const void* w, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream) {
+    if (strata::q36xr::mmvq(t, w, xq, y, n_in, n_out, ncols, stream, true)) return;
+    if (strata::q36dense::mmvq(t, w, xq, y, n_in, n_out, ncols, stream)) return;
+    k::native_mmvq_set_kreg(0);
+    k::native_mmvq(t, w, xq, y, n_in, n_out, ncols, stream);
+}
+
 std::vector<float> run(Dev& dev, int t, const void* dw, const uint8_t* dxq, float* dy, int n_in, int n_out, int T,
                        int kreg, bool per_column) {
     k::native_mmvq_set_kreg(0);   // (the default kernels: native_mmvq without KREG)
@@ -273,6 +281,154 @@ std::vector<float> run(Dev& dev, int t, const void* dw, const uint8_t* dxq, floa
     std::vector<float> y((size_t) T * n_out);
     dev.get(y.data(), dy, y.size() * 4);
     return y;
+}
+
+double xr_rel(int n_in, int t = 0) {
+    const int bpr = n_in / 256, c = n_in > 16384 ? 2 : 4, cb = (bpr + c - 1) / c;
+    const int per_blk = (t == 14 || t == 11) ? 16 : 8;
+    const int h = per_blk * cb + c + 6;
+    const double u = std::ldexp(1.0, -24);
+    return 2.0 * h * u / (1.0 - h * u);
+}
+
+int selftest_xr16(sycl::queue& q, Dev& dev) {
+    const Shape XR_SHAPES[] = {{17408, 5120}, {5120, 17408}, {6144, 5120}, {5120, 6144}, {5120, 10240}, {5120, 1024}};
+    const int xr_types[] = {11, 12, 13, 14, 20, 23};
+    const int TMAX = 16;
+    const char* xr16_env = std::getenv("STRATA_Q36_XR16");
+    if (xr16_env && xr16_env[0] == '0') {
+        std::printf("\nxr16 selftest skipped (STRATA_Q36_XR16=0)\n");
+        return 0;
+    }
+    strata::q36xr::init(&q);
+    std::printf("\n%-7s %5s x %5s %2s  %-11s %-11s %9s %9s %9s %s\n", "xr16", "n_in", "n_out", "T", "xr16/bound",
+                "split/bnd", "diff_vs8", "vs_split", "nonfinite", "");
+    std::fflush(stdout);
+    int bad = 0;
+    for (int t : xr_types) {
+        const Format* f = format_of(t);
+        if (!f) continue;
+        for (const Shape& sh : XR_SHAPES) {
+            if (!strata::q36xr::handles_call(t, sh.n_in, sh.n_out, TMAX, true)) continue;
+            const size_t wbytes = k::native_mmvq_weight_bytes(t, sh.n_in, sh.n_out);
+            const size_t nblk = wbytes / f->block_bytes;
+            std::mt19937 rng(991u + 37u * (unsigned) t + (unsigned) sh.n_in + 13u * (unsigned) sh.n_out);
+            std::vector<uint8_t> w(wbytes);
+            for (auto& b : w) b = (uint8_t) (rng() & 0xff);
+            for (size_t b = 0; b < nblk; ++b)
+                for (int at : f->scale_at)
+                    if (at >= 0) { const uint16_t h = sane_half(rng); std::memcpy(&w[b * f->block_bytes + at], &h, 2); }
+            const uint16_t big = 0x27FF;
+            std::memcpy(&w[f->scale_at[0]], &big, 2);
+
+            std::vector<float> hx((size_t) TMAX * sh.n_in);
+            std::normal_distribution<float> nd(0.f, 1.f);
+            for (auto& v : hx) v = nd(rng);
+
+            void* dw = dev.alloc(wbytes);
+            float* dx = (float*) dev.alloc(hx.size() * 4);
+            const size_t qcol = k::native_q8_1_bytes(sh.n_in, 1);
+            uint8_t* dxq = (uint8_t*) dev.alloc(qcol * TMAX + 64);
+            float* dy = (float*) dev.alloc((size_t) TMAX * sh.n_out * 4);
+            dev.put(dw, w.data(), wbytes);
+            dev.put(dx, hx.data(), hx.size() * 4);
+            // Flatten contiguous columns as one vector (MAX_NCOLS = 8 unless STRATA_VERIFY_MAX_T > 8, same as Engine::mmq).
+            k::native_quantize_q8_1(dx, dxq, sh.n_in * TMAX, 1, &q);
+            q.wait_and_throw();
+            std::vector<uint8_t> xq(qcol * TMAX);
+            dev.get(xq.data(), dxq, xq.size());
+            std::vector<double> x;
+            dequant_q8_1(xq.data(), sh.n_in, TMAX, x);
+
+            // Sample rows across start, middle and tail tiles for fp64 reference; compare 100% of elements against 8 + (T-8) split.
+            std::vector<int> sample_rows;
+            const int mid = (sh.n_out / 2) & ~15;
+            for (int r = 0; r < sh.n_out; ++r) {
+                if (r < 64 || (r >= mid && r < mid + 64) || r >= sh.n_out - 64) sample_rows.push_back(r);
+            }
+            std::vector<double> ref((size_t) TMAX * sample_rows.size(), 0.0), mag2(ref.size(), 0.0);
+            {
+                const int bpr = sh.n_in / 256, bb = f->block_bytes;
+                std::vector<double> rrow(sh.n_in), rmin(sh.n_in);
+                for (size_t ri = 0; ri < sample_rows.size(); ++ri) {
+                    const int r = sample_rows[ri];
+                    for (int b = 0; b < bpr; ++b)
+                        dequant_block(t, &w[((size_t) r * bpr + b) * bb], &rrow[(size_t) 256 * b], &rmin[(size_t) 256 * b]);
+                    for (int j = 0; j < TMAX; ++j) {
+                        const double* xj = &x[(size_t) j * sh.n_in];
+                        double s = 0, m2 = 0;
+                        for (int i = 0; i < sh.n_in; ++i) {
+                            s += rrow[i] * xj[i];
+                            m2 += std::fabs((rrow[i] + rmin[i]) * xj[i]) + std::fabs(rmin[i] * xj[i]);
+                        }
+                        ref[(size_t) j * sample_rows.size() + ri] = s;
+                        mag2[(size_t) j * sample_rows.size() + ri] = m2;
+                    }
+                }
+            }
+            const bool xr8 = strata::q36xr::handles_call(t, sh.n_in, sh.n_out, 8, true);
+            const double rel_new = xr_rel(sh.n_in, t);
+            const double rel_old = xr8 ? rel_new : kreg_rel(sh.n_in);
+
+            for (int T = 9; T <= TMAX; ++T) {
+                q.memset(dy, 0xff, (size_t) T * sh.n_out * 4).wait();
+                if (!strata::q36xr::mmvq(t, dw, dxq, dy, sh.n_in, sh.n_out, T, &q, true))
+                    throw std::runtime_error("XR16 declined a selftest call");
+                q.wait_and_throw();
+                std::vector<float> y16((size_t) T * sh.n_out);
+                dev.get(y16.data(), dy, y16.size() * 4);
+
+                q.memset(dy, 0xff, (size_t) T * sh.n_out * 4).wait();
+                for (int c0 = 0; c0 < T; c0 += 8) {
+                    call_eng8(t, dw, dxq + (size_t) c0 * qcol, dy + (size_t) c0 * sh.n_out, sh.n_in, sh.n_out,
+                              std::min(8, T - c0), &q);
+                }
+                q.wait_and_throw();
+                std::vector<float> y8((size_t) T * sh.n_out);
+                dev.get(y8.data(), dy, y8.size() * 4);
+
+                long long diff8 = 0, nf = 0;
+                double rms_ss = 0.0, rms_sd = 0.0;
+                for (size_t i = 0; i < y16.size(); ++i) {
+                    if (!std::isfinite(y16[i]) || !std::isfinite(y8[i])) { ++nf; continue; }
+                    uint32_t a, b;
+                    std::memcpy(&a, &y16[i], 4);
+                    std::memcpy(&b, &y8[i], 4);
+                    diff8 += (a != b);
+                    const double dlt = (double) y16[i] - (double) y8[i];
+                    rms_ss += (double) y8[i] * y8[i];
+                    rms_sd += dlt * dlt;
+                }
+                const double split_rel = std::sqrt(rms_sd / std::max(rms_ss, 1e-30));
+
+                double r_new = 0.0, r_old = 0.0;
+                for (int j = 0; j < T; ++j)
+                    for (size_t ri = 0; ri < sample_rows.size(); ++ri) {
+                        const size_t oi = (size_t) j * sh.n_out + sample_rows[ri];
+                        const size_t si = (size_t) j * sample_rows.size() + ri;
+                        if (std::isfinite(y16[oi])) r_new = std::max(r_new, std::fabs(y16[oi] - ref[si]) / (rel_new * mag2[si] + 1e-30));
+                        if (std::isfinite(y8[oi])) r_old = std::max(r_old, std::fabs(y8[oi] - ref[si]) / (rel_old * mag2[si] + 1e-30));
+                    }
+                const bool ok = nf == 0 && r_new <= 1.0 && r_old <= 1.0 && split_rel < (xr8 ? 1e-5 : 5e-4);
+                std::printf("%-7s %5d x %5d %2d  %-11.3f %-11.3f %9lld %9.2e %9lld %s\n", f->name, sh.n_in, sh.n_out, T,
+                            r_new, r_old, diff8, split_rel, nf, ok ? "ok" : "FAIL");
+                if (!ok) ++bad;
+                if (T == TMAX) {
+                    std::vector<uint8_t> w2(w.begin(), w.begin() + wbytes / sh.n_out);
+                    w2[f->sub0_scale_at] ^= 1;
+                    std::vector<double> ref2, m2a, m2b;
+                    reference(t, w2, sh.n_in, 1, 0, 1, x, TMAX, ref2, m2a, m2b);
+                    double seen = 0;
+                    for (int j = 0; j < TMAX; ++j)
+                        seen = std::max(seen, std::fabs(y16[(size_t) j * sh.n_out] - ref2[j]) / (rel_new * mag2[(size_t) j * sample_rows.size()] + 1e-30));
+                    std::printf("%-7s %5d x %5d     power: one scale step of row 0 is %.1f x the bound\n", f->name, sh.n_in, sh.n_out, seen);
+                    if (seen <= 1.0) ++bad;
+                }
+            }
+            sycl::free(dw, q); sycl::free(dx, q); sycl::free(dxq, q); sycl::free(dy, q);
+        }
+    }
+    return bad;
 }
 
 int selftest() {
@@ -363,6 +519,7 @@ int selftest() {
             sycl::free(dw, q); sycl::free(dx, q); sycl::free(dxq, q); sycl::free(dy, q);
         }
     }
+    bad += selftest_xr16(q, dev);
     k::native_mmvq_set_kreg(-1);
     std::printf("\nq36_mmvq_dense_parity: %d failures\n", bad);
     return bad;
@@ -437,8 +594,8 @@ int bench(const char* types_s, const char* ncols_s, const std::string& ssel) {
     const size_t max_alloc = (size_t) q.get_device().get_info<sycl::info::device::max_mem_alloc_size>();
     if (pool + 4096 > max_alloc) pool = (max_alloc > 4096 ? max_alloc - 4096 : 0) & ~(size_t) 255;
     const size_t POOL = pool;
-    const int maxc = 8, maxout = 248320;
-    const size_t xq_bytes = k::native_q8_1_bytes(17408, maxc) + 256;
+    const int maxc = 16, maxout = 248320;
+    const size_t xq_bytes = k::native_q8_1_bytes(17408 * maxc, 1) + 256;
     uint8_t* dpool = (uint8_t*) sycl::malloc_device(POOL + 4096, q);
     float* y = sycl::malloc_device<float>((size_t) maxc * maxout, q);
     std::vector<float> hx((size_t) maxc * 17408);
@@ -454,8 +611,10 @@ int bench(const char* types_s, const char* ncols_s, const std::string& ssel) {
     std::normal_distribution<float> nd(0.f, 1.f);
     for (auto& v : hx) v = nd(rng);
     q.memcpy(dx, hx.data(), hx.size() * 4).wait();
+    strata::q36xr::init(&q);
     std::printf("q36_mmvq_dense_parity --bench on %s: us per call (median), GB/s of weight bytes\n",
                 q.get_device().get_info<sycl::info::device::name>().c_str());
+    int bad = 0;
     for (const int t : types) {
         const Format* f = format_of(t);
         if (!f) { std::printf("type %d: not a KREG format (11, 12, 13, 14, 20, 23)\n", t); continue; }
@@ -471,32 +630,91 @@ int bench(const char* types_s, const char* ncols_s, const std::string& ssel) {
                 continue;
             }
             const int ndist = (int) std::max<size_t>(1, std::min<size_t>(128, POOL / slot)), nmat = std::max(ndist, 16);
+            const size_t qb = k::native_q8_1_bytes(sh.n_in, 1);
             for (const int nc : ncl) {
                 if (nc < 1 || nc > maxc) continue;
                 if ((size_t) nc * sh.n_in > hx.size() || (size_t) nc * sh.n_out > (size_t) maxc * maxout ||
-                    k::native_q8_1_bytes(sh.n_in, nc) > xq_bytes) {
+                    qb * nc > xq_bytes) {
                     std::printf("%-6s %-6s %5d x %6d nc %d: skipped, an activation or output buffer is too small\n", f->name, sh.name,
                                 sh.n_in, sh.n_out, nc);
                     continue;
                 }
-                k::native_quantize_q8_1(dx, xq, sh.n_in, nc, &q);
+                k::native_quantize_q8_1(dx, xq, sh.n_in * nc, 1, &q);
                 q.wait();
                 auto timed = [&](int mode) {
                     k::native_mmvq_set_kreg(0);
+                    call(mode != 0, t, dpool, xq, y, sh.n_in, sh.n_out, nc, &q);
+                    q.wait();
                     return time_graph(q, nmat, [&](int m) {
                         call(mode != 0, t, dpool + (size_t) (m % ndist) * slot, xq, y, sh.n_in, sh.n_out, nc, &q);
                     }, wb > (100u << 20) ? 7 : 11);
                 };
-                if (std::getenv("STRATA_BENCH_XR") && strata::q36xr::handles(t)) {   // the XMX form against KREG: us, GB/s, the outputs' distance
-                    const bool xr_q81 = true;   // the form reads the q8_1 image itself
+                if (nc > 8) {
+                    auto run_split = [&](int mode, const uint8_t* wptr) {
+                        for (int c0 = 0; c0 < nc; c0 += 8) {
+                            const int snc = std::min(8, nc - c0);
+                            const void* qptr = (const char*) xq + (size_t) c0 * qb;
+                            float* yptr = y + (size_t) c0 * sh.n_out;
+                            if (mode == 2) call_eng8(t, wptr, qptr, yptr, sh.n_in, sh.n_out, snc, &q);
+                            else call(mode != 0, t, wptr, qptr, yptr, sh.n_in, sh.n_out, snc, &q);
+                        }
+                    };
+                    auto timed_split = [&](int mode) {
+                        // mode: 0 = default split (8 + rest), 1 = KREG split, 2 = engine <=8 split (XR -> KREG -> native)
+                        k::native_mmvq_set_kreg(0);
+                        run_split(mode, dpool);   // warm up outside graph recording so lazy scratch buffers allocate safely
+                        q.wait();
+                        return time_graph(q, nmat, [&](int m) {
+                            run_split(mode, dpool + (size_t) (m % ndist) * slot);
+                        }, wb > (100u << 20) ? 7 : 11);
+                    };
+                    if (strata::q36xr::handles_call(t, sh.n_in, sh.n_out, nc, true)) {
+                        const bool xr8 = strata::q36xr::handles_call(t, sh.n_in, sh.n_out, 8, true);
+                        std::vector<float> hold((size_t) nc * sh.n_out), hnew((size_t) nc * sh.n_out);
+                        run_split(2, dpool);
+                        q.wait();
+                        q.memcpy(hold.data(), y, hold.size() * 4).wait();
+                        if (!strata::q36xr::mmvq(t, dpool, xq, y, sh.n_in, sh.n_out, nc, &q, true))
+                            throw std::runtime_error("XR16 declined a bench call");
+                        q.wait();
+                        q.memcpy(hnew.data(), y, hnew.size() * 4).wait();
+                        double ss = 0, sd = 0;
+                        long long bdiff = 0;
+                        for (size_t i = 0; i < hold.size(); ++i) {
+                            uint32_t a, b;
+                            std::memcpy(&a, &hold[i], 4); std::memcpy(&b, &hnew[i], 4);
+                            bdiff += (a != b);
+                            const double dlt = (double) hnew[i] - hold[i];
+                            ss += (double) hold[i] * hold[i]; sd += dlt * dlt;
+                        }
+                        const double rel = std::sqrt(sd / std::max(ss, 1e-30));
+                        const bool ok = rel < (xr8 ? 1e-4 : 5e-4);
+                        if (!ok) ++bad;
+                        const double u_old = timed_split(2);
+                        const double u_new = time_graph(q, nmat, [&](int m) {
+                            if (!strata::q36xr::mmvq(t, dpool + (size_t) (m % ndist) * slot, xq, y, sh.n_in, sh.n_out, nc, &q, true))
+                                throw std::runtime_error("XR16 declined a bench call");
+                        }, wb > (100u << 20) ? 7 : 11);
+                        std::printf("%-6s %-6s %5d x %6d nc %2d  %-8s %8.2f us %5.1f GB/s  xr16 %8.2f us %5.1f GB/s  x%.2f  rms diff / rms %.2e (diff %lld/%zu)%s\n",
+                                    f->name, sh.name, sh.n_in, sh.n_out, nc, xr8 ? "xr8+rest" : "eng8+rst",
+                                    u_old, wb / u_old / 1e3, u_new, wb / u_new / 1e3,
+                                    u_old / u_new, rel, bdiff, hold.size(), ok ? "" : "  FAIL");
+                    } else {
+                        const double u0 = timed_split(0);
+                        const double u1 = timed_split(1);
+                        std::printf("%-6s %-6s %5d x %6d nc %2d  dflt8+r %8.2f us %5.1f GB/s  kreg8+r %8.2f us %5.1f GB/s  x%.2f\n",
+                                    f->name, sh.name, sh.n_in, sh.n_out, nc, u0, wb / u0 / 1e3, u1, wb / u1 / 1e3, u0 / u1);
+                    }
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (std::getenv("STRATA_BENCH_XR") && strata::q36xr::handles_call(t, sh.n_in, sh.n_out, nc, true)) {   // the XMX form against KREG: us, GB/s, the outputs' distance
                     const double uk = timed(1);
                     q.wait();
                     std::vector<float> hk((size_t) nc * sh.n_out), hx_((size_t) nc * sh.n_out);
                     q.memcpy(hk.data(), y, hk.size() * 4).wait();
-                    strata::q36xr::quantize(dx, sh.n_in, nc, xact, &q);
-                    q.wait();
                     const double ux = time_graph(q, nmat, [&](int m) {
-                        if (!strata::q36xr::mmvq(t, dpool + (size_t) (m % ndist) * slot, xr_q81 ? xq : xact, y, sh.n_in, sh.n_out, nc, &q, xr_q81))
+                        if (!strata::q36xr::mmvq(t, dpool + (size_t) (m % ndist) * slot, xq, y, sh.n_in, sh.n_out, nc, &q, true))
                             throw std::runtime_error("the XMX form declined a bench call");
                     }, wb > (100u << 20) ? 7 : 11);
                     q.wait();
@@ -529,8 +747,8 @@ int bench(const char* types_s, const char* ncols_s, const std::string& ssel) {
         }
     }
     k::native_mmvq_set_kreg(-1);
-    sycl::free(dpool, q); sycl::free(y, q); sycl::free(dx, q); sycl::free(xq, q);
-    return 0;
+    sycl::free(dpool, q); sycl::free(y, q); sycl::free(dx, q); sycl::free(xq, q); sycl::free(xact, q);
+    return bad ? 1 : 0;
 }
 
 }  // namespace

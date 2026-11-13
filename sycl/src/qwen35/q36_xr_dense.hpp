@@ -13,10 +13,13 @@ std::size_t act_bytes(int n_in);
 /// x [ncols][n_in] floats -> `act`: per 32 activations the int8 values of up to 8 columns (q8_1 as llama.cpp: d = amax / 127),
 /// each column's scale and its scale x sum.  Columns ncols .. 7 are zero.
 void quantize(const float* x, int n_in, int ncols, void* act, void* stream);
-/// y[col * n_out + row] = weights . activations for 1-8 columns.  false: not taken (type, shape), nothing launched.
+/// y[col * n_out + row] = weights . activations for 1-16 columns (9-16 read each weight tile once; STRATA_Q36_XR16=0 keeps
+/// 9-16 off).  false: not taken (type, shape), nothing launched.
 /// q81 = false: `act` is quantize()'s block.  q81 = true: `act` is the q8_1 image native_quantize_q8_1 writes (ncols columns
 /// of n_in / 32 blocks of 36 bytes), with at least 28 readable bytes after its last block.
 bool mmvq(int ggml_type, const void* weights, const void* act, float* y, int n_in, int n_out, int ncols, void* stream, bool q81 = false);
+/// Whether mmvq() takes (ggml_type, n_in, n_out, ncols, q81), including STRATA_Q36_XR16* and STRATA_Q36_XR_IQ4.
+bool handles_call(int ggml_type, int n_in, int n_out, int ncols, bool q81 = true);
 /// B70W4 (tools/qwen35/b70w4_pack.py): the bytes of a packed n_out x n_in matrix (n_in a multiple of 256, n_out of 16).
 std::size_t w4_bytes(int n_in, int n_out);
 /// y[col * n_out + row] = W4 weights . the q8_1 image `xq` (with 28 readable bytes after its last block) for 1-32 columns

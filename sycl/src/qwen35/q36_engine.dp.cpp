@@ -421,8 +421,8 @@ struct Lookup {
         broke(p, next, a, d);
     }
 };
-// The XMX rows forms (STRATA_Q36_XR=0: off) (q36_xr_dense.dp.cpp: Q4_K, Q5_K, IQ4_XS; 1-8 columns for the price of one) take the
-// dense model's products before the KREG forms; they read the same q8_1 image.
+// The XMX rows forms (STRATA_Q36_XR=0: off; STRATA_Q36_XR16=0: split 9-16) (q36_xr_dense.dp.cpp: Q4_K, Q5_K, IQ4_XS; 1-16
+// columns in one read of the weights) take the dense model's products before the KREG forms; they read the same q8_1 image.
 inline bool q36_xr_on() {
     static const bool on = [] { const char* e = std::getenv("STRATA_Q36_XR"); return !(e && e[0] == '0'); }();
     return on;
@@ -4577,9 +4577,11 @@ work-group size if needed.
     /// T-column launch is bitwise T one-column launches (the multi_exact contract), so the split changes no output.)
     void mmq(const Mat& w, const void* q, float* out, int T) {
         if (q8_small(w, q, out, T)) return;
-        // (M2: 8 columns a call everywhere; KREG itself runs a row wider than 16384 - the 27B's ffn_down - with its K split over
-        // work-groups (M4: 4 parts, 5-8 columns in one pass).  A T-column call is bitwise T one-column calls.)
-        const int maxc = w.type == kW4Type ? 32 : 8;   // (the pack's form: up to 32 columns in one read of the weights)
+        // (M2: 8 columns a call for KREG / non-XR; KREG itself runs a row wider than 16384 - the 27B's ffn_down - with its K split
+        // over work-groups.  When XR handles the call at T in 1..16 (STRATA_Q36_XR16=1), one launch reads the weights once.)
+        int maxc = 8;
+        if (w.type == kW4Type) maxc = 32;   // (the pack's form: up to 32 columns in one read of the weights)
+        else if (g_q36_dense_forms && q36_xr_on() && strata::q36xr::handles_call(w.type, w.n_in, w.n_out, T, true)) maxc = 16;
         const size_t qb = K::native_q8_1_bytes(w.n_in, 1);
         for (int c0 = 0; c0 < T; c0 += maxc) {
             const int nc = std::min(maxc, T - c0);
