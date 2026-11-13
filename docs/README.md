@@ -6,7 +6,7 @@
 
 | I want… | Guide |
 | --- | --- |
-| Build and run on one Arc Pro B70 (Docker + `./setup.sh`) | [README](../README.md), [B70 branch notes](B70.md) |
+| Build and run on one Arc Pro B70 (Docker + `./setup.sh`) | [Quickstart](QUICKSTART.md), [README](../README.md), [B70 branch notes](B70.md) |
 | Install or update (Terminal / upstream installer reference) | [Install Strata](INSTALL.md) |
 | Choose a model and check B70 memory fit | [B70 model fit arithmetic](B70_MODELS.md), [Upstream models index](MODELS.md), [Quantizations](QUANTS.md) |
 | Start from the command line (`strata launch`) | [Terminal launch](TERMINAL_LAUNCH.md) |
