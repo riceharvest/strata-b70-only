@@ -57,6 +57,8 @@ struct Call {
     float* pm;                 //      row = (t - t0) * H + head: what k_attn_merge_gqa merges
     float* pl;
     int dbg = 0;               // (STRATA_XATT_DBG, timing only: parts of the kernels left out)
+    const uint32_t* tmask = nullptr;   // optional device [nt] ancestor bitmasks (tree verify)
+    const int32_t* tp0 = nullptr;      // device scalar tree root cell (defaults to *pos0 when null)
 };
 /// Three kernels on `stream`'s queue: the queries as int8, the scores and each chunk's softmax, the value sums.
 /// false: the shape is not taken (the caller runs k_attn_gqa).

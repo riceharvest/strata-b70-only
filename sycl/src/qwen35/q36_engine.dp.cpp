@@ -153,33 +153,41 @@ inline bool q36_draft_q4() {
 // The drafts a step offers, by the cells already in the cache.  Every column of the verify window reads the whole K / V
 // cache, so a draft more costs more the longer the conversation is.  Measured on the B70 (2026-11-12, UD-Q4_K_M, XMX forms):
 // short context, depth 3 / 4 / 5: 42.3 / 44.7 / 47.1 ms a step, 3.2 / 3.7 / 3.9 tokens a step -> 5 is best; after a 118K
-// prompt, depth 3 / 5: 85.3 / 114.6 ms a step, 32.5 / 27.0 tok/s -> 3 is best.  The crossing is near 20K cells.
-// STRATA_Q36_MTP_CELLS="a,b" (16384,32768): --mtp's depth below a cells, at most 4 below b, at most 3 from b on.
-inline int q36_depth_at(int64_t cells, int mtp_d) {
-    static const std::pair<long long, long long> lim = [] {
+// Adaptive MTP depth policy: cold base tapers at long context (5 / 4 / 3) while full-accept streaks unlock up to --mtp
+// (and tree mode always gets the unlocked budget).  STRATA_Q36_MTP_CELLS="a,b": hard cell thresholds if explicitly set.
+inline std::pair<long long, long long> q36_mtp_cells_env(bool& has_env) {
+    static const std::pair<bool, std::pair<long long, long long>> cfg = [] {
         long long a = 16384, b = 32768;
-        if (const char* e = std::getenv("STRATA_Q36_MTP_CELLS")) std::sscanf(e, "%lld,%lld", &a, &b);
-        return std::make_pair(a, std::max(a, b));
+        const char* e = std::getenv("STRATA_Q36_MTP_CELLS");
+        bool set = (e != nullptr && *e != '\0');
+        if (set) std::sscanf(e, "%lld,%lld", &a, &b);
+        return std::make_pair(set, std::make_pair(a, std::max(a, b)));
     }();
-    return cells < lim.first ? mtp_d : cells < lim.second ? std::min(mtp_d, 4) : std::min(mtp_d, 3);
+    has_env = cfg.first;
+    return cfg.second;
 }
-// Drafts beyond the base depth only on a run of accepted drafts.  A step offers kDraftBase drafts (or --mtp's, when that
-// is less); after a step whose drafts were all accepted the next offers one more, up to --mtp; after a miss it is back at
-// the base.  Text that the draft block predicts almost fully (an edit that repeats a file: 1,227 of 1,255 accepted) then
-// runs at the full depth (15 with the pack: a window of 16 rows), text it predicts half of stays at the base (the int4
-// pack, depth 5 / 7 fixed: 83.7 / 79.6 tok/s
-// on code-v1, 147.7 / 174.0 on a whole-file edit).  STRATA_Q36_MTP_BASE=N: another base (N >= --mtp: always --mtp).
 constexpr int kDraftBase = 5;
 inline int q36_draft_base(int mtp_d) {
     static const int e = [] { const char* v = std::getenv("STRATA_Q36_MTP_BASE"); const int n = v ? std::atoi(v) : 0; return n > 0 ? n : kDraftBase; }();
     return std::min(e, mtp_d);
 }
-inline int q36_next_cap(int offered, int accepted, int mtp_d) {
-    // every draft accepted: one more (two from 8 on); a miss: one more than was accepted, the base at least (a long accepted run that
-    // ends in one miss stays deep: a whole-file edit accepts 93% of its drafts and still misses once in most deep steps)
-    // (measured, int4 pack: +2 at every depth cost code-v1 3.3 tok/s, a reset to the base after a miss cost the edit 22)
-    if (accepted >= offered) return std::min(mtp_d, offered + (offered < 8 ? 1 : 2));
-    return std::min(mtp_d, std::max(q36_draft_base(mtp_d), accepted + 1));
+inline int q36_draft_base_at(int64_t cells, int mtp_d) {
+    static const bool has_base_env = [] { const char* v = std::getenv("STRATA_Q36_MTP_BASE"); return v && std::atoi(v) > 0; }();
+    const int base = q36_draft_base(mtp_d);
+    if (has_base_env) return base;
+    bool has_cells = false;
+    const auto lim = q36_mtp_cells_env(has_cells);
+    return cells < lim.first ? base : cells < lim.second ? std::min(base, 4) : std::min(base, 3);
+}
+inline int q36_depth_at(int64_t cells, int mtp_d) {
+    bool has_cells = false;
+    const auto lim = q36_mtp_cells_env(has_cells);
+    if (has_cells) return cells < lim.first ? mtp_d : cells < lim.second ? std::min(mtp_d, 4) : std::min(mtp_d, 3);
+    return cells < 131072 ? mtp_d : std::min(mtp_d, 6);
+}
+inline int q36_next_cap(int offered, int accepted, int mtp_d, int64_t cells = 0) {
+    if (accepted >= offered) return std::min(mtp_d, offered + (offered < 8 ? 2 : 3));
+    return std::min(mtp_d, std::max(q36_draft_base_at(cells, mtp_d), accepted + 1));
 }
 // Lookup drafts (STRATA_Q36_NGRAM=0: off; STRATA_Q36_NGRAM_LOG=1: a line an event).  A draft the host can guess costs no
 // draft call, and a window row more costs a column of each product.  When the model is copying - the tokens it just
@@ -196,7 +204,7 @@ inline int q36_next_cap(int offered, int accepted, int mtp_d) {
 //     that became 1-4 others is remembered and written that way in later drafts (an edit that renames a name everywhere);
 //     a remembered replacement the model does not make twice is forgotten.
 //   - A lookup step offers 8 drafts at first and the full depth after a fully accepted one.
-constexpr int kLookupProof = 5;
+constexpr int kLookupProof = 3;
 inline bool q36_ngram() {
     static const bool v = [] { const char* e = std::getenv("STRATA_Q36_NGRAM"); return !(e && e[0] == '0'); }();
     return v;
@@ -214,11 +222,25 @@ inline bool q36_ngram_log() {
 }
 struct Lookup {
     struct Pos { int32_t i = -1; int off = 0; };     // the source token t[i]; `off` tokens of its replacement are written
+    struct Ring4 {
+        int32_t e[4] = {-1, -1, -1, -1};
+        uint8_t n = 0, w = 0;
+        void add(int32_t v) {
+            const int lim = std::min<int>(n, 4);
+            for (int i = 0; i < lim; ++i) if (e[i] == v) return;
+            e[w & 3] = v;
+            ++w;
+            if (n < 4) ++n;
+        }
+    };
     std::vector<int32_t> t;                          // the conversation's tokens, as the session holds them
     std::unordered_map<uint64_t, int32_t> last;      // (a, b, c) -> the index after its latest occurrence
+    std::unordered_map<uint64_t, Ring4> multi3;      // (a, b, c) -> up to 4 recent indices after occurrence
+    std::unordered_map<uint64_t, int32_t> last4;     // (a, b, c, d) -> the index after its latest 4-gram occurrence
     std::unordered_map<int32_t, std::vector<int32_t>> subst;   // a source token -> what the model writes for it
     std::unordered_map<int32_t, int> bad;            // ... and how often it did not
-    int32_t place = -1;                              // no copy: where this step's last three tokens stand earlier (t[place ..] followed)
+    int32_t place = -1;                              // no copy: best candidate where last 3/4 tokens stand earlier
+    std::vector<int32_t> cands;                      // candidate source indices for next step
     Pos cur;                                         // a copy: the source's token for the one after x (i < 0: no copy)
     std::vector<Pos> pos;                            // this step's drafts: the source position of each, and the one after them
     int32_t mend = -1, near = -1;                    // a broken copy: the source token not written; where a dropped copy stood
@@ -228,10 +250,18 @@ struct Lookup {
     static uint64_t key(int32_t a, int32_t b, int32_t c) {
         return ((uint64_t) (uint32_t) a * 0x9E3779B97F4A7C15ull) ^ ((uint64_t) (uint32_t) b * 0xC2B2AE3D27D4EB4Full) ^ ((uint64_t) (uint32_t) c << 21);
     }
+    static uint64_t key4(int32_t a, int32_t b, int32_t c, int32_t d) {
+        return key(b, c, d) ^ (((uint64_t) (uint32_t) a * 0x165667B19E3779F9ull) << 11) ^ ((uint64_t) (uint32_t) a >> 13);
+    }
     void push(int32_t tok) {
         t.push_back(tok);
         const size_t n = t.size();
-        if (n >= 3) last[key(t[n - 3], t[n - 2], t[n - 1])] = (int32_t) n;
+        if (n >= 3) {
+            const uint64_t k3 = key(t[n - 3], t[n - 2], t[n - 1]);
+            last[k3] = (int32_t) n;
+            multi3[k3].add((int32_t) n);
+        }
+        if (n >= 4) last4[key4(t[n - 4], t[n - 3], t[n - 2], t[n - 1])] = (int32_t) n;
     }
     void idle() {
         cur = Pos{};
@@ -245,10 +275,13 @@ struct Lookup {
         if (live.size() < n || (n > 0 && live[n - 1] != t[n - 1])) {
             t.clear();
             last.clear();
+            multi3.clear();
+            last4.clear();
             subst.clear();
             bad.clear();
             idle();
             place = near = -1;
+            cands.clear();
             depth = 8;
         }
         for (size_t i = t.size(); i < live.size(); ++i) push(live[i]);
@@ -274,11 +307,45 @@ struct Lookup {
         while (gi < g.size() && p.i < n && at(p) == g[gi]) { step(p); ++gi; ++m; }
         return m;
     }
+    void collect_cands(int32_t x, std::vector<int32_t>& dst) const {
+        dst.clear();
+        const int32_t n = (int32_t) t.size();
+        if (n < 3) return;
+        const int32_t a = t[(size_t) n - 2], b = t[(size_t) n - 1];
+        auto add_cand = [&](int32_t e) {
+            if (e < 3 || e >= n) return;
+            if (t[(size_t) e - 1] != x || t[(size_t) e - 2] != b || t[(size_t) e - 3] != a) return;
+            for (int32_t prev : dst) if (prev == e) return;
+            dst.push_back(e);
+        };
+        if (near >= 0) {
+            for (int32_t j = std::max(3, near - 8); j < std::min(n, near + 96); ++j)
+                if (t[(size_t) j - 1] == x && t[(size_t) j - 2] == b && t[(size_t) j - 3] == a) { add_cand(j); break; }
+        }
+        if (n >= 4) {
+            const int32_t a0 = t[(size_t) n - 3];
+            if (auto it4 = last4.find(key4(a0, a, b, x)); it4 != last4.end()) {
+                const int32_t e = it4->second;
+                if (e >= 4 && e < n && t[(size_t) e - 4] == a0) add_cand(e);
+            }
+        }
+        if (auto it3 = multi3.find(key(a, b, x)); it3 != multi3.end()) {
+            const Ring4& r = it3->second;
+            const int cnt = std::min<int>(r.n, 4);
+            for (int k = 0; k < cnt; ++k) {
+                const int idx = ((int) r.w - 1 - k) & 3;
+                add_cand(r.e[idx]);
+            }
+        } else if (auto it = last.find(key(a, b, x)); it != last.end()) {
+            add_cand(it->second);
+        }
+    }
     /// The drafts after `x` (the decided next token, not yet in t): up to `maxn` tokens; none unless a copy runs.
     void propose(int32_t x, int maxn, std::vector<int32_t>& out) {
         out.clear();
         pos.clear();
         place = -1;
+        cands.clear();
         const int32_t n = (int32_t) t.size();
         if (!q36_ngram() || maxn <= 0 || n < 3) { idle(); return; }
         if ((cur.i >= 0 || mend >= 0) && n != want) idle();   // (tokens came in another way: a step without drafts)
@@ -291,15 +358,27 @@ struct Lookup {
             return;
         }
         if (mend >= 0) return;   // (an MTP step: observe() lines the copy up again)
-        const int32_t a = t[(size_t) n - 2], b = t[(size_t) n - 1];
-        if (near >= 0)           // a dropped copy: the place closest after where it stood
-            for (int32_t j = std::max(3, near - 8); j < std::min(n, near + 96); ++j)
-                if (t[(size_t) j - 1] == x && t[(size_t) j - 2] == b && t[(size_t) j - 3] == a) { place = j; break; }
-        if (place < 0)
-            if (auto it = last.find(key(a, b, x)); it != last.end()) {
-                const int32_t e = it->second;   // t[e - 1] is that occurrence's last token (x's twin), t[e ..] what followed
-                if (e >= 3 && e < n && t[(size_t) e - 1] == x && t[(size_t) e - 2] == b && t[(size_t) e - 3] == a) place = e;
-            }
+        collect_cands(x, cands);
+        if (!cands.empty()) place = cands[0];
+    }
+    /// Side-branch candidate continuations after `x` when no active copy is locked (for tree verify): distinct prefixes.
+    void propose_side(int32_t x, int max_branches, int max_len, std::vector<std::vector<int32_t>>& paths) const {
+        paths.clear();
+        const int32_t n = (int32_t) t.size();
+        if (!q36_ngram() || cur.i >= 0 || mend >= 0 || max_branches <= 0 || max_len <= 0 || n < 3) return;
+        std::vector<int32_t> tmp;
+        const std::vector<int32_t>* cp = &cands;
+        if (cp->empty()) { collect_cands(x, tmp); cp = &tmp; }
+        for (int32_t e : *cp) {
+            if ((int) paths.size() >= max_branches) break;
+            std::vector<int32_t> seq;
+            Pos p{e, 0};
+            while ((int) seq.size() < max_len && p.i < n) { seq.push_back(at(p)); step(p); }
+            if (seq.empty()) continue;
+            bool dup = false;
+            for (const auto& ex : paths) if (ex[0] == seq[0]) { dup = true; break; }
+            if (!dup) paths.push_back(std::move(seq));
+        }
     }
     /// `j` tokens were written for `s` of the source's at `m`: one source token that became others is remembered.
     void learn(int32_t m, int j, int s) {
@@ -392,18 +471,27 @@ struct Lookup {
             }
             return;
         }
-        if (place < 0) return;
+        if (place < 0 && cands.empty()) return;
         std::vector<int32_t> g(drafts.begin(), drafts.begin() + a);   // a copy starts when these are the place's continuation
         g.push_back(next);
-        Pos p{place, 0};
-        const int m = walk(g, 0, p);
-        if (m < kLookupProof) return;
-        if (q36_ngram_log()) std::fprintf(stderr, "lookup: copy from %d (%d of %d)\n", place, m, (int) g.size());
-        if (m == (int) g.size()) { idle(); cur = p; depth = 8; return; }
+        int32_t best_c = -1;
+        int best_m = 0;
+        Pos best_p{};
+        auto try_c = [&](int32_t c) {
+            if (c < 0 || c >= (int32_t) t.size()) return;
+            Pos p{c, 0};
+            const int m = walk(g, 0, p);
+            if (m > best_m) { best_m = m; best_c = c; best_p = p; }
+        };
+        if (place >= 0) try_c(place);
+        for (int32_t c : cands) try_c(c);
+        if (best_m < kLookupProof) return;
+        if (q36_ngram_log()) std::fprintf(stderr, "lookup: copy from %d (%d of %d)\n", best_c, best_m, (int) g.size());
+        if (best_m == (int) g.size()) { idle(); cur = best_p; depth = 8; return; }
         idle();
-        if (p.i >= (int32_t) t.size()) return;
-        mend = p.i;
-        wrote.assign(g.begin() + m, g.end());
+        if (best_p.i >= (int32_t) t.size()) return;
+        mend = best_p.i;
+        wrote.assign(g.begin() + best_m, g.end());
         align();
     }
     /// A lookup step's outcome: `a` of the proposal's `d` drafts stood, `next` is the token after them.
@@ -867,6 +955,8 @@ struct RowSel {
     // layer is then q36_xatt.hpp's v8t - [HKV][cells / 32][256 dims][32 cells] codes - and after it [HKV][cells] FP32
     // scales, one a cell: what the matrix-engine decode attention reads, with no second copy.
     int32_t vt = 0;
+    const uint32_t* tmask = nullptr; // device [T]: ancestor bitmask relative to *tp0 (tree verify)
+    const int32_t* tp0 = nullptr;    // device scalar: root cell index in cache
 };
 
 /// The K / V cache's element type: FP16 by default up to a context of 131072 (llama.cpp's f16 cache: half the bytes of
@@ -1331,6 +1421,7 @@ void k_attn_gqa(const float* q, const KV* kc, const KV* vc, const int32_t* pos0,
     auto& slo = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[R]>(wg);   // a row's cells in this chunk:
     auto& shi = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[R]>(wg);   // [slo, shi)
     auto& slv = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[R]>(wg);   // the row has cells in this block
+    auto& tmk_r = *sycl::ext::oneapi::group_local_memory_for_overwrite<uint32_t[R]>(wg);   // per-row tree ancestor mask
     const int tid = (int) it.get_local_id(2);
     const int c = (int) it.get_group(2), kvh = (int) it.get_group(1), grp = (int) it.get_group(0);
     const int G = H / HKV;
@@ -1340,6 +1431,8 @@ void k_attn_gqa(const float* q, const KV* kc, const KV* vc, const int32_t* pos0,
     const int nrt = rows ? 1 : sycl::min(per, t0 + nt - ta);
     const int nr = nrt * G;                                        // its rows: r = token * G + head
     const int n0 = rows ? rs.cell[ta] + 1 : *pos0 + ta + 1;        // the first token's cells; token k sees n0 + k
+    const bool has_tmask = !rows && rs.tmask != nullptr;
+    const int tp0 = has_tmask ? (rs.tp0 ? rs.tp0[0] : *pos0) : 0x3fffffff;
     // chunk c of token k: [c * cs_k, min((c + 1) * cs_k, n0 + k)), cs_k its own (the merge takes the same); the group
     // walks [ua, ub), the union (at most two chunk sizes in a group: a step comes every nchk * kAttBlk cells)
     int ua = 0x7fffffff, ub = 0;
@@ -1386,6 +1479,7 @@ void k_attn_gqa(const float* q, const KV* kc, const KV* vc, const int32_t* pos0,
         shi[tid] = b;
         sm[tid] = kAttNeg;
         sl[tid] = 0.f;
+        tmk_r[tid] = (has_tmask && tid < nr) ? rs.tmask[ta + tid / G] : 0xffffffffu;
     }
     it.barrier(sycl::access::fence_space::local_space);
     const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();   // 16 sub-groups
@@ -1430,7 +1524,14 @@ void k_attn_gqa(const float* q, const KV* kc, const KV* vc, const int32_t* pos0,
                     }
                     const float s = sg16_rsum8(sg, part, lane);
                     const int r = g8 * 8 + ((lane >> 1) & 7);
-                    if ((lane & 1) == 0 && r < nr) sp[r * SLD + cc] = p >= slo[r] && p < shi[r] ? s * scale : kAttNeg;
+                    if ((lane & 1) == 0 && r < nr) {
+                        bool ok = p >= slo[r] && p < shi[r];
+                        if (ok && has_tmask && p >= tp0) {
+                            const int u = p - tp0;
+                            ok = (uint32_t) u < 32u && ((tmk_r[r] & (1u << (uint32_t) u)) != 0u);
+                        }
+                        sp[r * SLD + cc] = ok ? s * scale : kAttNeg;
+                    }
                 }
             }
         }
@@ -1457,7 +1558,7 @@ void k_attn_gqa(const float* q, const KV* kc, const KV* vc, const int32_t* pos0,
 #pragma unroll
             for (int j = 0; j < BLK / 16; ++j) {
                 const int cc = lane + 16 * j;
-                const float e = cc < nb && pb + cc >= lo && pb + cc < hi ? sycl::native::exp(v[j] - mn) : 0.f;
+                const float e = cc < nb && pb + cc >= lo && pb + cc < hi && v[j] > -1e29f ? sycl::native::exp(v[j] - mn) : 0.f;
                 if (cc < nb) sp[r * SLD + cc] = e;
                 sum += e;
             }
@@ -1883,6 +1984,170 @@ auto &bv =
     }
 }
 constexpr int kArgBlocks = 128;   // (the row stride of k_argmax's partials)
+
+// ------------------------------------------------------------------------------------------------ speculative tree verify
+// STRATA_Q36_TREE (default 1): dynamic frontier drafting + spine-last SLM-checkpointed GDN verification (T <= 16).
+inline bool q36_tree_on() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_Q36_TREE"); return !(e && e[0] == '0'); }();
+    return v;
+}
+inline int q36_tree_nodes() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_Q36_TREE_NODES");
+        return e && *e ? std::max(2, std::min(16, std::atoi(e))) : 8;
+    }();
+    return v;
+}
+inline float q36_tree_thr0() {
+    static const float v = [] {
+        const char* e = std::getenv("STRATA_Q36_TREE_THR0");
+        return e && *e ? (float) std::atof(e) : 2.0f;
+    }();
+    return v;
+}
+inline float q36_tree_thr1() {
+    static const float v = [] {
+        const char* e = std::getenv("STRATA_Q36_TREE_THR1");
+        return e && *e ? (float) std::atof(e) : 1.2f;
+    }();
+    return v;
+}
+struct TreeTop2 {
+    int32_t id0 = 0, id1 = 0;
+    float v0 = -INFINITY, v1 = -INFINITY;
+};
+__dpct_inline__ void k_top2_ins(float v, int id, float& v0, int& i0, float& v1, int& i1) {
+    if (id == 0x7fffffff || id == i0 || id == i1) return;
+    if (v > v0 || (v == v0 && id < i0)) { v1 = v0; i1 = i0; v0 = v; i0 = id; }
+    else if (v > v1 || (v == v1 && id < i1)) { v1 = v; i1 = id; }
+}
+__dpct_inline__ void k_top2_stage1(const float* x, int n, float* pv, int32_t* pi) {
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto wg = sycl::ext::oneapi::this_work_item::get_work_group<3>();
+    auto& bv0 = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[kThreads]>(wg);
+    auto& bv1 = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[kThreads]>(wg);
+    auto& bi0 = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[kThreads]>(wg);
+    auto& bi1 = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[kThreads]>(wg);
+    const int row = (int) it.get_group(1), blk = (int) it.get_group(2), tid = (int) it.get_local_id(2);
+    const float* xr = x + (size_t) row * n;
+    float v0 = -INFINITY, v1 = -INFINITY;
+    int i0 = 0x7fffffff, i1 = 0x7fffffff;
+    for (int i = blk * kThreads + tid; i < n; i += kArgBlocks * kThreads) k_top2_ins(xr[i], i, v0, i0, v1, i1);
+    bv0[tid] = v0; bi0[tid] = i0;
+    bv1[tid] = v1; bi1[tid] = i1;
+    it.barrier(sycl::access::fence_space::local_space);
+    for (int s = kThreads / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            float a0 = bv0[tid], a1 = bv1[tid];
+            int j0 = bi0[tid], j1 = bi1[tid];
+            k_top2_ins(bv0[tid + s], bi0[tid + s], a0, j0, a1, j1);
+            k_top2_ins(bv1[tid + s], bi1[tid + s], a0, j0, a1, j1);
+            bv0[tid] = a0; bi0[tid] = j0;
+            bv1[tid] = a1; bi1[tid] = j1;
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+    }
+    if (tid == 0) {
+        const size_t o = ((size_t) row * kArgBlocks + blk) * 2;
+        pv[o] = bv0[0]; pi[o] = bi0[0];
+        pv[o + 1] = bv1[0]; pi[o + 1] = bi1[0];
+    }
+}
+__dpct_inline__ void k_top2_stage2(const float* pv, const int32_t* pi, int n, const int32_t* idv, TreeTop2* out) {
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto wg = sycl::ext::oneapi::this_work_item::get_work_group<3>();
+    auto& bv0 = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[kThreads]>(wg);
+    auto& bv1 = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[kThreads]>(wg);
+    auto& bi0 = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[kThreads]>(wg);
+    auto& bi1 = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[kThreads]>(wg);
+    const int row = (int) it.get_group(1), tid = (int) it.get_local_id(2);
+    const size_t base = (size_t) row * kArgBlocks * 2;
+    float v0 = -INFINITY, v1 = -INFINITY;
+    int i0 = 0x7fffffff, i1 = 0x7fffffff;
+    for (int e = tid; e < kArgBlocks * 2; e += kThreads) k_top2_ins(pv[base + e], pi[base + e], v0, i0, v1, i1);
+    bv0[tid] = v0; bi0[tid] = i0;
+    bv1[tid] = v1; bi1[tid] = i1;
+    it.barrier(sycl::access::fence_space::local_space);
+    for (int s = kThreads / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            float a0 = bv0[tid], a1 = bv1[tid];
+            int j0 = bi0[tid], j1 = bi1[tid];
+            k_top2_ins(bv0[tid + s], bi0[tid + s], a0, j0, a1, j1);
+            k_top2_ins(bv1[tid + s], bi1[tid + s], a0, j0, a1, j1);
+            bv0[tid] = a0; bi0[tid] = j0;
+            bv1[tid] = a1; bi1[tid] = j1;
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+    }
+    if (tid == 0) {
+        const int32_t k0 = bi0[0] < n ? (idv ? idv[bi0[0]] : bi0[0]) : 0;
+        const int32_t k1 = (bi1[0] < n && bi1[0] != 0x7fffffff) ? (idv ? idv[bi1[0]] : bi1[0]) : k0;
+        out[row] = {k0, k1, bv0[0], (bi1[0] < n && bi1[0] != 0x7fffffff) ? bv1[0] : bv0[0]};
+    }
+}
+__dpct_inline__ void k_gather_f32(float* dst, const float* src, const int32_t* idx, int N) {
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int b = (int) it.get_group(1);
+    const int i = (int) it.get_group(2) * kThreads + (int) it.get_local_id(2);
+    if (i < N) dst[(size_t) b * N + i] = src[(size_t) idx[b] * N + i];
+}
+__dpct_inline__ void k_compact_gdn(float* const* bases, const int32_t* widths, const int32_t* path, int n_keep) {
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int m_idx = (int) it.get_group(1);
+    const int col = (int) it.get_group(2) * kThreads + (int) it.get_local_id(2);
+    const int W = widths[m_idx];
+    if (col >= W) return;
+    float* const buf = bases[m_idx];
+    for (int k = 1; k < n_keep; ++k) {
+        const int src = path[k];
+        if (src != k) buf[(size_t) k * W + col] = buf[(size_t) src * W + col];
+    }
+}
+__dpct_inline__ void k_compact_kv(void* const* kc_tab, void* const* vc_tab, int HKV, int HD, int ctx, int kv_type, int vt_ctxp,
+                                  int pos0_i, const int32_t* path, int n_keep) {
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int ai = (int) it.get_group(1), kh = (int) it.get_group(2), i = (int) it.get_local_id(2);
+    if (i >= HD) return;
+    void* const kp = kc_tab[ai];
+    void* const vp = vc_tab[ai];
+    const size_t nall = (size_t) HKV * ctx * HD;
+    const size_t vtb = vt_ctxp > 0 ? (size_t) (vt_ctxp / 32) * HD * 32 : 0;
+    for (int k = 1; k < n_keep; ++k) {
+        const int src_c = pos0_i + path[k], dst_c = pos0_i + k;
+        if (src_c == dst_c) continue;
+        if (kv_type == 1) {
+            auto* k = static_cast<float*>(kp), *v = static_cast<float*>(vp);
+            k[((size_t) kh * ctx + dst_c) * HD + i] = k[((size_t) kh * ctx + src_c) * HD + i];
+            v[((size_t) kh * ctx + dst_c) * HD + i] = v[((size_t) kh * ctx + src_c) * HD + i];
+        } else if (kv_type == 0) {
+            auto* k = static_cast<sycl::half*>(kp), *v = static_cast<sycl::half*>(vp);
+            k[((size_t) kh * ctx + dst_c) * HD + i] = k[((size_t) kh * ctx + src_c) * HD + i];
+            v[((size_t) kh * ctx + dst_c) * HD + i] = v[((size_t) kh * ctx + src_c) * HD + i];
+        } else {
+            auto* k8 = static_cast<int8_t*>(kp);
+            k8[((size_t) kh * ctx + dst_c) * HD + i] = k8[((size_t) kh * ctx + src_c) * HD + i];
+            if ((i & 63) == 0) {
+                auto* ks = reinterpret_cast<uint16_t*>(k8 + nall);
+                ks[((size_t) kh * ctx + dst_c) * (HD / 64) + i / 64] = ks[((size_t) kh * ctx + src_c) * (HD / 64) + i / 64];
+            }
+            auto* v8 = static_cast<int8_t*>(vp);
+            if (vt_ctxp > 0) {
+                v8[(size_t) kh * vtb + ((size_t) (dst_c / 32) * HD + i) * 32 + dst_c % 32] =
+                    v8[(size_t) kh * vtb + ((size_t) (src_c / 32) * HD + i) * 32 + src_c % 32];
+                if (i == 0) {
+                    auto* vs = reinterpret_cast<float*>(v8 + (size_t) HKV * vtb);
+                    vs[(size_t) kh * vt_ctxp + dst_c] = vs[(size_t) kh * vt_ctxp + src_c];
+                }
+            } else {
+                v8[((size_t) kh * ctx + dst_c) * HD + i] = v8[((size_t) kh * ctx + src_c) * HD + i];
+                if ((i & 63) == 0) {
+                    auto* vs = reinterpret_cast<uint16_t*>(v8 + nall);
+                    vs[((size_t) kh * ctx + dst_c) * (HD / 64) + i / 64] = vs[((size_t) kh * ctx + src_c) * (HD / 64) + i / 64];
+                }
+            }
+        }
+    }
+}
 
 // ------------------------------------------------------------------------------------------------ drafting beyond greedy
 // A greedy request with a penalty and a sampled request (a temperature above 0) draft too: the verify window returns each
@@ -2414,15 +2679,17 @@ constexpr int kDecT = 16;   // the most tokens (Engine::kGemmT, Engine::kVerify)
 /// (k_conv_seq: two a token).  grid C / 128 work-groups of 128 (one head), thread = channel, sub-group 32.  write: the
 /// history becomes the last three of (history, inputs) (a decode step, a short prompt); a verify window leaves it to the
 /// commit (k_gdn_dec's hist).
+template <bool TREE = false>
 __dpct_inline__ void k_conv_dec(float *hist, const float *qkv, const float *w, float *h, int C, int qk_heads, float eps, int T,
-                                bool write) {
+                                bool write, const uint32_t *tprev3 = nullptr) {
     auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     auto &part = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[kDecT][4]>(
         sycl::ext::oneapi::this_work_item::get_work_group<3>());
     const int lid = (int) it.get_local_id(2);
     const int c = (int) it.get_group(2) * 128 + lid;
     const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
-    float v0 = hist[c * 3], v1 = hist[c * 3 + 1], v2 = hist[c * 3 + 2];
+    const float h0 = hist[c * 3], h1 = hist[c * 3 + 1], h2 = hist[c * 3 + 2];
+    float v0 = h0, v1 = h1, v2 = h2;
     float xs[kDecT], y[kDecT];
 #pragma unroll
     for (int t = 0; t < kDecT; ++t) xs[t] = t < T ? qkv[(size_t) t * C + c] : 0.0f;   // every input load before the math
@@ -2430,11 +2697,22 @@ __dpct_inline__ void k_conv_dec(float *hist, const float *qkv, const float *w, f
     for (int t = 0; t < kDecT; ++t) {
         y[t] = 0.0f;
         if (t < T) {
+            if constexpr (TREE) {
+                const uint32_t pk = tprev3[t];
+                const int p3 = (int) (pk & 0x1fu) - 3;
+                const int p2 = (int) ((pk >> 5) & 0x1fu) - 3;
+                const int p1 = (int) ((pk >> 10) & 0x1fu) - 3;
+                v0 = p3 >= 0 ? xs[p3] : (p3 == -1 ? h2 : (p3 == -2 ? h1 : h0));
+                v1 = p2 >= 0 ? xs[p2] : (p2 == -1 ? h2 : (p2 == -2 ? h1 : h0));
+                v2 = p1 >= 0 ? xs[p1] : (p1 == -1 ? h2 : (p1 == -2 ? h1 : h0));
+            }
             const float x = xs[t];
             const float sum = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
-            v0 = v1;
-            v1 = v2;
-            v2 = x;
+            if constexpr (!TREE) {
+                v0 = v1;
+                v1 = v2;
+                v2 = x;
+            }
             y[t] = sum / (1.0f + sycl::native::exp(-sum));
         }
     }
@@ -2473,8 +2751,9 @@ __dpct_inline__ void k_conv_dec(float *hist, const float *qkv, const float *w, f
 /// write stored, without recomputing the outputs the verify window already wrote.  grid (1, kGdnDecCG, HV), block
 /// (1, 4, 128 / kGdnDecCG).
 constexpr int kGdnDecCG = 4;
+template <bool TREE = false>
 __dpct_inline__ void k_gdn_dec(float *state, const float *h, int C, const float *gate, const float *beta, float *o_raw, int h_k,
-                               int h_v, int T, bool write, float *hist, const float *qkv_in) {
+                               int h_v, int T, bool write, float *hist, const float *qkv_in, const uint32_t *tslot = nullptr) {
     auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     auto wg = sycl::ext::oneapi::this_work_item::get_work_group<3>();
     constexpr int S = 128, NC = S / kGdnDecCG, RG = 4, RPG = S / RG;
@@ -2482,6 +2761,7 @@ __dpct_inline__ void k_gdn_dec(float *state, const float *h, int C, const float 
     auto &sq = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[2][S]>(wg);
     auto &red_kv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[RG][NC]>(wg);
     auto &red_o = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[RG][NC]>(wg);
+    auto &fork = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[TREE ? 2 : 1][TREE ? RG : 1][TREE ? NC * RPG : 1]>(wg);
     const int head = (int) it.get_group(2), cl = (int) it.get_local_id(2), rg = (int) it.get_local_id(1);
     const int tid = rg * NC + cl;   // 0 .. 127: one entry of sk / sq each
     const int col = (int) it.get_group(1) * NC + cl;
@@ -2522,6 +2802,17 @@ __dpct_inline__ void k_gdn_dec(float *state, const float *h, int C, const float 
         sq[par][tid] = nsq;
         const float vcur = nvv, gcur = ngate, bcur = nbeta;
         if (t + 1 < T) load(t + 1);
+        int ld_s = 0, sv_s = 0;
+        if constexpr (TREE) {
+            const uint32_t ts = tslot[t];
+            ld_s = (int) (ts & 3u);
+            sv_s = (int) ((ts >> 2) & 3u);
+            if (ld_s > 0) {
+                const int sl = (ld_s - 1) & 1;
+#pragma unroll
+                for (int r = 0; r < RPG; ++r) sv[r] = fork[TREE ? sl : 0][TREE ? rg : 0][TREE ? r * NC + cl : 0];
+            }
+        }
         it.barrier(sycl::access::fence_space::local_space);
         if (t > 0 && rg == 0 && o_raw) {   // token t - 1's output (red_o is rewritten only after this token's second barrier)
             o_raw[(size_t) (t - 1) * h_v * S + head * S + col] =
@@ -2540,6 +2831,13 @@ __dpct_inline__ void k_gdn_dec(float *state, const float *h, int C, const float 
         for (int r = 0; r < RPG; ++r) {
             sv[r] = sycl::fma((float) g, sv[r], sk[par][rg * RPG + r] * delta);
             o = sycl::fma(sv[r], sq[par][rg * RPG + r], o);
+        }
+        if constexpr (TREE) {
+            if (sv_s > 0) {
+                const int sl = (sv_s - 1) & 1;
+#pragma unroll
+                for (int r = 0; r < RPG; ++r) fork[TREE ? sl : 0][TREE ? rg : 0][TREE ? r * NC + cl : 0] = sv[r];
+            }
         }
         red_o[rg][cl] = o;
     }
@@ -3157,7 +3455,22 @@ struct Engine {
 #endif
     // verify windows (T <= kVerify): the GDN inputs of every row per layer, kept for the commit
     static constexpr int kVerify = 16;
+    static constexpr int kTreeFrontMax = 4;
     std::vector<float*> v_qkv, v_hc, v_alpha, v_beta;
+    // speculative tree verification state & buffers
+    bool tree_mode = false;
+    const int32_t* tree_tp0 = nullptr;
+    int32_t* d_tp0 = nullptr;
+    uint32_t *d_tmask = nullptr, *d_tprev3 = nullptr, *d_tslot = nullptr;
+    int32_t* d_tidx = nullptr;
+    float *d_tlogits = nullptr, *amv2 = nullptr;
+    int32_t* ami2 = nullptr;
+    TreeTop2 *d_top2 = nullptr, *h_top2 = nullptr;
+    float** d_cp_base = nullptr;
+    int32_t* d_cp_w = nullptr;
+    int cp_n = 0, cp_chunks = 0;
+    void **d_kv_kc = nullptr, **d_kv_vc = nullptr;
+    int kv_n_attn = 0;
     // the MTP block (when loaded)
     float *mtp_cat = nullptr, *hmtp = nullptr, *logits_m = nullptr;
     int32_t *tok_m = nullptr, *pos0_m = nullptr, *pick_m = nullptr;
@@ -3596,7 +3909,7 @@ struct Engine {
         the migrated code and was removed or replaced with 0. You may need to
         check the migrated code.
         */
-        CK(DPCT_CHECK_ERROR(hpin = sycl::malloc_host<int32_t>(256, q_ct1)));   // ([64..] a window's picks, [96..] its tokens, [128..] its drafts, [160..] given drafts)
+        CK(DPCT_CHECK_ERROR(hpin = sycl::malloc_host<int32_t>(512, q_ct1)));   // ([64..] picks, [96..] tokens, [128..] drafts, [160..] given, [256..511] tree)
         // the rows' attention partials (T <= kGemmT rows take it): k_attn_gqa's chunks per row (STRATA_Q36_ATT_CHUNKS,
         // 8 .. kAttMaxChunks; 96 measured best on the B70 - k_attn_gqa + merge per layer at depth 2K / 12K: 32 48.5 /
         // 155.2 us, 64 42.0 / 178.6, 96 40.6 / 153.9, 128 41.8 / 159.4), or with STRATA_Q36_ATTN_HEAD k_attn_part's
@@ -3766,7 +4079,6 @@ struct Engine {
             }
             d_rcell = dalloc_t<int32_t>(kVerify);
             d_rslot = dalloc_t<int32_t>(kVerify);
-            d_rdelta = dalloc_t<int32_t>(kVerify);
             d_gslot = dalloc_t<int32_t>(kVerify);
             d_grow0 = dalloc_t<int32_t>(kVerify);
             d_gcnt = dalloc_t<int32_t>(kVerify);
@@ -3776,6 +4088,56 @@ struct Engine {
             You may need to check the migrated code.
             */
             CK(DPCT_CHECK_ERROR(hrow = sycl::malloc_host<int32_t>(256, q_ct1)));   // (8 fields of 32: kHr*)
+        }
+        d_rdelta = dalloc_t<int32_t>(kVerify);
+        d_tp0 = dalloc_t<int32_t>(1);
+        d_tmask = dalloc_t<uint32_t>(kVerify);
+        d_tprev3 = dalloc_t<uint32_t>(kVerify);
+        d_tslot = dalloc_t<uint32_t>(kVerify);
+        d_tidx = dalloc_t<int32_t>(kVerify);
+        if (m->has_mtp) {
+            d_tlogits = dalloc((size_t) kTreeFrontMax * g.n_vocab);
+            amv2 = dalloc((size_t) kTreeFrontMax * kArgBlocks * 2);
+            ami2 = dalloc_t<int32_t>((size_t) kTreeFrontMax * kArgBlocks * 2);
+            d_top2 = dalloc_t<TreeTop2>(kTreeFrontMax);
+            CK(DPCT_CHECK_ERROR(h_top2 = sycl::malloc_host<TreeTop2>(kTreeFrontMax, q_ct1)));
+            {
+                std::vector<float*> cp_b;
+                std::vector<int32_t> cp_w;
+                cp_b.push_back(hmain);
+                cp_w.push_back((int32_t) N);
+                for (size_t li = 0; li < m->layers.size(); ++li) {
+                    if (m->layers[li].attn) continue;
+                    cp_b.push_back(v_qkv[li]);  cp_w.push_back((int32_t) C);
+                    cp_b.push_back(v_hc[li]);   cp_w.push_back((int32_t) C);
+                    cp_b.push_back(v_alpha[li]); cp_w.push_back((int32_t) g.ssm_v_heads);
+                    cp_b.push_back(v_beta[li]);  cp_w.push_back((int32_t) g.ssm_v_heads);
+                }
+                cp_n = (int) cp_b.size();
+                const int32_t mw = (int32_t) std::max(N, C);
+                cp_chunks = (mw + kThreads - 1) / kThreads;
+                CK(DPCT_CHECK_ERROR(d_cp_base = sycl::malloc_device<float*>(cp_b.size(), q_ct1)));
+                CK(DPCT_CHECK_ERROR(d_cp_w = sycl::malloc_device<int32_t>(cp_w.size(), q_ct1)));
+                CK(DPCT_CHECK_ERROR(q_ct1.memcpy(d_cp_base, cp_b.data(), cp_b.size() * sizeof(float*)).wait()));
+                CK(DPCT_CHECK_ERROR(q_ct1.memcpy(d_cp_w, cp_w.data(), cp_w.size() * sizeof(int32_t)).wait()));
+            }
+            {
+                std::vector<size_t> attn_ls;
+                for (size_t li = 0; li < m->layers.size(); ++li)
+                    if (m->layers[li].attn) attn_ls.push_back(li);
+                attn_ls.push_back(m->layers.size());
+                kv_n_attn = (int) attn_ls.size();
+                std::vector<void*> kptrs((size_t) n_sess * kv_n_attn), vptrs((size_t) n_sess * kv_n_attn);
+                for (int s_ = 0; s_ < n_sess; ++s_)
+                    for (int ai = 0; ai < kv_n_attn; ++ai) {
+                        kptrs[(size_t) s_ * kv_n_attn + ai] = sess[(size_t) s_].kc[attn_ls[(size_t) ai]];
+                        vptrs[(size_t) s_ * kv_n_attn + ai] = sess[(size_t) s_].vc[attn_ls[(size_t) ai]];
+                    }
+                CK(DPCT_CHECK_ERROR(d_kv_kc = sycl::malloc_device<void*>(kptrs.size(), q_ct1)));
+                CK(DPCT_CHECK_ERROR(d_kv_vc = sycl::malloc_device<void*>(vptrs.size(), q_ct1)));
+                CK(DPCT_CHECK_ERROR(q_ct1.memcpy(d_kv_kc, kptrs.data(), kptrs.size() * sizeof(void*)).wait()));
+                CK(DPCT_CHECK_ERROR(q_ct1.memcpy(d_kv_vc, vptrs.data(), vptrs.size() * sizeof(void*)).wait()));
+            }
         }
         if (vision) {
             d_mtab = dalloc_t<int32_t>((size_t) ctx * 3);
@@ -4815,6 +5177,10 @@ work-group size if needed.
             rs.delta = d_rdelta;
             rs.kc = reinterpret_cast<void* const*>(d_kc_tab + li * n_sess);
             rs.vc = reinterpret_cast<void* const*>(d_vc_tab + li * n_sess);
+        } else if (tree_mode) {
+            rs.delta = d_rdelta;
+            rs.tmask = d_tmask;
+            rs.tp0 = tree_tp0;
         }
         rs.vt = kv_vt ? vt_ctxp : 0;
         KV* const kcl = static_cast<KV*>(kc[li]);
@@ -5139,6 +5505,8 @@ work-group size if needed.
                 xc.pacc = pa + (size_t) r_off * H * nch * HD;
                 xc.pm = pmx + (size_t) r_off * H * nch;
                 xc.pl = psum + (size_t) r_off * H * nch;
+                xc.tmask = (!rows_mode && tree_mode) ? d_tmask : nullptr;
+                xc.tp0 = (!rows_mode && tree_mode) ? tree_tp0 : nullptr;
                 return strata::q36xatt::attend(xc, st);
             };
             // (M2 merge: R at most 16.  R <= 16 keeps DPT = 4, so the value sums' cell groups (NCG) and their order are the
@@ -5254,15 +5622,30 @@ work-group size if needed.
                 [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { k_gdn_norm_q8(o, zb, gam, eps, yq, HV); });
             return;
         }
-        st->parallel_for<class q36_conv_dec_m4>(
-            sycl::nd_range<3>(sycl::range<3>(1, 1, (size_t) (C / 128)) * sycl::range<3>(1, 1, 128), sycl::range<3>(1, 1, 128)),
-            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { k_conv_dec(hist, qkv_b, cw, hc_b, C, 2 * HK, eps, T, wr); });
-        st->parallel_for<class q36_gdn_dec_m4>(
-            sycl::nd_range<3>(sycl::range<3>(1, kGdnDecCG, (size_t) HV) * sycl::range<3>(1, 4, 128 / kGdnDecCG),
-                              sycl::range<3>(1, 4, 128 / kGdnDecCG)),
-            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
-                k_gdn_dec(Sl, hc_b, C, al_b, be_b, o, HK, HV, T, wr, nullptr, nullptr);
-            });
+        if (tree_mode) {
+            const uint32_t *const tp3 = d_tprev3, *const tsl = d_tslot;
+            st->parallel_for<class q36_conv_dec_tree>(
+                sycl::nd_range<3>(sycl::range<3>(1, 1, (size_t) (C / 128)) * sycl::range<3>(1, 1, 128), sycl::range<3>(1, 1, 128)),
+                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                    k_conv_dec<true>(hist, qkv_b, cw, hc_b, C, 2 * HK, eps, T, wr, tp3);
+                });
+            st->parallel_for<class q36_gdn_dec_tree>(
+                sycl::nd_range<3>(sycl::range<3>(1, kGdnDecCG, (size_t) HV) * sycl::range<3>(1, 4, 128 / kGdnDecCG),
+                                  sycl::range<3>(1, 4, 128 / kGdnDecCG)),
+                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
+                    k_gdn_dec<true>(Sl, hc_b, C, al_b, be_b, o, HK, HV, T, wr, nullptr, nullptr, tsl);
+                });
+        } else {
+            st->parallel_for<class q36_conv_dec_m4>(
+                sycl::nd_range<3>(sycl::range<3>(1, 1, (size_t) (C / 128)) * sycl::range<3>(1, 1, 128), sycl::range<3>(1, 1, 128)),
+                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { k_conv_dec(hist, qkv_b, cw, hc_b, C, 2 * HK, eps, T, wr); });
+            st->parallel_for<class q36_gdn_dec_m4>(
+                sycl::nd_range<3>(sycl::range<3>(1, kGdnDecCG, (size_t) HV) * sycl::range<3>(1, 4, 128 / kGdnDecCG),
+                                  sycl::range<3>(1, 4, 128 / kGdnDecCG)),
+                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
+                    k_gdn_dec(Sl, hc_b, C, al_b, be_b, o, HK, HV, T, wr, nullptr, nullptr);
+                });
+        }
         st->parallel_for<class q36_gdn_norm_q8_m4>(
             sycl::nd_range<3>(sycl::range<3>(1, (size_t) T, (size_t) HV) * sycl::range<3>(1, 1, 128), sycl::range<3>(1, 1, 128)),
             [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { k_gdn_norm_q8(o, zb, gam, eps, yq, HV); });
@@ -5877,6 +6260,55 @@ work-group size if needed.
                     });
             });
         }
+    }
+    /// Batched top-2 draft logits across B frontier rows (1 <= B <= kTreeFrontMax) -> d_top2[0..B-1].
+    void head_draft_top2(const float* hn, int B) {
+        const auto& g = m->g;
+        const int N = (int) g.n_embd;
+        const Mat& hd = m->head;
+        int nd = (int) g.n_vocab;
+        const int32_t* idv = nullptr;
+        if (head_d.d) {
+            mm(head_d, hn, d_tlogits, B);
+            nd = head_d.n_out;
+            idv = d_draft_ids;
+        } else if (fast_k && draft_n > 0 && draft_n < g.n_vocab && draft_n % 8 == 0 && hd.type == 8 && hd.n_in == N &&
+                   N / 32 == 64 && B >= 1 && B <= kTreeFrontMax) {
+            quant(hn, N, B, q8);
+            const uint8_t* pk = nullptr;
+            for (const auto& p : m->packed)
+                if (std::get<0>(p) == hd.d) pk = std::get<1>(p);
+            if (pk) {
+                const sycl::half* dpl = reinterpret_cast<const sycl::half*>(pk + (size_t) hd.n_in * hd.n_out);
+                switch (B) {
+                    case 1: q36k::launch_q8_rows<1, 2, true>(pk, dpl, q8, d_tlogits, 64, draft_n, st); break;
+                    case 2: q36k::launch_q8_rows<2, 2, true>(pk, dpl, q8, d_tlogits, 64, draft_n, st); break;
+                    case 3: q36k::launch_q8_rows<3, 2, true>(pk, dpl, q8, d_tlogits, 64, draft_n, st); break;
+                    case 4: q36k::launch_q8_rows<4, 2, true>(pk, dpl, q8, d_tlogits, 64, draft_n, st); break;
+                }
+            } else {
+                switch (B) {
+                    case 1: q36k::launch_q8_rows<1, 2, false>(hd.d, nullptr, q8, d_tlogits, 64, draft_n, st); break;
+                    case 2: q36k::launch_q8_rows<2, 2, false>(hd.d, nullptr, q8, d_tlogits, 64, draft_n, st); break;
+                    case 3: q36k::launch_q8_rows<3, 2, false>(hd.d, nullptr, q8, d_tlogits, 64, draft_n, st); break;
+                    case 4: q36k::launch_q8_rows<4, 2, false>(hd.d, nullptr, q8, d_tlogits, 64, draft_n, st); break;
+                }
+            }
+            nd = draft_n;
+        } else {
+            mm(hd, hn, d_tlogits, B);
+        }
+        float *const lg = d_tlogits, *const amv_ = amv2;
+        int32_t* const ami_ = ami2;
+        TreeTop2* const out = d_top2;
+        st->parallel_for<class q36_top2_s1>(
+            sycl::nd_range<3>(sycl::range<3>(1, (size_t) B, (size_t) kArgBlocks) * sycl::range<3>(1, 1, kThreads),
+                              sycl::range<3>(1, 1, kThreads)),
+            [=](sycl::nd_item<3>) { k_top2_stage1(lg, nd, amv_, ami_); });
+        st->parallel_for<class q36_top2_s2>(
+            sycl::nd_range<3>(sycl::range<3>(1, (size_t) B, 1) * sycl::range<3>(1, 1, kThreads),
+                              sycl::range<3>(1, 1, kThreads)),
+            [=](sycl::nd_item<3>) { k_top2_stage2(amv_, ami_, nd, idv, out); });
     }
 
     /// The MTP block over T rows: row t reads token tok_m[t] at position p0 + t (also at *pos0_m) and the seed hidden
@@ -7716,6 +8148,351 @@ work-group size if needed.
     }
     /// Whether a step may take its drafts from the host (spec_step's `given`): the graph form of the window.
     bool given_ok(int D) const { return D >= 1 && D + 1 <= kGemmT && spec_graphs() && !main_hybrid; }
+    /// Whether speculative tree verification is ready on this step.
+    bool tree_ok(int max_drafts) const {
+        return q36_tree_on() && max_drafts >= 2 && spec_graphs() && !main_hybrid && mtp_graph && gdn_dec_on() &&
+               !attn_head && fast_k && m->has_mtp && m->g.ssm_state_size == 128 && m->g.ssm_d_conv == 4 &&
+               m->g.ssm_conv_channels % 128 == 0 && (!vision || (!map_on && pos >= img_prompt_cells));
+    }
+    /// Compacts hmain, all GDN verify buffers, KV caches, and optionally logits in-place along winning path[0..n_keep-1].
+    void compact_tree_win(int n_keep, const std::vector<int32_t>& path, bool compact_logits = false) {
+        bool need = false;
+        for (int k = 0; k < n_keep; ++k)
+            if (path[(size_t) k] != k) { need = true; break; }
+        if (!need) return;
+        for (int k = 0; k < n_keep; ++k) hpin[336 + k] = path[(size_t) k];
+        CK(DPCT_CHECK_ERROR(st->memcpy(d_tidx, hpin + 336, (size_t) n_keep * 4)));
+        float *const *const cpb = d_cp_base;
+        const int32_t *const cpw = d_cp_w;
+        const int32_t *const kp = d_tidx;
+        st->parallel_for<class q36_compact_gdn_k>(
+            sycl::nd_range<3>(sycl::range<3>(1, (size_t) cp_n, (size_t) cp_chunks) * sycl::range<3>(1, 1, kThreads),
+                              sycl::range<3>(1, 1, kThreads)),
+            [=](sycl::nd_item<3>) { k_compact_gdn(cpb, cpw, kp, n_keep); });
+        if (n_keep > 1 && kv_n_attn > 0) {
+            const auto& g = m->g;
+            const int HKV = (int) g.n_head_kv, HD = (int) g.head_dim, cx = ctx;
+            const int kv_t = kv_f32 ? 1 : (kv_q8 ? 2 : 0);
+            const int vt = kv_vt ? vt_ctxp : 0;
+            const int32_t p0_i = (int32_t) pos;
+            void *const *const kct = d_kv_kc + (size_t) cur * kv_n_attn;
+            void *const *const vct = d_kv_vc + (size_t) cur * kv_n_attn;
+            st->parallel_for<class q36_compact_kv_k>(
+                sycl::nd_range<3>(sycl::range<3>(1, (size_t) kv_n_attn, (size_t) HKV) * sycl::range<3>(1, 1, (size_t) HD),
+                                  sycl::range<3>(1, 1, (size_t) HD)),
+                [=](sycl::nd_item<3>) { k_compact_kv(kct, vct, HKV, HD, cx, kv_t, vt, p0_i, kp, n_keep); });
+            if (!kv_vt && xatt_ready && pos >= xatt_min) {
+                const int32_t p32 = (int32_t) pos;
+                CK(DPCT_CHECK_ERROR(st->memcpy(xpos_d, &p32, 4).wait()));
+                for (size_t li = 0; li < sess[(size_t) cur].xv8t.size(); ++li) {
+                    if (sess[(size_t) cur].xv8t[li] == nullptr || li >= kc.size() || kc[li] == nullptr) continue;
+                    if (kv_f32) xmirror_sess<float>(cur, li, n_keep, xpos_d);
+                    else if (kv_q8) xmirror_sess<int8_t>(cur, li, n_keep, xpos_d);
+                    else xmirror_sess<sycl::half>(cur, li, n_keep, xpos_d);
+                }
+            }
+        }
+        if (compact_logits) {
+            const size_t V = (size_t) m->g.n_vocab;
+            for (int k = 1; k < n_keep; ++k) {
+                const int src = path[(size_t) k];
+                if (src != k) CK(DPCT_CHECK_ERROR(st->memcpy(logits + (size_t) k * V, logits + (size_t) src * V, V * 4)));
+            }
+        }
+    }
+    /// Dynamic tree draft + parallel tree verify step: guarantees <= 2 SLM GDN checkpoints via DFS spine-last order.
+    int spec_step_tree(int x_tok, const std::vector<int32_t>& fix, int max_drafts, int d_lim,
+                       const std::vector<std::vector<int32_t>>& side_paths, int& offered_d, std::vector<int32_t>& drafts,
+                       int32_t* picks, const std::atomic<bool>* cancel = nullptr, const SpecSel* sel = nullptr,
+                       bool compact_logits = false) {
+        const int N = (int) m->g.n_embd;
+        const int xatt_cap = (xatt_ready && pos >= xatt_min) ? std::max(1, xls_max * 16 / strata::q36xatt::kG) : kVerify;
+        const int Tmax = std::min({kVerify, q36_tree_nodes(), xatt_cap, max_drafts + 1});
+        const int max_d = std::min({max_drafts, std::max(1, d_lim), mtp_d, Tmax - 1});
+        if (Tmax < 3 || max_d < 2 || (sel != nullptr && sp_cand == nullptr)) {
+            offered_d = std::min({d_lim, mtp_d, max_drafts});
+            return spec_step(x_tok, fix, offered_d, drafts, picks, cancel, sel, nullptr);
+        }
+        const int F = (int) fix.size(), T0 = F + 1;
+        CK(DPCT_CHECK_ERROR(st->wait()));
+        for (int i = 0; i < F; ++i) hpin[96 + i] = fix[(size_t) i];
+        hpin[96 + F] = x_tok;
+        hpin[1] = (int32_t) (pos - F);
+        CK(DPCT_CHECK_ERROR(st->memcpy(tok_m, hpin + 96, (size_t) T0 * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(pos0_m, hpin + 1, 4)));
+        float* seeds = mtp_seed();
+        if (F > 0) CK(DPCT_CHECK_ERROR(st->memcpy(seeds, hmain, (size_t) F * N * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(seeds + (size_t) F * N, hlast, (size_t) N * 4)));
+        run_graph_key(100000 + T0, [&] {
+            forward_mtp(T0, pos - F, seeds, false, true);
+            head_draft_top2(hmtp + (size_t) F * N, 1);
+        });
+        CK(DPCT_CHECK_ERROR(st->memcpy(h_top2, d_top2, sizeof(TreeTop2))));
+        CK(DPCT_CHECK_ERROR(st->wait()));
+        struct TNode {
+            int32_t tok = 0;
+            int parent = -1, depth = 0, f_row = 0, mtp_off = -1;
+            uint32_t mtp_mask = 0;
+            bool is_spine = false;
+        };
+        std::vector<TNode> raw;
+        raw.reserve((size_t) Tmax);
+        raw.push_back({x_tok, -1, 0, F, 0, 1u, true});
+        int n_mtp_used = 1;
+        std::vector<int> frontier;
+        const float thr0 = q36_tree_thr0(), thr1 = q36_tree_thr1();
+        {
+            const TreeTop2& r0 = h_top2[0];
+            raw.push_back({r0.id0, 0, 1, 0, -1, 0u, true});
+            frontier.push_back(1);
+            const bool add_alt1 = (r0.v0 - r0.v1) <= thr0 && r0.id1 != r0.id0 && (int) raw.size() < Tmax;
+            if (add_alt1) {
+                raw.push_back({r0.id1, 0, 1, 0, -1, 0u, false});
+                if ((int) frontier.size() < kTreeFrontMax && (int) raw.size() + 1 < Tmax) frontier.push_back((int) raw.size() - 1);
+            }
+            if (!side_paths.empty() && (int) raw.size() + 1 < Tmax) {
+                const int32_t lk0 = side_paths[0][0];
+                if (lk0 != r0.id0 && (!add_alt1 || lk0 != r0.id1)) {
+                    const int lk_id = (int) raw.size();
+                    raw.push_back({lk0, 0, 1, 0, -1, 0u, false});
+                    if (!add_alt1 && side_paths[0].size() >= 2 && max_d >= 2 && (int) raw.size() + 3 < Tmax) {
+                        raw.push_back({side_paths[0][1], lk_id, 2, 0, -1, 0u, false});
+                    }
+                }
+            }
+        }
+        const int32_t base_rdelta = sess[(size_t) cur].rdelta;
+        for (int d = 1; d < max_d && !frontier.empty() && (int) raw.size() < Tmax && n_mtp_used + (int) frontier.size() <= Tmax; ++d) {
+            const int B = (int) frontier.size();
+            const int m_start = n_mtp_used;
+            for (int b = 0; b < B; ++b) {
+                const int u = frontier[(size_t) b];
+                const int p = raw[(size_t) u].parent;
+                const int off = m_start + b;
+                const uint32_t mk = raw[(size_t) p].mtp_mask | (1u << off);
+                raw[(size_t) u].mtp_off = off;
+                raw[(size_t) u].mtp_mask = mk;
+                hpin[352 + b] = raw[(size_t) u].tok;
+                hpin[368 + b] = raw[(size_t) p].f_row;
+                hpin[384 + b] = (int32_t) mk;
+                hpin[400 + b] = base_rdelta + d - off;
+            }
+            hpin[416] = (int32_t) (pos + m_start);
+            hpin[417] = (int32_t) pos;
+            CK(DPCT_CHECK_ERROR(st->memcpy(tok_m, hpin + 352, (size_t) B * 4)));
+            CK(DPCT_CHECK_ERROR(st->memcpy(pos0_m, hpin + 416, 4)));
+            CK(DPCT_CHECK_ERROR(st->memcpy(d_tp0, hpin + 417, 4)));
+            CK(DPCT_CHECK_ERROR(st->memcpy(d_tidx, hpin + 368, (size_t) B * 4)));
+            CK(DPCT_CHECK_ERROR(st->memcpy(d_tmask, hpin + 384, (size_t) B * 4)));
+            CK(DPCT_CHECK_ERROR(st->memcpy(d_rdelta, hpin + 400, (size_t) B * 4)));
+            run_graph_key(48000 + B, [&] {
+                float* const sd = seeds;
+                const float* const hm = hmtp;
+                const int32_t* const tidx = d_tidx;
+                st->parallel_for<class q36_gather_f32_k>(
+                    sycl::nd_range<3>(sycl::range<3>(1, (size_t) B, (size_t) ((N + kThreads - 1) / kThreads)) * sycl::range<3>(1, 1, kThreads),
+                                      sycl::range<3>(1, 1, kThreads)),
+                    [=](sycl::nd_item<3>) { k_gather_f32(sd, hm, tidx, N); });
+                tree_mode = true;
+                tree_tp0 = d_tp0;
+                forward_mtp(B, pos + m_start, seeds, false, true);
+                tree_mode = false;
+                tree_tp0 = nullptr;
+                head_draft_top2(hmtp, B);
+            });
+            n_mtp_used += B;
+            CK(DPCT_CHECK_ERROR(st->memcpy(h_top2, d_top2, (size_t) B * sizeof(TreeTop2))));
+            CK(DPCT_CHECK_ERROR(st->wait()));
+            for (int b = 0; b < B; ++b) raw[(size_t) frontier[(size_t) b]].f_row = b;
+            std::vector<int> next_f;
+            int rem = Tmax - (int) raw.size();
+            if (rem <= 0) break;
+            // Expand spine node first so depth progresses cleanly.
+            {
+                const int u0 = frontier[0];
+                const TreeTop2& tp = h_top2[0];
+                const int id_sp = (int) raw.size();
+                raw.push_back({tp.id0, u0, d + 1, 0, -1, 0u, true});
+                next_f.push_back(id_sp);
+                --rem;
+                if (rem > 0 && (tp.v0 - tp.v1) <= thr1 && tp.id1 != tp.id0) {
+                    const int id_alt = (int) raw.size();
+                    raw.push_back({tp.id1, u0, d + 1, 0, -1, 0u, false});
+                    --rem;
+                    if (d <= 2 && rem >= 2 && (int) next_f.size() < kTreeFrontMax) next_f.push_back(id_alt);
+                }
+            }
+            for (int b = 1; b < B && rem > 0; ++b) {
+                if (d >= 2 && rem < 2) break;   // preserve remaining slot for spine's next depth
+                const int u = frontier[(size_t) b];
+                const int id_c = (int) raw.size();
+                raw.push_back({h_top2[b].id0, u, d + 1, 0, -1, 0u, false});
+                --rem;
+                if (d == 1 && rem >= 3 && (int) next_f.size() < kTreeFrontMax) next_f.push_back(id_c);
+            }
+            frontier = std::move(next_f);
+        }
+        // DFS spine-last layout guaranteeing <= 2 active SLM checkpoint slots in k_gdn_dec<true>.
+        const int T = (int) raw.size();
+        std::vector<std::vector<int>> kids((size_t) T);
+        for (int u = 1; u < T; ++u) kids[(size_t) raw[(size_t) u].parent].push_back(u);
+        std::vector<int> sub_d((size_t) T, 0);
+        std::vector<uint8_t> on_sp((size_t) T, 0);
+        for (int u = T - 1; u >= 0; --u) {
+            on_sp[(size_t) u] = raw[(size_t) u].is_spine ? 1 : 0;
+            int mx = 0;
+            for (int c : kids[(size_t) u]) {
+                mx = std::max(mx, 1 + sub_d[(size_t) c]);
+                if (on_sp[(size_t) c]) on_sp[(size_t) u] = 1;
+            }
+            sub_d[(size_t) u] = mx;
+        }
+        for (int u = 0; u < T; ++u)
+            std::sort(kids[(size_t) u].begin(), kids[(size_t) u].end(), [&](int a, int b) {
+                if (on_sp[(size_t) a] != on_sp[(size_t) b]) return on_sp[(size_t) a] < on_sp[(size_t) b];
+                if (sub_d[(size_t) a] != sub_d[(size_t) b]) return sub_d[(size_t) a] < sub_d[(size_t) b];
+                return a < b;
+            });
+        std::vector<int32_t> dfs_tok((size_t) T), rdelta_dfs((size_t) T);
+        std::vector<uint32_t> tmask_dfs((size_t) T, 0u), tprev3_dfs((size_t) T, 0u), tslot_dfs((size_t) T, 0u);
+        std::vector<std::vector<int>> dfs_children((size_t) T);
+        std::vector<int> anc;
+        int used_slots = 0;
+        int spine_max_d = 0;
+        int cur_dfs = 0;
+        std::function<void(int, int, int)> walk_dfs = [&](int u, int ld_s, int parent_dfs) {
+            const int did = cur_dfs++;
+            anc.push_back(did);
+            dfs_tok[(size_t) did] = raw[(size_t) u].tok;
+            const int dep = (int) anc.size() - 1;
+            if (raw[(size_t) u].is_spine) spine_max_d = std::max(spine_max_d, dep);
+            rdelta_dfs[(size_t) did] = base_rdelta + dep - did;
+            uint32_t mk = 0u;
+            for (int a : anc) mk |= (1u << a);
+            tmask_dfs[(size_t) did] = mk;
+            const int L = (int) anc.size() - 1;
+            const int p1 = L >= 1 ? anc[(size_t) (L - 1)] : L - 1;
+            const int p2 = L >= 2 ? anc[(size_t) (L - 2)] : L - 2;
+            const int p3 = L >= 3 ? anc[(size_t) (L - 3)] : L - 3;
+            tprev3_dfs[(size_t) did] = (uint32_t) (p3 + 3) | ((uint32_t) (p2 + 3) << 5) | ((uint32_t) (p1 + 3) << 10);
+            if (parent_dfs >= 0) dfs_children[(size_t) parent_dfs].push_back(did);
+            const auto& ck = kids[(size_t) u];
+            int sv_s = 0;
+            if (ck.size() > 1) {
+                int sl = (used_slots & 1) == 0 ? 0 : ((used_slots & 2) == 0 ? 1 : 0);
+                used_slots |= (1 << sl);
+                sv_s = sl + 1;
+            }
+            tslot_dfs[(size_t) did] = (uint32_t) ld_s | ((uint32_t) sv_s << 2);
+            for (size_t i = 0; i < ck.size(); ++i) {
+                int c_ld = i == 0 ? 0 : sv_s;
+                if (i + 1 == ck.size() && sv_s > 0) used_slots &= ~(1 << (sv_s - 1));   // last child frees slot before recursing
+                walk_dfs(ck[i], c_ld, did);
+            }
+            anc.pop_back();
+        };
+        walk_dfs(0, 0, -1);
+        offered_d = spine_max_d;
+        // Upload tree verify inputs & run tree verify graph
+        hpin[40] = (int32_t) pos;
+        for (int i = 0; i < T; ++i) {
+            hpin[256 + i] = dfs_tok[(size_t) i];
+            hpin[272 + i] = (int32_t) tmask_dfs[(size_t) i];
+            hpin[288 + i] = rdelta_dfs[(size_t) i];
+            hpin[304 + i] = (int32_t) tprev3_dfs[(size_t) i];
+            hpin[320 + i] = (int32_t) tslot_dfs[(size_t) i];
+        }
+        CK(DPCT_CHECK_ERROR(st->memcpy(tok, hpin + 256, (size_t) T * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(pos0, hpin + 40, 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(d_tmask, hpin + 272, (size_t) T * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(d_rdelta, hpin + 288, (size_t) T * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(d_tprev3, hpin + 304, (size_t) T * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(d_tslot, hpin + 320, (size_t) T * 4)));
+        if (sel != nullptr) {
+            sp_h[0] = sel->M;
+            CK(DPCT_CHECK_ERROR(st->memcpy(sp_m, sp_h, 4)));
+        }
+        rows_deferred = true;
+        const auto vbody = [&] {
+            tree_mode = true;
+            tree_tp0 = pos0;
+            forward(T, pos, T, true, true);
+            tree_mode = false;
+            tree_tp0 = nullptr;
+        };
+        if (sel == nullptr) run_graph_key(120000 + T, vbody);
+        else run_graph_key(130000 + T, [&] { vbody(); sp_topm(T); });
+        rows_deferred = false;
+        if (sel == nullptr) CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 64, pick, (size_t) T * 4)));
+        else CK(DPCT_CHECK_ERROR(st->memcpy(sp_h + 1, sp_rows, (size_t) T * kSpecRowWords * 4)));
+        CK(DPCT_CHECK_ERROR(st->wait()));
+        std::vector<int32_t> path = {0};
+        drafts.clear();
+        int cur_u = 0;
+        if (sel == nullptr) {
+            picks[0] = hpin[64];
+            int step_i = 0;
+            while (step_i < max_drafts) {
+                if (cancel != nullptr && cancel->load()) break;
+                const int32_t wanted = picks[step_i];
+                int match_u = -1;
+                for (int c_u : dfs_children[(size_t) cur_u])
+                    if (dfs_tok[(size_t) c_u] == wanted) { match_u = c_u; break; }
+                if (match_u < 0) break;
+                drafts.push_back(wanted);
+                path.push_back(match_u);
+                cur_u = match_u;
+                ++step_i;
+                picks[step_i] = hpin[64 + cur_u];
+            }
+        } else {
+            if (q36_spec_check_on()) sp_check(T);
+            const strata::qwen35::Sampling& smp = *sel->s;
+            const bool pen = strata::qwen35::penalty_active(smp);
+            std::vector<int32_t> seq;
+            if (pen) {
+                const int n_tail = (int) std::min<size_t>(sel->hist->size(), (size_t) smp.last_n);
+                seq.assign(sel->hist->end() - n_tail, sel->hist->end());
+            }
+            int step_i = 0;
+            for (;;) {
+                const int32_t* ids = sp_h + 1 + (size_t) cur_u * kSpecRowWords;
+                const int32_t* pen_ptr = nullptr;
+                int pen_n = 0;
+                if (pen) {
+                    const int from = std::max(0, (int) seq.size() - smp.last_n);
+                    pen_ptr = seq.data() + from;
+                    pen_n = (int) seq.size() - from;
+                }
+                picks[step_i] = strata::qwen35::sample_window_row(ids, ids + kSpecTopM, sel->M, smp, sel->kk, pen_ptr, pen_n, *sel->rng);
+                if ((cancel != nullptr && cancel->load()) || step_i >= max_drafts) break;
+                const int32_t wanted = picks[step_i];
+                int match_u = -1;
+                for (int c_u : dfs_children[(size_t) cur_u])
+                    if (dfs_tok[(size_t) c_u] == wanted) { match_u = c_u; break; }
+                if (match_u < 0) break;
+                drafts.push_back(wanted);
+                path.push_back(match_u);
+                if (pen) seq.push_back(wanted);
+                cur_u = match_u;
+                ++step_i;
+            }
+        }
+        const int a = (int) drafts.size();
+        static const bool tdbg = std::getenv("STRATA_Q36_TREE_DBG") != nullptr;
+        if (tdbg) {
+            std::fprintf(stderr, "TREE pos=%lld F=%d T=%d a=%d d_off=%d path=[", (long long) pos, F, T, a, offered_d);
+            for (int k = 0; k <= a; ++k) std::fprintf(stderr, "%s%d", k ? "," : "", path[(size_t) k]);
+            std::fprintf(stderr, "] tsl=[");
+            for (int i = 0; i < T; ++i) std::fprintf(stderr, "%s%u", i ? "," : "", tslot_dfs[(size_t) i]);
+            std::fprintf(stderr, "]\n");
+        }
+        compact_tree_win(a + 1, path, compact_logits);
+        commit_graph(a + 1);
+        pos += a + 1;
+        after_rows(a + 1);
+        return a;
+    }
     int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
                   const std::atomic<bool>* cancel = nullptr, const SpecSel* sel = nullptr, const std::vector<int32_t>* given = nullptr) {
         const int N = (int) m->g.n_embd;
@@ -8961,7 +9738,7 @@ struct Serve {
         std::vector<int32_t> hist = ids;
         const auto d0 = Clock::now();
         long long produced = 0, offered = 0, accepted = 0;
-        int depth_cap = q36_draft_base(E.mtp_d);   // (the next step's drafts: q36_next_cap)
+        int depth_cap = q36_draft_base_at(E.pos, E.mtp_d);   // (the next step's drafts: q36_next_cap)
         std::vector<int32_t> given;                // a lookup's drafts
         long long looked = 0, look_ok = 0;
         Lookup& look = looks[s];
@@ -9062,10 +9839,19 @@ struct Serve {
                     look.result(a, D, picks[a]);
                     looked += D;
                     look_ok += a;
+                } else if (E.tree_ok(max_drafts)) {
+                    std::vector<std::vector<int32_t>> side_paths;
+                    look.propose_side(nx, 1, 3, side_paths);
+                    const int d_lim = q36_depth_at(E.pos, std::min(E.mtp_d, depth_cap));
+                    int tree_D = d_lim;
+                    a = E.spec_step_tree(nx, fix, max_drafts, d_lim, side_paths, tree_D, drafts, picks, &stop, plan.ok ? &sel : nullptr);
+                    D = tree_D;
+                    depth_cap = q36_next_cap(D, a, E.mtp_d, E.pos);
+                    look.observe(drafts, a, picks[a]);
                 } else {
                     D = std::min({q36_depth_at(E.pos, std::min(E.mtp_d, depth_cap)), E.lookup_depth(), max_drafts});   // (the window fits the attention's scratch)
                     a = E.spec_step(nx, fix, D, drafts, picks, &stop, plan.ok ? &sel : nullptr);
-                    depth_cap = q36_next_cap(D, a, E.mtp_d);
+                    depth_cap = q36_next_cap(D, a, E.mtp_d, E.pos);
                     look.observe(drafts, a, picks[a]);
                 }
                 offered += D;
@@ -9498,7 +10284,7 @@ int strata::qwen35::run(int argc, char** argv) {
         int32_t picks[16];
         int nx = E.greedy();
         int dumped = 0;
-        int cli_cap = q36_draft_base(E.mtp_d);
+        int cli_cap = q36_draft_base_at(E.pos, E.mtp_d);
         if (ff) {
             E.host_logits(lg);
             std::fwrite(lg.data(), 4, lg.size(), ff);
@@ -9509,9 +10295,17 @@ int strata::qwen35::run(int argc, char** argv) {
             if ((int) gen.size() >= n_gen) break;
             // (a verify window whose rows' chunk sizes differ: the case M3b's per-row chunking makes bitwise the decode steps)
             straddled += att_chunk_cells((int) E.pos + 1, E.n_chunk) != att_chunk_cells((int) E.pos + E.mtp_d + 1, E.n_chunk);
-            const int D = q36_depth_at(E.pos, std::min(E.mtp_d, cli_cap));
-            const int a = E.spec_step(nx, fix, D, drafts, picks);
-            cli_cap = q36_next_cap(D, a, E.mtp_d);
+            const int cli_left = n_gen - (int) gen.size();
+            const int cli_lim = q36_depth_at(E.pos, std::min(E.mtp_d, cli_cap));
+            int D = cli_lim;
+            int a = 0;
+            if (E.tree_ok(cli_left)) {
+                static const std::vector<std::vector<int32_t>> no_side;
+                a = E.spec_step_tree(nx, fix, cli_left, cli_lim, no_side, D, drafts, picks, nullptr, nullptr, ff != nullptr);
+            } else {
+                a = E.spec_step(nx, fix, D, drafts, picks);
+            }
+            cli_cap = q36_next_cap(D, a, E.mtp_d, E.pos);
             for (int i = 0; ff && i <= a && dumped < n_gen; ++i, ++dumped) {
                 E.host_logits_row(i, lg);
                 std::fwrite(lg.data(), 4, lg.size(), ff);

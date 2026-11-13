@@ -160,6 +160,16 @@ template <int NLS, int NS> void launch_scores(sycl::queue& q, const Call c) {
             int csk[16];
 #pragma unroll
             for (int k = 0; k < 16; ++k) csk[k] = k < nt ? chunk_cells(n0 + k, nchk, inv) : 0;
+            const bool has_tmask = c.tmask != nullptr;
+            const int p0_tree = has_tmask ? (c.tp0 ? c.tp0[0] : c.pos0[0]) : 0x3fffffff;
+            simd<uint32_t, 16> tmk[NLS];
+            if (has_tmask) {
+                for (int ls = 0; ls < NLS; ++ls)
+                    for (int lane = 0; lane < 16; ++lane) {
+                        const int tok_k = (16 * ls + lane) / kG;
+                        tmk[ls][lane] = tok_k < nt ? c.tmask[c.t0 + tok_k] : 0u;
+                    }
+            }
             const int kst = c.kstride > 0 ? c.kstride : c.ctxp;
             const uint32_t* kb = c.k8 + (size_t) kvh * kst * 64;
             const float* ksb = NS == 1 ? c.ks + (size_t) kvh * kst : nullptr;
@@ -293,6 +303,11 @@ template <int NLS, int NS> void launch_scores(sycl::queue& q, const Call c) {
                             }
                             simd<int, 16> pv(p + c8);
                             simd_mask<16> off = (lo[ls] > pv) | (hi[ls] <= pv);
+                            if (has_tmask && (p + c8) >= p0_tree) {
+                                const int u = (p + c8) - p0_tree;
+                                const uint32_t bit = (uint32_t) u < 32u ? (1u << (uint32_t) u) : 0u;
+                                off = off | ((tmk[ls] & bit) == 0u);
+                            }
                             sv.merge(simd<float, 16>(kNeg), off);
                             mw[ls] = (es::max)(mw[ls], sv);
                             simd<float, 16> vv(vc1);
