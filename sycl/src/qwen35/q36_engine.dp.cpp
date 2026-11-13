@@ -8868,7 +8868,7 @@ int strata::qwen35::run(int argc, char** argv) {
             dpct::get_current_device().get_memory_info(fr, tot)));
         const double GiB = (double) (1ull << 30), kv = (double) q36_sess_bytes(m, ctx) * std::max(1, batch);
         chunk = 512;
-        for (int c : {2048, 1024}) {
+        for (int c : {4096, 2048, 1024}) {   // (4096: a prompt read 6% faster than 2048 on the B70, the weights' dequantize pass is paid once a chunk)
             const double buf = 1.85 * GiB + (double) (c - 512) * 0.5 * 1048576.0;
             if ((double) fr >= kv + buf + 0.4 * GiB && (double) m.gpu_bytes + kv + buf <= (double) tot - 3.0 * GiB) {
                 chunk = c;
