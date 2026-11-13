@@ -85,6 +85,8 @@ namespace strata::qwen35 {
 bool requant_q8_0(int type, const void* src, int64_t n_in, int64_t n_out, std::vector<uint8_t>& out);
 /// ... to any ggml type (q36_requant.cpp).
 bool requant(int type, const void* src, int64_t n_in, int64_t n_out, int dst_type, std::vector<uint8_t>& out);
+/// ... packed straight to the int4 layout B70W4 (q36_requant.cpp, n_in % 256 == 0, n_out % 16 == 0).
+bool requant_b70w4(int type, const void* src, int64_t n_in, int64_t n_out, std::vector<uint8_t>& out);
 }
 
 namespace {
@@ -148,6 +150,12 @@ bool g_q36_dense_forms = false;
 // and the verify window decides with the file's own weights, so the text is the plain greedy text; only the acceptance can move.
 inline bool q36_draft_q4() {
     static const bool on = [] { const char* e = std::getenv("STRATA_Q36_DRAFT_Q4"); return !(e && e[0] == '0'); }();
+    return on;
+}
+// Pack the draft side (blk.64 + head_d) into B70W4 at load (STRATA_Q36_DRAFT_W4=1 opt-in; off by default because
+// 128-elem B70W4 without imatrix drops MTP accept rate ~5-7% vs Q4_K 32-elem sub-blocks).
+inline bool q36_draft_w4() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_DRAFT_W4"); return q36_draft_q4() && (e && e[0] == '1'); }();
     return on;
 }
 // The drafts a step offers, by the cells already in the cache.  Every column of the verify window reads the whole K / V
@@ -696,9 +704,9 @@ auto &sh =
 /// the row issued up front into registers and SLM (n <= NMAX: 8 elements a thread at most), the squares summed per old thread
 /// (element t, t + 256, ... in order) from SLM, the old tree's first three levels in SLM and its last five as sub-group 0's
 /// xor butterfly (lane 0 adds the same pairs in the same order), out = (x * r) * w.  grid T, block 1024, sub-group 32.
-template <bool ADD, int NMAX>
+template <bool ADD, int NMAX, bool HAS_Q = false>
 __dpct_inline__ void k_rms_fast(const float *x, int ldx, const float *add, float *xw, const float *w, float *out, int ld_out,
-                                int n, float eps) {
+                                int n, float eps, q36k::QB *hq = nullptr) {
     auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     auto wg = sycl::ext::oneapi::this_work_item::get_work_group<3>();
     auto &vv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[NMAX]>(wg);
@@ -708,6 +716,7 @@ __dpct_inline__ void k_rms_fast(const float *x, int ldx, const float *add, float
     const size_t r = it.get_group(2);
     const float *xr = x + r * ldx;
     float *orow = out + r * ld_out;
+    q36k::QB *qr = (HAS_Q && hq) ? (hq + r * (size_t) (n / 32)) : nullptr;
     float xv[EPT], wv[EPT];
 #pragma unroll
     for (int e = 0; e < EPT; ++e) {
@@ -751,7 +760,75 @@ __dpct_inline__ void k_rms_fast(const float *x, int ldx, const float *add, float
 #pragma unroll
     for (int e = 0; e < EPT; ++e) {
         const int i = t + e * 1024;
-        if (i < n) orow[i] = xv[e] * rr * wv[e];
+        if (i < n) {
+            const float hv = xv[e] * rr * wv[e];
+            orow[i] = hv;
+            if constexpr (HAS_Q) {
+                vv[i] = hv;
+                q36k::q8_store(qr, i, ((volatile float *) &vv[0])[i], t & 31);
+            }
+        }
+    }
+}
+
+template <int NMAX, bool HAS_Q>
+__dpct_inline__ void k_rms2_cat_q(const float *x0, const float *w0, const float *x1, const float *w1, float *out,
+                                  q36k::QB *hq, int n, float eps) {
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto wg = sycl::ext::oneapi::this_work_item::get_work_group<3>();
+    auto &vv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[NMAX]>(wg);
+    auto &sh = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[256]>(wg);
+    constexpr int EPT = (NMAX + 1023) / 1024;
+    const int t = (int) it.get_local_id(2);
+    const int g = (int) it.get_group(1);
+    const size_t r = it.get_group(2);
+    const float *xr = (g == 0 ? x0 : x1) + r * n;
+    const float *w = (g == 0 ? w0 : w1);
+    float *orow = out + r * (size_t) (2 * n) + (size_t) g * n;
+    q36k::QB *qr = HAS_Q ? (hq + (r * 2 + (size_t) g) * (size_t) (n / 32)) : nullptr;
+    float xv[EPT], wv[EPT];
+#pragma unroll
+    for (int e = 0; e < EPT; ++e) {
+        const int i = t + e * 1024;
+        xv[e] = 0.f;
+        wv[e] = 0.f;
+        if (i < n) {
+            xv[e] = xr[i];
+            wv[e] = w[i];
+            vv[i] = xv[e];
+        }
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+    if (t < 256) {
+        float s = 0.f;
+        for (int i = t; i < n; i += 256) s += vv[i] * vv[i];
+        sh[t] = s;
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+    if (t < 128) sh[t] += sh[t + 128];
+    it.barrier(sycl::access::fence_space::local_space);
+    if (t < 64) sh[t] += sh[t + 64];
+    it.barrier(sycl::access::fence_space::local_space);
+    if (t < 32) {
+        float v = sh[t] + sh[t + 32];
+        const auto sg = it.get_sub_group();
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+        if (t == 0) sh[0] = v;
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+    const float rr = sycl::rsqrt(sh[0] / (float) n + eps);
+#pragma unroll
+    for (int e = 0; e < EPT; ++e) {
+        const int i = t + e * 1024;
+        if (i < n) {
+            const float hv = xv[e] * rr * wv[e];
+            orow[i] = hv;
+            if constexpr (HAS_Q) {
+                vv[i] = hv;
+                q36k::q8_store(qr, i, ((volatile float *) &vv[0])[i], t & 31);
+            }
+        }
     }
 }
 /// The MoE block's end for one token row (block per row): x += sum_k w_k part_k (in pick order, FMA after the first
@@ -2946,6 +3023,7 @@ struct Model {
     // the GGUF-native MTP block (blk.<n_layers>, loaded with --mtp): eh_proj over [enorm(e) | hnorm(h)], then an
     // attention + MoE layer, shared_head_norm, the main head
     bool has_mtp = false;
+    bool draft_w4 = false;   // draft-side matrices packed into B70W4 at load
     int w4_mats = 0;   // matrices loaded from a B70W4 pack (--w4)
     Layer mtp;
     Mat eh_proj;
@@ -3127,7 +3205,15 @@ bool load(const std::string &path, Model &m, std::string &err, bool want_mtp) {
         const uint8_t* src = gm.shard(s).tensor_data(*t);
         uint64_t nb = strata::tensor_payload_bytes(*t);
         std::vector<uint8_t> rq;   // a type the native MMVQ does not take, as Q8_0
-        if (rq_draft && (w.type == 13 || w.type == 14) && w.n_in % 256 == 0 &&
+        if (rq_draft && q36_draft_w4() && (w.type == 12 || w.type == 13 || w.type == 14) &&
+            w.n_in % 256 == 0 && w.n_out % 16 == 0 && strata::qwen35::requant_b70w4(w.type, src, w.n_in, w.n_out, rq)) {
+            std::fprintf(stderr, "strata-q36: draft side: %s (%s) as B70W4 (%.1f -> %.1f MiB)\n", name.c_str(), t->type_name(),
+                         nb / 1048576.0, rq.size() / 1048576.0);
+            w.type = kW4Type;
+            m.draft_w4 = true;
+            src = rq.data();
+            nb = rq.size();
+        } else if (rq_draft && (w.type == 13 || w.type == 14) && w.n_in % 256 == 0 &&
             strata::qwen35::requant(w.type, src, w.n_in, w.n_out, 12, rq)) {
             std::fprintf(stderr, "strata-q36: draft side: %s (%s) as Q4_K (%.1f -> %.1f MiB)\n", name.c_str(), t->type_name(),
                          nb / 1048576.0, rq.size() / 1048576.0);
@@ -3142,7 +3228,7 @@ bool load(const std::string &path, Model &m, std::string &err, bool want_mtp) {
             src = rq.data();
             nb = rq.size();
         }
-        if (!K::native_mmvq_supported(w.type)) {
+        if (w.type != kW4Type && !K::native_mmvq_supported(w.type)) {
             std::fprintf(stderr, "strata-q36: %s is %s, which the native MMVQ does not take\n", name.c_str(), t->type_name());
             std::exit(1);
         }
@@ -3865,8 +3951,10 @@ struct Engine {
                 take(m->mtp);
                 big = std::max<int64_t>(big, (int64_t) m->eh_proj.n_in * m->eh_proj.n_out);
             }
-            if (m->w4_mats > 0)
+            if (m->w4_mats > 0 || m->draft_w4 || (m->has_mtp && q36_draft_w4())) {
+                w4_f16_elems = big;
                 CK(DPCT_CHECK_ERROR(w4_f16 = (uint16_t *)sycl::malloc_device((size_t) big * 2, q_ct1)));
+            }
             if (!gemm.init(st, big, gerr)) {
                 std::fprintf(stderr, "strata-q36: prompt GEMM: %s\n", gerr.c_str());
                 std::exit(1);
@@ -3922,15 +4010,21 @@ struct Engine {
         pl = dalloc((size_t) att_rows * n_chunk);
         {
             const char* e = std::getenv("STRATA_Q36_W4A16");
-            // on for a batch engine (its windows are many rows); a single session: off unless STRATA_Q36_W4A16=1 - its usual 6
-            // rows gain nothing and the images cost 3 launches a layer (8 requests: 104.0 -> 100.3 tok/s; an edit's 16-row
-            // windows 287 -> 317)
-            w4a16 = m->w4_mats > 0 && (e ? e[0] == '1' : n_sess > 1);
+            const char* et = std::getenv("STRATA_Q36_W4H_T");
+            const bool draft_may_w4 = m->draft_w4 || (m->has_mtp && q36_draft_w4());
+            // Auto-hybrid W4 (1..8 cols) + W4A16 (9..16 cols) for batched decode (n_sess > 1) or explicit override;
+            // single-session stays on W4 (FP16 x Q8_1) at <= 9 cols for parity and higher throughput without pack16 overhead.
+            const bool want_w4a16 = e ? (e[0] == '1') : (n_sess > 1 || (et && *et));
+            w4a16 = (m->w4_mats > 0 || draft_may_w4) && want_w4a16;
             if (w4a16) {
-                const size_t nh = strata::q36xr::w4h_act_halfs((int) std::max<int64_t>(g.n_embd, g.n_ff) + 255, 32);
+                if (et && *et) w4h_min_t = std::max(1, std::atoi(et));
+                else if (e && e[0] == '1' && n_sess <= 1) w4h_min_t = 1;
+                else w4h_min_t = 9;
+                const size_t nh = strata::q36xr::w4h_act_halfs((int) std::max<int64_t>({2 * g.n_embd, g.n_ff}) + 255, 32);
                 xa16 = reinterpret_cast<uint16_t*>(dalloc(nh / 2 + 16));
                 xb16 = reinterpret_cast<uint16_t*>(dalloc(nh / 2 + 16));
-                std::fprintf(stderr, "strata-q36: the pack's decode-side products read FP16 activations (W4A16)\n");
+                std::fprintf(stderr, "strata-q36: W4A16 active for B70W4 matrices at %d..%d columns (STRATA_Q36_W4H_T=%d)\n",
+                             w4h_min_t, kGemmT, w4h_min_t);
             }
         }
         {
@@ -4200,8 +4294,21 @@ struct Engine {
     // rows interleaved by 16 inputs - instead of the q8_1 image, at every row count (so a row's result does not depend on
     // its window).  xa16: the image of the layer's input h; xb16: of an inner activation.
     bool w4a16 = false;
+    int w4h_min_t = 9;
+    int64_t w4_f16_elems = 0;
     uint16_t *xa16 = nullptr, *xb16 = nullptr;
-    bool a16(const Mat& w, int T) const { return w4a16 && w.type == kW4Type && T <= kGemmT; }
+    const float* q8_src = nullptr;
+    int q8_stride = 0, q8_rows = 0;
+    const void* q8_hit(const float* xin, int n, int T) {
+        if (!q8_src || n != q8_stride || xin < q8_src || T > kGemmT) return nullptr;
+        const std::ptrdiff_t diff = xin - q8_src;
+        if (diff % n != 0) return nullptr;
+        const int row0 = (int) (diff / n);
+        if (row0 < 0 || row0 + T > q8_rows) return nullptr;
+        q8_src = nullptr;
+        return (const char*) q8 + (size_t) row0 * K::native_q8_1_bytes(n, 1);
+    }
+    bool a16(const Mat& w, int T) const { return w4a16 && w.type == kW4Type && T >= w4h_min_t && T <= kGemmT; }
     void pack16(const float* x, int n, int T, uint16_t* d) { strata::q36xr::w4h_pack(x, n, d, n, T, st); }
     void mmh(const Mat& w, const uint16_t* x16v, float* out, int T) {
         if (!strata::q36xr::mmvq_w4h(w.d, x16v, out, w.n_in, w.n_out, T, st)) {
@@ -4223,13 +4330,25 @@ struct Engine {
         }
     }
     void mm(const Mat& w, const float* xin, float* out, int T) {
+        if (T > kGemmT && w.type == kW4Type && (int64_t) w.n_in * w.n_out > w4_f16_elems) {
+            q8_src = nullptr;
+            for (int c0 = 0; c0 < T; c0 += kGemmT) {
+                mm(w, xin + (size_t) c0 * w.n_in, out + (size_t) c0 * w.n_out, std::min(kGemmT, T - c0));
+            }
+            return;
+        }
         if (a16(w, T)) {
+            q8_src = nullptr;
             pack16(xin, w.n_in, T, xb16);
             mmh(w, xb16, out, T);
             return;
         }
-        prep(xin, w.n_in, T, q8);
-        apply(w, q8, out, T);
+        const void* qh = q8_hit(xin, w.n_in, T);
+        if (!qh) {
+            prep(xin, w.n_in, T, q8);
+            qh = q8;
+        }
+        apply(w, qh, out, T);
     }
     /// y [T][n_out] = W [n_out][n_in] (f32) x [T][n_in]: a decode batch on the warp-per-row kernel, a prompt chunk on
     /// cuBLAS's FP32 GEMM (the router and the GDN alpha / beta stay in FP32, as llama.cpp keeps them).
@@ -4360,7 +4479,10 @@ struct Engine {
         } else mmq(w, q, out, T);
     }
     /// x [T][n] -> its q8_1 image (T contiguous columns: one vector of T * n), for every matrix that reads x.
-    void quant(const float* xin, int n, int T, void* q) { K::native_quantize_q8_1(xin, q, n * T, 1, st); }
+    void quant(const float* xin, int n, int T, void* q) {
+        if (q == q8) q8_src = nullptr;
+        K::native_quantize_q8_1(xin, q, n * T, 1, st);
+    }
     // ---- decode kernels of this engine (q36_kernels.cuh), each the old kernel's bits (STRATA_Q36_VERIFY=1 compares)
     bool fast_k = std::getenv("STRATA_Q36_OLD_KERNELS") == nullptr;
     bool verify_k = std::getenv("STRATA_Q36_VERIFY") != nullptr;
@@ -5071,6 +5193,7 @@ work-group size if needed.
             if (!xq_post) quant(h, N, T, xq);
             mmq(L.ffn_gate, xq, sg, T);
             mmq(L.ffn_up, xq, su, T);
+            q8_src = nullptr;
             if (T <= 8) K::native_swiglu_quantize_q8_1(sg, su, q8, FF, T, st);
             else K::native_swiglu_quantize_q8_1(sg, su, q8, FF * T, 1, st);   // (9+ columns: as one vector, the same blocks)
             mmq(L.ffn_down, q8, sy, T);
@@ -5110,9 +5233,15 @@ work-group size if needed.
             }
             apply(L.ffn_down, nullptr, sy, T);
         }
-        const bool mkq = fast_k && T <= kGemmT && wn != nullptr && hout == h && N % 256 == 0;   // the next layer's input
-        if (mkq) {
-            q36k::launch_add_rms_q(x, sy, wn, h, (q36k::QB *) xq, N, T, m->eps, (sycl::queue *) st);   // M2: 1024 threads a row
+        const bool mkq_in = fast_k && T <= kGemmT && wn != nullptr && hout == h && N % 256 == 0;   // the next layer's input
+        const bool mkq_out = !mkq_in && fast_k && T <= kGemmT && wn != nullptr && (hout == hmain || hout == hmtp) && N % 256 == 0;
+        if (mkq_in || mkq_out) {
+            q36k::launch_add_rms_q(x, sy, wn, hout, (q36k::QB *) (mkq_in ? xq : q8), N, T, m->eps, (sycl::queue *) st);   // M2: 1024 threads a row
+            if (mkq_out) {
+                q8_src = hout;
+                q8_stride = N;
+                q8_rows = T;
+            }
         } else if (!rms_fast(x, N, sy, x, wn, hout, N, N, T)) {   // (M4: the decode side's last layer / MTP block output norm)
             auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
@@ -5130,7 +5259,7 @@ work-group size if needed.
                     });
             });
         }
-        xq_ready = mkq;
+        xq_ready = mkq_in;
     }
 
     /// An attention layer's attention after its q / k / v products (qg, kx, vx), into att (gated): the rows' q and k
@@ -5543,19 +5672,43 @@ work-group size if needed.
     /// M4: k_rms_fast for T <= kGemmT rows (n <= 8192, n % 32 == 0): out[r * ld_out ..] = rms(x[r * ldx ..] (+ add[r])) * w, with
     /// add the sum stored to xw (the same rows as x); the bits of the 256-thread kernels it replaces.  false: the caller runs its
     /// own kernel - prompt chunks, the old kernels (STRATA_Q36_OLD_KERNELS), STRATA_Q36_RMS_FAST=0.
-    bool rms_fast(const float *xin, int ldx, const float *add, float *xw, const float *w, float *out, int ld_out, int n, int T) {
+    static bool rms_fast_on() {
         static const bool on = [] { const char* e = std::getenv("STRATA_Q36_RMS_FAST"); return !(e && e[0] == '0'); }();
-        if (!on || !fast_k || T < 1 || T > kGemmT || n > 8192 || n % 32 != 0 || w == nullptr) return false;
+        return on;
+    }
+    bool rms_fast(const float *xin, int ldx, const float *add, float *xw, const float *w, float *out, int ld_out, int n, int T,
+                  q36k::QB *hq = nullptr) {
+        if (!rms_fast_on() || !fast_k || T < 1 || T > kGemmT || n > 8192 || n % 32 != 0 || w == nullptr) return false;
         const float eps = m->eps;
         const sycl::nd_range<3> nr(sycl::range<3>(1, 1, (size_t) T * 1024), sycl::range<3>(1, 1, 1024));
         if (add)
             st->parallel_for<class q36_rms_fast_add_m4>(nr, [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
                 k_rms_fast<true, 8192>(xin, ldx, add, xw, w, out, ld_out, n, eps);
             });
+        else if (hq)
+            st->parallel_for<class q36_rms_fast_q_p3>(nr, [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                k_rms_fast<false, 8192, true>(xin, ldx, nullptr, nullptr, w, out, ld_out, n, eps, hq);
+            });
         else
             st->parallel_for<class q36_rms_fast_m4>(nr, [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
                 k_rms_fast<false, 8192>(xin, ldx, nullptr, nullptr, w, out, ld_out, n, eps);
             });
+        return true;
+    }
+    bool rms2_cat_q(const float *x0, const float *w0, const float *x1, const float *w1, float *out, q36k::QB *hq, int n, int T) {
+        if (!rms_fast_on() || !fast_k || T < 1 || T > kGemmT || n > 8192 || n % 32 != 0 || !w0 || !w1) return false;
+        const float eps = m->eps;
+        const sycl::nd_range<3> nr(sycl::range<3>(1, 2, (size_t) T) * sycl::range<3>(1, 1, 1024), sycl::range<3>(1, 1, 1024));
+        if (hq) {
+            q8_src = nullptr;
+            st->parallel_for<class q36_rms2_cat_q_p3>(nr, [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                k_rms2_cat_q<8192, true>(x0, w0, x1, w1, out, hq, n, eps);
+            });
+        } else {
+            st->parallel_for<class q36_rms2_cat_p3>(nr, [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                k_rms2_cat_q<8192, false>(x0, w0, x1, w1, out, nullptr, n, eps);
+            });
+        }
         return true;
     }
     /// M4: the decode-side GDN kernels (k_conv_dec, k_gdn_dec, k_gdn_norm_q8) for every forward of T <= kGemmT rows outside the
@@ -5599,6 +5752,7 @@ work-group size if needed.
         const float *const cw = L.conv, *const gam = L.ssm_norm, *const zb = z;
         float *const o = gdn_y;
         q36k::QB *const yq = (q36k::QB *) q8;
+        q8_src = nullptr;
         const float eps = m->eps;
         const bool wr = !verify;
         if (rows_mode) {   // batch rows: grid dim 0 = the session group (STRATA_Q36_FUSE)
@@ -5672,7 +5826,8 @@ work-group size if needed.
             float* hc_b = verify ? v_hc[li] : hc;
             float* al_b = verify ? v_alpha[li] : alpha;
             float* be_b = verify ? v_beta[li] : beta;
-            prep_in(T);
+            if (!a16(L.qkv, T) || !a16(L.zg, T)) prep_in(T);
+            else xq_ready = false;
             bool pk16 = false;
             apply2(L.qkv, xq, h, pk16, qkv_b, T);
             apply2(L.zg, xq, h, pk16, z, T);
@@ -5914,7 +6069,8 @@ work-group size if needed.
             if (dec && !a16(L.ssm_out, T)) apply(L.ssm_out, q8, y, T);   // (q8: gdn_y's q8_1 image, from k_gdn_norm_q8)
             else mm(L.ssm_out, gdn_y, y, T);
         } else {
-            prep_in(T);
+            if (!a16(L.wq, T) || !a16(L.wk, T) || !a16(L.wv, T)) prep_in(T);
+            else xq_ready = false;
             bool pk16 = false;
             apply2(L.wq, xq, h, pk16, qg, T);
             apply2(L.wk, xq, h, pk16, kx, T);
@@ -6052,6 +6208,8 @@ work-group size if needed.
     void forward(int T, int64_t p0, int heads, bool graph_mode, bool verify) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
+        q8_src = nullptr;
+        xq_ready = false;
         if (main_hybrid && T > hybrid_t && use_mmq) {
             std::vector<int> seq;
             for (size_t l = 0; l < m->layers.size(); ++l)
@@ -6076,8 +6234,12 @@ work-group size if needed.
                     });
             });
         } // a picture's cells take its rows
-        if (!rms_fast(x, N, nullptr, nullptr, m->layers[0].attn_norm, h, N, N, T))   // M4: rows of a decode-side forward
-        {
+        const Layer& L0 = m->layers[0];
+        const bool want_q0 = T <= kGemmT && (L0.attn ? (!a16(L0.wq, T) || !a16(L0.wk, T) || !a16(L0.wv, T))
+                                                     : (!a16(L0.qkv, T) || !a16(L0.zg, T)));
+        if (rms_fast(x, N, nullptr, nullptr, L0.attn_norm, h, N, N, T, want_q0 ? (q36k::QB*) xq : nullptr)) {   // M4: rows of a decode-side forward
+            xq_ready = want_q0;
+        } else {
             auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
@@ -6102,6 +6264,7 @@ work-group size if needed.
                   last ? hmain : h);
         }
         if (heads > 0) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
+        else q8_src = nullptr;
     }
     /// logits [n][V] = W_out hn rows, and each row's greedy pick.
     void head_rows(const float* hn, int n, float* lg, int32_t* pk) {
@@ -6166,10 +6329,18 @@ work-group size if needed.
         }).wait();
         head_d.d = dst;
         head_d.type = hd.type;
-        if (q36_draft_q4() && (hd.type == 13 || hd.type == 14) && hd.n_in % 256 == 0) {   // the gathered rows as Q4_K
+        if (q36_draft_q4() && (hd.type == 12 || hd.type == 13 || hd.type == 14) && hd.n_in % 256 == 0) {
             std::vector<uint8_t> hrows(rb * (size_t) n), rq;
             st->memcpy(hrows.data(), dst, hrows.size()).wait();
-            if (strata::qwen35::requant(hd.type, hrows.data(), hd.n_in, n, 12, rq)) {
+            if (q36_draft_w4() && n % 16 == 0 && strata::qwen35::requant_b70w4(hd.type, hrows.data(), hd.n_in, n, rq)) {
+                uint8_t* d4 = (uint8_t*) sycl::aligned_alloc_device((size_t) 2 << 20, rq.size(), *st);
+                st->memcpy(d4, rq.data(), rq.size()).wait();
+                sycl::free(dst, *st);
+                head_d.d = d4;
+                head_d.type = kW4Type;
+                std::fprintf(stderr, "strata-q36: draft side: the draft head as B70W4 (%.0f -> %.0f MB)\n", (double) rb * n / 1e6,
+                             (double) rq.size() / 1e6);
+            } else if (hd.type != 12 && strata::qwen35::requant(hd.type, hrows.data(), hd.n_in, n, 12, rq)) {
                 uint8_t* d4 = (uint8_t*) sycl::aligned_alloc_device((size_t) 2 << 20, rq.size(), *st);
                 st->memcpy(d4, rq.data(), rq.size()).wait();
                 sycl::free(dst, *st);
@@ -6210,16 +6381,20 @@ work-group size if needed.
             head_rows(hn, 1, logits_m, pick_m);
             return;
         }
-        quant(hn, N, 1, q8);
+        const void* qh = q8_hit(hn, N, 1);
+        if (!qh) {
+            quant(hn, N, 1, q8);
+            qh = q8;
+        }
         const uint8_t* pk = nullptr;
         for (const auto& p : m->packed)
             if (std::get<0>(p) == hd.d) pk = std::get<1>(p);
         if (pk) {
             const sycl::half *dpl = reinterpret_cast<const sycl::half *>(
                 pk + (size_t)hd.n_in * hd.n_out);
-            q36k::launch_q8_rows<1, 2, true>(pk, dpl, q8, logits_m, 64, draft_n, st);
+            q36k::launch_q8_rows<1, 2, true>(pk, dpl, qh, logits_m, 64, draft_n, st);
         } else {
-            q36k::launch_q8_rows<1, 2, false>(hd.d, nullptr, q8, logits_m, 64, draft_n, st);
+            q36k::launch_q8_rows<1, 2, false>(hd.d, nullptr, qh, logits_m, 64, draft_n, st);
         }
         {
             auto exp_props = sycl::ext::oneapi::experimental::properties{};
@@ -6274,24 +6449,28 @@ work-group size if needed.
             idv = d_draft_ids;
         } else if (fast_k && draft_n > 0 && draft_n < g.n_vocab && draft_n % 8 == 0 && hd.type == 8 && hd.n_in == N &&
                    N / 32 == 64 && B >= 1 && B <= kTreeFrontMax) {
-            quant(hn, N, B, q8);
+            const void* qh = q8_hit(hn, N, B);
+            if (!qh) {
+                quant(hn, N, B, q8);
+                qh = q8;
+            }
             const uint8_t* pk = nullptr;
             for (const auto& p : m->packed)
                 if (std::get<0>(p) == hd.d) pk = std::get<1>(p);
             if (pk) {
                 const sycl::half* dpl = reinterpret_cast<const sycl::half*>(pk + (size_t) hd.n_in * hd.n_out);
                 switch (B) {
-                    case 1: q36k::launch_q8_rows<1, 2, true>(pk, dpl, q8, d_tlogits, 64, draft_n, st); break;
-                    case 2: q36k::launch_q8_rows<2, 2, true>(pk, dpl, q8, d_tlogits, 64, draft_n, st); break;
-                    case 3: q36k::launch_q8_rows<3, 2, true>(pk, dpl, q8, d_tlogits, 64, draft_n, st); break;
-                    case 4: q36k::launch_q8_rows<4, 2, true>(pk, dpl, q8, d_tlogits, 64, draft_n, st); break;
+                    case 1: q36k::launch_q8_rows<1, 2, true>(pk, dpl, qh, d_tlogits, 64, draft_n, st); break;
+                    case 2: q36k::launch_q8_rows<2, 2, true>(pk, dpl, qh, d_tlogits, 64, draft_n, st); break;
+                    case 3: q36k::launch_q8_rows<3, 2, true>(pk, dpl, qh, d_tlogits, 64, draft_n, st); break;
+                    case 4: q36k::launch_q8_rows<4, 2, true>(pk, dpl, qh, d_tlogits, 64, draft_n, st); break;
                 }
             } else {
                 switch (B) {
-                    case 1: q36k::launch_q8_rows<1, 2, false>(hd.d, nullptr, q8, d_tlogits, 64, draft_n, st); break;
-                    case 2: q36k::launch_q8_rows<2, 2, false>(hd.d, nullptr, q8, d_tlogits, 64, draft_n, st); break;
-                    case 3: q36k::launch_q8_rows<3, 2, false>(hd.d, nullptr, q8, d_tlogits, 64, draft_n, st); break;
-                    case 4: q36k::launch_q8_rows<4, 2, false>(hd.d, nullptr, q8, d_tlogits, 64, draft_n, st); break;
+                    case 1: q36k::launch_q8_rows<1, 2, false>(hd.d, nullptr, qh, d_tlogits, 64, draft_n, st); break;
+                    case 2: q36k::launch_q8_rows<2, 2, false>(hd.d, nullptr, qh, d_tlogits, 64, draft_n, st); break;
+                    case 3: q36k::launch_q8_rows<3, 2, false>(hd.d, nullptr, qh, d_tlogits, 64, draft_n, st); break;
+                    case 4: q36k::launch_q8_rows<4, 2, false>(hd.d, nullptr, qh, d_tlogits, 64, draft_n, st); break;
                 }
             }
             nd = draft_n;
@@ -6336,50 +6515,65 @@ work-group size if needed.
                     });
             });
         }
-        if (!rms_fast(y, N, nullptr, nullptr, m->mtp_enorm, mtp_cat, 2 * N, N, T))   // M4
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{};
+        q8_src = nullptr;
+        xq_ready = false;
+        const bool want_ehq = fast_k && T <= kGemmT && !a16(m->eh_proj, T);
+        if (rms2_cat_q(y, m->mtp_enorm, seeds, m->mtp_hnorm, mtp_cat, want_ehq ? (q36k::QB*) q8 : nullptr, N, T)) {
+            if (want_ehq) {
+                q8_src = mtp_cat;
+                q8_stride = 2 * N;
+                q8_rows = T;
+            }
+        } else {
+            if (!rms_fast(y, N, nullptr, nullptr, m->mtp_enorm, mtp_cat, 2 * N, N, T))   // M4
+            {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
-            ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
-                const float *y_ct0 = y;
-                auto m_mtp_enorm_ct2 = m->mtp_enorm;
-                auto mtp_cat_ct3 = mtp_cat;
-                auto N_ct4 = 2 * N;
-                auto m_eps_ct6 = m->eps;
+                ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
+                    const float *y_ct0 = y;
+                    auto m_mtp_enorm_ct2 = m->mtp_enorm;
+                    auto mtp_cat_ct3 = mtp_cat;
+                    auto N_ct4 = 2 * N;
+                    auto m_eps_ct6 = m->eps;
 
-                cgh.parallel_for<dpct_kernel_name<class k_rms_ld_679d26>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, T) *
-                                          sycl::range(1, 1, kThreads),
-                                      sycl::range(1, 1, kThreads)),
-                    exp_props, [=](sycl::nd_item<3> item_ct1) {
-                        k_rms_ld(y_ct0, N, m_mtp_enorm_ct2, mtp_cat_ct3, N_ct4,
-                                 N, m_eps_ct6);
-                    });
-            });
-        } // [e | ...]
-        if (!rms_fast(seeds, N, nullptr, nullptr, m->mtp_hnorm, mtp_cat + N, 2 * N, N, T))   // M4
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{};
+                    cgh.parallel_for<dpct_kernel_name<class k_rms_ld_679d26>>(
+                        sycl::nd_range<3>(sycl::range(1, 1, T) *
+                                              sycl::range(1, 1, kThreads),
+                                          sycl::range(1, 1, kThreads)),
+                        exp_props, [=](sycl::nd_item<3> item_ct1) {
+                            k_rms_ld(y_ct0, N, m_mtp_enorm_ct2, mtp_cat_ct3, N_ct4,
+                                     N, m_eps_ct6);
+                        });
+                });
+            } // [e | ...]
+            if (!rms_fast(seeds, N, nullptr, nullptr, m->mtp_hnorm, mtp_cat + N, 2 * N, N, T))   // M4
+            {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
-            ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
-                auto m_mtp_hnorm_ct2 = m->mtp_hnorm;
-                auto mtp_cat_N_ct3 = mtp_cat + N;
-                auto N_ct4 = 2 * N;
-                auto m_eps_ct6 = m->eps;
+                ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
+                    auto m_mtp_hnorm_ct2 = m->mtp_hnorm;
+                    auto mtp_cat_N_ct3 = mtp_cat + N;
+                    auto N_ct4 = 2 * N;
+                    auto m_eps_ct6 = m->eps;
 
-                cgh.parallel_for<dpct_kernel_name<class k_rms_ld_521f8b>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, T) *
-                                          sycl::range(1, 1, kThreads),
-                                      sycl::range(1, 1, kThreads)),
-                    exp_props, [=](sycl::nd_item<3> item_ct1) {
-                        k_rms_ld(seeds, N, m_mtp_hnorm_ct2, mtp_cat_N_ct3,
-                                 N_ct4, N, m_eps_ct6);
-                    });
-            });
-        } // [... | h]
+                    cgh.parallel_for<dpct_kernel_name<class k_rms_ld_521f8b>>(
+                        sycl::nd_range<3>(sycl::range(1, 1, T) *
+                                              sycl::range(1, 1, kThreads),
+                                          sycl::range(1, 1, kThreads)),
+                        exp_props, [=](sycl::nd_item<3> item_ct1) {
+                            k_rms_ld(seeds, N, m_mtp_hnorm_ct2, mtp_cat_N_ct3,
+                                     N_ct4, N, m_eps_ct6);
+                        });
+                });
+            } // [... | h]
+        }
         mm(m->eh_proj, mtp_cat, x, T);
-        if (!rms_fast(x, N, nullptr, nullptr, m->mtp.attn_norm, h, N, N, T))   // M4
-        {
+        const Layer& Lm = m->mtp;
+        const bool want_qm = T <= kGemmT && (Lm.attn ? (!a16(Lm.wq, T) || !a16(Lm.wk, T) || !a16(Lm.wv, T))
+                                                     : (!a16(Lm.qkv, T) || !a16(Lm.zg, T)));
+        if (rms_fast(x, N, nullptr, nullptr, Lm.attn_norm, h, N, N, T, want_qm ? (q36k::QB*) xq : nullptr)) {   // M4
+            xq_ready = want_qm;
+        } else {
             auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
             ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
@@ -7416,49 +7610,65 @@ work-group size if needed.
                 xbatch_slots.push_back({rows[r].slot, r, 1, rows[r].cell, false});
         }
         run_rows_graph(3000, 0, T, [&] {
+            q8_src = nullptr;
+            xq_ready = false;
             K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok_m, T, N, y, st);
-            {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{};
+            const bool want_ehq = fast_k && T <= kGemmT && !a16(m->eh_proj, T);
+            if (rms2_cat_q(y, m->mtp_enorm, mtp_seed(), m->mtp_hnorm, mtp_cat, want_ehq ? (q36k::QB*) q8 : nullptr, N, T)) {
+                if (want_ehq) {
+                    q8_src = mtp_cat;
+                    q8_stride = 2 * N;
+                    q8_rows = T;
+                }
+            } else {
+                {
+                    auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
-                ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
-                    const float *y_ct0 = y;
-                    auto m_mtp_enorm_ct2 = m->mtp_enorm;
-                    auto mtp_cat_ct3 = mtp_cat;
-                    auto N_ct4 = 2 * N;
-                    auto m_eps_ct6 = m->eps;
+                    ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
+                        const float *y_ct0 = y;
+                        auto m_mtp_enorm_ct2 = m->mtp_enorm;
+                        auto mtp_cat_ct3 = mtp_cat;
+                        auto N_ct4 = 2 * N;
+                        auto m_eps_ct6 = m->eps;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_rms_ld_459115>>(
-                        sycl::nd_range<3>(sycl::range(1, 1, T) *
-                                              sycl::range(1, 1, kThreads),
-                                          sycl::range(1, 1, kThreads)),
-                        exp_props, [=](sycl::nd_item<3> item_ct1) {
-                            k_rms_ld(y_ct0, N, m_mtp_enorm_ct2, mtp_cat_ct3,
-                                     N_ct4, N, m_eps_ct6);
-                        });
-                });
-            } // [e | ...]
-            {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{};
+                        cgh.parallel_for<dpct_kernel_name<class k_rms_ld_459115>>(
+                            sycl::nd_range<3>(sycl::range(1, 1, T) *
+                                                  sycl::range(1, 1, kThreads),
+                                              sycl::range(1, 1, kThreads)),
+                            exp_props, [=](sycl::nd_item<3> item_ct1) {
+                                k_rms_ld(y_ct0, N, m_mtp_enorm_ct2, mtp_cat_ct3,
+                                         N_ct4, N, m_eps_ct6);
+                            });
+                    });
+                } // [e | ...]
+                {
+                    auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
-                ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
-                    const float *mtp_seed_ct0 = mtp_seed();
-                    auto m_mtp_hnorm_ct2 = m->mtp_hnorm;
-                    auto mtp_cat_N_ct3 = mtp_cat + N;
-                    auto N_ct4 = 2 * N;
-                    auto m_eps_ct6 = m->eps;
+                    ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
+                        const float *mtp_seed_ct0 = mtp_seed();
+                        auto m_mtp_hnorm_ct2 = m->mtp_hnorm;
+                        auto mtp_cat_N_ct3 = mtp_cat + N;
+                        auto N_ct4 = 2 * N;
+                        auto m_eps_ct6 = m->eps;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_rms_ld_ca3ffc>>(
-                        sycl::nd_range<3>(sycl::range(1, 1, T) *
-                                              sycl::range(1, 1, kThreads),
-                                          sycl::range(1, 1, kThreads)),
-                        exp_props, [=](sycl::nd_item<3> item_ct1) {
-                            k_rms_ld(mtp_seed_ct0, N, m_mtp_hnorm_ct2,
-                                     mtp_cat_N_ct3, N_ct4, N, m_eps_ct6);
-                        });
-                });
-            } // [... | h]
+                        cgh.parallel_for<dpct_kernel_name<class k_rms_ld_ca3ffc>>(
+                            sycl::nd_range<3>(sycl::range(1, 1, T) *
+                                                  sycl::range(1, 1, kThreads),
+                                              sycl::range(1, 1, kThreads)),
+                            exp_props, [=](sycl::nd_item<3> item_ct1) {
+                                k_rms_ld(mtp_seed_ct0, N, m_mtp_hnorm_ct2,
+                                         mtp_cat_N_ct3, N_ct4, N, m_eps_ct6);
+                            });
+                    });
+                } // [... | h]
+            }
             mm(m->eh_proj, mtp_cat, x, T);
-            {
+            const Layer& Lm = m->mtp;
+            const bool want_qm = T <= kGemmT && (Lm.attn ? (!a16(Lm.wq, T) || !a16(Lm.wk, T) || !a16(Lm.wv, T))
+                                                         : (!a16(Lm.qkv, T) || !a16(Lm.zg, T)));
+            if (rms_fast(x, N, nullptr, nullptr, Lm.attn_norm, h, N, N, T, want_qm ? (q36k::QB*) xq : nullptr)) {
+                xq_ready = want_qm;
+            } else {
                 auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
                 ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
@@ -7482,6 +7692,7 @@ work-group size if needed.
             const bool dh = head_d.d != nullptr;
             const int nv = dh ? head_d.n_out : (int) g.n_vocab;
             mm(dh ? head_d : m->head, hmtp, logits_mr, T);
+            q8_src = nullptr;
             {
                 auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
