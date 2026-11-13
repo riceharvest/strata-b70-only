@@ -994,6 +994,15 @@ inline Q36XattSwitch q36_xatt_switch() {
     const char* ve = std::getenv("STRATA_Q36_KV_VT");
     return {xe ? xe[0] == '1' : true, xe != nullptr, !(ve && ve[0] == '0')};
 }
+/// Matrix-engine decode attention for multi-session batches (n_sess > 1).  Read once; STRATA_Q36_XATT_BATCH=0 restores
+/// the single-session-only gate (FP32 k_attn_gqa and plain V layout for --batch).
+inline bool q36_xatt_batch_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_Q36_XATT_BATCH");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 /// Bytes of one cache allocation (one layer's K, or its V) of n = HKV * ctx * HD values: the codes and their scales.
 inline size_t q36_kv_alloc_bytes(size_t n) {
     return q36_kv() == kKvF32 ? n * 4 : q36_kv() == kKvQ8 ? n + n / 64 * 2 : n * 2;
@@ -3034,15 +3043,15 @@ struct Engine {
     int n_chunk = 0, att_rows = 0;   // attention partials: att_rows query rows x n_chunk chunks
     std::vector<float*> conv, S;   // per layer: the CURRENT session's (select)
     std::vector<void*> kc, vc;     // per layer, the MTP block's at index n_layers: the K / V cache (q36_kv_alloc_bytes)
-    // The matrix-engine decode attention (q36_xatt.dp.cpp; on by default when it fits - q36_xatt_switch(); one session): each attention layer's mirror
-    // (int8 K, transposed int8 V, a scale a cell), one set of scratch.  xatt_now: this window's rows take it (the cells
-    // reach STRATA_Q36_XATT_MIN, default 4096); its graphs are recorded apart (run_graph_key).
-    // The mirror is written only by the windows that read it: xmir_n = the cells [0, xmir_n) it holds (any other write of
-    // cells - a prompt chunk, a window below the threshold - lowers it); the first window past the threshold fills the
-    // cells up to its own first (xatt_catch_up), from then on each window writes its rows.
+    // The matrix-engine decode attention (q36_xatt.dp.cpp; on by default when it fits - q36_xatt_switch()): either the
+    // 8-bit cache directly with V transposed (kv_vt, zero mirrors) or per-session mirrors in Sess (int8 K, transposed
+    // int8 V, one scale per cell), plus one call scratch reused sequentially on the in-order queue.  xatt_now: this
+    // window's rows take it (the cells reach STRATA_Q36_XATT_MIN, default 4096); its graphs are recorded apart.
+    // A session's mirror is written only by the windows that read it: Sess::xmir_n = the cells [0, xmir_n) it holds
+    // (any other write of cells - a prompt chunk, a window below the threshold - lowers it); the first window past the
+    // threshold fills the cells up to its own first (xatt_catch_up_sess), from then on each window writes its rows.
     bool xatt_ready = false, xatt_now = false;
     int xatt_min = 4096, xctxp = 0, xcapc = 0;
-    int64_t xmir_n = 0;
     int32_t* xpos_d = nullptr;
     bool xatt_kq8 = false;   // the cache is 8-bit: the scores read its K (a scale per 64 values), no K copy
     // The 8-bit cache's V stored transposed (RowSel::vt) when the matrix-engine attention will read it: then that
@@ -3057,8 +3066,13 @@ struct Engine {
         if (xatt_ready && pos >= xatt_min) return std::min(mtp_d, xls_max * 16 / strata::q36xatt::kG - 1);
         return mtp_d;
     }
-    std::vector<uint32_t*> xk8, xv8t;
-    std::vector<float*> xks, xvs;
+    struct XBatchSlot {
+        int slot = 0, r0 = 0, cnt = 0;
+        int64_t cell0 = 0;
+        bool xatt = false;
+    };
+    std::vector<XBatchSlot> xbatch_slots;
+    bool xbatch_xatt_any = false;
     uint32_t *xqb = nullptr, *xpb = nullptr;
     float *xqs = nullptr, *xsc = nullptr, *xsrow = nullptr;
     bool kv_f32 = false;           // the cache in FP32 (STRATA_Q36_KV=f32)
@@ -3127,6 +3141,9 @@ struct Engine {
         int32_t rdelta = 0;                 // rotary offset of the text after the last picture (see k_attn_prep)
         std::vector<int32_t> live;          // the tokens whose state it holds (cell i = live[i])
         std::vector<ImgKey> imgs;           // the pictures among them
+        int64_t xmir_n = 0;                 // cells [0, xmir_n) held in this session's non-kv_vt XATT mirror
+        std::vector<uint32_t*> xk8, xv8t;   // per-layer non-kv_vt XATT mirrors (allocated when xatt_ready && !kv_vt)
+        std::vector<float*> xks, xvs;
         bool active = false;                // a batch slot is decoding in it
         uint64_t used = 0;                  // when it was last used (the LRU pick)
     };
@@ -3254,6 +3271,22 @@ struct Engine {
             ss.vc.push_back(kv_alloc_v((size_t) g.n_head_kv * ctx * g.head_dim));
         }
         ss.hlast = dalloc((size_t) g.n_embd);
+        if (xatt_ready && !kv_vt) {
+            const int hkv = (int) g.n_head_kv;
+            ss.xk8.assign(m->layers.size() + 1, nullptr);
+            ss.xv8t.assign(m->layers.size() + 1, nullptr);
+            ss.xks.assign(m->layers.size() + 1, nullptr);
+            ss.xvs.assign(m->layers.size() + 1, nullptr);
+            for (size_t li = 0; li <= m->layers.size(); ++li)   // (index n_layers: the MTP block's cache)
+                if (li < m->layers.size() ? m->layers[li].attn : m->has_mtp) {
+                    if (!xatt_kq8) {
+                        ss.xk8[li] = reinterpret_cast<uint32_t*>(dalloc(strata::q36xatt::k8_dwords(hkv, xctxp)));
+                        ss.xks[li] = dalloc(strata::q36xatt::sc_floats(hkv, xctxp));
+                    }
+                    ss.xv8t[li] = reinterpret_cast<uint32_t*>(dalloc(strata::q36xatt::v8t_dwords(hkv, xctxp)));
+                    ss.xvs[li] = dalloc(strata::q36xatt::sc_floats(hkv, xctxp));
+                }
+        }
     }
 
     /// The current session: `i`'s state, cache and position become the engine's (conv / S / kc / vc / pos / hlast).
@@ -3528,12 +3561,13 @@ struct Engine {
             // scratch of a call, made for windows of 16, 8 or 5 tokens - the largest that fits (a larger window runs
             // k_attn_gqa; the lookup drafts keep to it, lookup_depth()).
             const Q36XattSwitch xsw = q36_xatt_switch();
-            const bool xe = xsw.explicit_on;   // (an explicit 1 skips the fit test below)
+            const bool xe = xsw.explicit_on;   // (an explicit 1 skips the 2 GiB headroom test when it still fits VRAM)
             const bool xwant = xsw.want;
-            const bool xshape = n_sess == 1 && !attn_head && (int) g.head_dim == xa::kHD && (int) g.n_head == xa::kG * (int) g.n_head_kv;
+            const bool batch_ok = n_sess == 1 || q36_xatt_batch_on();
+            const bool xshape = batch_ok && !attn_head && (int) g.head_dim == xa::kHD && (int) g.n_head == xa::kG * (int) g.n_head_kv;
             if (xwant && xshape) {
-                // the 8-bit cache then stores V transposed (kv_vt) and needs no copy; if the fit fails below it goes back to
-                // the plain layout (kv_vt = false), so V is transposed only when the attention that reads it is on
+                // the 8-bit cache then stores V transposed (kv_vt) for all sessions and needs no mirror; if the fit fails
+                // below it goes back to the plain layout (kv_vt = false), so V is transposed only when XATT is active
                 kv_vt = kv_q8 && xsw.vt_ok;
                 vt_ctxp = kv_vt ? xa::ctx_pad(ctx) : 0;
                 const int hkv = (int) g.n_head_kv;
@@ -3544,40 +3578,32 @@ struct Engine {
                 xatt_kq8 = kv_q8;
                 const size_t per_layer = kv_vt ? 0 : ((xatt_kq8 ? 0 : xa::k8_dwords(hkv, xctxp) + xa::sc_floats(hkv, xctxp)) +
                                                       xa::v8t_dwords(hkv, xctxp) + xa::sc_floats(hkv, xctxp)) * 4;
+                const size_t total_mir = nl * (size_t) n_sess * per_layer;
                 const double per = kv_q8 ? 1.04 : (kv_f32 ? 4.0 : 2.0);   // the cache's bytes a value
                 const size_t cache = (size_t) ((double) nl * 2.0 * hkv * (double) ctx * g.head_dim * per);
+                const size_t total_cache = n_sess == 1 ? cache : (size_t) n_sess * q36_sess_bytes(*m, ctx);
                 size_t vfr = 0, vtot = 0;
                 dpct::get_current_device().get_memory_info(vfr, vtot);
                 int ls = 0;
                 size_t scratch = 0;
                 for (const int t : {6, 3, 2}) {
                     scratch = (xa::score_floats(hkv, n_chunk, xcapc, t) + xa::pb_dwords(hkv, n_chunk, xcapc, t)) * 4;
-                    if (xe || vfr >= nl * per_layer + scratch + cache + ((size_t) 2 << 30)) { ls = t; break; }
+                    const bool fits_2g = vfr >= total_mir + scratch + total_cache + ((size_t) 2 << 30);
+                    const bool fits_xe = xe && (n_sess == 1 || vfr > total_mir + scratch + total_cache);
+                    if (fits_2g || fits_xe) { ls = t; break; }
                 }
                 if (ls == 0) {
-                    kv_vt = false;   // (no attention reads a transposed V: the cache keeps the plain layout)
+                    kv_vt = false;   // (no attention reads a transposed V: all sessions keep the plain layout)
                     vt_ctxp = 0;
-                    std::fprintf(stderr, "strata-q36: decode attention stays on the FP32 kernel: the matrix engine's copy (%.2f GiB) does not fit "
-                                         "beside the cache at this context (%.2f GiB of VRAM free)\n",
-                                 (double) (nl * per_layer + scratch) / 1073741824.0, (double) vfr / 1073741824.0);
+                    std::fprintf(stderr, "strata-q36: decode attention stays on the FP32 kernel: the matrix engine's %s (%.2f GiB) does not fit "
+                                         "beside the %s at this context (%.2f GiB of VRAM free)\n",
+                                 total_mir > 0 ? "copy" : "scratch",
+                                 (double) (total_mir + scratch) / 1073741824.0,
+                                 n_sess > 1 ? "sessions' caches" : "cache",
+                                 (double) vfr / 1073741824.0);
                 } else {
                     if (const char* e = std::getenv("STRATA_Q36_XATT_MIN")) xatt_min = std::max(64, std::atoi(e));
                     xls_max = ls;
-                    xk8.assign(m->layers.size() + 1, nullptr);
-                    xv8t.assign(m->layers.size() + 1, nullptr);
-                    xks.assign(m->layers.size() + 1, nullptr);
-                    xvs.assign(m->layers.size() + 1, nullptr);
-                    for (size_t li = 0; li <= m->layers.size(); ++li)   // (index n_layers: the MTP block's cache)
-                        if (li < m->layers.size() ? m->layers[li].attn : m->has_mtp) {
-                            if (!xatt_kq8) {
-                                xk8[li] = reinterpret_cast<uint32_t*>(dalloc(xa::k8_dwords(hkv, xctxp)));
-                                xks[li] = dalloc(xa::sc_floats(hkv, xctxp));
-                            }
-                            if (!kv_vt) {
-                                xv8t[li] = reinterpret_cast<uint32_t*>(dalloc(xa::v8t_dwords(hkv, xctxp)));
-                                xvs[li] = dalloc(xa::sc_floats(hkv, xctxp));
-                            }
-                        }
                     xqb = reinterpret_cast<uint32_t*>(dalloc(xa::qb_dwords(hkv)));
                     xqs = dalloc(xa::qs_floats(hkv));
                     xsc = dalloc(xa::score_floats(hkv, n_chunk, xcapc, ls));
@@ -3585,9 +3611,12 @@ struct Engine {
                     xsrow = dalloc(xa::srow_floats(hkv, n_chunk));
                     xpos_d = reinterpret_cast<int32_t*>(dalloc(4));
                     xatt_ready = true;
+                    char btag[32] = "";
+                    if (n_sess > 1) std::snprintf(btag, sizeof btag, ", %d slots", n_sess);
                     std::fprintf(stderr, "strata-q36: decode attention on the matrix engine from %d cells on (%s, transposed int8 V; windows of up "
-                                         "to %d tokens): %.2f GiB of VRAM\n", xatt_min, kv_vt ? "the 8-bit cache as it is: its K" : xatt_kq8 ? "the 8-bit cache's K" : "int8 K", ls * 16 / xa::kG,
-                                 (double) (nl * per_layer + scratch) / 1073741824.0);
+                                         "to %d tokens%s): %.2f GiB of VRAM\n", xatt_min,
+                                 kv_vt ? "the 8-bit cache as it is: its K" : xatt_kq8 ? "the 8-bit cache's K" : "int8 K",
+                                 ls * 16 / xa::kG, btag, (double) (total_mir + scratch) / 1073741824.0);
                 }
             }
 #ifdef STRATA_Q36_TLA
@@ -3723,6 +3752,7 @@ struct Engine {
         CK(DPCT_CHECK_ERROR(st->wait()));
         pos = 0;
         sess[(size_t) cur].pos = 0;
+        sess[(size_t) cur].xmir_n = 0;
         set_delta(0);
     }
     catch (sycl::exception const &exc) {
@@ -4674,29 +4704,32 @@ work-group size if needed.
     /// the cache's cells, or the rows (a decode step, a verify window, the MTP block's rows; batch rows in rows_mode) on
     /// The cells [*dpos, *dpos + T) of layer li's cache into its mirror (k_xatt_mirror).
     template <typename KV>
-    void xmirror(size_t li, int T, const int32_t* dpos) {
-        const KV *const kcm = static_cast<const KV*>(kc[li]), *const vcm = static_cast<const KV*>(vc[li]);
+    void xmirror_sess(int s, size_t li, int T, const int32_t* dpos) {
+        const Sess& ss = sess[(size_t) s];
+        const KV *const kcm = static_cast<const KV*>(ss.kc[li]), *const vcm = static_cast<const KV*>(ss.vc[li]);
         const int hkv = (int) m->g.n_head_kv, cxm = ctx, cxp = xctxp;
-        int8_t* const k8 = reinterpret_cast<int8_t*>(xk8[li]);
-        int8_t* const v8 = reinterpret_cast<int8_t*>(xv8t[li]);
-        float *const ksm = xks[li], *const vsm = xvs[li];
+        int8_t* const k8 = reinterpret_cast<int8_t*>(xatt_kq8 ? nullptr : ss.xk8[li]);
+        int8_t* const v8 = reinterpret_cast<int8_t*>(ss.xv8t[li]);
+        float *const ksm = xatt_kq8 ? nullptr : ss.xks[li], *const vsm = ss.xvs[li];
         st->parallel_for<dpct_kernel_name<class k_xatt_mirror_91d2, KV>>(
             sycl::nd_range<3>(sycl::range<3>(1, (size_t) T, (size_t) hkv * 256), sycl::range<3>(1, 1, 256)),
             [=](sycl::nd_item<3>) { k_xatt_mirror<KV>(kcm, vcm, dpos, hkv, cxm, cxp, k8, ksm, v8, vsm); });
     }
-    /// Before a window that reads the mirror: the cells it does not hold yet, up to the window's position.
-    void xatt_catch_up() {
-        if (kv_vt || xmir_n >= pos) { xmir_n = INT64_MAX / 4; return; }
-        const int32_t a = (int32_t) std::max<int64_t>(0, xmir_n);
-        const int n = (int) (pos - a);
+    /// Before a window that reads slot `s`'s mirror: the cells it does not hold yet, up to `ss.pos`.
+    void xatt_catch_up_sess(int s) {
+        Sess& ss = sess[(size_t) s];
+        const int64_t sp = s == cur ? pos : ss.pos;
+        if (kv_vt || ss.xmir_n >= sp) { ss.xmir_n = INT64_MAX / 4; return; }
+        const int32_t a = (int32_t) std::max<int64_t>(0, ss.xmir_n);
+        const int n = (int) (sp - a);
         st->memcpy(xpos_d, &a, 4).wait();
-        for (size_t li = 0; li < xk8.size(); ++li) {
-            if (xv8t[li] == nullptr || li >= kc.size() || kc[li] == nullptr) continue;
-            if (kv_f32) xmirror<float>(li, n, xpos_d);
-            else if (kv_q8) xmirror<int8_t>(li, n, xpos_d);
-            else xmirror<sycl::half>(li, n, xpos_d);
+        for (size_t li = 0; li < ss.xv8t.size(); ++li) {
+            if (ss.xv8t[li] == nullptr || li >= ss.kc.size() || ss.kc[li] == nullptr) continue;
+            if (kv_f32) xmirror_sess<float>(s, li, n, xpos_d);
+            else if (kv_q8) xmirror_sess<int8_t>(s, li, n, xpos_d);
+            else xmirror_sess<sycl::half>(s, li, n, xpos_d);
         }
-        xmir_n = INT64_MAX / 4;   // (the windows keep it whole from here)
+        ss.xmir_n = INT64_MAX / 4;   // (the windows keep it whole from here)
     }
     /// k_attn_gqa + k_attn_merge_gqa (STRATA_Q36_ATTN_HEAD=1: k_attn_part + k_attn_merge).  KV: the cache's element type.
     template <typename KV>
@@ -4748,10 +4781,22 @@ work-group size if needed.
             });
         }
         // (the layer has what the matrix-engine attention reads: the cache itself with V transposed, else its mirror)
-        const bool xlay = xatt_ready && !rows_mode && (kv_vt || (li < xv8t.size() && xv8t[li] != nullptr));
-        const bool xmir = xlay && xatt_now;
-        if (xmir && !kv_vt) xmirror<KV>(li, T, dpos);   // the stored cells into the layer's mirror
-        else if (xatt_ready && !kv_vt) xmir_n = std::min<int64_t>(xmir_n, p0);   // (cells written past the mirror)
+        if (rows_mode) {
+            if (xbatch_xatt_any && !kv_vt) {
+                for (const XBatchSlot& bs : xbatch_slots) {
+                    if (!bs.xatt) continue;
+                    const Sess& bss = sess[(size_t) bs.slot];
+                    if (li < bss.xv8t.size() && bss.xv8t[li] != nullptr)
+                        xmirror_sess<KV>(bs.slot, li, bs.cnt, d_rcell + bs.r0);
+                }
+            }
+        } else {
+            Sess& xss = sess[(size_t) cur];
+            const bool xlay = xatt_ready && (kv_vt || (li < xss.xv8t.size() && xss.xv8t[li] != nullptr));
+            const bool xmir = xlay && xatt_now;
+            if (xmir && !kv_vt) xmirror_sess<KV>(cur, li, T, dpos);   // the stored cells into the layer's mirror
+            else if (xatt_ready && !kv_vt) xss.xmir_n = std::min<int64_t>(xss.xmir_n, p0);   // (cells written past the mirror)
+        }
         if (T > kGemmT) {
             // M4b: the flash kernel (q36_prefill.dp.hpp) on the FP16 cache unless STRATA_Q36_PATTN=gemm or the shape is not
             // its: q -> q16 below, then flash_prompt_attn instead of the slices, then the gate as before.  The 8-bit cache
@@ -4972,51 +5017,76 @@ work-group size if needed.
         for (int t0 = 0; t0 < T; t0 += rows_per) {
             const int nt = std::min(rows_per, T - t0);
             const int need = rows_mode ? G : nt * G;
-            auto run = [&](auto rtag) {
+            auto run = [&](auto rtag, int t_sub, int nt_sub) {
                 constexpr int R = decltype(rtag)::value;
                 const int per = rows_mode ? 1 : R / G;
-                const int ngrp = rows_mode ? nt : (nt + per - 1) / per;
+                const int ngrp = rows_mode ? nt_sub : (nt_sub + per - 1) / per;
+                float* const pa_sub = pa + (size_t) t_sub * H * nch * HD;
+                float* const pm_sub = pmx + (size_t) t_sub * H * nch;
+                float* const pl_sub = psum + (size_t) t_sub * H * nch;
                 st->parallel_for<dpct_kernel_name<class k_attn_gqa_7a1c3e, KV, dpct_kernel_scalar<R>>>(
                     sycl::nd_range<3>(sycl::range<3>((size_t) ngrp, (size_t) HKV, (size_t) nch * 256),
                                       sycl::range<3>(1, 1, 256)),
                     [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(16)]] {
-                        k_attn_gqa<KV, R>(qq, kc_rows, vc_rows, dpos, t0, nt, H, HKV, cx, scale, nch, pa, pmx, psum, rs);
+                        k_attn_gqa<KV, R>(qq, kc_rows, vc_rows, dpos, t_sub, nt_sub, H, HKV, cx, scale, nch, pa_sub, pm_sub, pl_sub, rs);
                     });
+            };
+            auto run_range = [&](int t_sub, int nt_sub) {
+                if (need <= 8) run(std::integral_constant<int, 8>(), t_sub, nt_sub);
+                else run(std::integral_constant<int, 16>(), t_sub, nt_sub);
+            };
+            auto run_xatt = [&](int s_id, const KV* k_in, const KV* v_in, int r_off, int n_tok, const int32_t* pos_ptr) -> bool {
+                const Sess& bss = sess[(size_t) s_id];
+                if (!kv_vt && (li >= bss.xv8t.size() || bss.xv8t[li] == nullptr)) return false;
+                if (n_tok < 1 || n_tok > 16) return false;
+                strata::q36xatt::Call xc{};
+                xc.q = qq + (size_t) r_off * H * HD;
+                xc.pos0 = pos_ptr;
+                xc.t0 = 0;
+                xc.nt = n_tok;
+                xc.H = H; xc.HKV = HKV; xc.nchk = nch; xc.scale = scale;
+                if (xatt_kq8) {   // the 8-bit cache's own K: its codes, then an FP16 scale per 64 values
+                    xc.k8 = reinterpret_cast<const uint32_t*>(k_in);
+                    xc.ks16 = reinterpret_cast<const uint16_t*>(reinterpret_cast<const int8_t*>(k_in) + (size_t) HKV * ctx * HD);
+                    xc.ns = 4;
+                    xc.kstride = ctx;
+                } else {
+                    xc.k8 = bss.xk8[li];
+                    xc.ks = bss.xks[li];
+                }
+                xc.max_ls = xls_max;
+                if (kv_vt) {   // V is the cache's
+                    xc.v8t = reinterpret_cast<const uint32_t*>(v_in);
+                    xc.vs = reinterpret_cast<const float*>(reinterpret_cast<const int8_t*>(v_in) + strata::q36xatt::v8t_dwords(HKV, xctxp) * 4);
+                } else {
+                    xc.v8t = bss.xv8t[li];
+                    xc.vs = bss.xvs[li];
+                }
+                xc.ctxp = xctxp;
+                xc.qb = xqb; xc.qs = xqs; xc.sc = xsc; xc.pb = xpb; xc.srow = xsrow; xc.capc = xcapc;
+                xc.pacc = pa + (size_t) r_off * H * nch * HD;
+                xc.pm = pmx + (size_t) r_off * H * nch;
+                xc.pl = psum + (size_t) r_off * H * nch;
+                return strata::q36xatt::attend(xc, st);
             };
             // (M2 merge: R at most 16.  R <= 16 keeps DPT = 4, so the value sums' cell groups (NCG) and their order are the
             // same at every window size and a verify window's rows are bitwise the decode step's; R 32 / 64 (DPT 2 / 1)
             // summed them in another order, and the MTP answer on code-v1 left the plain one at token 70 (44 at 6+
             // drafts).  A window of 3+ tokens at G = 6 takes ceil(T / 2) row groups, each reading the K / V once.)
             (void) slm64;
-            bool xdone = false;
-            if (xmir && xatt_now && nt <= 16) {   // the matrix engine: every row of the window in one pass over the mirror
-                strata::q36xatt::Call xc{};
-                xc.q = qq; xc.pos0 = dpos; xc.t0 = t0; xc.nt = nt; xc.H = H; xc.HKV = HKV; xc.nchk = nch; xc.scale = scale;
-                if (xatt_kq8) {   // the 8-bit cache's own K: its codes, then an FP16 scale per 64 values
-                    xc.k8 = reinterpret_cast<const uint32_t*>(kcl);
-                    xc.ks16 = reinterpret_cast<const uint16_t*>(reinterpret_cast<const int8_t*>(kcl) + (size_t) HKV * ctx * HD);
-                    xc.ns = 4;
-                    xc.kstride = ctx;
-                } else {
-                    xc.k8 = xk8[li];
-                    xc.ks = xks[li];
+            if (rows_mode && xbatch_xatt_any && t0 == 0 && nt == T) {
+                for (const XBatchSlot& bs : xbatch_slots) {
+                    const Sess& bss = sess[(size_t) bs.slot];
+                    const bool ok = bs.xatt &&
+                        run_xatt(bs.slot, static_cast<const KV*>(bss.kc[li]), static_cast<const KV*>(bss.vc[li]),
+                                 bs.r0, bs.cnt, d_rcell + bs.r0);
+                    if (!ok) run_range(bs.r0, bs.cnt);
                 }
-                xc.max_ls = xls_max;
-                if (kv_vt) {   // V is the cache's
-                    xc.v8t = reinterpret_cast<const uint32_t*>(vcl);
-                    xc.vs = reinterpret_cast<const float*>(reinterpret_cast<const int8_t*>(vcl) + strata::q36xatt::v8t_dwords(HKV, xctxp) * 4);
-                } else {
-                    xc.v8t = xv8t[li];
-                    xc.vs = xvs[li];
-                }
-                xc.ctxp = xctxp;
-                xc.qb = xqb; xc.qs = xqs; xc.sc = xsc; xc.pb = xpb; xc.srow = xsrow; xc.capc = xcapc;
-                xc.pacc = pa; xc.pm = pmx; xc.pl = psum;
-                xdone = strata::q36xatt::attend(xc, st);
+            } else {
+                const bool xok = !rows_mode && xatt_ready && xatt_now && t0 == 0 && nt == T &&
+                    run_xatt(cur, kcl, vcl, t0, nt, dpos);
+                if (!xok) run_range(t0, nt);
             }
-            if (xdone) {}
-            else if (need <= 8) run(std::integral_constant<int, 8>());
-            else run(std::integral_constant<int, 16>());
             st->parallel_for<dpct_kernel_name<class k_attn_merge_gqa_5e2b91, KV>>(
                 sycl::nd_range<3>(sycl::range(1, 1, nt * H) * sycl::range(1, 1, HD), sycl::range(1, 1, HD)),
                 [=](sycl::nd_item<3> item_ct1) {
@@ -6195,7 +6265,8 @@ work-group size if needed.
     template <class F>
     void graph_run(dpct::experimental::command_graph_exec_ptr &gx, F body) try {
         // (a graph that does not write the mirror, replayed: its cells are no longer in it)
-        if (xatt_ready && !xatt_now) xmir_n = std::min<int64_t>(xmir_n, std::max<int64_t>(0, pos - kVerify));
+        if (!rows_mode && xatt_ready && !xatt_now)
+            sess[(size_t) cur].xmir_n = std::min<int64_t>(sess[(size_t) cur].xmir_n, std::max<int64_t>(0, pos - kVerify));
         if (!use_graph) { body(); return; }
         if (!gx) {
             dpct::experimental::command_graph_ptr graph = nullptr;
@@ -6340,7 +6411,7 @@ work-group size if needed.
                 // depth - a teacher-forced logit dump then measures it)
                 static const bool xall = [] { const char* e = std::getenv("STRATA_Q36_XATT_ALL"); return e && e[0] == '1'; }();
                 xatt_now = xatt_ready && xall && pos + kVerify + 8 <= ctx;
-                if (xatt_now) xatt_catch_up();
+                if (xatt_now) xatt_catch_up_sess(cur);
                 graph_run(gs().g1, [&] { forward(1, pos, 1, use_graph, false); });
                 xatt_now = false;
             }
@@ -6440,8 +6511,8 @@ work-group size if needed.
     // ---- batch rows: one decode window for the next token of several sessions
     struct Row { int slot; int32_t tok; };
     long long win_count = 0;
-    std::map<int, dpct::experimental::command_graph_exec_ptr>
-        row_graphs; // by (rows, groups, kind): graphs of the batch windows
+    std::map<std::vector<int>, dpct::experimental::command_graph_exec_ptr>
+        row_graphs; // by kind / rows / per-slot XATT slicing: graphs of the windows
     /// A slot's rows of one window: `n` consecutive cells from the session's position (the next token, then the MTP
     /// drafts the window verifies after it).
     struct Group { int slot; int n; int32_t tok[kVerify]; };
@@ -6452,11 +6523,42 @@ work-group size if needed.
         // (the window's attention kernel: a graph of its own.  Not in the context's last cells: a tile of 8 cells may read
         // past a row's last cell, and the 8-bit cache has no spare cells)
         xatt_now = xatt_ready && pos >= xatt_min && pos + kVerify + 8 <= ctx;
-        if (xatt_now) xatt_catch_up();
-        else if (xatt_ready) xmir_n = std::min<int64_t>(xmir_n, std::max<int64_t>(0, pos - kVerify));   // (a replayed graph's cells)
+        if (xatt_now) xatt_catch_up_sess(cur);
+        else if (xatt_ready) sess[(size_t) cur].xmir_n = std::min<int64_t>(sess[(size_t) cur].xmir_n, std::max<int64_t>(0, pos - kVerify));   // (a replayed graph's cells)
         if (!use_graph) body();
-        else graph_run(row_graphs[key + (xatt_now ? 1000000 : 0)], body);
+        else graph_run(row_graphs[{key + (xatt_now ? 1000000 : 0)}], body);
         xatt_now = false;
+    }
+
+    /// Evaluates per-slot XATT eligibility and catches up non-kv_vt mirrors before running/capturing a batch row graph.
+    void run_rows_graph(int kind, int g_arg, int T, const std::function<void()>& body) {
+        const int xatt_max_nt = xls_max * 16 / strata::q36xatt::kG;
+        xbatch_xatt_any = false;
+        for (XBatchSlot& bs : xbatch_slots) {
+            const Sess& ss = sess[(size_t) bs.slot];
+            bs.xatt = xatt_ready && ss.pos >= xatt_min && bs.cell0 + bs.cnt + 8 <= ctx &&
+                      bs.cnt >= 1 && bs.cnt <= xatt_max_nt;
+            xbatch_xatt_any = xbatch_xatt_any || bs.xatt;
+        }
+        if (xatt_ready && !kv_vt) {
+            for (const XBatchSlot& bs : xbatch_slots) {
+                if (bs.xatt) xatt_catch_up_sess(bs.slot);
+                else sess[(size_t) bs.slot].xmir_n = std::min<int64_t>(sess[(size_t) bs.slot].xmir_n, std::max<int64_t>(0, bs.cell0));
+            }
+        }
+        std::vector<int> gkey = {kind, g_arg, T};
+        if (xbatch_xatt_any) {
+            gkey.push_back(1);
+            for (const XBatchSlot& bs : xbatch_slots) {
+                gkey.push_back(bs.slot);
+                gkey.push_back(bs.cnt);
+                gkey.push_back(bs.xatt ? 1 : 0);
+            }
+        }
+        if (!use_graph) body();
+        else graph_run(row_graphs[gkey], body);
+        xbatch_slots.clear();
+        xbatch_xatt_any = false;
     }
 
     /// One window over the groups' rows.  `verify`: a verify window - the GDN state is read, not written (commit_rows writes
@@ -6467,8 +6569,11 @@ work-group size if needed.
         CK(DPCT_CHECK_ERROR(st->wait())); // the pinned staging is free again
         int64_t pmax = 0;
         int T = 0;
+        xbatch_slots.clear();
+        xbatch_slots.reserve((size_t) G);
         for (int g = 0; g < G; ++g) {
             const Sess& ss = sess[(size_t) gr[g].slot];
+            xbatch_slots.push_back({gr[g].slot, T, gr[g].n, ss.pos, false});
             hrow[160 + g] = gr[g].slot;
             hrow[192 + g] = T;
             hrow[224 + g] = gr[g].n;
@@ -6535,7 +6640,7 @@ work-group size if needed.
         rows_mode = true;
         rows_G = G;
         rows_deferred = true;
-        run_graph_key((verify ? 400000 : 300000) + G * 64 + T, [&] { forward(T, pmax, T, use_graph, verify); });
+        run_rows_graph(verify ? 400000 : 300000, G, T, [&] { forward(T, pmax, T, use_graph, verify); });
         rows_deferred = false;
         rows_mode = false;
         /*
@@ -6582,7 +6687,7 @@ work-group size if needed.
         CK(DPCT_CHECK_ERROR(st->memcpy(d_gcnt, hrow + 224, (size_t)G * 4)));
         rows_mode = true;
         rows_G = G;
-        run_graph_key(2000 + G, [&] {
+        auto commit_body = [&] {
             for (size_t l = 0; l < m->layers.size(); ++l) {
                 const Layer& L = m->layers[l];
                 if (L.attn) continue;
@@ -6657,7 +6762,9 @@ work-group size if needed.
                     });
                 }
             }
-        });
+        };
+        if (!use_graph) commit_body();
+        else graph_run(row_graphs[{2000, G}], commit_body);
         rows_mode = false;
         CK(DPCT_CHECK_ERROR(st->wait()));
         for (int i = 0; i < G; ++i) sess[(size_t) gr[i].slot].pos += keep[i];
@@ -6729,7 +6836,15 @@ work-group size if needed.
         rows_mode = true;
         rows_G = T;
         rows_deferred = true;
-        run_graph_key(3000 + T, [&] {
+        xbatch_slots.clear();
+        for (int r = 0; r < T; ++r) {
+            if (!xbatch_slots.empty() && xbatch_slots.back().slot == rows[r].slot &&
+                xbatch_slots.back().cell0 + xbatch_slots.back().cnt == rows[r].cell)
+                ++xbatch_slots.back().cnt;
+            else
+                xbatch_slots.push_back({rows[r].slot, r, 1, rows[r].cell, false});
+        }
+        run_rows_graph(3000, 0, T, [&] {
             K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok_m, T, N, y, st);
             {
                 auto exp_props = sycl::ext::oneapi::experimental::properties{};
@@ -6918,24 +7033,45 @@ work-group size if needed.
                 CK(DPCT_CHECK_ERROR(dpct::async_dpct_memcpy(
                     b.kc[l], row, a.kc[l], row, (size_t)a.pos * g.head_dim * eb,
                     (size_t)g.n_head_kv, dpct::device_to_device, *(st))));
-                /*
-                DPCT1124:134: cudaMemcpy2DAsync is migrated to asynchronous
-                memcpy API. While the origin API might be synchronous, it
-                depends on the type of operand memory, so you may need to call
-                wait() on event return by memcpy API to ensure synchronization
-                behavior.
-                */
-                CK(DPCT_CHECK_ERROR(dpct::async_dpct_memcpy(
-                    b.vc[l], row, a.vc[l], row, (size_t)a.pos * g.head_dim * eb,
-                    (size_t)g.n_head_kv, dpct::device_to_device, *(st))));
-                if (kv_q8)   // the cells' scales
-                    for (int w = 0; w < 2; ++w) {
-                        const int8_t* from = static_cast<const int8_t*>(w ? a.vc[l] : a.kc[l]) + sbase;
-                        int8_t* to = static_cast<int8_t*>(w ? b.vc[l] : b.kc[l]) + sbase;
+                if (kv_q8) {   // K's per-64-dim FP16 scales
+                    const int8_t* kfrom = static_cast<const int8_t*>(a.kc[l]) + sbase;
+                    int8_t* kto = static_cast<int8_t*>(b.kc[l]) + sbase;
+                    CK(DPCT_CHECK_ERROR(dpct::async_dpct_memcpy(
+                        kto, srow, kfrom, srow, (size_t)a.pos * (g.head_dim / 64) * 2, (size_t)g.n_head_kv,
+                        dpct::device_to_device, *(st))));
+                }
+                if (kv_vt) {
+                    // V is transposed in 32-cell blocks [HKV][vt_ctxp / 32][HD][32], followed by FP32 scales [HKV][vt_ctxp]
+                    const size_t vtb = (size_t) (vt_ctxp / 32) * g.head_dim * 32;
+                    const size_t nblk = ((size_t) a.pos + 31) / 32;
+                    CK(DPCT_CHECK_ERROR(dpct::async_dpct_memcpy(
+                        b.vc[l], vtb, a.vc[l], vtb, nblk * g.head_dim * 32,
+                        (size_t) g.n_head_kv, dpct::device_to_device, *(st))));
+                    const size_t svbase = (size_t) g.n_head_kv * vtb;
+                    const size_t svrow = (size_t) vt_ctxp * 4;
+                    CK(DPCT_CHECK_ERROR(dpct::async_dpct_memcpy(
+                        static_cast<int8_t*>(b.vc[l]) + svbase, svrow,
+                        static_cast<const int8_t*>(a.vc[l]) + svbase, svrow,
+                        (size_t) a.pos * 4, (size_t) g.n_head_kv, dpct::device_to_device, *(st))));
+                } else {
+                    /*
+                    DPCT1124:134: cudaMemcpy2DAsync is migrated to asynchronous
+                    memcpy API. While the origin API might be synchronous, it
+                    depends on the type of operand memory, so you may need to
+                    call wait() on event return by memcpy API to ensure
+                    synchronization behavior.
+                    */
+                    CK(DPCT_CHECK_ERROR(dpct::async_dpct_memcpy(
+                        b.vc[l], row, a.vc[l], row, (size_t)a.pos * g.head_dim * eb,
+                        (size_t)g.n_head_kv, dpct::device_to_device, *(st))));
+                    if (kv_q8) {   // V's per-64-dim FP16 scales
+                        const int8_t* vfrom = static_cast<const int8_t*>(a.vc[l]) + sbase;
+                        int8_t* vto = static_cast<int8_t*>(b.vc[l]) + sbase;
                         CK(DPCT_CHECK_ERROR(dpct::async_dpct_memcpy(
-                            to, srow, from, srow, (size_t)a.pos * (g.head_dim / 64) * 2, (size_t)g.n_head_kv,
+                            vto, srow, vfrom, srow, (size_t)a.pos * (g.head_dim / 64) * 2, (size_t)g.n_head_kv,
                             dpct::device_to_device, *(st))));
                     }
+                }
             }
         }
         /*
@@ -6948,6 +7084,7 @@ work-group size if needed.
             st->memcpy(b.hlast, a.hlast, (size_t)g.n_embd * 4)));
         CK(DPCT_CHECK_ERROR(st->wait()));
         b.pos = a.pos;
+        b.xmir_n = 0;
         b.rdelta = a.rdelta;
         b.live = a.live;
         b.imgs = a.imgs;
