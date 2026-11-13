@@ -3022,6 +3022,46 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+struct CkptTile {
+    uint32_t seg_idx;
+    uint32_t seg_dw_off;
+    uint32_t len_dw;
+    uint32_t aligned4;
+    uint64_t blob_dw_off;
+};
+
+static inline void q36_launch_ckpt_copy(dpct::queue_ptr q, uint32_t* blob, uint32_t* const* seg_ptrs,
+                                        const CkptTile* tiles, int n_tiles, bool to_blob) {
+    if (n_tiles <= 0) return;
+    q->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) n_tiles * 256), sycl::range<1>(256)),
+        [=](sycl::nd_item<1> it) {
+            const int g = (int) it.get_group(0);
+            const int lid = (int) it.get_local_id(0);
+            const CkptTile t = tiles[g];
+            uint32_t* seg = seg_ptrs[t.seg_idx] + t.seg_dw_off;
+            uint32_t* blk = blob + t.blob_dw_off;
+            if (t.aligned4) {
+                const uint32_t n4 = t.len_dw >> 2;
+                if (to_blob) {
+                    const sycl::uint4* src = reinterpret_cast<const sycl::uint4*>(seg);
+                    sycl::uint4* dst = reinterpret_cast<sycl::uint4*>(blk);
+                    for (uint32_t i = (uint32_t) lid; i < n4; i += 256u) dst[i] = src[i];
+                } else {
+                    const sycl::uint4* src = reinterpret_cast<const sycl::uint4*>(blk);
+                    sycl::uint4* dst = reinterpret_cast<sycl::uint4*>(seg);
+                    for (uint32_t i = (uint32_t) lid; i < n4; i += 256u) dst[i] = src[i];
+                }
+            } else {
+                if (to_blob) {
+                    for (uint32_t i = (uint32_t) lid; i < t.len_dw; i += 256u) blk[i] = seg[i];
+                } else {
+                    for (uint32_t i = (uint32_t) lid; i < t.len_dw; i += 256u) seg[i] = blk[i];
+                }
+            }
+        });
+}
+
 /// A picture in a prompt: its first cell, its rows, and the hash the conversation cache compares it by.
 struct ImgKey {
     int64_t cell = 0, n = 0;
@@ -3701,6 +3741,8 @@ struct Engine {
             }
         }
         for (Sess& ss : sess) alloc_session(ss);
+        kv_live.resize(sess.size());
+        kv_imgs.resize(sess.size());
         if (n_sess > 1) {   // the batch rows' tables: per state index the session pointers, on the device
             const size_t ns = sess[0].conv.size();
             std::vector<float*> hc(ns * (size_t) n_sess), hs(hc), hk(hc), hv(hc);
@@ -3757,6 +3799,9 @@ struct Engine {
         device information which may not be supported by all compilers or
         runtimes. You may need to adjust the code.
         */
+        CK(DPCT_CHECK_ERROR(
+            dpct::get_current_device().get_memory_info(fr, tot)));
+        init_ckpts(fr);
         CK(DPCT_CHECK_ERROR(
             dpct::get_current_device().get_memory_info(fr, tot)));
         std::fprintf(stderr, "strata-q36: context %d cells, prompt chunk %d%s, %.2f GiB of VRAM free\n", ctx, tmax,
@@ -7182,6 +7227,10 @@ work-group size if needed.
         b.rdelta = a.rdelta;
         b.live = a.live;
         b.imgs = a.imgs;
+        if (src < (int) kv_live.size() && dst < (int) kv_live.size()) {
+            kv_live[(size_t) dst] = kv_live[(size_t) src];
+            kv_imgs[(size_t) dst] = kv_imgs[(size_t) src];
+        }
         if (dst == cur) load_cur();
     }
     catch (sycl::exception const &exc) {
@@ -7189,6 +7238,279 @@ work-group size if needed.
                 << ", line:" << __LINE__ << std::endl;
       std::exit(1);
     }
+
+    // ---- prefix state checkpoints (GDN S + conv + hlast): rewinds without wiping valid VRAM KV prefix
+    struct PrefixEntry {
+        std::vector<int32_t> tokens;
+        std::vector<ImgKey> imgs;
+        int64_t pos = 0;
+        int32_t rdelta = 0;
+        int vram_slot = -1;
+        std::vector<uint8_t> ram_blob;
+        uint64_t lru = 0;
+        bool pin_turn = false;
+        int rolling_tag = -1; // >= 0: per-session rolling decode checkpoint updated in place
+    };
+    bool ckpt_on = true;
+    size_t ckpt_bytes = 0;
+    int ckpt_vram_cap = 0, ckpt_ram_cap = 24, ckpt_n_tiles = 0, ckpt_n_segs = 0;
+    CkptTile* d_ckpt_tiles = nullptr;
+    std::vector<uint32_t**> d_sess_ckpt_ptrs;
+    std::vector<void*> ckpt_vram;
+    std::vector<PrefixEntry*> ckpt_vram_owner;
+    std::vector<std::unique_ptr<PrefixEntry>> ckpt_entries;
+    uint64_t ckpt_clock = 0;
+    std::vector<std::vector<int32_t>> kv_live;
+    std::vector<std::vector<ImgKey>> kv_imgs;
+
+    static std::vector<ImgKey> imgs_within(const std::vector<ImgKey>& imgs, int64_t limit) {
+        std::vector<ImgKey> out;
+        for (const ImgKey& k : imgs)
+            if (k.cell + k.n <= limit) out.push_back(k);
+        return out;
+    }
+
+    static bool imgs_boundary_ok(const std::vector<ImgKey>& imgs, int64_t p) {
+        for (const ImgKey& k : imgs)
+            if (k.cell < p && p < k.cell + k.n) return false;
+        return true;
+    }
+
+    void init_ckpts(size_t free_vram) {
+        if (const char* e = std::getenv("STRATA_Q36_CKPT")) ckpt_on = !(e[0] == '0');
+        if (!ckpt_on || sess.empty()) { ckpt_on = false; return; }
+        const auto& g = m->g;
+        const size_t C = (size_t) g.ssm_conv_channels;
+        const size_t conv_dw = C * (size_t) (g.ssm_d_conv - 1);
+        const size_t S_dw = (size_t) g.ssm_v_heads * (size_t) g.ssm_state_size * (size_t) g.ssm_state_size;
+        const size_t h_dw = (size_t) g.n_embd;
+
+        std::vector<size_t> seg_dws;
+        std::vector<CkptTile> tiles;
+        uint64_t blob_dw = 0;
+        auto add_seg = [&](size_t dw) {
+            const uint32_t seg_idx = (uint32_t) seg_dws.size();
+            seg_dws.push_back(dw);
+            blob_dw = (blob_dw + 3ull) & ~3ull;
+            for (size_t off = 0; off < dw; off += 65536u) {
+                const uint32_t len = (uint32_t) std::min<size_t>(65536u, dw - off);
+                const uint32_t al4 = ((off % 4 == 0) && (len % 4 == 0) && (blob_dw % 4 == 0)) ? 1u : 0u;
+                tiles.push_back({seg_idx, (uint32_t) off, len, al4, blob_dw});
+                blob_dw += len;
+            }
+        };
+        for (size_t l = 0; l < m->layers.size(); ++l) {
+            if (!m->layers[l].attn) {
+                add_seg(conv_dw);
+                add_seg(S_dw);
+            }
+        }
+        add_seg(h_dw);
+        blob_dw = (blob_dw + 3ull) & ~3ull;
+        ckpt_bytes = (size_t) blob_dw * 4u;
+        ckpt_n_segs = (int) seg_dws.size();
+        ckpt_n_tiles = (int) tiles.size();
+        if (ckpt_bytes == 0 || ckpt_n_tiles == 0) { ckpt_on = false; return; }
+
+        int vram_req = 8;
+        if (const char* e = std::getenv("STRATA_Q36_CKPT_VRAM")) vram_req = std::max(0, std::atoi(e));
+        if (const char* e = std::getenv("STRATA_Q36_CKPT_RAM")) ckpt_ram_cap = std::max(0, std::atoi(e));
+        const size_t headroom = (size_t) 1536 << 20;
+        const int vram_avail = free_vram > headroom ? (int) ((free_vram - headroom) / ckpt_bytes) : 0;
+        ckpt_vram_cap = std::min(vram_req, std::max(0, vram_avail));
+        if (ckpt_vram_cap <= 0) { ckpt_on = false; return; }
+
+        d_ckpt_tiles = dalloc_t<CkptTile>((size_t) ckpt_n_tiles);
+        CK(DPCT_CHECK_ERROR(st->memcpy(d_ckpt_tiles, tiles.data(), (size_t) ckpt_n_tiles * sizeof(CkptTile)).wait()));
+        d_sess_ckpt_ptrs.assign(sess.size(), nullptr);
+        for (size_t si = 0; si < sess.size(); ++si) {
+            std::vector<uint32_t*> ptrs;
+            ptrs.reserve((size_t) ckpt_n_segs);
+            for (size_t l = 0; l < m->layers.size(); ++l) {
+                if (!m->layers[l].attn) {
+                    ptrs.push_back(reinterpret_cast<uint32_t*>(sess[si].conv[l]));
+                    ptrs.push_back(reinterpret_cast<uint32_t*>(sess[si].S[l]));
+                }
+            }
+            ptrs.push_back(reinterpret_cast<uint32_t*>(sess[si].hlast));
+            d_sess_ckpt_ptrs[si] = dalloc_t<uint32_t*>((size_t) ckpt_n_segs);
+            CK(DPCT_CHECK_ERROR(st->memcpy(d_sess_ckpt_ptrs[si], ptrs.data(), (size_t) ckpt_n_segs * sizeof(uint32_t*)).wait()));
+        }
+        ckpt_vram.reserve((size_t) ckpt_vram_cap);
+        for (int v = 0; v < ckpt_vram_cap; ++v) {
+            void* p = nullptr;
+            try {
+                p = sycl::malloc_device(ckpt_bytes, *st);
+            } catch (const sycl::exception&) {
+                p = nullptr;
+            }
+            if (!p) break;
+            ckpt_vram.push_back(p);
+        }
+        ckpt_vram_cap = (int) ckpt_vram.size();
+        ckpt_vram_owner.assign((size_t) ckpt_vram_cap, nullptr);
+        if (ckpt_vram_cap <= 0) { ckpt_on = false; return; }
+        std::fprintf(stderr, "strata-q36: prefix checkpoints: %.1f MiB/ckpt (%d VRAM + %d RAM slots)\n",
+                     (double) ckpt_bytes / (1 << 20), ckpt_vram_cap, ckpt_ram_cap);
+    }
+
+    void trim_ram_ckpts() {
+        for (;;) {
+            int ram_cnt = 0;
+            int victim = -1;
+            for (int i = 0; i < (int) ckpt_entries.size(); ++i) {
+                const PrefixEntry* e = ckpt_entries[(size_t) i].get();
+                if (e->vram_slot < 0 && !e->ram_blob.empty()) {
+                    ++ram_cnt;
+                    if (victim < 0 ||
+                        (e->pin_turn < ckpt_entries[(size_t) victim]->pin_turn) ||
+                        (e->pin_turn == ckpt_entries[(size_t) victim]->pin_turn &&
+                         e->lru < ckpt_entries[(size_t) victim]->lru))
+                        victim = i;
+                }
+            }
+            if (ram_cnt <= ckpt_ram_cap || victim < 0) break;
+            ckpt_entries.erase(ckpt_entries.begin() + victim);
+        }
+    }
+
+    void spill_vram_slot(int vslot) {
+        PrefixEntry* old = ckpt_vram_owner[(size_t) vslot];
+        if (!old) return;
+        CK(DPCT_CHECK_ERROR(st->wait()));
+        if (ckpt_ram_cap > 0 && old->rolling_tag < 0) {
+            if (old->ram_blob.empty()) {
+                old->ram_blob.resize(ckpt_bytes);
+                CK(DPCT_CHECK_ERROR(st->memcpy(old->ram_blob.data(), ckpt_vram[(size_t) vslot], ckpt_bytes).wait()));
+            }
+            old->vram_slot = -1;
+            ckpt_vram_owner[(size_t) vslot] = nullptr;
+            trim_ram_ckpts();
+        } else {
+            ckpt_vram_owner[(size_t) vslot] = nullptr;
+            old->vram_slot = -1;
+            for (auto it = ckpt_entries.begin(); it != ckpt_entries.end(); ++it) {
+                if (it->get() == old) { ckpt_entries.erase(it); break; }
+            }
+        }
+    }
+
+    int alloc_vram_slot(PrefixEntry* skip = nullptr) {
+        for (int v = 0; v < ckpt_vram_cap; ++v)
+            if (!ckpt_vram_owner[(size_t) v]) return v;
+        int best = -1;
+        for (int v = 0; v < ckpt_vram_cap; ++v) {
+            PrefixEntry* o = ckpt_vram_owner[(size_t) v];
+            if (o == skip) continue;
+            if (best < 0) { best = v; continue; }
+            PrefixEntry* b = ckpt_vram_owner[(size_t) best];
+            if ((o->pin_turn ? 1 : 0) != (b->pin_turn ? 1 : 0)) {
+                if (!o->pin_turn) best = v;
+            } else if (o->lru < b->lru) {
+                best = v;
+            }
+        }
+        if (best >= 0) spill_vram_slot(best);
+        return best;
+    }
+
+    void save_ckpt(int s, const std::vector<int32_t>& toks, const std::vector<ImgKey>& imgs_in,
+                   int64_t p, int32_t rdelta_v, bool pin_turn, int rolling_tag = -1) {
+        if (!ckpt_on || ckpt_vram_cap <= 0 || p <= 0 || (size_t) p > toks.size()) return;
+        std::vector<ImgKey> sub_imgs = imgs_within(imgs_in, p);
+        PrefixEntry* target = nullptr;
+        if (rolling_tag >= 0) {
+            for (auto& up : ckpt_entries)
+                if (up->rolling_tag == rolling_tag) { target = up.get(); break; }
+        }
+        if (!target) {
+            for (auto& up : ckpt_entries) {
+                if (up->pos == p && up->rdelta == rdelta_v && up->imgs == sub_imgs &&
+                    std::equal(toks.begin(), toks.begin() + p, up->tokens.begin())) {
+                    up->lru = ++ckpt_clock;
+                    up->pin_turn = up->pin_turn || pin_turn;
+                    if (up->vram_slot >= 0) return;
+                    target = up.get();
+                    break;
+                }
+            }
+        }
+        if (!target) {
+            auto up = std::make_unique<PrefixEntry>();
+            target = up.get();
+            target->rolling_tag = rolling_tag;
+            ckpt_entries.push_back(std::move(up));
+        }
+        int vslot = target->vram_slot;
+        if (vslot < 0) vslot = alloc_vram_slot(target);
+        if (vslot < 0) return;
+        target->tokens.assign(toks.begin(), toks.begin() + p);
+        target->imgs = std::move(sub_imgs);
+        target->pos = p;
+        target->rdelta = rdelta_v;
+        target->pin_turn = pin_turn;
+        target->lru = ++ckpt_clock;
+        target->vram_slot = vslot;
+        target->ram_blob.clear();
+        ckpt_vram_owner[(size_t) vslot] = target;
+        q36_launch_ckpt_copy(st, reinterpret_cast<uint32_t*>(ckpt_vram[(size_t) vslot]),
+                             d_sess_ckpt_ptrs[(size_t) s], d_ckpt_tiles, ckpt_n_tiles, true);
+    }
+
+    void restore_ckpt(int s, PrefixEntry& e) {
+        if (cur != s) select(s);
+        if (e.vram_slot < 0) {
+            const int vslot = alloc_vram_slot(&e);
+            if (vslot < 0 || e.ram_blob.size() != ckpt_bytes) return;
+            CK(DPCT_CHECK_ERROR(st->wait()));
+            CK(DPCT_CHECK_ERROR(st->memcpy(ckpt_vram[(size_t) vslot], e.ram_blob.data(), ckpt_bytes).wait()));
+            e.vram_slot = vslot;
+            ckpt_vram_owner[(size_t) vslot] = &e;
+        }
+        q36_launch_ckpt_copy(st, reinterpret_cast<uint32_t*>(ckpt_vram[(size_t) e.vram_slot]),
+                             d_sess_ckpt_ptrs[(size_t) s], d_ckpt_tiles, ckpt_n_tiles, false);
+        CK(DPCT_CHECK_ERROR(st->wait()));
+        Sess& ss = sess[(size_t) s];
+        ss.pos = e.pos;
+        pos = e.pos;
+        ss.rdelta = e.rdelta;
+        set_delta(e.rdelta);
+        ss.xmir_n = std::min<int64_t>(ss.xmir_n, e.pos);
+        ss.live = e.tokens;
+        ss.imgs = e.imgs;
+        e.lru = ++ckpt_clock;
+    }
+
+    size_t kv_lcp(int s, const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs) const {
+        if (s < 0 || s >= (int) kv_live.size()) return 0;
+        const auto& kl = kv_live[(size_t) s];
+        const auto& ki = kv_imgs[(size_t) s];
+        size_t i = 0;
+        while (i < kl.size() && i < ids.size() && kl[i] == ids[i]) ++i;
+        if (i == 0) return 0;
+        size_t img_lim = i;
+        for (const ImgKey& k : imgs) {
+            if (k.cell < (int64_t) i && k.cell + k.n > (int64_t) i) img_lim = std::min(img_lim, (size_t) k.cell);
+        }
+        for (const ImgKey& k : ki) {
+            if (k.cell < (int64_t) i && k.cell + k.n > (int64_t) i) img_lim = std::min(img_lim, (size_t) k.cell);
+        }
+        i = img_lim;
+        size_t a_idx = 0, b_idx = 0;
+        while (a_idx < imgs.size() && imgs[a_idx].cell + imgs[a_idx].n <= (int64_t) i) {
+            const ImgKey& ak = imgs[a_idx];
+            if (b_idx >= ki.size() || !(ki[b_idx] == ak)) {
+                i = std::min(i, (size_t) ak.cell);
+                break;
+            }
+            ++a_idx;
+            ++b_idx;
+        }
+        if (b_idx < ki.size() && ki[b_idx].cell + ki[b_idx].n <= (int64_t) i)
+            i = std::min(i, (size_t) ki[b_idx].cell);
+        return i;
+    }
+
     int hybrid_swaps_after_prompt = 2048;
     /// the MTP seed rows of a prompt chunk: a buffer the block's own forward does not use (`moe_out`, [tmax][N])
     float* mtp_seed() { return moe_out; }
@@ -8227,6 +8549,7 @@ struct Serve {
             for (int j = 0; j < rows_kept; ++j) {
                 if (j > 0) y = pk[j];
                 ss.live.push_back(gr[(size_t) i].tok[j]);
+                if (b >= 0 && b < (int) E.kv_live.size()) E.kv_live[(size_t) b].push_back(gr[(size_t) i].tok[j]);
                 std::printf("BT %d %d\n", b, y);
                 ++sl.produced;
                 sl.hist.push_back(y);
@@ -8343,6 +8666,7 @@ struct Serve {
                     ss.hlast, E.hmain + r * (size_t)E.m->g.n_embd, Nb)));
             sl.drafts.clear();
             ss.live.push_back(sl.x);
+            if (b >= 0 && b < (int) E.kv_live.size()) E.kv_live[(size_t) b].push_back(sl.x);
             int y;
             if (sl.smp.needs_logits()) {
                 E.host_logits_row((int) r, lg);
@@ -8488,11 +8812,13 @@ struct Serve {
             if (!ve.empty()) { std::printf("ERR %s\n", ve.c_str()); std::fflush(stdout); return; }
         }
         stop.store(false);
-        // ---- the session: the held state continues when the request extends it (the recurrent state cannot step back)
-        const int s = adm ? slot : pick_session(ids, ir.imgs);
-        Engine::Sess& ss = E.sess[(size_t) s];
-        size_t reuse = match_len(ss, ids, ir.imgs);
-        if (adm) {   // another session holding more of this prompt (the conversation was read alone): copy its state
+        // ---- the session: live continuation when possible, else restore an earlier GDN checkpoint over valid KV
+        Engine::PrefixEntry* pick_ckpt = nullptr;
+        size_t reuse = 0;
+        int s = -1;
+        if (adm) {
+            s = slot;
+            reuse = match_len(E.sess[(size_t) s], ids, ir.imgs);
             int src = -1;
             size_t best = reuse;
             for (int i = 0; i < E.n_sess; ++i) {
@@ -8504,19 +8830,76 @@ struct Serve {
                 E.copy_session(src, s);
                 reuse = best;
             }
+            E.select(s);
+            if (reuse == 0) {
+                E.reset();
+                E.sess[(size_t) s].live.clear();
+                E.sess[(size_t) s].imgs.clear();
+                if (s < (int) E.kv_live.size()) {
+                    E.kv_live[(size_t) s].clear();
+                    E.kv_imgs[(size_t) s].clear();
+                }
+            }
+        } else {
+            int free_empty = -1, lru = -1;
+            for (int i = 0; i < E.n_sess; ++i) {
+                const Engine::Sess& cs = E.sess[(size_t) i];
+                if (cs.active) continue;
+                if (cs.live.empty() && free_empty < 0) free_empty = i;
+                if (lru < 0 || cs.used < E.sess[(size_t) lru].used) lru = i;
+                const size_t l_live = match_len(cs, ids, ir.imgs);
+                if (l_live > reuse || (l_live == reuse && l_live > 0 && pick_ckpt != nullptr)) {
+                    reuse = l_live;
+                    s = i;
+                    pick_ckpt = nullptr;
+                }
+                if (E.ckpt_on) {
+                    const size_t kvl = E.kv_lcp(i, ids, ir.imgs);
+                    for (auto& up : E.ckpt_entries) {
+                        const size_t cp = (size_t) up->pos;
+                        if (cp <= reuse || cp >= ids.size() || cp > kvl) continue;
+                        if (Engine::imgs_within(ir.imgs, up->pos) == up->imgs &&
+                            std::equal(up->tokens.begin(), up->tokens.end(), ids.begin())) {
+                            reuse = cp;
+                            s = i;
+                            pick_ckpt = up.get();
+                        }
+                    }
+                }
+            }
+            if (s < 0) s = free_empty >= 0 ? free_empty : lru;
+            if (pick_ckpt != nullptr) {
+                E.restore_ckpt(s, *pick_ckpt);
+                reuse = (size_t) pick_ckpt->pos;
+            } else {
+                E.select(s);
+                if (reuse == 0) {
+                    E.reset();
+                    E.sess[(size_t) s].live.clear();
+                    E.sess[(size_t) s].imgs.clear();
+                    if (s < (int) E.kv_live.size()) {
+                        E.kv_live[(size_t) s].clear();
+                        E.kv_imgs[(size_t) s].clear();
+                    }
+                }
+            }
         }
-        E.select(s);
-        if (reuse == 0) {
-            E.reset();
-            ss.live.clear();
-            ss.imgs.clear();
+        Engine::Sess& ss = E.sess[(size_t) s];
+        if (s >= 0 && s < (int) E.kv_live.size()) {
+            if (E.kv_live[(size_t) s].size() > reuse) {
+                E.kv_live[(size_t) s].resize(reuse);
+                E.kv_imgs[(size_t) s] = Engine::imgs_within(E.kv_imgs[(size_t) s], (int64_t) reuse);
+            }
         }
         if (geni) E.set_images(ir.rows, ir.cell_row, ir.mrope, (int64_t) ids.size(), ir.delta);
         else E.clear_images();
         const auto t0 = Clock::now();
         const int64_t fresh = (int64_t) (ids.size() - reuse);
         bool cancelled = false;
-        const int64_t got = E.process(ids.data() + reuse, fresh, [&](int64_t done) -> bool {
+        const bool split_tail_ckpt = !adm && E.ckpt_on && ids.size() >= 256 && fresh >= 2;
+        const int64_t first_n = split_tail_ckpt ? fresh - 1 : fresh;
+        auto run_pp_cb = [&](int64_t done_ofs, int64_t done_local, int64_t limit_local, bool save_chunks) -> bool {
+            const int64_t done = done_ofs + done_local;
             /*
             DPCT1040:43: Use sycl::stream instead of printf if your code is used
             on the device.
@@ -8535,8 +8918,22 @@ struct Serve {
                 poll_control();
             }
             if (stop.load() && done < fresh) { cancelled = true; return false; }
+            if (save_chunks && done_local < limit_local && (int64_t) reuse + done < (int64_t) ids.size() - 1) {
+                const int64_t cpos = (int64_t) reuse + done;
+                if (Engine::imgs_boundary_ok(ir.imgs, cpos))
+                    E.save_ckpt(s, ids, ir.imgs, cpos, ss.rdelta, false);
+            }
             return true;
+        };
+        int64_t got = E.process(ids.data() + reuse, first_n, [&](int64_t done) -> bool {
+            return run_pp_cb(0, done, first_n, !adm && E.ckpt_on);
         });
+        if (split_tail_ckpt && !cancelled && got == first_n) {
+            E.save_ckpt(s, ids, ir.imgs, (int64_t) reuse + first_n, ss.rdelta, true);
+            got += E.process(ids.data() + reuse + first_n, 1, [&](int64_t done) -> bool {
+                return run_pp_cb(first_n, done, 1, false);
+            });
+        }
         ss.live.insert(ss.live.end(), ids.begin() + (long) reuse, ids.begin() + (long) reuse + (long) got);
         ss.imgs.clear();
         bool cut = false;
@@ -8547,6 +8944,10 @@ struct Serve {
         if (cancelled && cut) {   // stopped inside a picture: the state cannot be continued, the next read starts over
             ss.live.clear();
             ss.imgs.clear();
+        }
+        if (s >= 0 && s < (int) E.kv_live.size()) {
+            E.kv_live[(size_t) s] = ss.live;
+            E.kv_imgs[(size_t) s] = ss.imgs;
         }
         E.sess[(size_t) E.cur].pos = E.pos;
         const double prompt_ms = ms_since(t0);
@@ -8578,9 +8979,11 @@ struct Serve {
         }
         const bool spec = E.mtp_d > 0 && !adm && (!smp.needs_logits() || plan.ok);
         const Engine::SpecSel sel{&smp, plan.kk, plan.M, &hist, &rng};
-        std::vector<int32_t> fix, drafts;
+        std::vector<int32_t> fix, drafts, client_live = ids;
         int32_t picks[16];
         bool decided = false;   // nx is the token a verify window drew: the loop's own draw below would be a second one
+        bool mid_draft_stop = false;
+        int64_t last_ckpt_blk = 0;
         int nx = smp.needs_logits() ? -1 : E.greedy();
         if (adm) {
             if (smp.needs_logits()) {
@@ -8638,6 +9041,7 @@ struct Serve {
                 std::fflush(stdout);
                 ++produced;
                 hist.push_back(t);
+                client_live.push_back(t);
                 if (is_eos(t)) { finish = "stop"; return false; }
                 if (produced >= max_new) return false;
                 if (stop.load()) { finish = "cancel"; return false; }
@@ -8645,10 +9049,13 @@ struct Serve {
             };
             if (!emit(nx)) break;
             if (n_active > 0) window();
-            if (spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
+            const int64_t left = max_new - produced;
+            if (spec && n_active == 0 && left >= 1 && E.pos + 2 <= E.ctx) {
                 int D = 0, a = 0;
+                const int max_drafts = (int) std::min<int64_t>(left, E.ctx - E.pos - 1);
                 look.sync(ss.live);
-                look.propose(nx, E.lookup_depth(), given);   // (every row of a copy stands: the full depth at any context length)
+                look.propose(nx, std::min(E.lookup_depth(), max_drafts), given);   // (every row of a copy stands: the full depth at any context length)
+                if ((int) given.size() > max_drafts) given.resize((size_t) max_drafts);
                 if (!given.empty() && E.given_ok((int) given.size())) {   // a lookup step: the drafts cost no draft call
                     D = (int) given.size();
                     a = E.spec_step(nx, fix, D, drafts, picks, &stop, plan.ok ? &sel : nullptr, &given);
@@ -8656,24 +9063,32 @@ struct Serve {
                     looked += D;
                     look_ok += a;
                 } else {
-                    D = std::min(q36_depth_at(E.pos, std::min(E.mtp_d, depth_cap)), E.lookup_depth());   // (the window fits the attention's scratch)
+                    D = std::min({q36_depth_at(E.pos, std::min(E.mtp_d, depth_cap)), E.lookup_depth(), max_drafts});   // (the window fits the attention's scratch)
                     a = E.spec_step(nx, fix, D, drafts, picks, &stop, plan.ok ? &sel : nullptr);
                     depth_cap = q36_next_cap(D, a, E.mtp_d);
                     look.observe(drafts, a, picks[a]);
                 }
                 offered += D;
                 accepted += a;
-                // the state now holds x and every accepted draft, whether or not the answer ends inside them (an end of
-                // answer, max_new): the held tokens say so, so a later request that continues this conversation matches them
-                // (a prompt that has the same tokens next reuses the state, any other reads from the start) and never reads
-                // a token twice
                 ss.live.push_back(nx);
-                for (int i = 0; i < a; ++i) ss.live.push_back(drafts[(size_t) i]);
+                if (s < (int) E.kv_live.size()) E.kv_live[(size_t) s].push_back(nx);
+                for (int i = 0; i < a; ++i) {
+                    ss.live.push_back(drafts[(size_t) i]);
+                    if (s < (int) E.kv_live.size()) E.kv_live[(size_t) s].push_back(drafts[(size_t) i]);
+                }
                 fix.assign(drafts.begin(), drafts.begin() + a);
                 bool ended = false;
-                for (int i = 0; i < a && !ended; ++i)
-                    if (!emit(drafts[(size_t) i])) ended = true;
+                for (int i = 0; i < a && !ended; ++i) {
+                    if (!emit(drafts[(size_t) i])) {
+                        ended = true;
+                        if (i + 1 < a) mid_draft_stop = true;
+                    }
+                }
                 if (ended) break;
+                if (E.ckpt_on && ss.live.size() == client_live.size() && produced / 32 != last_ckpt_blk) {
+                    last_ckpt_blk = produced / 32;
+                    E.save_ckpt(s, ss.live, ss.imgs, (int64_t) ss.live.size(), ss.rdelta, false, s);
+                }
                 nx = picks[a];
                 decided = true;   // (only read when the request needs logits: a greedy one has its pick already)
                 continue;
@@ -8682,7 +9097,12 @@ struct Serve {
             const int32_t one = nx;
             E.process(&one, 1, [](int64_t) {});
             ss.live.push_back(nx);
+            if (s < (int) E.kv_live.size()) E.kv_live[(size_t) s].push_back(nx);
             fix.clear();
+            if (E.ckpt_on && ss.live.size() == client_live.size() && produced / 32 != last_ckpt_blk) {
+                last_ckpt_blk = produced / 32;
+                E.save_ckpt(s, ss.live, ss.imgs, (int64_t) ss.live.size(), ss.rdelta, false, s);
+            }
             if (!smp.needs_logits()) nx = E.greedy();
         }
         E.sess[(size_t) E.cur].pos = E.pos;
@@ -8690,6 +9110,10 @@ struct Serve {
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
                     decode_ms, finish, accepted, offered, reuse, (long long) fresh);
         std::fflush(stdout);
+        if (E.ckpt_on && !adm && !mid_draft_stop && ss.live.size() >= 256 &&
+            ss.live.size() <= client_live.size() && std::equal(ss.live.begin(), ss.live.end(), client_live.begin())) {
+            E.save_ckpt(s, ss.live, ss.imgs, (int64_t) ss.live.size(), ss.rdelta, true);
+        }
         std::fprintf(stderr, "strata serve: session %d: prompt %zu tokens = %zu reused + %lld read in %.0f ms (%.1f tok/s), "
                      "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld, of them lookups %lld of %lld (%s)\n", s, ids.size(), reuse,
                      (long long) fresh, prompt_ms, prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, produced,
