@@ -8,7 +8,7 @@
 | --- | --- |
 | Build and run on one Arc Pro B70 (Docker + `./setup.sh`) | [README](../README.md), [B70 branch notes](B70.md) |
 | Install or update (Terminal / upstream installer reference) | [Install Strata](INSTALL.md) |
-| Choose a model and check memory | [Models and quantizations](MODELS.md), [Quantizations](QUANTS.md) |
+| Choose a model and check B70 memory fit | [B70 model fit arithmetic](B70_MODELS.md), [Upstream models index](MODELS.md), [Quantizations](QUANTS.md) |
 | Start from the command line (`strata launch`) | [Terminal launch](TERMINAL_LAUNCH.md) |
 | Connect a coding tool | [Tool connections](TERMINAL_LAUNCH.md#connect-your-apps-strata-connect) |
 | Fix an install or startup problem | [Troubleshooting](TROUBLESHOOTING.md) |
@@ -29,6 +29,7 @@ This fork builds only the Intel Arc (`sycl/`) engine on Linux for one Arc Pro B7
 | Guide | What it covers |
 | --- | --- |
 | [The `b70` branch](B70.md) | What the `b70` branch changes over upstream `main`, defaults, compiler pins, and B70 measurements |
+| [B70 model fit arithmetic](B70_MODELS.md) | Exact B70 VRAM and host RAM sums picking `UD-IQ1_S` (Flash-Next) and `UD-Q4_K_M` (27B dense) and why `--ple-io ram` needs 85 GB+ |
 | [The B70 served setup](B70.md#the-served-setup) | What `./setup.sh --backend sycl --family unsloth --model UD-IQ1_S` configures on one B70 (layer-18 graft, MTP, KV/experts, `--no-served-recipe`) |
 | [Intel Arc SYCL engine](INTEL.md) | Building and running the `sycl/` engine inside `strata-sycl-dev` and maintaining the port |
 | [Qwen3.8-27B (`qwen35`) on B70](Q36.md) | The dense Qwen3.8-27B family built into the same `strata` binary (`Q36=OFF` excludes it) |
