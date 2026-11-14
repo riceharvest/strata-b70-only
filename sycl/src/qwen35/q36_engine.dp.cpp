@@ -3582,6 +3582,8 @@ struct Engine {
     std::vector<int> qsa_ord;                      // model layer -> index into qsa_w / qsa_st, -1: not a QSA layer
     strata::q36qsa::Scratch qsa_sc;
     int32_t* qsa_p0 = nullptr;                     // device scalar (a tree commit's root cell)
+    std::string qsa_dump_dir;                      // STRATA_Q36_QSA_DUMP=<dir>: one decode step's tensors of one layer, for tools/qwen35/qsa_ref.py (needs --no-graph)
+    int qsa_dump_layer = -1, qsa_dump_left = 0, qsa_dump_min = 2200;
     // ---- end QSA BLOCK 1
     uint32_t *xqb = nullptr, *xpb = nullptr;
     float *xqs = nullptr, *xsc = nullptr, *xsrow = nullptr;
@@ -5703,6 +5705,14 @@ work-group size if needed.
         qsa_p0 = dalloc_t<int32_t>(1);
         qsa_prefill = std::getenv("STRATA_Q36_QSA_PREFILL") != nullptr && std::getenv("STRATA_Q36_QSA_PREFILL")[0] == '1';
         qsa_on = true;
+        if (const char* dd = std::getenv("STRATA_Q36_QSA_DUMP"); dd != nullptr && dd[0] != '\0') {
+            qsa_dump_dir = dd;
+            qsa_dump_layer = std::getenv("STRATA_Q36_QSA_DUMP_LAYER") ? std::atoi(std::getenv("STRATA_Q36_QSA_DUMP_LAYER")) : qsa_w.layer_ids[0];
+            qsa_dump_left = std::getenv("STRATA_Q36_QSA_DUMP_COUNT") ? std::atoi(std::getenv("STRATA_Q36_QSA_DUMP_COUNT")) : 1;
+            qsa_dump_min = std::getenv("STRATA_Q36_QSA_DUMP_MIN") ? std::atoi(std::getenv("STRATA_Q36_QSA_DUMP_MIN")) : 2200;
+            std::fprintf(stderr, "strata-q36: QSA dump: layer %d of the first %d decode step(s) from cell %d on go to %s%s\n", qsa_dump_layer, qsa_dump_left,
+                         qsa_dump_min, qsa_dump_dir.c_str(), use_graph ? " (NEEDS --no-graph: nothing is written from a replayed graph)" : "");
+        }
         std::fprintf(stderr, "strata-q36: QSA on: %zu attention layers keep 4-cell block keys (top 512 blocks = 2048 cells a row, own block always); indexer weights %.0f MB%s, "
                              "state %.2f GiB, scratch %.1f MiB; windows of up to %d rows %s, prompt chunks %s; the MTP block stays dense\n",
                      qsa_w.w.size(), (double) qsa_w.bytes / 1e6, qsa_w.from_f32 ? " (fp32 file rounded to fp16)" : "",
@@ -5729,6 +5739,43 @@ work-group size if needed.
     void qsa_index(size_t li, int T, const int32_t* dpos) {
         const int ord = qsa_ord[li];
         strata::q36qsa::index_rows(qsa_w.w[(size_t) ord], qsa_st[(size_t) ord], qsa_sc, h, qsa_win(T, dpos), qsa_rope(), tree_mode, (void*) st);
+    }
+    /// One decode step's tensors of layer li into qsa_dump_dir (raw binary files + meta.txt; tools/qwen35/qsa_ref.py reads them): the layer's input row,
+    /// the main query and gate, the indexer's query, the pooled block keys, the scores, the selection, the output, the whole K / V allocations.
+    void qsa_dump(size_t li, int64_t p0) {
+        namespace qs = strata::q36qsa;
+        const auto& g = m->g;
+        const int H = (int) g.n_head, HKV = (int) g.n_head_kv, HD = (int) g.head_dim;
+        CK(DPCT_CHECK_ERROR(st->wait()));
+        const int ord = qsa_ord[li];
+        const int c = (int) ((p0 + 1) / qs::kRatio);
+        auto put = [&](const char* name, const void* dptr, size_t bytes) {
+            std::vector<char> hbuf(bytes);
+            CK(DPCT_CHECK_ERROR(st->memcpy(hbuf.data(), dptr, bytes).wait()));
+            const std::string fn = qsa_dump_dir + "/" + name;
+            FILE* f = std::fopen(fn.c_str(), "wb");
+            if (!f) { std::fprintf(stderr, "strata-q36: QSA dump: cannot write %s\n", fn.c_str()); return; }
+            std::fwrite(hbuf.data(), 1, bytes, f);
+            std::fclose(f);
+        };
+        put("h.f32", h, (size_t) g.n_embd * 4);
+        put("q.f32", q, (size_t) H * HD * 4);
+        put("gate.f32", gate, (size_t) H * HD * 4);
+        put("att.f32", att, (size_t) H * HD * 4);
+        put("qidx.f32", qsa_sc.qidx, (size_t) qs::kHeads * qs::kD * 4);
+        put("pooled.f16", qsa_st[(size_t) ord].pooled, (size_t) c * qs::kD * 2);
+        put("score.f32", qsa_sc.score, (size_t) c * 4);
+        put("sel.i32", qsa_sc.sel, (size_t) qs::kTopBlocks * 4);
+        put("nsel.i32", qsa_sc.nsel, 4);
+        put("kcache.bin", kc[li], q36_kv_alloc_bytes((size_t) HKV * ctx * HD));
+        put("vcache.bin", vc[li], strata::q36xatt::v8t_dwords(HKV, vt_ctxp) * 4 + (size_t) HKV * vt_ctxp * 4);
+        FILE* f = std::fopen((qsa_dump_dir + "/meta.txt").c_str(), "w");
+        if (f) {
+            std::fprintf(f, "pos=%lld\nctx=%d\nvt=%d\nH=%d\nHKV=%d\nlayer=%zu\nblocks=%d\ntop_blocks=%d\nrope_base=%.9g\nn_rot=%d\neps=%.9g\n", (long long) p0, ctx, vt_ctxp, H, HKV, li, c,
+                         qs::kTopBlocks, (double) m->rope_base, (int) m->n_rot, (double) m->eps);
+            std::fclose(f);
+        }
+        std::fprintf(stderr, "strata-q36: QSA dump of layer %zu at cell %lld written to %s\n", li, (long long) p0, qsa_dump_dir.c_str());
     }
     /// A tree window committed along `path` (window row of each kept cell, n_keep of them; the root is the host's `pos`): the kept rows'
     /// raw keys into every layer's ring and the blocks they complete pooled.
@@ -5826,6 +5873,23 @@ work-group size if needed.
                     aa.sel = qsa_sc.sel; aa.nsel = qsa_sc.nsel; aa.nitems = qsa_sc.nitems;
                     aa.pacc = qsa_sc.pacc; aa.pm = qsa_sc.pm; aa.pl = qsa_sc.pl;
                     qs::attend_rows(aa, w, (void*) st);
+                    if (T == 1 && qsa_dump_left > 0 && (int) li == qsa_dump_layer && p0 >= qsa_dump_min && !use_graph) { --qsa_dump_left; qsa_dump(li, p0); }
+                    return;
+                }
+                if (qsa_prefill && !rows_mode) {
+                    // a prompt chunk: the rows in tiles of 16, each tile's selection and sparse attention (the keys of every row are already pooled)
+                    namespace qs = strata::q36qsa;
+                    for (int r0 = 0; r0 < T; r0 += qs::kMaxWin) {
+                        qs::Win w = qsa_win(T, dpos);
+                        w.row0 = r0; w.nr = std::min(qs::kMaxWin, T - r0);
+                        qs::select_rows(qsa_st[(size_t) qsa_ord[li]], qsa_sc, w, (void*) st);
+                        qs::AttendArgs aa;
+                        aa.q = q + (size_t) r0 * H * HD; aa.gate = gate + (size_t) r0 * H * HD; aa.out = att + (size_t) r0 * H * HD; aa.kc = kcl; aa.vc = vcl;
+                        aa.ctx = ctx; aa.vt = vt_ctxp; aa.H = H; aa.HKV = HKV;
+                        aa.sel = qsa_sc.sel; aa.nsel = qsa_sc.nsel; aa.nitems = qsa_sc.nitems;
+                        aa.pacc = qsa_sc.pacc; aa.pm = qsa_sc.pm; aa.pl = qsa_sc.pl;
+                        qs::attend_rows(aa, w, (void*) st);
+                    }
                     return;
                 }
             }

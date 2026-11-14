@@ -239,8 +239,8 @@ void test_score(const Weights16& w) {
                 sum += std::max(a, 0.0);
                 mag += m;
             }
-            sum /= std::sqrt((double) kD);
-            mag /= std::sqrt((double) kD);
+            sum *= (double) kInvSqrtD;
+            mag *= (double) kInvSqrtD;
             const double d = std::fabs(sum - (double) score[(size_t) t * nbc + b]);
             worst = std::max(worst, d / (4e-6 * mag + 1e-6));
             if (d > 4e-6 * mag + 1e-6) all_ok = false;
@@ -312,7 +312,7 @@ void test_select() {
                 const float k0 = u2h(pk[(size_t) b * kD]);
                 float a = std::max(k0, 0.f);
                 a += std::max(k0, 0.f); a += std::max(k0, 0.f); a += std::max(k0, 0.f);
-                s[b] = a * (1.0f / std::sqrt(128.0f));
+                s[b] = a * kInvSqrtD;
             }
             std::vector<int> idx(c);
             for (int b = 0; b < c; ++b) idx[b] = b;
@@ -426,11 +426,11 @@ void test_attend() {
     Scratch sc;
     alloc_scratch(sc, 16, kMaxWin, ctx, g_q);
     for (int variant = 0; variant < 4; ++variant) {
-        // 0: linear window of 16 at P = 3000 (c <= 512: everything), 1: linear window of 16 at P = 9001 (c > 512: 512 random blocks a row),
+        // 0: linear window of 16 at P = 1500 (c <= 512: everything), 1: linear window of 16 at P = 9001 (c > 512: 512 random blocks a row),
         // 2: one row at P = 8999 (own block complete), 3: a tree window of 11 rows over root 9001
         const bool tree = variant == 3;
         const int T = variant == 2 ? 1 : (tree ? 11 : 16);
-        const int P = variant == 0 ? 3000 : variant == 2 ? 8999 : 9001;
+        const int P = variant == 0 ? 1500 : variant == 2 ? 8999 : 9001;
         std::vector<float> q((size_t) T * 24 * kHD), gate((size_t) T * 24 * kHD);
         for (auto& x : q) x = rnd();
         for (auto& x : gate) x = rnd();
@@ -445,6 +445,7 @@ void test_attend() {
             else {
                 std::vector<char> pick(cvis, 0);
                 int n = 0;
+                if (!tree && (cell + 1) % kRatio == 0 && (variant == 2 || (rbits() & 1))) { pick[cvis - 1] = 1; n = 1; }   // the own block (complete) selected: counted once
                 while (n < kTopBlocks) { const int b = (int) (rbits() % cvis); if (!pick[b]) { pick[b] = 1; ++n; } }
                 for (int b = 0; b < cvis; ++b) if (pick[b]) ids.push_back(b);
             }

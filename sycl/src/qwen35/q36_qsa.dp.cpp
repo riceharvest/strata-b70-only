@@ -259,6 +259,7 @@ void launch_project(sycl::queue& q, const half* wq, const half* wk, const float*
         float acc[16];
 #pragma unroll
         for (int r = 0; r < 16; ++r) acc[r] = 0.f;
+#pragma unroll 4   // (4 loads of 256 B a sub-group in flight: 1 KiB, the card's rule for a stream)
         for (int itn = 0; itn < kEmbd / 128; ++itn) {
             const int k = itn * 128 + l * 8;
             const sycl::vec<uint32_t, 4> wv = *reinterpret_cast<const sycl::vec<uint32_t, 4>*>(w + k);
@@ -394,7 +395,7 @@ void launch_score(sycl::queue& q, const half* pooled, const float* qidx, Win win
                 }
             }
         }
-        const float inv = 1.0f / sycl::sqrt((float) kD);
+        const float inv = kInvSqrtD;
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             if (r < nr) {

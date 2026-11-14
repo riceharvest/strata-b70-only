@@ -36,6 +36,7 @@ constexpr int kPieces = 9;        // ceil((512 + kMaxTail) / kPieceItems)
 constexpr int kHD = 256;          // main attention head dimension
 constexpr int kG = 6;             // query heads per KV head
 constexpr int kScoreRows = 8;     // rows of one scoring launch (the accumulators live in registers)
+constexpr float kInvSqrtD = 0.08838834764831845f;   // 1 / sqrt(128) as a float constant (the same bits on the host and the card)
 
 /// One attention layer's indexer weights (device pointers; the weights are fp16, the norm multipliers fp32).
 struct LayerWeights {
