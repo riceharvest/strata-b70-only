@@ -66,7 +66,8 @@ bool attend(const Call& c, void* stream);
 
 // ---- XATT2 (STRATA_Q36_XATT2=1): single-pass online-softmax ESIMD+DPAS split-K attention + fast ESIMD merge.
 constexpr int kMaxBatchGroups2 = 16;   // max slot groups in one batched rows_mode launch (total tokens <= 16)
-constexpr int kMaxSegs2 = 96;          // fits inside Engine::n_chunk = 96 partials allocation
+constexpr int kMaxSegs2 = 96;          // Engine::n_chunk: the partial slots a row of a 16-token call has (the engine allocates 16 x H x 96)
+constexpr int kMaxSegsHard2 = 252;     // most segments a row may have (a call of nt tokens: nseg_max * 16 / nt of them fit the same partials)
 
 inline std::size_t qb2_dwords(int hkv) { return (std::size_t) hkv * 8 * kMaxBatchGroups2 * 128; }
 inline std::size_t qs2_floats(int hkv) { return (std::size_t) hkv * kMaxBatchGroups2 * 16; }
@@ -106,7 +107,7 @@ struct Call2 {
     int kstride = 0;                     // cells per KV head of K (0 -> ctxp)
     int ctxp = 0;                        // ctx_pad(ctx)
     int pos_hint = 0;                    // host cell count estimate for auto nseg selection
-    int nseg_max = kMaxSegs2;            // max segments allocated in pacc/pm/pl
+    int nseg_max = kMaxSegs2;            // segments a row has room for when the call is 16 tokens (nt tokens: nseg_max * 16 / nt, at most 252)
 
     // Tiny query scratch (NO xsc, xpb, or xsrow required!):
     uint32_t* qb = nullptr;              // >= qb2_dwords(HKV) dwords
@@ -129,6 +130,7 @@ struct Call2 {
     int form_override = -1;              // -1=auto/env, 0=R8 (reg/L1), 1=RS16 (16K SLM / R8_D8), 2=RS8 (8K SLM), 3=RS16K (16K Kb+Vb)
     int nseg_override = 0;               // 0=auto/env, >0=fixed segments per KV head
     int u16_override = -1;               // -1=auto/env (default 1), 0=u8 P, 1=u16 P
+    int exp_override = -1;               // -1=env (STRATA_Q36_XATT2_EXP, default 0), 0=hardware exp2, 1=exp by its series
     int zero_fence = 0;                  // runtime 0 for anti-hoist fencing
 
     // Optional bounds-check debug mode (active under STRATA_Q36_XATT2_DBG=1):
@@ -146,6 +148,13 @@ struct Call2 {
 const char* xatt2_form_name(int form);
 /// Returns the planned segment count for group `group_idx` (matches attend2's dispatch).
 int xatt2_plan_nseg(const Call2& c, int group_idx = 0);
+/// The row stride of the partials pm / pl / pacc (segments a row) the call will use (matches attend2).
+int xatt2_plan_stride(const Call2& c);
+/// The form attend2 picks for the call (the forced one, else the auto policy of the rows a row set holds).
+int xatt2_plan_form(const Call2& c);
+/// A probe of the softmax's two exps on the device (no attention): out_hw[i] = hardware exp2(x[i] * log2e), out_poly[i] =
+/// the series, for n inputs in [-87, 0] (n a multiple of 32).  The parity compares them with exp in float64.
+bool xatt2_exp_probe(void* stream, const float* d_x, float* d_hw, float* d_poly, int n);
 /// Single-pass online-softmax attention (+ merge when c.out != nullptr).
 bool attend2(const Call2& c, void* stream);
 

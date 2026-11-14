@@ -1194,6 +1194,13 @@ inline bool q36_xatt2_on() {
     }();
     return on;
 }
+/// STRATA_Q36_XATT2_MIN: the cells from which a window takes XATT2 (below it the XATT1 kernels run: measured at 26K the
+/// whole engine got slower with XATT2, at 118K it got 7% faster; unset: 32768).  Read once.  With XATT2_MIN above
+/// STRATA_Q36_XATT_MIN the XATT1 scratch is allocated too (0.77 GiB at 256K cells).
+inline int q36_xatt2_min_cells() {
+    static const int v = [] { const char* e = std::getenv("STRATA_Q36_XATT2_MIN"); return e && *e ? std::max(0, std::atoi(e)) : 32768; }();
+    return v;
+}
 /// Bytes of one cache allocation (one layer's K, or its V) of n = HKV * ctx * HD values: the codes and their scales.
 inline size_t q36_kv_alloc_bytes(size_t n) {
     return q36_kv() == kKvF32 ? n * 4 : q36_kv() == kKvQ8 ? n + n / 64 * 2 : n * 2;
@@ -3538,6 +3545,9 @@ struct Engine {
     // (any other write of cells - a prompt chunk, a window below the threshold - lowers it); the first window past the
     // threshold fills the cells up to its own first (xatt_catch_up_sess), from then on each window writes its rows.
     bool xatt_ready = false, xatt_now = false;
+    bool xatt2_now = false;      // this window takes XATT2 (xatt_now, XATT2 on, the cells reach q36_xatt2_min_cells())
+    bool xbatch_x2 = false;      // the batch window's XATT slots take XATT2
+    bool xatt1_scratch = false;  // the XATT1 scratch (xsc, xpb, xsrow) exists
     int xatt_min = 4096, xctxp = 0, xcapc = 0;
     int32_t* xpos_d = nullptr;
     bool xatt_kq8 = false;   // the cache is 8-bit: the scores read its K (a scale per 64 values), no K copy
@@ -4101,14 +4111,19 @@ struct Engine {
                 dpct::get_current_device().get_memory_info(vfr, vtot);
                 int ls = 0;
                 size_t scratch = 0;
-                if (xatt2_on) {
-                    scratch = (xa::qb2_dwords(hkv) + xa::qs2_floats(hkv)) * 4;
+                // XATT1 stays the kernel below STRATA_Q36_XATT2_MIN cells: its scratch is then needed beside XATT2's
+                int xmin_pre = xatt_min;
+                if (const char* e = std::getenv("STRATA_Q36_XATT_MIN")) xmin_pre = std::max(64, std::atoi(e));
+                const bool need_x1 = !xatt2_on || q36_xatt2_min_cells() > xmin_pre;
+                const size_t x2_scratch = xatt2_on ? (xa::qb2_dwords(hkv) + xa::qs2_floats(hkv)) * 4 : 0;
+                if (xatt2_on && !need_x1) {
+                    scratch = x2_scratch;
                     const bool fits_2g = vfr >= total_mir + scratch + total_cache + ((size_t) 2 << 30);
                     const bool fits_xe = xe && (n_sess == 1 || vfr > total_mir + scratch + total_cache);
                     if (fits_2g || fits_xe) ls = 6;
                 } else {
                     for (const int t : {6, 3, 2}) {
-                        scratch = (xa::score_floats(hkv, n_chunk, xcapc, t) + xa::pb_dwords(hkv, n_chunk, xcapc, t)) * 4;
+                        scratch = (xa::score_floats(hkv, n_chunk, xcapc, t) + xa::pb_dwords(hkv, n_chunk, xcapc, t)) * 4 + x2_scratch;
                         const bool fits_2g = vfr >= total_mir + scratch + total_cache + ((size_t) 2 << 30);
                         const bool fits_xe = xe && (n_sess == 1 || vfr > total_mir + scratch + total_cache);
                         if (fits_2g || fits_xe) { ls = t; break; }
@@ -4126,18 +4141,24 @@ struct Engine {
                 } else {
                     if (const char* e = std::getenv("STRATA_Q36_XATT_MIN")) xatt_min = std::max(64, std::atoi(e));
                     xls_max = ls;
-                    if (xatt2_on) {
+                    if (xatt2_on) {   // (XATT2's query scratch is the larger one: XATT1 uses the same pointers)
                         xqb = reinterpret_cast<uint32_t*>(dalloc(xa::qb2_dwords(hkv)));
                         xqs = dalloc(xa::qs2_floats(hkv));
                     } else {
                         xqb = reinterpret_cast<uint32_t*>(dalloc(xa::qb_dwords(hkv)));
                         xqs = dalloc(xa::qs_floats(hkv));
+                    }
+                    if (need_x1) {
                         xsc = dalloc(xa::score_floats(hkv, n_chunk, xcapc, ls));
                         xpb = reinterpret_cast<uint32_t*>(dalloc(xa::pb_dwords(hkv, n_chunk, xcapc, ls)));
                         xsrow = dalloc(xa::srow_floats(hkv, n_chunk));
+                        xatt1_scratch = true;
                     }
                     xpos_d = reinterpret_cast<int32_t*>(dalloc(4));
                     xatt_ready = true;
+                    if (xatt2_on)
+                        std::fprintf(stderr, "strata-q36: XATT2 from %d cells on (STRATA_Q36_XATT2_MIN), the XATT1 kernels below%s\n",
+                                     std::max(xatt_min, q36_xatt2_min_cells()), need_x1 ? "" : " (not allocated: XATT2 from the first XATT cell)");
                     char btag[32] = "";
                     if (n_sess > 1) std::snprintf(btag, sizeof btag, ", %d slots", n_sess);
                     std::fprintf(stderr, "strata-q36: decode attention on %s from %d cells on (%s, transposed int8 V; windows of up "
@@ -5884,6 +5905,7 @@ work-group size if needed.
             };
             auto run_xatt = [&](int s_id, const KV* k_in, const KV* v_in, int r_off, int n_tok, const int32_t* pos_ptr) -> bool {
                 const Sess& bss = sess[(size_t) s_id];
+                if (!xatt1_scratch) return false;   // (XATT2 only: no XATT1 scratch)
                 if (!kv_vt && (li >= bss.xv8t.size() || bss.xv8t[li] == nullptr)) return false;
                 if (n_tok < 1 || n_tok > 16) return false;
                 strata::q36xatt::Call xc{};
@@ -5923,7 +5945,7 @@ work-group size if needed.
             // summed them in another order, and the MTP answer on code-v1 left the plain one at token 70 (44 at 6+
             // drafts).  A window of 3+ tokens at G = 6 takes ceil(T / 2) row groups, each reading the K / V once.)
             (void) slm64;
-            if (xatt2_on) {
+            if (xatt2_on && (rows_mode ? xbatch_x2 : xatt2_now)) {
                 bool xatt2_merged = false;
                 if (rows_mode && xbatch_xatt_any && t0 == 0 && nt == T) {
                     strata::q36xatt::Call2 cb{};
@@ -7511,9 +7533,11 @@ work-group size if needed.
                 // depth - a teacher-forced logit dump then measures it)
                 static const bool xall = [] { const char* e = std::getenv("STRATA_Q36_XATT_ALL"); return e && e[0] == '1'; }();
                 xatt_now = xatt_ready && xall && pos + kVerify + 8 <= ctx;
+                xatt2_now = xatt_now && xatt2_on && !xatt1_scratch;   // (this test graph has no key: one kernel set)
                 if (xatt_now) xatt_catch_up_sess(cur);
                 graph_run(gs().g1, [&] { forward(1, pos, 1, use_graph, false); });
                 xatt_now = false;
+                xatt2_now = false;
             }
             mtab_now = nullptr;
             map_on = false;
@@ -7623,11 +7647,14 @@ work-group size if needed.
         // (the window's attention kernel: a graph of its own.  Not in the context's last cells: a tile of 8 cells may read
         // past a row's last cell, and the 8-bit cache has no spare cells)
         xatt_now = xatt_ready && pos >= xatt_min && pos + kVerify + 8 <= ctx;
+        // XATT2 from q36_xatt2_min_cells() on (always when there is no XATT1 scratch to fall back to); its graph is its own
+        xatt2_now = xatt_now && xatt2_on && (!xatt1_scratch || pos >= q36_xatt2_min_cells());
         if (xatt_now) xatt_catch_up_sess(cur);
         else if (xatt_ready) sess[(size_t) cur].xmir_n = std::min<int64_t>(sess[(size_t) cur].xmir_n, std::max<int64_t>(0, pos - kVerify));   // (a replayed graph's cells)
         if (!use_graph) body();
-        else graph_run(row_graphs[{key + (xatt_now ? 1000000 : 0)}], body);
+        else graph_run(row_graphs[{key + (xatt2_now ? 2000000 : xatt_now ? 1000000 : 0)}], body);
         xatt_now = false;
+        xatt2_now = false;
     }
 
     /// Evaluates per-slot XATT eligibility and catches up non-kv_vt mirrors before running/capturing a batch row graph.
@@ -7646,9 +7673,18 @@ work-group size if needed.
                 else sess[(size_t) bs.slot].xmir_n = std::min<int64_t>(sess[(size_t) bs.slot].xmir_n, std::max<int64_t>(0, bs.cell0));
             }
         }
+        // XATT2 for the XATT slots when XATT2 is on and the deepest of them reaches q36_xatt2_min_cells() (always without the
+        // XATT1 scratch); part of the graph's key
+        xbatch_x2 = false;
+        if (xatt2_on && xbatch_xatt_any) {
+            int64_t deepest = 0;
+            for (const XBatchSlot& bs : xbatch_slots)
+                if (bs.xatt) deepest = std::max<int64_t>(deepest, bs.cell0 + bs.cnt);
+            xbatch_x2 = !xatt1_scratch || deepest >= q36_xatt2_min_cells();
+        }
         std::vector<int> gkey = {kind, g_arg, T};
         if (xbatch_xatt_any) {
-            gkey.push_back(1);
+            gkey.push_back(xbatch_x2 ? 2 : 1);
             for (const XBatchSlot& bs : xbatch_slots) {
                 gkey.push_back(bs.slot);
                 gkey.push_back(bs.cnt);
@@ -7659,6 +7695,7 @@ work-group size if needed.
         else graph_run(row_graphs[gkey], body);
         xbatch_slots.clear();
         xbatch_xatt_any = false;
+        xbatch_x2 = false;
     }
 
     /// One window over the groups' rows.  `verify`: a verify window - the GDN state is read, not written (commit_rows writes

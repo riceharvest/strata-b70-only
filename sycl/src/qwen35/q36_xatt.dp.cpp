@@ -619,6 +619,10 @@ inline int xatt2_env_u16() {
     static const int v = [] { const char* e = std::getenv("STRATA_Q36_XATT2_U16"); return e && *e ? std::atoi(e) : 1; }();
     return v;
 }
+inline int xatt2_env_exp() {
+    static const int v = [] { const char* e = std::getenv("STRATA_Q36_XATT2_EXP"); return e && *e ? (std::atoi(e) != 0 ? 1 : 0) : 0; }();
+    return v;
+}
 inline int xatt2_env_pfd() {
     static const int v = [] { const char* e = std::getenv("STRATA_Q36_XATT2_PFD"); return e && *e ? std::atoi(e) : 1; }();
     return v;
@@ -735,6 +739,7 @@ struct AttnPlan2 {
     int32_t ctxp = 0;
     int32_t wg_threads = 1;
     int32_t pfd = 2;
+    int32_t exp_poly = 0;   // STRATA_Q36_XATT2_EXP=1: the softmax's exp by its series, not the hardware exp2
     int32_t zero_fence = 0;
     int32_t nseg_stride = 1;
     int32_t t0 = 0;
@@ -1197,6 +1202,22 @@ SYCL_ESIMD_FUNCTION inline simd<float, 32> load_vs32_safe(const float* vsb, int 
     return vs32;
 }
 
+// e^x for x in [-87, 0] by its series (1.2e-7, exp16's): STRATA_Q36_XATT2_EXP=1 takes it instead of the hardware exp2 in the
+// softmax (the u16 parity missed its 3e-4 bound by 2x; a per-cell relative error of the exp of eps costs about eps of the
+// output - measured in a float32 emulation of the kernel: eps 1e-4 -> 1e-4, 1e-3 -> 1e-3).  The parity's exp probe
+// (--xatt2, stage 0) prints both errors.
+template <int N>
+SYCL_ESIMD_FUNCTION inline simd<float, N> exp_series(simd<float, N> x) {
+    simd<float, N> y = x * 1.44269504f;
+    simd<int, N> n = convert<int>(y - 0.5f);
+    simd<float, N> nf = n;
+    simd<float, N> z = (y - nf) * 0.693147181f;
+    simd<float, N> e = 1.0f + z * (1.0f + z * (0.5f + z * (0.16666667f + z * (0.041666668f + z * (0.008333334f + z * 0.0013888889f)))));
+    simd<int, N> b = (n + 127) << 23;
+    simd<float, N> sc = b.template bit_cast_view<float>();
+    return e * sc;
+}
+
 // Shared online softmax + per-row vmx=max(p*vs) quantization + native stride-2 byte pack into pa_lo / pa_hi.
 // Never contains a barrier(). Leaves o16 untouched when no row exceeds its running max (chg == false).
 template <int U16>
@@ -1206,7 +1227,7 @@ SYCL_ESIMD_FUNCTION inline void softmax_pack_r8(
     simd<int, 8> hi_v, simd<uint32_t, 8> tmk_v,
     simd<float, 128> o16[16], simd<float, 8>& m, simd<float, 8>& l,
     simd<uint32_t, 64>& pa_lo, simd<uint32_t, 64>& pa_hi, simd<float, 8>& srw,
-    bool& row_valid) {
+    bool& row_valid, bool exp_poly) {
     if (!full_row_blk) {
         const simd<int, 16> c_idx0(p0, 1);
         const simd<int, 16> c_idx1 = c_idx0 + 16;
@@ -1240,7 +1261,8 @@ SYCL_ESIMD_FUNCTION inline void softmax_pack_r8(
     simd<float, 8> m_new = (es::max)(m, m_blk);
     const bool chg = (hmax<float>(m_blk - m) > 0.0f);
     if (chg) {
-        simd<float, 8> alpha = es::exp2((es::max)(m - m_new, simd<float, 8>(-87.0f)) * kLog2e2);
+        const simd<float, 8> dm = (es::max)(m - m_new, simd<float, 8>(-87.0f));
+        simd<float, 8> alpha = exp_poly ? exp_series<8>(dm) : es::exp2(dm * kLog2e2);
         alpha.merge(simd<float, 8>(0.0f), m <= -1e29f);
         l *= alpha;
         simd<float, 128> a128;
@@ -1264,7 +1286,8 @@ SYCL_ESIMD_FUNCTION inline void softmax_pack_r8(
         simd<float, 32> sr;
         sr.template select<16, 1>(0) = sc0[r];
         sr.template select<16, 1>(16) = sc1[r];
-        simd<float, 32> e = es::exp2((es::max)(sr - float(m_new[r]), simd<float, 32>(-87.0f)) * kLog2e2);
+        const simd<float, 32> dx = (es::max)(sr - float(m_new[r]), simd<float, 32>(-87.0f));
+        simd<float, 32> e = exp_poly ? exp_series<32>(dx) : es::exp2(dx * kLog2e2);
         if (!full_row_blk) e.merge(simd<float, 32>(0.0f), sr < -1e29f);
         l_blk[r] = hsum32_f(e);
         simd<float, 32> pvr = e * vs32;
@@ -1732,6 +1755,7 @@ template <int NS, int U16> void launch_r8(sycl::queue& q, const AttnPlan2& pl) {
     const uint32_t dbg = pl.dbg, k8_max_cells = pl.k8_max_cells, v8t_max_blks = pl.v8t_max_blks, vs_max_cells = pl.vs_max_cells;
     const uint64_t qb_dwords = pl.qb_dwords, qs_floats = pl.qs_floats, p_elems = pl.p_elems, pacc_elems = pl.pacc_elems;
     const int ngrp = pl.ngrp, per_tok_pos = pl.per_tok_pos;
+    const bool exp_poly = pl.exp_poly != 0;
     const uint64_t gp0 = pl.gp0, gp1 = pl.gp1, gp2 = pl.gp2, gp3 = pl.gp3;
     const uint64_t gp4 = pl.gp4, gp5 = pl.gp5, gp6 = pl.gp6, gp7 = pl.gp7;
     q.submit([&](sycl::handler& h) {
@@ -1805,7 +1829,7 @@ template <int NS, int U16> void launch_r8(sycl::queue& q, const AttnPlan2& pl) {
                             bool row_valid = false;
                             softmax_pack_r8<U16>(
                                 sc0, sc1, vs32, p0, full_row_blk, has_tmask, p0_tree,
-                                hi_v, tmk_v, o16, m, l, pa_lo, pa_hi, srw, row_valid);
+                                hi_v, tmk_v, o16, m, l, pa_lo, pa_hi, srw, row_valid, exp_poly);
                             if (zero_fence == -99) pl_ptr[0] = 0.0f;
                             if (row_valid) {
                                 accum_vb_dram_r8_blk<U16>(
@@ -1846,6 +1870,7 @@ template <int NS, int U16> void launch_r8_d8(sycl::queue& q, const AttnPlan2& pl
     const uint32_t dbg = pl.dbg, k8_max_cells = pl.k8_max_cells, v8t_max_blks = pl.v8t_max_blks, vs_max_cells = pl.vs_max_cells;
     const uint64_t qb_dwords = pl.qb_dwords, qs_floats = pl.qs_floats, p_elems = pl.p_elems, pacc_elems = pl.pacc_elems;
     const int ngrp = pl.ngrp, per_tok_pos = pl.per_tok_pos;
+    const bool exp_poly = pl.exp_poly != 0;
     const uint64_t gp0 = pl.gp0, gp1 = pl.gp1, gp2 = pl.gp2, gp3 = pl.gp3;
     const uint64_t gp4 = pl.gp4, gp5 = pl.gp5, gp6 = pl.gp6, gp7 = pl.gp7;
     q.submit([&](sycl::handler& h) {
@@ -1910,7 +1935,7 @@ template <int NS, int U16> void launch_r8_d8(sycl::queue& q, const AttnPlan2& pl
                         bool row_valid = false;
                         softmax_pack_r8<U16>(
                             sc0, sc1, vs32, p0, full_row_blk, has_tmask, p0_tree,
-                            hi_v, tmk_v, o16, m, l, pa_lo, pa_hi, srw, row_valid);
+                            hi_v, tmk_v, o16, m, l, pa_lo, pa_hi, srw, row_valid, exp_poly);
                         if (zero_fence == -99) pl_ptr[0] = 0.0f;
                         if (row_valid) {
                             accum_vb_dram_r8_blk<U16>(
@@ -1948,6 +1973,7 @@ template <int NS, int U16> void launch_rs16(sycl::queue& q, const AttnPlan2& pl)
     const uint32_t dbg = pl.dbg, k8_max_cells = pl.k8_max_cells, v8t_max_blks = pl.v8t_max_blks, vs_max_cells = pl.vs_max_cells;
     const uint64_t qb_dwords = pl.qb_dwords, qs_floats = pl.qs_floats, p_elems = pl.p_elems, pacc_elems = pl.pacc_elems;
     const int ngrp = pl.ngrp, per_tok_pos = pl.per_tok_pos;
+    const bool exp_poly = pl.exp_poly != 0;
     const uint64_t gp0 = pl.gp0, gp1 = pl.gp1, gp2 = pl.gp2, gp3 = pl.gp3;
     const uint64_t gp4 = pl.gp4, gp5 = pl.gp5, gp6 = pl.gp6, gp7 = pl.gp7;
     q.submit([&](sycl::handler& h) {
@@ -2022,7 +2048,7 @@ template <int NS, int U16> void launch_rs16(sycl::queue& q, const AttnPlan2& pl)
                             bool row_valid = false;
                             softmax_pack_r8<U16>(
                                 sc0, sc1, vs32, p0, full_row_blk, has_tmask, p0_tree,
-                                hi_v, tmk_v, o16, m, l, pa_lo, pa_hi, srw, row_valid);
+                                hi_v, tmk_v, o16, m, l, pa_lo, pa_hi, srw, row_valid, exp_poly);
                             if (zero_fence == -99) pl_ptr[0] = 0.0f;
                             if (row_valid) {
                                 accum_vb_slm_r8_blk<U16>(8192u, pa_lo, pa_hi, srw, o16, zero_fence, pl_ptr);
@@ -2062,6 +2088,7 @@ template <int NS, int U16> void launch_rs8(sycl::queue& q, const AttnPlan2& pl) 
     const uint32_t dbg = pl.dbg, k8_max_cells = pl.k8_max_cells, v8t_max_blks = pl.v8t_max_blks, vs_max_cells = pl.vs_max_cells;
     const uint64_t qb_dwords = pl.qb_dwords, qs_floats = pl.qs_floats, p_elems = pl.p_elems, pacc_elems = pl.pacc_elems;
     const int ngrp = pl.ngrp, per_tok_pos = pl.per_tok_pos;
+    const bool exp_poly = pl.exp_poly != 0;
     const uint64_t gp0 = pl.gp0, gp1 = pl.gp1, gp2 = pl.gp2, gp3 = pl.gp3;
     const uint64_t gp4 = pl.gp4, gp5 = pl.gp5, gp6 = pl.gp6, gp7 = pl.gp7;
     q.submit([&](sycl::handler& h) {
@@ -2135,7 +2162,7 @@ template <int NS, int U16> void launch_rs8(sycl::queue& q, const AttnPlan2& pl) 
                             const simd<float, 32> vs32 = load_vs32_safe(vsb, p0, ub, full_kv_blk);
                             softmax_pack_r8<U16>(
                                 sc0, sc1, vs32, p0, full_row_blk, has_tmask, p0_tree,
-                                hi_v, tmk_v, o16, m, l, pa_lo, pa_hi, srw, row_valid);
+                                hi_v, tmk_v, o16, m, l, pa_lo, pa_hi, srw, row_valid, exp_poly);
                             if (zero_fence == -99) pl_ptr[0] = 0.0f;
                         }
                         barrier();
@@ -2178,6 +2205,7 @@ template <int NS, int U16> void launch_rs16k(sycl::queue& q, const AttnPlan2& pl
     const uint32_t dbg = pl.dbg, k8_max_cells = pl.k8_max_cells, v8t_max_blks = pl.v8t_max_blks, vs_max_cells = pl.vs_max_cells;
     const uint64_t qb_dwords = pl.qb_dwords, qs_floats = pl.qs_floats, p_elems = pl.p_elems, pacc_elems = pl.pacc_elems;
     const int ngrp = pl.ngrp, per_tok_pos = pl.per_tok_pos;
+    const bool exp_poly = pl.exp_poly != 0;
     const uint64_t gp0 = pl.gp0, gp1 = pl.gp1, gp2 = pl.gp2, gp3 = pl.gp3;
     const uint64_t gp4 = pl.gp4, gp5 = pl.gp5, gp6 = pl.gp6, gp7 = pl.gp7;
     q.submit([&](sycl::handler& h) {
@@ -2251,7 +2279,7 @@ template <int NS, int U16> void launch_rs16k(sycl::queue& q, const AttnPlan2& pl
                             bool row_valid = false;
                             softmax_pack_r8<U16>(
                                 sc0, sc1, vs32, p0, full_row_blk, has_tmask, p0_tree,
-                                hi_v, tmk_v, o16, m, l, pa_lo, pa_hi, srw, row_valid);
+                                hi_v, tmk_v, o16, m, l, pa_lo, pa_hi, srw, row_valid, exp_poly);
                             if (row_valid) {
                                 accum_vb_slm_r8_blk<U16>(8192u, pa_lo, pa_hi, srw, o16, zero_fence, pl_ptr);
                             }
@@ -2340,11 +2368,21 @@ template <int HAS_GATE> void launch_merge2(sycl::queue& q, const MPlan2& pl) {
                     w.merge(simd<float, 16>(0.0f), (mv <= -1e29f) | ((s0 + lane) >= nseg));
                     den += hsum16_f(w * lv);
                     const float* pa_base = pacc + (row_off + (size_t) s0) * (size_t) kHD + (size_t) d0;
-                    for (int k = 0; k < 16 && s0 + k < nseg; ++k) {
-                        const float wk = w[k];
-                        if (wk != 0.0f) {
-                            const simd<float, 64> pv = block_load<float, 64>(pa_base + (size_t) k * (size_t) kHD);
-                            num += wk * pv;
+                    if (s0 + 16 <= nseg) {
+                        // all 16 partials' loads in flight at once (every segment of the row was stored: an empty one holds
+                        // zeros and has weight 0), not one load per dependent branch
+                        simd<float, 64> pv[16];
+#pragma unroll
+                        for (int k = 0; k < 16; ++k) pv[k] = block_load<float, 64>(pa_base + (size_t) k * (size_t) kHD);
+#pragma unroll
+                        for (int k = 0; k < 16; ++k) num += float(w[k]) * pv[k];
+                    } else {
+                        for (int k = 0; k < 16 && s0 + k < nseg; ++k) {
+                            const float wk = w[k];
+                            if (wk != 0.0f) {
+                                const simd<float, 64> pv = block_load<float, 64>(pa_base + (size_t) k * (size_t) kHD);
+                                num += wk * pv;
+                            }
                         }
                     }
                 }
@@ -2364,26 +2402,41 @@ inline void pack_u8_16(uint64_t& lo, uint64_t& hi, int idx, uint8_t val) {
     w = (w & ~(0xffull << sh)) | ((uint64_t) val << sh);
 }
 
+// Segments a row may have: the partial slots a call of nt tokens owns (16 x H x nseg_max of them, shared by its nt x H rows).
+inline int plan2_seg_cap(const Call2& c) {
+    const int nt = std::max(1, c.nt);
+    return std::max(1, std::min(kMaxSegsHard2, std::max(1, c.nseg_max) * 16 / nt));
+}
+
+// The threads the segments should keep busy (-doubleGRF: 1024 in flight at most).  Measured at 118K (ns=4): T=5 (W=4, 48 segs,
+// 768 threads) 480 us; T=1 (W=1, 96 segs, 384 threads) 714 us - a thread keeps about 1 KiB of loads in flight, so the bytes
+// in flight follow the thread count: W=1 gets 1024 threads (hypothesis, Hermes measures: STRATA_Q36_XATT2_THREADS).
+inline int xatt2_env_threads() {
+    static const int v = [] { const char* e = std::getenv("STRATA_Q36_XATT2_THREADS"); return e && *e ? std::atoi(e) : 0; }();
+    return v;
+}
+
 inline int plan2_choose_nseg(int HKV, int w, int ngrp_i, int seg_cap, int nseg_req, int nblk) {
     if (nseg_req > 0) return std::max(1, std::min(seg_cap / std::max(1, ngrp_i), nseg_req));
-    // Target ~768 active threads across 32 Xe cores (<= 24 thr/core <= 32 -doubleGRF limit):
-    // W=1 -> 96 segs (384 thr, 12 WGs/core); W=4 (T=5) -> 48 segs (768 thr, 6 WGs/core);
-    // W=6 (T=8) -> 32 segs (768 thr, 4 WGs/core); W=12 (T=16) -> 16 segs (768 thr, 2 WGs/core).
+    // Target ~768 active threads across 32 Xe cores (<= 24 thr/core <= 32 -doubleGRF limit) for W >= 2:
+    // W=4 (T=5) -> 48 segs (768 thr, 6 WGs/core); W=6 (T=8) -> 32 segs; W=12 (T=16) -> 16 segs.  W=1 (<= 8 rows) -> 1024 threads.
     // Align nseg to a multiple of (32 / HKV) so total WGs divide evenly across 32 Xe cores.
-    const int tgt_threads = 768;
+    const int env_thr = xatt2_env_threads();
+    const int tgt_threads = env_thr > 0 ? env_thr : (w == 1 ? 1024 : 768);
     const int core_align = std::max(1, 32 / std::max(1, HKV));
     int budget_per_kv = std::min(seg_cap, std::max(1, tgt_threads / (std::max(1, HKV) * std::max(1, w))));
     if (ngrp_i == 1 && budget_per_kv >= core_align) {
         budget_per_kv = (budget_per_kv / core_align) * core_align;
     }
-    const int blk_floor = std::max(1, nblk / 2);
+    // a segment of fewer than 4 blocks (W = 1) / 2 blocks costs more in its setup (queries, partials) than it streams
+    const int blk_floor = std::max(1, nblk / (w == 1 ? 4 : 2));
     const int share = (ngrp_i == 1) ? budget_per_kv : std::max(1, std::min(seg_cap / ngrp_i, budget_per_kv / ngrp_i));
     return std::max(1, std::min(share, blk_floor));
 }
 
 inline void plan2_group_nsegs(const Call2& c, int ngrp_i, int max_rows, int g_nseg[kMaxBatchGroups2]) {
     const int w = std::max(1, (max_rows + 7) / 8);
-    const int seg_cap = std::min(kMaxSegs2, std::max(1, c.nseg_max));
+    const int seg_cap = plan2_seg_cap(c);
     const int nseg_req = c.nseg_override > 0 ? c.nseg_override : xatt2_env_segs();
     int total_tasks = 0;
     for (int i = 0; i < ngrp_i; ++i) {
@@ -2417,6 +2470,7 @@ int build_plan2(const Call2& c, HostPlan2& hp, int& form_out, int& u16_out) {
     pl.kst = c.kstride > 0 ? c.kstride : (c.ctx > 0 && c.ns == 4 && c.k_tab ? c.ctx : c.ctxp);
     pl.ctxp = c.ctxp;
     pl.pfd = env_pfd >= 0 ? env_pfd : 0;
+    pl.exp_poly = c.exp_override >= 0 ? (c.exp_override != 0 ? 1 : 0) : xatt2_env_exp();
     pl.zero_fence = c.zero_fence;
     pl.scale = c.scale;
     pl.pos0 = c.pos0;
@@ -2530,7 +2584,7 @@ int build_plan2(const Call2& c, HostPlan2& hp, int& form_out, int& u16_out) {
     const int w = (max_rows + 7) / 8;
     pl.wg_threads = w;
 
-    const int seg_cap = std::min(kMaxSegs2, std::max(1, c.nseg_max));
+    const int seg_cap = plan2_seg_cap(c);
     const int ngrp_i = pl.ngrp;
     plan2_group_nsegs(c, ngrp_i, max_rows, g_nseg);
 
@@ -2630,6 +2684,36 @@ int xatt2_plan_nseg(const Call2& c, int group_idx) {
     return g_nseg[group_idx];
 }
 
+static int plan2_max_rows(const Call2& c) {
+    int max_rows = 0;
+    if (c.ngrp > 0) {
+        for (int i = 0; i < std::min(c.ngrp, kMaxBatchGroups2); ++i) max_rows = std::max(max_rows, c.grp[i].cnt * kG);
+    } else {
+        max_rows = std::max(1, c.nt) * kG;
+    }
+    return max_rows;
+}
+
+int xatt2_plan_stride(const Call2& c) {
+    const int ngrp_i = (c.ngrp > 0) ? std::min(c.ngrp, kMaxBatchGroups2) : 1;
+    int g_nseg[kMaxBatchGroups2]{};
+    plan2_group_nsegs(c, ngrp_i, plan2_max_rows(c), g_nseg);
+    int max_nseg = 1;
+    for (int i = 0; i < ngrp_i; ++i) max_nseg = std::max(max_nseg, g_nseg[i]);
+    int stride = max_nseg;
+    if (c.out != nullptr && stride > 1) {
+        const int a4 = (stride + 3) & ~3;
+        if (a4 <= plan2_seg_cap(c)) stride = a4;
+    }
+    return stride;
+}
+
+int xatt2_plan_form(const Call2& c) {
+    const int f = (c.form_override >= 0) ? c.form_override : xatt2_env_form();
+    if (f >= 0 && f <= 3) return f;
+    return plan2_max_rows(c) <= 8 ? kFormR8 : kFormRS16K;
+}
+
 bool attend2(const Call2& c, void* stream) {
     HostPlan2 hp;
     int form = 0, u16 = 1;
@@ -2647,6 +2731,26 @@ bool attend2(const Call2& c, void* stream) {
         if (c.gate) launch_merge2<1>(q, hp.m);
         else launch_merge2<0>(q, hp.m);
     }
+    return true;
+}
+
+struct TagXa2ExpProbe;
+bool xatt2_exp_probe(void* stream, const float* d_x, float* d_hw, float* d_poly, int n) {
+    if (!stream || !d_x || !d_hw || !d_poly || n <= 0 || (n % 32) != 0) return false;
+    sycl::queue& q = *strata::q_of(stream);
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for<TagXa2ExpProbe>(
+            sycl::nd_range<1>(sycl::range<1>((size_t) (n / 32)), sycl::range<1>(1)),
+            [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+                const size_t o = (size_t) it.get_global_id(0) * 32u;
+                simd<float, 32> x = block_load<float, 32>(d_x + o);
+                x = (es::max)(x, simd<float, 32>(-87.0f));
+                simd<float, 32> hw = es::exp2(x * kLog2e2);
+                simd<float, 32> po = exp_series<32>(x);
+                block_store<float, 32>(d_hw + o, hw);
+                block_store<float, 32>(d_poly + o, po);
+            });
+    });
     return true;
 }
 

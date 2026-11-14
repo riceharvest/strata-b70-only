@@ -1837,12 +1837,14 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
 
     int bad = 0;
     // Reference quantized float64 attention matching XATT2 (int8 Q, int8/fp16 K scales, int8 V, u16/u8 per-32-cell V-scale quant, segment merge).
+    struct SegRef { double M = -1e300, l = 0.0; std::vector<double> o; };
     auto ref_row = [&](int kvh, const float* qr, int n, uint32_t tmask_row, int p0_tree,
                        int kst, int ctxp, int ns_ref, bool u16, float gate_val_scale,
                        const std::vector<float>& K_raw, const std::vector<float>& V_raw,
                        const int8_t* k8b, const float* hks, const uint16_t* hk16,
                        const int8_t* v8b, const float* hvs, int cells_raw, int nseg_ref,
-                       double& rq_out, double& rx_out, const float* got, double& nrm2_out) {
+                       double& rq_out, double& rx_out, const float* got, double& nrm2_out,
+                       std::vector<SegRef>* segs_out = nullptr) {
         (void) gate_val_scale;
         float mx = 0.f;
         for (int d = 0; d < HD; ++d) mx = std::max(mx, std::fabs(qr[d]));
@@ -1919,6 +1921,11 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
                 l_acc = l_acc * alpha + lb;
                 M = mn;
             }
+            if (segs_out) {   // the kernel's partials of this segment, for the stage-by-stage diagnostics
+                SegRef sr;
+                sr.M = M; sr.l = l_acc; sr.o.assign(o_acc, o_acc + HD);
+                segs_out->push_back(std::move(sr));
+            }
             if (l_acc > 0.0) {
                 if (l_glob <= 0.0) {
                     M_glob = M;
@@ -1965,6 +1972,25 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
             n2 += rx * rx;
         }
         rq_out += eq; rx_out += ex; nrm2_out += n2;
+    };
+
+    // The kernel's partials (pm, pl, pacc at index base + seg) of one row against the contract's per segment.
+    auto diag_segs = [&](const std::vector<SegRef>& segs, const std::vector<float>& pm_h, const std::vector<float>& pl_h,
+                         const std::vector<float>& pa_h, size_t base, double& d_m, double& d_l, double& d_o) {
+        for (size_t sg = 0; sg < segs.size(); ++sg) {
+            const SegRef& r = segs[sg];
+            if (!(r.l > 0.0)) continue;
+            const size_t i = base + sg;
+            if (i >= pm_h.size()) continue;
+            d_m = std::max(d_m, std::fabs((double) pm_h[i] - r.M));
+            d_l = std::max(d_l, std::fabs((double) pl_h[i] - r.l) / r.l);
+            double e2 = 0.0, n2s = 0.0;
+            for (int d = 0; d < HD; ++d) {
+                const double a = pa_h[i * HD + d], b = r.o[d];
+                e2 += (a - b) * (a - b); n2s += b * b;
+            }
+            d_o = std::max(d_o, std::sqrt(e2 / std::max(n2s, 1e-300)));
+        }
     };
 
     // Helper: quantize synthetic K/V for parity and allocate matching device buffers.
@@ -2136,6 +2162,33 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
         }
     }
 
+    // ---- Stage 0b: the softmax's two exps on the device against float64 (the u16 parity's 2x miss of its 3e-4 bound is an exp
+    // error of that size per cell if hw exp2 is coarse: error of the output ~ the per-cell relative error of p)
+    {
+        const int n = 1 << 20;
+        std::vector<float> hx(n), hh(n), hp(n);
+        for (int i = 0; i < n; ++i) hx[i] = (i < n / 2) ? -(float) ((double) (xr() >> 11) / 9007199254740992.0 * 30.0)
+                                                         : -(float) ((double) (xr() >> 11) / 9007199254740992.0 * 87.0);
+        auto* dxp = (float*) dev((size_t) n * 4); auto* dhw = (float*) dev((size_t) n * 4); auto* dpo = (float*) dev((size_t) n * 4);
+        q.memcpy(dxp, hx.data(), (size_t) n * 4).wait();
+        const bool okp = xa::xatt2_exp_probe(&q, dxp, dhw, dpo, n);
+        q.wait();
+        q.memcpy(hh.data(), dhw, (size_t) n * 4); q.memcpy(hp.data(), dpo, (size_t) n * 4); q.wait();
+        double mh = 0, mp = 0, sh = 0, sp = 0, mh30 = 0;
+        for (int i = 0; i < n; ++i) {
+            const double ex = std::exp((double) hx[i]);
+            const double eh = std::fabs((double) hh[i] - ex) / ex, ep = std::fabs((double) hp[i] - ex) / ex;
+            mh = std::max(mh, eh); mp = std::max(mp, ep); sh += eh * eh; sp += ep * ep;
+            if (i < n / 2) mh30 = std::max(mh30, eh);
+        }
+        std::printf("exp probe (%d x in [-87,0], half of them in [-30,0]): hardware exp2 relative error max %.2e rms %.2e (max on [-30,0] %.2e); "
+                    "series max %.2e rms %.2e%s\n  (a per-cell relative error eps costs ~eps of the output: eps 5e-4 explains the 3e-4..7e-4 u16 misses; "
+                    "STRATA_Q36_XATT2_EXP=1 takes the series)\n",
+                    n, mh, std::sqrt(sh / n), mh30, mp, std::sqrt(sp / n), okp ? "" : " NOT RUN");
+        std::fflush(stdout);
+        sycl::free(dxp, q); sycl::free(dhw, q); sycl::free(dpo, q);
+    }
+
     // ---- Stage 1: Functional parity (first context, odd unaligned kstride=cells tail guard + all forms + u8/u16 + tree mask + 4-slot batch)
     {
         const int cells = cl.empty() ? 25123 : (cl[0] | 3);   // force non-multiple-of-32 to exercise tail OOB guard
@@ -2151,14 +2204,15 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
                     "expected RMS vs float64 quantized ref <= 3.0e-4 (u16), <= 2.5e-2 (u8)\n");
         std::fflush(stdout);
         std::vector<float> host_out(rows_m * HD);
-        auto run_check = [&](int T, int form, int u16, bool use_tmask, int pos0_val) {
+        auto run_check = [&](int T, int form, int u16, bool use_tmask, int pos0_val, int exp_ov = -1) {
             std::vector<uint32_t> htm(TM, 0xffffffffu);
             int p0_tree = pos0_val;
             std::fill(host_out.begin(), host_out.end(), 0.0f);
             uint32_t h_dbg = 0;
             bool taken = false;
-            int nseg_planned = 1;
+            int nseg_planned = 1, stride_planned = 1;
             std::string exc_msg;
+            std::vector<float> hp_m, hp_l, hp_a;   // the kernel's partials (m, l, o a row's segment), for the diagnostics
             try {
                 q.memcpy(dpos, &pos0_val, 4);
                 q.memset(d_dbg_flag, 0, 4);
@@ -2177,34 +2231,47 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
                 c.qb = dqb; c.qs = dqs; c.pacc = dpa; c.pm = dpm; c.pl = dpl;
                 c.out = dout;
                 if (use_tmask) { c.tmask = dtmask; c.tp0 = dtp0; }
-                c.form_override = form; c.u16_override = u16;
+                c.form_override = form; c.u16_override = u16; c.exp_override = exp_ov;
                 set_dbg_caps(c, p, T);
                 nseg_planned = xa::xatt2_plan_nseg(c, 0);
+                stride_planned = xa::xatt2_plan_stride(c);
                 taken = xa::attend2(c, &q);
                 q.wait();
                 q.memcpy(host_out.data(), dout, (size_t) T * H * HD * 4);
                 q.memcpy(&h_dbg, d_dbg_flag, 4);
                 q.wait();
+                const size_t np = (size_t) T * H * (size_t) stride_planned;
+                hp_m.resize(np); hp_l.resize(np); hp_a.resize(np * HD);
+                q.memcpy(hp_m.data(), dpm, np * 4);
+                q.memcpy(hp_l.data(), dpl, np * 4);
+                q.memcpy(hp_a.data(), dpa, np * HD * 4);
+                q.wait();
             } catch (const sycl::exception& exc) {
                 exc_msg = exc.what();
             }
             double eq = 0, ex = 0, n2 = 0;
+            double d_m = 0, d_l = 0, d_o = 0;   // worst |dM|, relative dl, relative do over the sampled rows' segments
             const int samp[] = {0, 5, 7, H - 1, (T - 1) * H + 3, T * H - 1};
             for (int row : samp) {
                 if (row >= T * H) continue;
                 const int t = row / H, head = row % H, kvh = head / (H / HKV);
                 const int n = pos0_val + t + 1;
+                std::vector<SegRef> segs;
                 ref_row(kvh, &Q[(size_t) row * HD], n, htm[t], p0_tree, ctx, ctxp, ns, u16 != 0, 1.f,
                         K, V, k8b, hks.data(), hk16.data(), v8b, hvs.data(), cells, nseg_planned,
-                        eq, ex, &host_out[(size_t) row * HD], n2);
+                        eq, ex, &host_out[(size_t) row * HD], n2, &segs);
+                if (!hp_m.empty()) diag_segs(segs, hp_m, hp_l, hp_a, (size_t) row * stride_planned, d_m, d_l, d_o);
             }
             const double rq = std::sqrt(eq / n2), rx = std::sqrt(ex / n2);
             const double limit = u16 ? 3e-4 : 2.5e-2;
             const bool ok = exc_msg.empty() && h_dbg == 0 && taken && rq < limit;
             if (!ok) ++bad;
-            std::printf("  T=%2d form=%-5s u16=%d tmask=%d nseg=%2d pos0=%d | vs q_f64=%.2e (bound %.1e) vs fp64=%.2e dbg=%u %s%s%s\n",
-                        T, xa::xatt2_form_name(form), u16, use_tmask ? 1 : 0, nseg_planned, pos0_val, rq, limit, rx, h_dbg,
+            std::printf("  T=%2d form=%-5s u16=%d exp=%s tmask=%d nseg=%2d pos0=%d | vs q_f64=%.2e (bound %.1e) vs fp64=%.2e dbg=%u %s%s%s\n",
+                        T, xa::xatt2_form_name(form), u16, exp_ov < 0 ? "env" : exp_ov ? "series" : "hw", use_tmask ? 1 : 0, nseg_planned, pos0_val, rq, limit, rx, h_dbg,
                         ok ? "ok" : "FAIL", exc_msg.empty() ? "" : " EXC=", exc_msg.c_str());
+            // stage by stage: the segments' max M, sum l and value sum o against the float64 contract (which stage carries a miss)
+            if (!ok || std::getenv("STRATA_Q36_XATT2_DIAG"))
+                std::printf("      partials vs contract: max|dM|=%.2e  max rel dl=%.2e  max rel do=%.2e  (rows sampled, every segment)\n", d_m, d_l, d_o);
             std::fflush(stdout);
         };
         for (int T : tl) {
@@ -2216,6 +2283,10 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
             run_check(T, 3, 1, false, pos0);
             run_check(T, 0, 0, false, pos0);
             run_check(T, 3, 0, false, pos0);
+            run_check(T, 0, 1, false, pos0, 0);   // the same u16 forms with the hardware exp2 / the series, whatever the env says
+            run_check(T, 3, 1, false, pos0, 0);
+            run_check(T, 0, 1, false, pos0, 1);
+            run_check(T, 3, 1, false, pos0, 1);
         }
         if (cells > 16) {
             run_check(5, 0, 1, true, cells - 8);
@@ -2269,46 +2340,76 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
             cb.qb = dqb; cb.qs = dqs; cb.pacc = dpa; cb.pm = dpm; cb.pl = dpl;
             cb.out = dout; cb.gate = dgate;
             set_dbg_caps(cb, p, r0);
-            uint32_t h_dbg = 0;
-            bool taken = false;
-            std::string exc_msg;
-            std::fill(host_out.begin(), host_out.end(), 0.0f);
-            std::vector<int> nseg_grp(ngrp, 1);
-            try {
-                q.memcpy(dpos, hrc, (size_t) r0 * 4);
-                q.memset(d_dbg_flag, 0, 4);
-                q.wait();
-                for (int gi = 0; gi < ngrp; ++gi) nseg_grp[gi] = xa::xatt2_plan_nseg(cb, gi);
-                taken = xa::attend2(cb, &q);
-                q.wait();
-                q.memcpy(host_out.data(), dout, (size_t) r0 * H * HD * 4);
-                q.memcpy(&h_dbg, d_dbg_flag, 4);
-                q.wait();
-            } catch (const sycl::exception& exc) {
-                exc_msg = exc.what();
-            }
-            // Reference with gate: multiply un-gated ref by sigm(G) on a host check copy:
-            double eq = 0, ex = 0, n2 = 0;
-            for (int gi = 0; gi < ngrp; ++gi) {
-                const int tok = cb.grp[gi].r0 + cb.grp[gi].cnt - 1;
-                for (int head : {0, 5, 13, 23}) {
-                    const size_t row = (size_t) tok * H + head;
-                    std::vector<float> ungated(HD);
-                    for (int d = 0; d < HD; ++d) {
-                        const double g = (double) G[row * HD + d];
-                        const double s = 1.0 / (1.0 + std::exp(-g));
-                        ungated[d] = (float) ((double) host_out[row * HD + d] / std::max(s, 1e-12));
-                    }
-                    ref_row(head / (H / HKV), &Q[row * HD], hrc[tok] + 1, 0xffffffffu, 0x3fffffff, ctx, ctxp, ns, true, 1.f,
-                            K, V, k8b, hks.data(), hk16.data(), v8b, hvs.data(), cells, nseg_grp[gi],
-                            eq, ex, ungated.data(), n2);
+            // One batch run: `form` (-1: the auto policy), the fused gate or not.  Per group (its last token, 4 heads) the
+            // error against the contract; the partials against the contract's segments, stage by stage.
+            auto run_batch = [&](int form, bool with_gate) {
+                uint32_t h_dbg = 0;
+                bool taken = false;
+                std::string exc_msg;
+                std::fill(host_out.begin(), host_out.end(), 0.0f);
+                std::vector<int> nseg_grp(ngrp, 1);
+                xa::Call2 cbr = cb;
+                cbr.form_override = form;
+                if (!with_gate) cbr.gate = nullptr;
+                int stride_b = 1;
+                std::vector<float> hp_m, hp_l, hp_a;
+                try {
+                    q.memcpy(dpos, hrc, (size_t) r0 * 4);
+                    q.memset(d_dbg_flag, 0, 4);
+                    q.wait();
+                    for (int gi = 0; gi < ngrp; ++gi) nseg_grp[gi] = xa::xatt2_plan_nseg(cbr, gi);
+                    stride_b = xa::xatt2_plan_stride(cbr);
+                    taken = xa::attend2(cbr, &q);
+                    q.wait();
+                    q.memcpy(host_out.data(), dout, (size_t) r0 * H * HD * 4);
+                    q.memcpy(&h_dbg, d_dbg_flag, 4);
+                    const size_t np = (size_t) r0 * H * (size_t) stride_b;
+                    hp_m.resize(np); hp_l.resize(np); hp_a.resize(np * HD);
+                    q.memcpy(hp_m.data(), dpm, np * 4);
+                    q.memcpy(hp_l.data(), dpl, np * 4);
+                    q.memcpy(hp_a.data(), dpa, np * HD * 4);
+                    q.wait();
+                } catch (const sycl::exception& exc) {
+                    exc_msg = exc.what();
                 }
-            }
-            const double rq = std::sqrt(eq / n2), rx = std::sqrt(ex / n2);
-            const bool ok = exc_msg.empty() && h_dbg == 0 && taken && rq < 3e-4;
-            if (!ok) ++bad;
-            std::printf("  batch ngrp=%d nt=%d (single launch + fused gate) | vs q_f64=%.2e vs fp64=%.2e dbg=%u %s%s%s\n",
-                        ngrp, cb.nt, rq, rx, h_dbg, ok ? "ok" : "FAIL", exc_msg.empty() ? "" : " EXC=", exc_msg.c_str());
+                // With the gate: the un-gated output is out / sigmoid(gate) (the gate is the host's own float64 sigmoid).
+                double eq = 0, ex = 0, n2 = 0;
+                std::string per_group;
+                for (int gi = 0; gi < ngrp; ++gi) {
+                    const int tok = cb.grp[gi].r0 + cb.grp[gi].cnt - 1;
+                    double gq = 0, gx = 0, gn = 0, g_m = 0, g_l = 0, g_o = 0;
+                    for (int head : {0, 5, 13, 23}) {
+                        const size_t row = (size_t) tok * H + head;
+                        std::vector<float> ungated(HD);
+                        for (int d = 0; d < HD; ++d) {
+                            double sg = 1.0;
+                            if (with_gate) sg = std::max(1.0 / (1.0 + std::exp(-(double) G[row * HD + d])), 1e-12);
+                            ungated[d] = (float) ((double) host_out[row * HD + d] / sg);
+                        }
+                        std::vector<SegRef> segs;
+                        ref_row(head / (H / HKV), &Q[row * HD], hrc[tok] + 1, 0xffffffffu, 0x3fffffff, ctx, ctxp, ns, true, 1.f,
+                                K, V, k8b, hks.data(), hk16.data(), v8b, hvs.data(), cells, nseg_grp[gi],
+                                gq, gx, ungated.data(), gn, &segs);
+                        if (!hp_m.empty()) diag_segs(segs, hp_m, hp_l, hp_a, row * (size_t) stride_b, g_m, g_l, g_o);
+                    }
+                    eq += gq; ex += gx; n2 += gn;
+                    char b[160];
+                    std::snprintf(b, sizeof b, " g%d(cnt=%d nseg=%d): q=%.1e dl=%.1e do=%.1e;", gi, cb.grp[gi].cnt, nseg_grp[gi],
+                                  std::sqrt(gq / std::max(gn, 1e-300)), g_l, g_o);
+                    per_group += b;
+                }
+                const double rq = std::sqrt(eq / n2), rx = std::sqrt(ex / n2);
+                const bool ok = exc_msg.empty() && h_dbg == 0 && taken && rq < 3e-4;
+                if (!ok) ++bad;
+                std::printf("  batch ngrp=%d nt=%d form=%-5s %s | vs q_f64=%.2e vs fp64=%.2e dbg=%u %s%s%s\n",
+                            ngrp, cb.nt, xa::xatt2_form_name(form >= 0 ? form : xa::xatt2_plan_form(cb)),
+                            with_gate ? "fused-gate" : "no-gate   ", rq, rx, h_dbg,
+                            ok ? "ok" : "FAIL", exc_msg.empty() ? "" : " EXC=", exc_msg.c_str());
+                if (!ok || std::getenv("STRATA_Q36_XATT2_DIAG")) std::printf("     per group:%s\n", per_group.c_str());
+            };
+            run_batch(-1, true);    // the auto policy with the fused gate (what the engine launches)
+            run_batch(-1, false);   // the same without the gate (is it the gate, or the attention)
+            for (int fm : {0, 1, 2, 3}) run_batch(fm, false);   // every form on the same batch (is it a form)
             std::fflush(stdout);
             sycl::free(k_blob, q); sycl::free(v_blob, q);
             sycl::free(d_ktab, q); sycl::free(d_vtab, q); sycl::free(d_mtab, q);
@@ -2355,6 +2456,18 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
         std::printf("\nxatt2 bench ctx=%d (logical %.1f MB/layer, rotating %d bufs = %.0f MB, ns=%d):\n",
                     cells, logical_bytes / 1e6, n_bufs, pool_mb, ns);
 
+        // XATT1 on the same buffers for the crossover (the engine's XATT1 window = these three kernels + k_attn_merge_gqa, which
+        // is not timed here: XATT2 below includes its merge, so a XATT1 time within ~15 us of the XATT2 one is a tie).
+        // XATT2_NO_CMP1=1 leaves it out.
+        constexpr int NCHK1 = 96;
+        const bool cmp1 = !sweep && !std::getenv("XATT2_NO_CMP1") && cells >= 4096;
+        const int capc1 = xa::chunk_cap(ctx, NCHK1);
+        float* dsc1 = nullptr; uint32_t* dpb1 = nullptr; float* dsr1 = nullptr;
+        if (cmp1) {
+            dsc1 = (float*) dev(xa::score_floats(HKV, NCHK1, capc1) * 4);
+            dpb1 = (uint32_t*) dev(xa::pb_dwords(HKV, NCHK1, capc1) * 4);
+            dsr1 = (float*) dev(xa::srow_floats(HKV, NCHK1) * 4);
+        }
         double t1_us = 0.0, t16_us = 0.0;
         for (int T : tl) {
             if (T < 1 || T > TM || cells < T + 8) continue;
@@ -2377,17 +2490,33 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
                 const double gbps = (logical_bytes / (us * 1e-6)) / 1e9;
                 const double pct = 100.0 * gbps / 590.0;
                 const double x16_ms = us * 16.0 / 1000.0;
-                std::printf("  T=%2d (%2d rows/kvh): %7.1f us/layer (%5.2f ms x16) | %5.1f GB/s (%5.1f%% of 590)\n",
+                std::printf("  T=%2d (%2d rows/kvh): %7.1f us/layer (%5.2f ms x16) | %5.1f GB/s (%5.1f%% of 590)",
                             T, T * (H / HKV), us, x16_ms, gbps, pct);
+                if (cmp1) {
+                    const double us1 = time_graph_warm(q, 16, [&](int m) {
+                        const KvBuf& kb = bufs[m % n_bufs];
+                        xa::Call c1{};
+                        c1.q = dq; c1.pos0 = dpos; c1.t0 = 0; c1.nt = T; c1.H = H; c1.HKV = HKV; c1.nchk = NCHK1; c1.scale = 1.0f / 16.0f;
+                        c1.k8 = kb.k8; c1.ks = kb.ks; c1.ks16 = kb.ks16; c1.ns = ns; c1.kstride = ctx;
+                        c1.v8t = kb.v8t; c1.vs = kb.vs; c1.ctxp = ctxp;
+                        c1.qb = dqb; c1.qs = dqs; c1.sc = dsc1; c1.pb = dpb1; c1.srow = dsr1; c1.capc = capc1;
+                        c1.pacc = dpa; c1.pm = dpm; c1.pl = dpl;
+                        xa::attend(c1, &q);
+                    }, 0.40, 15);
+                    std::printf(" | XATT1 %7.1f us (no merge) %s", us1, us1 + 15.0 < us ? "XATT1 wins" : "XATT2");
+                }
+                std::printf("\n");
             } else {
                 const int forms_t1[] = {0, 1};
                 const int forms_tn[] = {0, 1, 2, 3};
                 const int* forms = (T == 1) ? forms_t1 : forms_tn;
                 const int nforms = (T == 1) ? 2 : 4;
-                const int segs_list[] = {8, 16, 24, 32, 48, 64, 96};
+                const int segs_list[] = {8, 16, 24, 32, 48, 64, 96, 128, 192, 248};
+                const int seg_cap_t = std::min(xa::kMaxSegsHard2, xa::kMaxSegs2 * 16 / T);
                 for (int fi = 0; fi < nforms; ++fi) {
                     const int fm = forms[fi];
                     for (int nseg : segs_list) {
+                        if (nseg > seg_cap_t) continue;   // (more segments than a T-token call has partial slots for)
                         const double us = time_graph_warm(q, 16, [&](int m) {
                             const KvBuf& kb = bufs[m % n_bufs];
                             xa::Call2 c{};
@@ -2480,6 +2609,7 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
             for (int i = 0; i < ngrp; ++i) { sycl::free(k_blobs[i], q); sycl::free(v_blobs[i], q); }
             sycl::free(dk_t, q); sycl::free(dv_t, q); sycl::free(dm_t, q);
         }
+        if (cmp1) { sycl::free(dsc1, q); sycl::free(dpb1, q); sycl::free(dsr1, q); }
         for (int b = 0; b < n_bufs; ++b) {
             sycl::free(bufs[b].k8, q);
             if (bufs[b].ks) sycl::free(bufs[b].ks, q);
@@ -2504,7 +2634,7 @@ int main(int argc, char** argv) try {
     if (argc > 1 && (std::string(argv[1]) == "--xatt2" || std::string(argv[1]) == "--xatt2-sweep")) {
         const bool sweep = std::string(argv[1]) == "--xatt2-sweep";
         return xatt2_bench(sweep,
-                           argc > 2 ? argv[2] : "1,5,8,16",
+                           argc > 2 ? argv[2] : "1,2,3,4,5,6,7,8,12,16",
                            argc > 3 ? argv[3] : "25120,65536,118000,256000",
                            argc > 4 ? std::atoi(argv[4]) : 4);
     }
