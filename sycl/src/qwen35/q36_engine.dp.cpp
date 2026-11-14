@@ -10620,10 +10620,10 @@ struct Serve {
                 if (df_step) {
                     D = (int) given.size();
                     bool taken = false;
-                    if (E.df_tree && !E.dtree_ok(max_drafts, plan.ok)) ++dt_off;   // (the switch is on but this step cannot verify a tree: tree_ok() false, a sampled request without the candidate kernels, ...)
+                    if (E.df_tree && max_drafts >= 2 && !E.dtree_ok(max_drafts, plan.ok)) ++dt_off;   // (the switch is on but this step cannot verify a tree: tree_ok() false, a sampled request without the candidate kernels, ...)
                     if (E.dtree_ok(max_drafts, plan.ok)) {   // DFLASH TREE: the drafter's candidates as a tree (the chain is its spine); a chain alone goes the linear way
                         strata::q36dt::Params tp;
-                        tp.max_rows = E.dtree_rows();
+                        tp.max_rows = std::min(E.dtree_rows(), max_drafts + 1);   // (as spec_step_tree's window: the rows are cells pos .. pos + rows - 1, which must stay inside the context and the request's budget)
                         tp.max_depth = D;
                         tp.spine = D;
                         tp.min_lp = E.df_tree_minlp;
