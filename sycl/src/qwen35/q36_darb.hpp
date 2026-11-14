@@ -76,12 +76,13 @@ public:
                     probing_ = true;
                     probe_bad_ = 0;
                     probe_got_ = 0;
+                    probe_need_ = first ? c_.init : 1;
                 }
             }
             return;
         }
         ++probes_;
-        if (++probe_got_ >= (est_[1 - cur_].n(g_) < kMinN ? c_.init : 1)) end_probe(true);
+        if (++probe_got_ >= probe_need_) end_probe(true);
     }
 
     double rate(int arm) const { return est_[arm].rate(); }
@@ -156,7 +157,7 @@ private:
     ArbCfg c_;
     Est est_[2];
     int cur_ = kDf, period_;
-    int since_probe_ = 0, probe_bad_ = 0, probe_got_ = 0;
+    int since_probe_ = 0, probe_bad_ = 0, probe_got_ = 0, probe_need_ = 1;
     bool probing_ = false;
     long long total_[2] = {0, 0}, probes_ = 0, flips_ = 0, invalid_ = 0, g_ = 0;
 };
