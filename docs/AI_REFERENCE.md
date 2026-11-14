@@ -96,6 +96,7 @@ Default local server address: `http://127.0.0.1:8080`. The configured port and a
 | Client API | Base URL | Request endpoint |
 | --- | --- | --- |
 | OpenAI Chat Completions | `http://127.0.0.1:8080/v1` | `POST /v1/chat/completions` |
+| OpenAI Completions (raw prompt, no chat template) | `http://127.0.0.1:8080/v1` | `POST /v1/completions` |
 | OpenAI Responses | `http://127.0.0.1:8080/v1` | `POST /v1/responses` |
 | Anthropic Messages | `http://127.0.0.1:8080` | `POST /v1/messages` |
 

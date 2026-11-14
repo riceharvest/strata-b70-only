@@ -887,6 +887,54 @@ void test_plan() {
     check(spec_plan(S(0.f, 20, 1.f, 0.f, 0.5f, 0), V).ok && spec_plan(S(0.f, 20, 1.f, 0.f, 0.5f, 0), V).M == 1, "a penalty with window 0 at temperature 0 is the argmax: 1 candidate");
 }
 
+
+// 9. LANE SOLO: the stream of a request that goes from the single-session path to a slot.  A window draws its rows in order and the
+// request shows only some of them: the stream before the window advanced by the shown ones is the stream after plain draws of
+// those tokens (advance_draws), whatever the window drew past them.
+void test_rng_hand() {
+    std::printf("random stream hand-over\n");
+    Sampling s;
+    s.temperature = 1.0f; s.top_k = 8; s.top_p = 0.95f;
+    const int M = 8, D = 5, T = D + 1;
+    std::vector<int32_t> rows((size_t) T * kSpecRowWords, 0);
+    std::mt19937_64 gen(77);
+    for (int t = 0; t < T; ++t) {
+        int32_t* r = rows.data() + (size_t) t * kSpecRowWords;
+        for (int i = 0; i < kSpecTopM; ++i) { r[i] = -1; r[kSpecTopM + i] = 0; }
+        for (int i = 0; i < M; ++i) {
+            r[i] = 100 * t + i;
+            const float v = 10.f - 0.7f * (float) i + (float) (gen() % 100) / 400.f;
+            r[kSpecTopM + i] = __builtin_bit_cast(int32_t, v);
+        }
+    }
+    int bad = 0, cases = 0, partial = 0;
+    for (unsigned long long seed = 1; seed <= 60; ++seed) {
+        // drafts: the row's first candidate for a few rows, then a miss
+        std::vector<int32_t> drafts((size_t) D);
+        for (int d = 0; d < D; ++d) drafts[(size_t) d] = 100 * d + (d < (int) (seed % 5) ? 0 : 7);
+        const std::vector<int32_t> hist(1, 5);
+        std::mt19937_64 pre(seed), wr(seed);
+        int32_t picks[16];
+        const int a = decide_window(s, 8, M, D, hist, drafts.data(), rows.data(), wr, picks);
+        for (int shown = 1; shown <= a + 1; ++shown) {
+            std::mt19937_64 hand = pre;
+            advance_draws(hand, shown);
+            // the plain loop: one draw a row, in order, the same rows
+            std::mt19937_64 plain(seed);
+            for (int t = 0; t < shown; ++t) {
+                const int32_t* r = rows.data() + (size_t) t * kSpecRowWords;
+                const int p = sample_window_row(r, r + kSpecTopM, M, s, 8, nullptr, 0, plain);
+                if (p != picks[t]) { ++bad; std::printf("pick mismatch seed %llu t %d a %d\n", seed, t, a); }
+            }
+            ++cases;
+            if (shown < a + 1) ++partial;   // a stop inside the window: it drew more rows than were shown
+            if (hand != plain) { ++bad; std::printf("stream mismatch seed %llu shown %d\n", seed, shown); }
+            if (shown == a + 1 && wr != hand) { ++bad; std::printf("window stream mismatch seed %llu a %d\n", seed, a); }   // every draw shown: the window's own stream
+        }
+    }
+    check(cases >= 60 && partial > 0 && bad == 0, "stream before the window + shown draws = the plain loop's stream, and the picks agree (some cases cut inside the window)");
+}
+
 }  // namespace
 
 int main() {
@@ -899,6 +947,7 @@ int main() {
     test_flash_next_point_mass();
     test_plain_unchanged();
     test_plan();
+    test_rng_hand();
     std::printf("%d checks, %d failed\n", g_checks, g_fail);
     std::printf(g_fail == 0 ? "ALL PASSED\n" : "FAILED\n");
     return g_fail == 0 ? 0 : 1;

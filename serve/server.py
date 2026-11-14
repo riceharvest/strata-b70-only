@@ -3,7 +3,8 @@
     python -m serve.server --engine mock --port 8095            (a scripted engine, for clients and tests)
     python -m serve.server --engine strata --config strata.json --port 8080   (the real engine, resident)
 
-Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
+Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/completions (OpenAI text completion: the raw prompt, no
+chat template, stream and non-stream), POST /v1/messages (Anthropic, stream and
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time behind a FIFO (plan: one resident sequence).
 Image generation (optional, when the config has an "images" section): POST /v1/images/generations (OpenAI's shape,
 plus seed and steps) runs stable-diffusion.cpp's sd-cli for Qwen-Image-2.1-Turbo, one job at a time on the GPU the
@@ -374,6 +375,22 @@ ENGINE_READY_S = _timeout_env("STRATA_ENGINE_READY_S", 900.0)
 class Engine(Protocol):
     max_context: int
     def generate(self, ids: list[int], max_new: int, sampling: dict, cancel: threading.Event) -> Iterator[int]: ...
+
+
+class RawTextParser:
+    """POST /v1/completions: the model's text as it is.  Takes the place of OutputParser in Service._run (no thinking, no
+    tool calls, no tags read): every piece of text is content.  It has the attributes _run reads of a parser."""
+    state, buf, clean = "content", "", True
+    rescued = refused = stray_think = unread = 0
+
+    def __init__(self, *_, **__):
+        self.pending, self.name_repairs, self.notes, self.unread_names = [], [], [], []
+
+    def feed(self, delta: str) -> list[Event]:
+        return [Event("content", delta)] if delta else []
+
+    def finish(self, finish: str) -> list[Event]:
+        return []
 
 
 class MockEngine:
@@ -1533,6 +1550,8 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
+        if sampling.get("ignore_eos") is True:       # vLLM's / llama.cpp's flag: an end-of-turn token does not end the reply
+            keys += " ignore_eos=1"
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
@@ -1924,6 +1943,10 @@ class StrataEngine:
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
         keys = self.sampling_keys(sampling or {})
+        ignore_eos = (sampling or {}).get("ignore_eos") is True   # the end token is a token like another: the engine does not end at it
+
+        def ended_at_eos():
+            return not ignore_eos and bool(out) and out[-1] in EOS_IDS
         # logprobs: only an admission's token can have an LP line here (the slot's "BT" lines carry none), so the
         # server refuses these requests unless max_tokens is 1.  The lines go to the request itself, through its
         # cancel Event: several requests read control lines at once, and the engine's lp_lines is one attribute.
@@ -2013,7 +2036,7 @@ class StrataEngine:
                     if slot is None:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
-                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS):
+                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or ended_at_eos():
                             return
                         if reused0 is None:
                             reused0 = (self.last or {}).get("reused")
@@ -2199,7 +2222,7 @@ class StrataEngine:
                             self.slot_held[slot] = []
                             raise EngineNonFinite("the engine's logits became non-finite (#879)")
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
-                                and not (out and out[-1] in EOS_IDS)):
+                                and not ended_at_eos()):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
                             # last token are in them) and decodes with MTP drafts again
                             carry_leg(carry, self.last)         # #1869: the solo path's DONE replaces these figures
@@ -2235,7 +2258,7 @@ class StrataEngine:
             except EngineDied:
                 pass
             bdone_in = False
-            if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and self.gen == born:
+            if phase == "slot" and slot is not None and ended_at_eos() and self.gen == born:
                 bd = self._bdone_after_eos(slot)            # (#1869) the slot's figures, not the admission's
                 if bd is not None:
                     self._apply_bdone(bd.split())
@@ -4655,7 +4678,7 @@ class Service:
             # one request at a time (more wait their turn), or "parallel": N batch slots (#465)
             "concurrency": {"serving": max(1, int(getattr(self.engine, "batch", 0) or 0)),
                             "requested": getattr(self, "requested_slots", max(1, int(getattr(self.engine, "batch", 0) or 0)))},
-            "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
+            "dialects": ["/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses"],
             "vision": {"enabled": images, "available": images, "error": None},
             "image_generation": self.images.status() if self.images is not None else {"enabled": False},
             "activity": {"requests": totals["requests"] + running,
@@ -4765,6 +4788,44 @@ class Service:
             self.prompts.forget(ids)
 
 
+    def fit_max_new(self, ids, max_new, forget=None):
+        """The reply's token budget for a prompt of `ids` in the engine's context: an unset or non-positive `max_new`
+        is the room that is left; one that does not fit is a 400 (or, with fit_max_tokens, shortened to the room).
+        `forget`: the prompt ids the encode cache kept (a prompt refused for the context is not kept, #567)."""
+        ctx = self.engine.max_context
+        if ctx <= 0:
+            if getattr(self.engine, "starting", False):   # #344: (re)starting, not a prompt that is too long
+                raise EngineStarting("the engine is starting (a minute or two); try again shortly")
+            # a failed restart leaves max_context 0: check against the last known context, so the request reaches
+            # run() - which starts the engine again - instead of failing with "exceeds the context (0)" forever
+            ctx = getattr(self.engine, "known_ctx", 0)
+            if ctx <= 0:
+                raise EngineStarting("the engine is starting (a minute or two); try again shortly")
+        room = ctx - CTX_SLACK - len(ids)
+        if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
+            if room < 1:
+                # A prompt refused for the context is not kept (#567): the client cannot resend it unchanged.  The
+                # other refusals (engine starting, images) keep it: the same prompt comes back and its encode is reused.
+                if forget is not None:
+                    self.forget_prompt(forget)
+                raise ValueError("request exceeds the context window: "
+                                 f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
+                                 f"({ctx}); requests are never truncated")
+            max_new = room
+        elif max_new > room:
+            if not self.fit_max_tokens:
+                if forget is not None:
+                    self.forget_prompt(forget)
+                raise ValueError("request exceeds the context window: "
+                                 f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
+                                 f"({ctx}); requests are never truncated. Send a smaller "
+                                 f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
+                                 "model's strata-<model>.json to shorten it to the room left (#545)")
+            print(f"[strata] max_tokens {max_new} shortened to {max(1, room)}: the prompt ({len(ids)} tokens) leaves that much "
+                  f"of the context ({ctx}); \"fit_max_tokens\": false answers 400 instead", flush=True)
+            max_new = max(1, room)          # a shorter completion beats a 400 (the default)
+        return max_new
+
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
@@ -4854,36 +4915,7 @@ class Service:
             if k != len(encoded):
                 raise ValueError("the prompt and its images do not match")
             ids = out
-        ctx = self.engine.max_context
-        if ctx <= 0:
-            if getattr(self.engine, "starting", False):   # #344: (re)starting, not a prompt that is too long
-                raise EngineStarting("the engine is starting (a minute or two); try again shortly")
-            # a failed restart leaves max_context 0: check against the last known context, so the request reaches
-            # run() - which starts the engine again - instead of failing with "exceeds the context (0)" forever
-            ctx = getattr(self.engine, "known_ctx", 0)
-            if ctx <= 0:
-                raise EngineStarting("the engine is starting (a minute or two); try again shortly")
-        room = ctx - CTX_SLACK - len(ids)
-        if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
-            if room < 1:
-                # A prompt refused for the context is not kept (#567): the client cannot resend it unchanged.  The
-                # other refusals (engine starting, images) keep it: the same prompt comes back and its encode is reused.
-                self.forget_prompt(encoded_ids)
-                raise ValueError("request exceeds the context window: "
-                                 f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
-                                 f"({ctx}); requests are never truncated")
-            max_new = room
-        elif max_new > room:
-            if not self.fit_max_tokens:
-                self.forget_prompt(encoded_ids)
-                raise ValueError("request exceeds the context window: "
-                                 f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
-                                 f"({ctx}); requests are never truncated. Send a smaller "
-                                 f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
-                                 "model's strata-<model>.json to shorten it to the room left (#545)")
-            print(f"[strata] max_tokens {max_new} shortened to {max(1, room)}: the prompt ({len(ids)} tokens) leaves that much "
-                  f"of the context ({ctx}); \"fit_max_tokens\": false answers 400 instead", flush=True)
-            max_new = max(1, room)          # a shorter completion beats a 400 (the default)
+        max_new = self.fit_max_new(ids, max_new, encoded_ids)
         if images:
             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
             # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
@@ -5041,12 +5073,12 @@ class Service:
         return now
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
-            declared_only=False) -> Iterator[tuple[str, object]]:
+            declared_only=False, raw=False) -> Iterator[tuple[str, object]]:
         """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
         ka = self.keep_awake
         if ka is not None:
             ka.acquire()
-        inner = self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only)
+        inner = self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, raw)
         try:
             for kind, x in inner:
                 # a reply that calls a tool leaves its thread open: the agent's next request follows (stream_order.py)
@@ -5092,12 +5124,13 @@ class Service:
             self.order.evicted(n if n > 0 else 1 << 10)                 # (fewer than before: the engine started again)
 
     def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
-             declared_only=False) -> Iterator[tuple[str, object]]:
+             declared_only=False, raw=False) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
         sampling = resolve_sampling(self.model_arch, thinking, self.sampling_defaults, self.shared, sampling)
+        ignore_eos = isinstance(sampling, dict) and sampling.get("ignore_eos") is True
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
@@ -5125,8 +5158,8 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        parser = self.parser_cls(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
-                                 declared_only=declared_only)
+        parser = RawTextParser() if raw else self.parser_cls(thinking=thinking, tools=tools, stream_tools=True,
+                                                             recover=self.tool_call_recovery, declared_only=declared_only)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         cyc_hist = []                                   # repeat_cycle_tokens: the last few tokens
@@ -5327,6 +5360,10 @@ class Service:
                                 if trace is not None and trace["first_token_s"] is None:
                                     with self.status_lock:
                                         trace["first_token_s"] = round(time.perf_counter() - trace["_clock"], 3)
+                                if t in self.stop_ids and ignore_eos:    # (the engine went on: the token counts, its text is not sent)
+                                    raw_ids.append(t)
+                                    seg.append(t)
+                                    continue
                                 if t in self.stop_ids:
                                     if force and parser.state == "reasoning" and parser.buf == THINK_END:
                                         opens = True    # #537: the held </think> was the end: the call opens there
@@ -5428,6 +5465,9 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                        if (ignore_eos and finish == "length" and not nonfinite and not cancel.is_set() and seg
+                                and seg[-1] in self.stop_ids and n < max_new):
+                            finish = "stop"             # an engine that does not read ignore_eos ended at its end token anyway
                         if nonfinite and not cancel.is_set():
                             # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
                             # from token 0.  Nothing sent yet: the same request once more, unseen by the client
@@ -6222,6 +6262,87 @@ def openai_collect(chunks) -> dict:
         out["timings"] = last["timings"]
     if last.get("strata_rejected_tool_calls"):
         out["strata_rejected_tool_calls"] = last["strata_rejected_tool_calls"]
+    return out
+
+
+def completion_prompt(svc: Service, req: dict) -> list[int]:
+    """POST /v1/completions: the request's `prompt` as token ids - no chat template.  A string, a list of token ids, or
+    a list holding one of them (one prompt a request: a batch of prompts is a 400).  The string is read with the
+    model's control tokens (<|im_start|> ...) as such, as a tokenizer's own encode does, and gets no start token of
+    its own."""
+    prompt = req.get("prompt")
+    if prompt is None:
+        raise ValueError("prompt is required")
+    if isinstance(prompt, list) and len(prompt) == 1 and isinstance(prompt[0], (str, list)):
+        prompt = prompt[0]
+    if isinstance(prompt, str):
+        if not prompt:
+            raise ValueError("prompt must not be empty")
+        ids = list(svc.tok.encode(prompt, parse_special=True))
+    elif isinstance(prompt, list) and prompt and all(isinstance(t, int) and not isinstance(t, bool) for t in prompt):
+        ids = list(prompt)
+        n_vocab = len(getattr(svc.tok, "tokens", ())) or None
+        bad = [t for t in ids if t < 0 or (n_vocab is not None and t >= n_vocab)]
+        if bad:
+            raise ValueError(f"prompt: token id {bad[0]} is outside the vocabulary" +
+                             (f" (0..{n_vocab - 1})" if n_vocab else ""))
+    elif isinstance(prompt, list) and len(prompt) > 1 and all(isinstance(x, (str, list)) for x in prompt):
+        raise ValueError("prompt: send one prompt a request (a batch of prompts is not supported)")
+    else:
+        raise ValueError("prompt must be a string, a list of token ids, or a list holding one of them")
+    if not ids:
+        raise ValueError("prompt must not be empty")
+    return ids
+
+
+def completions_chunks(svc: Service, req: dict, ids, max_new, cancel, usage_chunk: bool, echo: str | None = None):
+    """/v1/completions' events as OpenAI's `text_completion` chunks (None: a keep-alive): the text as the model wrote it
+    (Service.run with raw=True: no thinking, no tool calls), then a chunk with the finish reason.  `usage_chunk`: one more
+    chunk after it, with no choices and the usage (stream_options.include_usage; a reply that is not streamed always
+    has it).  `echo`: the prompt's text, sent first."""
+    cid, created = "cmpl-" + uuid.uuid4().hex[:24], int(time.time())
+    model = svc.model_for(req)
+
+    def chunk(text, finish=None):
+        return {"id": cid, "object": "text_completion", "created": created, "model": model,
+                "choices": [{"index": 0, "text": text, "logprobs": None, "finish_reason": finish}]}
+    if echo:
+        yield chunk(echo)
+    for kind, x in svc.run(ids, False, None, max_new, req, cancel, raw=True):
+        if kind == "ping":
+            yield None
+        elif kind == "event":
+            if x.kind == "content" and x.text:
+                yield chunk(x.text)
+        else:
+            yield chunk("", {"cancel": "stop"}.get(x["finish"], x["finish"]))
+            if usage_chunk:
+                pt = x.get("prompt_tokens", len(ids))
+                last = {"id": cid, "object": "text_completion", "created": created, "model": model, "choices": [],
+                        "usage": {"prompt_tokens": pt, "completion_tokens": x["completion_tokens"],
+                                  "total_tokens": pt + x["completion_tokens"],
+                                  "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0}}}
+                if x.get("timings"):
+                    last["timings"] = x["timings"]          # llama.cpp's field, as /v1/chat/completions
+                yield last
+
+
+def completions_collect(chunks) -> dict:
+    """The one `text_completion` reply of a request that is not streamed."""
+    text, finish, usage, timings, head = [], None, None, None, None
+    for c in chunks:
+        if c is None:
+            continue
+        head = head or c
+        for choice in c["choices"]:
+            text.append(choice.get("text") or "")
+            finish = choice.get("finish_reason") or finish
+        usage = c.get("usage") or usage
+        timings = c.get("timings") or timings
+    out = {"id": head["id"], "object": "text_completion", "created": head["created"], "model": head["model"],
+           "choices": [{"index": 0, "text": "".join(text), "logprobs": None, "finish_reason": finish}], "usage": usage}
+    if timings:
+        out["timings"] = timings
     return out
 
 
@@ -7173,7 +7294,7 @@ def make_handler(svc: Service):
                 return
             reserved = False
             try:
-                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                if path in ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses"):
                     reserved = svc.reserve_inference()
                     if reserved is None:
                         error = {"type": "server_error", "code": "server_draining",
@@ -7272,7 +7393,7 @@ def make_handler(svc: Service):
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
-                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                if path in ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/responses":
                     self._responses(req)
@@ -7287,6 +7408,8 @@ def make_handler(svc: Service):
                     self._json(code, body)
                 elif path == "/v1/chat/completions":
                     self._openai(req)
+                elif path == "/v1/completions":
+                    self._completions(req)
                 elif path == "/v1/messages":
                     self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
@@ -7584,6 +7707,10 @@ def make_handler(svc: Service):
                             delta = item["choices"][0]["delta"]
                             content, reasoning = delta.get("content", ""), delta.get("reasoning_content", "")
                             usage, timings = item.get("usage"), item.get("timings")
+                        elif api == "completions":
+                            choices = item.get("choices") or [{}]
+                            content, reasoning = choices[0].get("text") or "", ""
+                            usage, timings = item.get("usage"), item.get("timings")
                         elif api == "responses":
                             kind = item["type"]
                             content = item["delta"] if kind == "response.output_text.delta" else ""
@@ -7668,6 +7795,11 @@ def make_handler(svc: Service):
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
+            self._stream_out(chunks, cancel)
+
+        def _stream_out(self, chunks, cancel):
+            """Sends `chunks` (None: a keep-alive) as server-sent events, then [DONE]; the ways it can end early are told to
+            the client as a stream's last event (the headers are out) - /v1/chat/completions and /v1/completions."""
             self._sse()
             try:
                 for c in chunks:
@@ -7697,6 +7829,48 @@ def make_handler(svc: Service):
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+
+        def _completions(self, req):
+            """POST /v1/completions: OpenAI's text completion - the `prompt` as it is (no chat template), the same sampling
+            fields, stop strings and logit_bias as /v1/chat/completions, stream (and stream_options.include_usage) or not.
+            Not supported (a 400): n / best_of above 1, suffix, logprobs and a batch of prompts."""
+            req = svc.with_shared(req, "openai")
+            n_vocab = len(getattr(svc.tok, "tokens", ())) or None
+            bias_api.normalize(req.get("logit_bias"), n_vocab)
+            for key in ("n", "best_of"):
+                if req.get(key) not in (None, 1):
+                    raise ValueError(f"{key}: only 1 is supported")
+            if req.get("suffix"):
+                raise ValueError("suffix is not supported")
+            if req.get("logprobs") is not None and req.get("logprobs") is not False:
+                raise ValueError("logprobs is not supported on /v1/completions; /v1/chat/completions has it")
+            if req.get("echo") not in (None, True, False):
+                raise ValueError("echo must be true or false")
+            opts = req.get("stream_options")
+            if opts is not None and not isinstance(opts, dict):
+                raise ValueError("stream_options must be an object")
+            include_usage = isinstance(opts, dict) and opts.get("include_usage") is True
+            ids = completion_prompt(svc, req)
+            svc.load()
+            asked = req.get("max_tokens")
+            if asked is not None and (isinstance(asked, bool) or not isinstance(asked, int)):
+                raise ValueError("max_tokens must be a whole number")
+            bias_api.validate_request(req, svc.engine, n_vocab)
+            stop_strings(req)                                 # a bad stop is a 400 before anything is sent
+            check_request_sampling(req)                       # ... and a sampling field of the wrong type
+            echo = None
+            if req.get("echo") is True:
+                echo = req["prompt"] if isinstance(req["prompt"], str) else svc.tok.decode(ids)
+                if isinstance(req["prompt"], list) and len(req["prompt"]) == 1 and isinstance(req["prompt"][0], str):
+                    echo = req["prompt"][0]
+            cancel = threading.Event()
+            self._watch_client(cancel)
+            max_new = svc.fit_max_new(ids, asked or 0)
+            chunks = completions_chunks(svc, req, ids, max_new, cancel, include_usage or not req.get("stream"), echo)
+            chunks = self._capture(chunks, "completions")
+            if not req.get("stream"):
+                return self._json(200, completions_collect(chunks))
+            self._stream_out(chunks, cancel)
 
         def _responses_ready(self, req, events):
             """Send a finished Responses result that did not run on the engine."""
@@ -9327,7 +9501,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.start_idle_unload()
     svc.start_vision_idle()
     here = "[::1]" if a.host == "::" else "127.0.0.1" if a.host in ("0.0.0.0", "") else f"[{a.host}]" if ":" in a.host else a.host
-    print(f"ready: http://{here}:{bound_port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
+    print(f"ready: http://{here}:{bound_port}/v1  (OpenAI: /v1/chat/completions and /v1/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
           f"{', API key required' if svc.api_key else ''})", flush=True)
     print(f"       open http://{here}:{bound_port}/ in a browser to chat; close this window to stop the model", flush=True)

@@ -2261,6 +2261,22 @@ bool q36_batch_sample_on() {   // STRATA_Q36_BATCH_SAMPLE=1: in a --batch --batc
     static const bool on = [] { const char* e = std::getenv("STRATA_Q36_BATCH_SAMPLE"); return !(e && e[0] == '0'); }();   // (default on; 0: the old one-row step)
     return on;
 }
+// ---- LANE SOLO (begin): a lone request on a --batch N engine
+// STRATA_Q36_SOLO_WINDOW=1: a request that runs with no slot decoding (the solo path of a --batch N engine) uses the single-session
+// speculative windows (the graph form, with the sampled / penalised draw on the host) and the single-session product choice, so it
+// runs at the single-stream speed whatever its sampler.  0 (default): the solo path of a batch engine is as before (greedy drafts
+// through the eager step, a sampled request one token a step).
+bool q36_solo_window_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_SOLO_WINDOW"); return e && e[0] != '0' && e[0] != '\0'; }();
+    return on;
+}
+// STRATA_Q36_RNG_HAND=1: a sampled request that the server stops to continue it in a batch slot hands its random stream over (the
+// state after the draws of the tokens it showed), so the slot goes on with the next draw instead of starting the stream again.
+bool q36_rng_hand_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_RNG_HAND"); return e && e[0] != '0' && e[0] != '\0'; }();
+    return on;
+}
+// ---- LANE SOLO (end)
 bool q36_spec_check_on() {   // STRATA_Q36_SPEC_CHECK=1: compare each window's rows with the host's top M (a debug aid)
     static const bool on = [] { const char* e = std::getenv("STRATA_Q36_SPEC_CHECK"); return e && e[0] != '0' && e[0] != '\0'; }();
     return on;
@@ -4046,6 +4062,10 @@ struct Engine {
             // single-session stays on W4 (FP16 x Q8_1) at <= 9 cols for parity and higher throughput without pack16 overhead.
             const bool want_w4a16 = e ? (e[0] == '1') : (n_sess > 1 || (et && *et));
             w4a16 = (m->w4_mats > 0 || draft_may_w4) && want_w4a16;
+            // LANE SOLO: with neither STRATA_Q36_W4A16 nor STRATA_Q36_W4H_T set, a single-session engine runs W4 at every width (the batch
+            // engine's auto-hybrid takes 9..16 columns): solo_mode takes that.  With either set the batch values stand (the one-token
+            // decode graph is shared between the modes, so they must not differ at 1 column).
+            solo_w4a16 = (e || (et && *et)) ? w4a16 : false;
             if (w4a16) {
                 if (et && *et) w4h_min_t = std::max(1, std::atoi(et));
                 else if (e && e[0] == '1' && n_sess <= 1) w4h_min_t = 1;
@@ -4389,7 +4409,11 @@ struct Engine {
         q8_src = nullptr;
         return (const char*) q8 + (size_t) row0 * K::native_q8_1_bytes(n, 1);
     }
-    bool a16(const Mat& w, int T) const { return w4a16 && w.type == kW4Type && T >= w4h_min_t && T <= kGemmT; }
+    // LANE SOLO: in solo_mode the product choice is the single-session engine's (so the text is the same): W4A16 only if it was asked for
+    bool solo_w4a16 = false;
+    bool a16(const Mat& w, int T) const {
+        return (solo_mode ? solo_w4a16 : w4a16) && w.type == kW4Type && T >= w4h_min_t && T <= kGemmT;
+    }
     void pack16(const float* x, int n, int T, uint16_t* d) { strata::q36xr::w4h_pack(x, n, d, n, T, st); }
     void mmh(const Mat& w, const uint16_t* x16v, float* out, int T) {
         if (!strata::q36xr::mmvq_w4h(w.d, x16v, out, w.n_in, w.n_out, T, st)) {
@@ -7513,6 +7537,7 @@ work-group size if needed.
         if (xatt_now) xatt_catch_up_sess(cur);
         else if (xatt_ready) sess[(size_t) cur].xmir_n = std::min<int64_t>(sess[(size_t) cur].xmir_n, std::max<int64_t>(0, pos - kVerify));   // (a replayed graph's cells)
         if (!use_graph) body();
+        else if (n_sess > 1) graph_run(row_graphs[{key + (xatt_now ? 1000000 : 0), cur}], body);   // (LANE SOLO: the graph holds the session's pointers)
         else graph_run(row_graphs[{key + (xatt_now ? 1000000 : 0)}], body);
         xatt_now = false;
     }
@@ -8418,7 +8443,10 @@ work-group size if needed.
     /// the T0 redo rows, the D - 1 chained drafts (each draft's pick fed back on the device as the next row's token, its position
     /// advanced there), each pick written into the verify window's token row, then the verify window.  Graph C (per kept count):
     /// the commit and hlast.  The same kernels on the same rows as the eager form, so the same picks.
-    bool spec_graphs() const { return use_graph && mtp_graph && n_sess == 1 && !main_hybrid; }
+    // LANE SOLO: on a --batch N engine the graph windows are also valid for the one request that runs alone (`solo_mode`, set by
+    // Serve::request when no slot decodes and STRATA_Q36_SOLO_WINDOW=1): their graphs are keyed by the session (run_graph_key).
+    bool solo_mode = false;
+    bool spec_graphs() const { return use_graph && mtp_graph && (n_sess == 1 || solo_mode) && !main_hybrid; }
     /// Whether a window may return its rows' top candidates for the host to draw (STRATA_Q36_SPEC_PEN / _SAMPLE): the
     /// graph form of the verify window only (one session, no hybrid experts, a window that fits kGemmT rows).
     /// Whether a batch window (--batch N --batch-mtp) may return its rows' top candidates for the host to draw
@@ -9105,6 +9133,9 @@ work-group size if needed.
     void warmup() {
         const auto t0 = Clock::now();
         warming = true;
+        // LANE SOLO: warm the single-session windows of session 0 too (the other sessions record theirs at their first solo use)
+        struct SoloWarm { Engine& e; ~SoloWarm() { e.solo_mode = false; } } solo_warm{*this};
+        solo_mode = n_sess > 1 && mtp_d > 0 && q36_solo_window_on();
         const int32_t filler = 198;   // a newline: any token works
         // #4708: the prompt chunk may equal or exceed the context (--context 2048 with a 2048-token chunk): warm only cells that
         // exist, and start the small-prompt, decode and speculative probes in a fresh sequence instead of appending past the cache.
@@ -9574,6 +9605,8 @@ struct Slot {
     std::vector<int32_t> drafts;  // --batch-mtp: the MTP block's chained proposals for the tokens after `x`
     int depth = 2;                // ... how many the next window takes (follows what was accepted)
     long long offered = 0, accepted = 0;
+    bool ignore_eos = false;   // LANE SOLO: the request's ignore_eos=1: an end-of-answer token is a token like another
+    bool eos(int t) const { return !ignore_eos && is_eos(t); }
     strata::qwen35::SpecPlan plan;   // STRATA_Q36_BATCH_SAMPLE: plan.ok = a request that needs the host's draw drafts through the window's top-M rows
     /// Whether the slot takes drafts in a --batch-mtp window: it decodes greedily on the device, or its rows' candidates serve it.
     bool drafts_ok() const { return !smp.needs_logits() || plan.ok; }
@@ -9595,6 +9628,30 @@ struct Serve {
     std::vector<Slot> slots;
     int n_active = 0;
     std::vector<float> lg;
+    // LANE SOLO (STRATA_Q36_RNG_HAND): the random streams of sampled requests the server stopped to continue them in a batch slot.
+    // `ids` = the request's prompt + every token it showed (what the server sends back as the slot's prompt), `rng` = the stream
+    // after the draws of those tokens.  The BGEN that sends exactly those ids with the same sampler takes it; at most 4 are kept.
+    struct RngHand { std::vector<int32_t> ids; Sampling smp; std::mt19937_64 rng; };
+    std::deque<RngHand> rng_hand;
+    static bool same_sampler(const Sampling& a, const Sampling& b) {
+        return a.temperature == b.temperature && a.top_p == b.top_p && a.min_p == b.min_p && a.repeat == b.repeat &&
+               a.freq == b.freq && a.present == b.present && a.top_k == b.top_k && a.last_n == b.last_n && a.seed == b.seed;
+    }
+    bool take_rng_hand(const std::vector<int32_t>& ids, const Sampling& smp, std::mt19937_64& rng) {
+        for (auto it = rng_hand.begin(); it != rng_hand.end(); ++it) {
+            if (it->ids == ids && same_sampler(it->smp, smp)) {
+                rng = it->rng;
+                rng_hand.erase(it);
+                return true;
+            }
+        }
+        return false;
+    }
+    void put_rng_hand(const std::vector<int32_t>& ids, const Sampling& smp, const std::mt19937_64& rng) {
+        for (auto it = rng_hand.begin(); it != rng_hand.end();) it = (it->ids == ids) ? rng_hand.erase(it) : it + 1;
+        rng_hand.push_back(RngHand{ids, smp, rng});
+        while (rng_hand.size() > 4) rng_hand.pop_front();
+    }
     // decode windows of the other slots between two chunks of a prompt read: STRATA_Q36_READ_WINDOWS (default 1; a chunk
     // takes ~0.15 s at 512 tokens, a window ~0.012 s: more windows give the decoding slots more of the time a read takes)
     int read_windows = 1;
@@ -9763,7 +9820,7 @@ struct Serve {
             if (cand) {
                 pk = cpicks;
                 a = strata::qwen35::batch_slot_step(sl.smp, sl.plan, sl.hist, sl.drafts, E.rows_cand(r0), sl.rng, cpicks, sl.stop,
-                                                    sl.produced, sl.max_new, ss.pos, E.ctx, [](int t) { return is_eos(t); });
+                                                    sl.produced, sl.max_new, ss.pos, E.ctx, [&sl](int t) { return sl.eos(t); });
                 y0 = cpicks[0];
             } else {
                 if (sl.smp.needs_logits()) {   // (a request the candidates cannot serve: one row, the whole row to the host)
@@ -9772,7 +9829,7 @@ struct Serve {
                 }
                 // draft a + 1 stands when the pick before it is that draft (ss.pos: the position of the slot's next token: the
                 // window did not move it)
-                for (int y = y0; a < D && y == sl.drafts[(size_t) a] && !is_eos(y) && !sl.stop && sl.produced + a + 2 <= sl.max_new &&
+                for (int y = y0; a < D && y == sl.drafts[(size_t) a] && !sl.eos(y) && !sl.stop && sl.produced + a + 2 <= sl.max_new &&
                                  ss.pos + a + 3 <= E.ctx; y = E.rows_pick[r0 + a])
                     ++a;
             }
@@ -9790,7 +9847,7 @@ struct Serve {
                 std::printf("BT %d %d\n", b, y);
                 ++sl.produced;
                 sl.hist.push_back(y);
-                const char* fin = is_eos(y) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+                const char* fin = sl.eos(y) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
                                   : ss.pos + j + 2 > E.ctx ? "length" : nullptr;
                 if (fin) {
                     if (btime && bt_n > 0)
@@ -9914,7 +9971,7 @@ struct Serve {
             std::printf("BT %d %d\n", b, y);
             ++sl.produced;
             sl.hist.push_back(y);
-            const char* fin = is_eos(y) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+            const char* fin = sl.eos(y) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
                               : ss.pos + 1 > E.ctx ? "length" : nullptr;
             if (fin) {
                 std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms_since(sl.t0));
@@ -9984,6 +10041,7 @@ struct Serve {
         }
         const long long max_new = std::strtoll(p, &p, 10);
         Sampling smp;
+        bool ignore_eos = false;   // LANE SOLO: ignore_eos=1 (the server sends it for a request that asked: a benchmark's fixed length)
         std::vector<uint64_t> img_keys;
         for (;;) {
             while (*p == ' ') ++p;
@@ -10003,6 +10061,7 @@ struct Serve {
             else if (key == "penalty_freq") smp.freq = std::strtof(v, nullptr);
             else if (key == "penalty_present") smp.present = std::strtof(v, nullptr);
             else if (key == "seed") smp.seed = std::strtoull(v, nullptr, 10);
+            else if (key == "ignore_eos") ignore_eos = std::atoi(v) != 0;
             else if (key == "img_keys") {
                 const char* q = v;
                 img_keys.clear();
@@ -10130,6 +10189,14 @@ struct Serve {
         }
         if (geni) E.set_images(ir.rows, ir.cell_row, ir.mrope, (int64_t) ids.size(), ir.delta);
         else E.clear_images();
+        // LANE SOLO: a request on a --batch N engine with no slot decoding runs as the single-session engine would (graph windows,
+        // its product choice) - see Engine::solo_mode.  Not for an admission, and not for a request that starts beside decoding
+        // slots (n_active does not change while this call runs: its prompt read only polls BSTOP / BYIELD).
+        struct SoloGuard {
+            Engine& e;
+            ~SoloGuard() { e.solo_mode = false; }
+        } solo_guard{E};
+        E.solo_mode = !adm && n_active == 0 && E.n_sess > 1 && E.mtp_d > 0 && q36_solo_window_on();
         const auto t0 = Clock::now();
         const int64_t fresh = (int64_t) (ids.size() - reuse);
         bool cancelled = false;
@@ -10195,6 +10262,10 @@ struct Serve {
             return;
         }
         std::mt19937_64 rng(smp.seed);
+        // LANE SOLO: the slot goes on with the stream of the request it takes over (else it starts the stream again, as before)
+        const bool hand_on = q36_rng_hand_on() && smp.temperature > 0.f && E.n_sess > 1;
+        bool took_hand = false;
+        if (adm && hand_on) took_hand = take_rng_hand(ids, smp, rng);
         std::vector<int32_t> hist = ids;
         const auto d0 = Clock::now();
         long long produced = 0, offered = 0, accepted = 0;
@@ -10220,6 +10291,11 @@ struct Serve {
         int32_t picks[16];
         bool decided = false;   // nx is the token a verify window drew: the loop's own draw below would be a second one
         bool mid_draft_stop = false;
+        // LANE SOLO: the stream before the last verify window and how many of the window's tokens were shown (see the end of the loop)
+        const bool keep_win = hand_on && !adm && spec && plan.ok && plan.sampled;
+        std::mt19937_64 rng_pre;
+        bool win_valid = false;
+        long long win_shown = 0;
         int64_t last_ckpt_blk = 0;
         int nx = smp.needs_logits() ? -1 : E.greedy();
         if (adm) {
@@ -10230,7 +10306,7 @@ struct Serve {
             std::printf("T %d\n", nx);
             ++produced;
             hist.push_back(nx);
-            const char* fin = is_eos(nx) ? "stop" : stop.load() ? "cancel" : max_new <= 1 ? "length"
+            const char* fin = (!ignore_eos && is_eos(nx)) ? "stop" : stop.load() ? "cancel" : max_new <= 1 ? "length"
                               : E.pos + 1 > E.ctx ? "length" : nullptr;
             const bool cont = fin == nullptr;
             std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
@@ -10250,6 +10326,7 @@ struct Serve {
                 sl.produced = 1;
                 sl.max_new = max_new;
                 sl.smp = smp;
+                sl.ignore_eos = ignore_eos;
                 sl.rng = rng;
                 sl.hist = hist;
                 sl.t0 = Clock::now();
@@ -10259,17 +10336,20 @@ struct Serve {
             std::printf("BADM %d %d\n", slot, cont ? 1 : 0);
             std::fflush(stdout);
             std::fprintf(stderr, "strata batch: slot %d takes a prompt of %zu tokens = %zu reused + %lld read in %.0f ms (%.1f "
-                         "tok/s)%s\n", slot, ids.size(), reuse, (long long) fresh, prompt_ms,
-                         prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, cont ? "" : ", done at once");
+                         "tok/s)%s%s\n", slot, ids.size(), reuse, (long long) fresh, prompt_ms,
+                         prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, cont ? "" : ", done at once",
+                         took_hand ? ", random stream taken over from the solo request" : "");
             return;
         }
         for (;;) {
             if (smp.needs_logits() && !decided) {
                 E.host_logits(lg);
                 nx = sample(lg, smp, hist, rng);
+                win_valid = false;   // (a plain draw after the window: the stream stands as the shown tokens left it)
             }
             decided = false;
             auto emit = [&](int t) {   // false: the answer ends here
+                ++win_shown;
                 /*
                 DPCT1040:44: Use sycl::stream instead of printf if your code is
                 used on the device.
@@ -10279,7 +10359,7 @@ struct Serve {
                 ++produced;
                 hist.push_back(t);
                 client_live.push_back(t);
-                if (is_eos(t)) { finish = "stop"; return false; }
+                if (!ignore_eos && is_eos(t)) { finish = "stop"; return false; }
                 if (produced >= max_new) return false;
                 if (stop.load()) { finish = "cancel"; return false; }
                 return true;
@@ -10289,6 +10369,7 @@ struct Serve {
             const int64_t left = max_new - produced;
             if (spec && n_active == 0 && left >= 1 && E.pos + 2 <= E.ctx) {
                 int D = 0, a = 0;
+                if (keep_win) { rng_pre = rng; win_valid = true; win_shown = 0; }
                 const int max_drafts = (int) std::min<int64_t>(left, E.ctx - E.pos - 1);
                 look.sync(ss.live);
                 look.propose(nx, std::min(E.lookup_depth(), max_drafts), given);   // (every row of a copy stands: the full depth at any context length)
@@ -10352,6 +10433,18 @@ struct Serve {
             if (!smp.needs_logits()) nx = E.greedy();
         }
         E.sess[(size_t) E.cur].pos = E.pos;
+        // LANE SOLO: a sampled request the server stopped (to continue it in a slot) leaves its stream for that slot.  A verify window
+        // draws its rows in order and emits the drafts it kept one by one, so the draws of the tokens shown are the first
+        // `win_shown` of the window (a stop mid-window, or the cancel that keeps only row 0, drew more): the stream is the one before
+        // the window advanced by those.  After a plain draw (win_valid false) `rng` is exact: one draw a token.
+        if (hand_on && !adm && std::strcmp(finish, "cancel") == 0) {
+            std::mt19937_64 hr = rng;
+            if (win_valid) {
+                hr = rng_pre;
+                strata::qwen35::advance_draws(hr, win_shown);
+            }
+            put_rng_hand(client_live, smp, hr);
+        }
         const double decode_ms = ms_since(d0);
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
                     decode_ms, finish, accepted, offered, reuse, (long long) fresh);

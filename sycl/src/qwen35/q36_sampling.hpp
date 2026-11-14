@@ -114,6 +114,15 @@ inline int draw(const std::vector<Cand>& top, const Sampling& s, std::mt19937_64
     return top[keep - 1].id;
 }
 
+/// `rng` after `n` more draws.  Every draw of the sampler is one call of a uniform_real_distribution<double> on the engine, and a
+/// draw's range does not change how many outputs it takes, so n calls of any such distribution advance the stream as n draws do.
+/// For a request that goes from the single-session path to a batch slot: its stream must stand after the draws of the tokens it
+/// showed (a verify window may have drawn rows past them).
+inline void advance_draws(std::mt19937_64& rng, long long n) {
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    for (long long i = 0; i < n; ++i) (void) u(rng);
+}
+
 /// The plain path: one token from a full logit row (it is changed: the penalties are applied in place).  A temperature of 0 or
 /// less is the argmax (the lowest id on a tie).
 inline int sample_row(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
