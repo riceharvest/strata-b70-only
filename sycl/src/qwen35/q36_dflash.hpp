@@ -25,6 +25,8 @@
 #include <string>
 #include <vector>
 
+#include "q36_dtree.hpp"
+
 namespace strata::q36df {
 
 constexpr int kN = 5120, kFF = 17408, kLayers = 5, kHeads = 32, kKvHeads = 8, kHd = 128;
@@ -74,6 +76,10 @@ void top2(sycl::queue& q, const uint64_t* part, int nch, int rows, const int32_t
 /// hp [nb x 8][256], cand / unary [nb x 7][16]; block b walks from meta anchor b and writes out_tok / out_prob [b][7]
 void selector_walk(sycl::queue& q, const float* hp, const int32_t* cand, const float* unary, const uint16_t* pred, const uint16_t* succ, const int32_t* meta,
                    int32_t* out_tok, float* out_prob, int nb = 1);
+/// STRATA_Q36_DFLASH_TREE: the host image of everything the tree builder scores with (q36_dtree.hpp's Gather), one block: anchor, the selector's picks, candidates,
+/// raw logits, hp rows 1 .. 7, the bf16 pred_cb rows of the possible previous tokens and the succ_cb rows of every candidate.
+void gather_tree(sycl::queue& q, const int32_t* out_tok, const int32_t* cand, const float* unary, const float* hp, const uint16_t* pred, const uint16_t* succ,
+                 const int32_t* meta, q36dt::Gather* g);
 }   // namespace k
 
 /// The target's pieces the drafter borrows (the engine fills them).
@@ -144,6 +150,14 @@ public:
     void run(sycl::queue& q, int n);
     const int32_t* out_tokens() const { return out_tok_; }   ///< device [nb][7]
     const float* out_probs() const { return out_prob_; }     ///< device [7]
+    // ---- STRATA_Q36_DFLASH_TREE (the engine turns it on; off: nothing below runs)
+    /// On: a single block pass also gathers the scores of its candidates (tree_gather(), device) for the host's tree builder.  Allocates once.
+    bool enable_tree(sycl::queue& q, bool on);
+    bool tree_on() const { return tree_ && tgath_ != nullptr; }
+    const q36dt::Gather* tree_gather() const { return tgath_; }   ///< device; valid after run() of a single block with the tree on
+    /// After a tree verify of `n_keep` rows whose row r (the window's DFS order) was captured at position p0 + r: the kept rows path[k] (DFS rows, path[0] = 0) move to
+    /// position p0 + k of the slot's staging ring (in order, on q).  Rows the capture wrote for rejected nodes are left (never read: the host mirror ends at p0 + n_keep).
+    void compact_stage(sycl::queue& q, int64_t p0, const int32_t* path, int n_keep, int slot = 0);
     /// Debug: the last block's intermediates and candidates (waits).
     bool debug_last(sycl::queue& q, Debug& d);
     /// Debug: staging rows of positions [p0, p0 + n) as bf16 [n][5 x kN] (waits); false when a position is not in the ring.
@@ -211,6 +225,8 @@ private:
     uint64_t* top_part_ = nullptr;
     float* hn_ = nullptr;                      // the head's input rows [kMaxBlocks x 7][kN]
     int n_slots_ = 1;
+    bool tree_ = false;
+    q36dt::Gather* tgath_ = nullptr;           // device image for the tree builder (STRATA_Q36_DFLASH_TREE)
     int32_t *cand_ = nullptr, *out_tok_ = nullptr;
     float *unary_ = nullptr, *out_prob_ = nullptr, *dbg_embed_ = nullptr;
     int nch_ = 0;

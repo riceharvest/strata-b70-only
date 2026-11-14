@@ -3645,6 +3645,11 @@ struct Engine {
     bool df_warm_pending = false;   // STRATA_Q36_DFLASH_WARM: warm the drafter's graphs once the engine is up (use_graph is decided in init)
     bool df_keep_mtp = false;   // ... but it still reads the window's rows (its cache stays whole) while the adaptive fallback to MTP is armed
     std::map<int, dpct::experimental::command_graph_exec_ptr> df_graphs;   // by the number of context rows the pass takes
+    // ---- DFLASH TREE (STRATA_Q36_DFLASH_TREE=1, default off): the window verifies a TREE of the drafter's candidates (q36_dtree.hpp) instead of its one chain.
+    bool df_tree = false;
+    int df_tree_rows = 16;               // STRATA_Q36_DFLASH_TREE_NODES draft nodes + the root (default 15 + 1)
+    float df_tree_minlp = -3.912023f;    // STRATA_Q36_DFLASH_TREE_MINP (default 0.02): a pending node below this cumulative probability is not added
+    strata::q36dt::Gather* df_tg_h = nullptr;   // pinned host image of the last draft's scores (dflash_draft fills it when the tree is on)
     /// DFlash drafts are usable for a step now (single session, graphs, no pictures).
     bool df_on() const { return df != nullptr && df_cap && n_sess == 1 && spec_graphs() && !main_hybrid && !vision && !attn_head; }
     bool df_batch = false;      // STRATA_Q36_DFLASH_BATCH=1 with --batch N --batch-mtp: the slots' windows take the drafter's block, one pass for all the slots
@@ -3688,6 +3693,7 @@ struct Engine {
         const int n = df->prepare(*st, pos, x_tok);
         graph_run(df_graphs[n], [&] { df->run(*st, n); });
         int32_t h[strata::q36df::kDrafts];
+        if (df_tree && df_tg_h != nullptr && df->tree_on()) CK(DPCT_CHECK_ERROR(st->memcpy(df_tg_h, df->tree_gather(), sizeof(strata::q36dt::Gather))));   // (in order: before the wait)
         CK(DPCT_CHECK_ERROR(st->memcpy(h, df->out_tokens(), sizeof(h)).wait()));
         out.assign(h, h + D);
         df->dump_step(*st, pos, x_tok);
@@ -9042,6 +9048,138 @@ work-group size if needed.
         after_rows(a + 1);
         return a;
     }
+    /// DFLASH TREE: whether this step may verify the drafter's tree: the switch, the drafter's gather, the tree verify's own conditions (as tree_ok: the dense GDN decode
+    /// kernels, the speculative graphs) and, for a sampled request, the candidate kernels.
+    bool dtree_ok(int max_drafts, bool sampled) const {
+        return df_tree && df != nullptr && df->tree_on() && df_tg_h != nullptr && df_on() && tree_ok(max_drafts) && (!sampled || sp_cand != nullptr);
+    }
+    /// The rows a tree window may have this step (as spec_step_tree: the attention's scratch caps a window of rows) and the draft budget.
+    int dtree_rows() const {
+        const int xatt_cap = (xatt_ready && pos >= xatt_min) ? std::max(1, xls_max * 16 / strata::q36xatt::kG) : kVerify;
+        return std::min({kVerify, df_tree_rows, xatt_cap, strata::q36dt::kRows});
+    }
+    /// DFLASH TREE: the window of the drafter's tree L (q36_dtree.hpp: rows in DFS order, row 0 = x) is verified in one pass with the checkpointed GDN verify of spec_step_tree;
+    /// the accepted path is walked as there (greedy: the child that is the target's pick; sampled: the child that is the exact draw of the row, sample_window_row), the
+    /// window is compacted along it, and the drafter's staging rows follow (compact_stage: row path[k] -> position pos + k) before df_note tells it the rows stayed.
+    /// The MTP block does not draft; with the fallback armed (df_keep_mtp) it still takes the rows (hmain, fix) + (hlast, x) so its cache stays whole.
+    int spec_step_dtree(int x_tok, const std::vector<int32_t>& fix, int max_drafts, const strata::q36dt::Layout& L, int& offered_d, std::vector<int32_t>& drafts,
+                        int32_t* picks, const std::atomic<bool>* cancel, const SpecSel* sel) {
+        const int N = (int) m->g.n_embd;
+        const int T = L.T, F = (int) fix.size(), T0 = F + 1;
+        CK(DPCT_CHECK_ERROR(st->wait()));
+        if (df_keep_mtp) {
+            for (int i = 0; i < F; ++i) hpin[96 + i] = fix[(size_t) i];
+            hpin[96 + F] = x_tok;
+            hpin[1] = (int32_t) (pos - F);
+            CK(DPCT_CHECK_ERROR(st->memcpy(tok_m, hpin + 96, (size_t) T0 * 4)));
+            CK(DPCT_CHECK_ERROR(st->memcpy(pos0_m, hpin + 1, 4)));
+            float* seeds = mtp_seed();
+            if (F > 0) CK(DPCT_CHECK_ERROR(st->memcpy(seeds, hmain, (size_t) F * N * 4)));
+            CK(DPCT_CHECK_ERROR(st->memcpy(seeds + (size_t) F * N, hlast, (size_t) N * 4)));
+            run_graph_key(170000 + T0, [&] { forward_mtp(T0, pos - F, seeds, false, true); });
+        }
+        const int32_t base_rdelta = sess[(size_t) cur].rdelta;
+        hpin[40] = (int32_t) pos;
+        for (int i = 0; i < T; ++i) {
+            hpin[256 + i] = L.tok[i];
+            hpin[272 + i] = (int32_t) L.tmask[i];
+            hpin[288 + i] = base_rdelta + L.dep[i] - i;
+            hpin[304 + i] = (int32_t) L.tprev3[i];
+            hpin[320 + i] = (int32_t) L.tslot[i];
+        }
+        CK(DPCT_CHECK_ERROR(st->memcpy(tok, hpin + 256, (size_t) T * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(pos0, hpin + 40, 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(d_tmask, hpin + 272, (size_t) T * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(d_rdelta, hpin + 288, (size_t) T * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(d_tprev3, hpin + 304, (size_t) T * 4)));
+        CK(DPCT_CHECK_ERROR(st->memcpy(d_tslot, hpin + 320, (size_t) T * 4)));
+        if (sel != nullptr) {
+            sp_h[0] = sel->M;
+            CK(DPCT_CHECK_ERROR(st->memcpy(sp_m, sp_h, 4)));
+        }
+        rows_deferred = true;
+        const auto vbody = [&] {
+            tree_mode = true;
+            tree_tp0 = pos0;
+            forward(T, pos, T, true, true);
+            tree_mode = false;
+            tree_tp0 = nullptr;
+        };
+        if (sel == nullptr) run_graph_key(200000 + T, vbody);
+        else run_graph_key(210000 + T, [&] { vbody(); sp_topm(T); });
+        rows_deferred = false;
+        if (sel == nullptr) CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 64, pick, (size_t) T * 4)));
+        else CK(DPCT_CHECK_ERROR(st->memcpy(sp_h + 1, sp_rows, (size_t) T * kSpecRowWords * 4)));
+        CK(DPCT_CHECK_ERROR(st->wait()));
+        std::vector<int32_t> path = {0};
+        drafts.clear();
+        int cur_u = 0;
+        auto child_of = [&](int u, int32_t wanted) {
+            for (int i = 0; i < L.nchild[u]; ++i)
+                if (L.tok[L.child[u][i]] == wanted) return L.child[u][i];
+            return -1;
+        };
+        if (sel == nullptr) {
+            picks[0] = hpin[64];
+            int step_i = 0;
+            while (step_i < max_drafts) {
+                if (cancel != nullptr && cancel->load()) break;
+                const int match_u = child_of(cur_u, picks[step_i]);
+                if (match_u < 0) break;
+                drafts.push_back(picks[step_i]);
+                path.push_back(match_u);
+                cur_u = match_u;
+                ++step_i;
+                picks[step_i] = hpin[64 + cur_u];
+            }
+        } else {
+            if (q36_spec_check_on()) sp_check(T);
+            const strata::qwen35::Sampling& smp = *sel->s;
+            const bool pen = strata::qwen35::penalty_active(smp);
+            std::vector<int32_t> seq;
+            if (pen) {
+                const int n_tail = (int) std::min<size_t>(sel->hist->size(), (size_t) smp.last_n);
+                seq.assign(sel->hist->end() - n_tail, sel->hist->end());
+            }
+            int step_i = 0;
+            for (;;) {   // (the exact rule: the row's own draw from the target's distribution at the node; the tree only decides which child it lands in)
+                const int32_t* ids = sp_h + 1 + (size_t) cur_u * kSpecRowWords;
+                const int32_t* pen_ptr = nullptr;
+                int pen_n = 0;
+                if (pen) {
+                    const int from = std::max(0, (int) seq.size() - smp.last_n);
+                    pen_ptr = seq.data() + from;
+                    pen_n = (int) seq.size() - from;
+                }
+                picks[step_i] = strata::qwen35::sample_window_row(ids, ids + kSpecTopM, sel->M, smp, sel->kk, pen_ptr, pen_n, *sel->rng);
+                if ((cancel != nullptr && cancel->load()) || step_i >= max_drafts) break;
+                const int match_u = child_of(cur_u, picks[step_i]);
+                if (match_u < 0) break;
+                drafts.push_back(picks[step_i]);
+                path.push_back(match_u);
+                if (pen) seq.push_back(picks[step_i]);
+                cur_u = match_u;
+                ++step_i;
+            }
+        }
+        const int a = (int) drafts.size();
+        offered_d = L.spine_depth;
+        static const bool tdbg = std::getenv("STRATA_Q36_TREE_DBG") != nullptr;
+        if (tdbg) {
+            std::fprintf(stderr, "DTREE pos=%lld F=%d T=%d a=%d spine=%d depth=%d path=[", (long long) pos, F, T, a, L.spine_depth, L.max_depth);
+            for (int k = 0; k <= a; ++k) std::fprintf(stderr, "%s%d", k ? "," : "", path[(size_t) k]);
+            std::fprintf(stderr, "] tsl=[");
+            for (int i = 0; i < T; ++i) std::fprintf(stderr, "%s%u", i ? "," : "", L.tslot[i]);
+            std::fprintf(stderr, "]\n");
+        }
+        compact_tree_win(a + 1, path, false);
+        if (df != nullptr) df->compact_stage(*st, pos, path.data(), a + 1, df_slot());
+        commit_graph(a + 1);
+        df_note(pos, a + 1);
+        pos += a + 1;
+        after_rows(a + 1);
+        return a;
+    }
     int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
                   const std::atomic<bool>* cancel = nullptr, const SpecSel* sel = nullptr, const std::vector<int32_t>* given = nullptr) {
         const int N = (int) m->g.n_embd;
@@ -10359,7 +10497,7 @@ struct Serve {
         long long produced = 0, offered = 0, accepted = 0;
         int depth_cap = q36_draft_base_at(E.pos, E.mtp_d);   // (the next step's drafts: q36_next_cap)
         std::vector<int32_t> given;                // a lookup's drafts
-        long long looked = 0, look_ok = 0, df_steps = 0, df_acc = 0;
+        long long looked = 0, look_ok = 0, df_steps = 0, df_acc = 0, dt_steps = 0, dt_rows = 0, dt_nodes_acc = 0;
         DfRule dfr;   // DFLASH BLOCK
         Lookup& look = looks[s];
         const char* finish = "length";
@@ -10479,9 +10617,29 @@ struct Serve {
                 }
                 if (df_step) {
                     D = (int) given.size();
-                    E.df_skip_mtp = true;
-                    a = E.spec_step(nx, fix, D, drafts, picks, &stop, plan.ok ? &sel : nullptr, &given);
-                    E.df_skip_mtp = false;
+                    bool taken = false;
+                    if (E.dtree_ok(max_drafts, plan.ok)) {   // DFLASH TREE: the drafter's candidates as a tree (the chain is its spine); a chain alone goes the linear way
+                        strata::q36dt::Params tp;
+                        tp.max_rows = E.dtree_rows();
+                        tp.max_depth = D;
+                        tp.spine = D;
+                        tp.min_lp = E.df_tree_minlp;
+                        const auto tnodes = strata::q36dt::build(*E.df_tg_h, tp);
+                        const strata::q36dt::Layout tl = strata::q36dt::layout(tnodes);
+                        if (tl.ok && tl.T > D + 1) {
+                            int tree_off = D;
+                            a = E.spec_step_dtree(nx, fix, max_drafts, tl, tree_off, drafts, picks, &stop, plan.ok ? &sel : nullptr);
+                            taken = true;
+                            ++dt_steps;
+                            dt_rows += tl.T;
+                            dt_nodes_acc += a;
+                        }
+                    }
+                    if (!taken) {
+                        E.df_skip_mtp = true;
+                        a = E.spec_step(nx, fix, D, drafts, picks, &stop, plan.ok ? &sel : nullptr, &given);
+                        E.df_skip_mtp = false;
+                    }
                     ++df_steps;
                     df_acc += a;
                     dfr.offered += D;
@@ -10570,6 +10728,9 @@ struct Serve {
             std::fprintf(stderr, "strata serve: dflash: drafts offered a step %.2f; accepted per step: 0:%lld 1:%lld 2:%lld 3:%lld 4:%lld 5:%lld 6:%lld 7:%lld; context rows at the first block %d of %d; "
                                  "fallbacks %lld (%lld steps on the lookup / MTP path)\n", (double) dfr.offered / (double) df_steps, dfr.hist[0], dfr.hist[1], dfr.hist[2], dfr.hist[3],
                          dfr.hist[4], dfr.hist[5], dfr.hist[6], dfr.hist[7], dfr.first_rows, dfr.first_need, dfr.switches, dfr.fb_steps);
+            if (dt_steps > 0)   // DFLASH TREE
+                std::fprintf(stderr, "strata serve: dflash tree: %lld of %lld steps verified a tree, mean %.2f rows a window, %.2f drafts accepted a tree step\n", dt_steps, df_steps,
+                             (double) dt_rows / (double) dt_steps, (double) dt_nodes_acc / (double) dt_steps);
         }
     }
 
@@ -10881,6 +11042,16 @@ int strata::qwen35::run(int argc, char** argv) {
         {   // the fallback to MTP needs the MTP block's cache whole: it reads the drafter steps' rows too (a hole otherwise).  MIN_TOK = 0: off, nothing extra runs
             const char* mt = std::getenv("STRATA_Q36_DFLASH_MIN_TOK");
             E.df_keep_mtp = (mt == nullptr || mt[0] == '\0' ? 3.0 : std::atof(mt)) > 0.0;
+        }
+        if (const char* te = std::getenv("STRATA_Q36_DFLASH_TREE"); te != nullptr && std::atoi(te) != 0 && E.df_cap && !E.df_batch) {   // DFLASH TREE (single stream only)
+            if (const char* tn = std::getenv("STRATA_Q36_DFLASH_TREE_NODES"); tn != nullptr && tn[0] != '\0') E.df_tree_rows = std::max(3, std::min(16, std::atoi(tn) + 1));
+            if (const char* tp = std::getenv("STRATA_Q36_DFLASH_TREE_MINP"); tp != nullptr && tp[0] != '\0') E.df_tree_minlp = std::atof(tp) > 0.0 ? (float) std::log(std::atof(tp)) : -1.0e9f;
+            if (dflash.enable_tree(*E.st, true)) {
+                E.df_tg_h = sycl::malloc_host<strata::q36dt::Gather>(1, *E.st);
+                E.df_tree = E.df_tg_h != nullptr;
+            }
+            std::fprintf(stderr, "strata-q36: dflash tree: %s (up to %d rows a window, floor %.4f of cumulative probability); T >= 9 windows take the W4A16 products (a16), their numerics differ from the 8-row window's\n",
+                         E.df_tree ? "on" : "NOT on (no device / host memory)", E.df_tree_rows, (double) std::exp(E.df_tree_minlp));
         }
         if (!E.df_cap) std::fprintf(stderr, "strata-q36: dflash: off with --batch (STRATA_Q36_DFLASH_BATCH=1 with --batch N --batch-mtp turns it on) / --vision / hybrid experts\n");
         if (const char* dd = std::getenv("STRATA_Q36_DFLASH_DUMP"); dd != nullptr && dd[0] != '\0') {

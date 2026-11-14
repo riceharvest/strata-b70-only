@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -484,6 +485,28 @@ void selector_walk(sycl::queue& q, const float* hp0, const int32_t* cand0, const
     });
 }
 
+
+// STRATA_Q36_DFLASH_TREE: one word of the Gather image a work-item (q36_dtree.hpp: the layout).  Rows of pred_cb / succ_cb are 256 bf16 = 512 B, 4-byte aligned.
+void gather_tree(sycl::queue& q, const int32_t* out_tok, const int32_t* cand, const float* unary, const float* hp, const uint16_t* pred, const uint16_t* succ,
+                 const int32_t* meta, q36dt::Gather* g) {
+    using G = q36dt::Gather;
+    static_assert(sizeof(G) % 4 == 0 && offsetof(G, pred) % 4 == 0 && offsetof(G, succ) % 4 == 0 && offsetof(G, hp) % 4 == 0, "Gather words");
+    constexpr size_t o_tok = offsetof(G, out_tok), o_cand = offsetof(G, cand), o_un = offsetof(G, unary), o_hp = offsetof(G, hp), o_pred = offsetof(G, pred), o_succ = offsetof(G, succ);
+    q.parallel_for<Tag<20>>(sycl::range<1>(sizeof(G) / 4), [=](sycl::id<1> id) {
+        const size_t b = id[0] * 4;
+        uint32_t* dst = reinterpret_cast<uint32_t*>(g) + id[0];
+        if (b < o_tok) { *dst = (uint32_t) meta[kMetaAnchor]; return; }
+        if (b < o_cand) { const size_t i = (b - o_tok) / 4; *dst = i < (size_t) kDrafts ? (uint32_t) out_tok[i] : 0u; return; }
+        if (b < o_un) { *dst = (uint32_t) cand[(b - o_cand) / 4]; return; }
+        if (b < o_hp) { *dst = __builtin_bit_cast(uint32_t, unary[(b - o_un) / 4]); return; }
+        if (b < o_pred) { const size_t i = (b - o_hp) / 4; *dst = __builtin_bit_cast(uint32_t, hp[(i / kRank + 1) * kRank + i % kRank]); return; }
+        const bool is_pred = b < o_succ;
+        const size_t o = is_pred ? b - o_pred : b - o_succ;
+        const size_t r = o / (kRank * 2), j = (o % (kRank * 2)) / 4;
+        const int32_t tok = is_pred ? (r == 0 ? meta[kMetaAnchor] : cand[r - 1]) : cand[r];   // pred row 1 + (16 l + c) = candidate l * 16 + c; succ row = candidate r
+        *dst = *reinterpret_cast<const uint32_t*>((is_pred ? pred : succ) + (size_t) tok * kRank + 2 * j);
+    });
+}
 }   // namespace k
 
 namespace {
@@ -935,6 +958,25 @@ void Dflash::block_batch(sycl::queue& q, int nb) {
     k::top1(q, logits_, nd, hr, (nd + kTopChunk - 1) / kTopChunk, top_part_);
     k::top2(q, top_part_, (nd + kTopChunk - 1) / kTopChunk, hr, idmap, cand_, unary_);
     k::selector_walk(q, hp_y_, cand_, unary_, pred_cb_, succ_cb_, meta_, out_tok_, out_prob_, nb);
+    if (tree_ && tgath_ != nullptr && nb == 1) k::gather_tree(q, out_tok_, cand_, unary_, hp_y_, pred_cb_, succ_cb_, meta_, tgath_);
+}
+
+bool Dflash::enable_tree(sycl::queue& q, bool on) {
+    if (!on) { tree_ = false; return true; }
+    if (tgath_ == nullptr) tgath_ = static_cast<q36dt::Gather*>(sycl::aligned_alloc_device(4096, (sizeof(q36dt::Gather) + 4095) / 4096 * 4096, q));
+    if (tgath_ == nullptr) return false;
+    tree_ = true;
+    return true;
+}
+
+// the window's kept rows path[k] (DFS rows) go to position p0 + k.  path[k] >= k and rises, so copying in order never overwrites a row a later k still reads.
+void Dflash::compact_stage(sycl::queue& q, int64_t p0, const int32_t* path, int n_keep, int slot) {
+    if (stag_ == nullptr || slot < 0 || slot >= n_slots_) return;
+    uint16_t* base = stag_ + (size_t) slot * kStagElems;
+    for (int k = 1; k < n_keep; ++k) {
+        if (path[k] == k) continue;
+        q.memcpy(base + (size_t) ((p0 + k) % kRing) * (kTaps * kN), base + (size_t) ((p0 + path[k]) % kRing) * (kTaps * kN), (size_t) kTaps * kN * sizeof(uint16_t));
+    }
 }
 
 void Dflash::run(sycl::queue& q, int n) {

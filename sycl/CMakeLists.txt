@@ -341,6 +341,10 @@ add_test(NAME spec_admission_exact_top_only COMMAND ${CMAKE_COMMAND} -E env STRA
 add_executable(draft_policy_test ${STRATA_ROOT}/src/spec/draft_policy_test.cpp ${STRATA_ROOT}/src/spec/draft_policy.cpp)
 target_include_directories(draft_policy_test PRIVATE ${STRATA_ROOT}/include)
 add_test(NAME draft_policy_test COMMAND draft_policy_test)
+# Host-only test of the DFlash drafter's verify tree (q36_dtree.hpp): best-first growth, DFS layout, the 2 GDN checkpoint slots simulated.
+add_executable(dflash_tree_test ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/dflash_tree_test.cpp)
+target_include_directories(dflash_tree_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
+add_test(NAME dflash_tree_test COMMAND dflash_tree_test)
 
 # The kernel parity programs, tests and benches run on the card. Each one compiles its own device code, which is most of a
 # full build's time: they are built on request (-DSTRATA_SYCL_PARITY=ON, or build.sh with a target name after configuring with it).

@@ -551,6 +551,85 @@ void batch_vs_singles(Dflash& d) {
     sycl::free(dpos, *g_q);
 }
 
+// STRATA_Q36_DFLASH_TREE: the gather image against the buffers it copies, the host's re-computation of the selector against the device's walk (the same 7 picks and
+// probabilities: it proves the host scores the tree with the device's formula), the tree built from it.
+void test_tree_gather(Dflash& d, const std::vector<int32_t>& tok, const std::vector<float>& pr, const Debug& dbg) {
+    namespace dt = strata::q36dt;
+    check("tree gather: switched on, image allocated", d.tree_on(), "");
+    std::vector<char> gb(sizeof(dt::Gather));
+    g_q->memcpy(gb.data(), d.tree_gather(), gb.size()).wait();
+    const dt::Gather& g = *reinterpret_cast<const dt::Gather*>(gb.data());
+    bool ok = g.anchor == 4242;
+    for (int l = 0; l < kDrafts; ++l) ok = ok && g.out_tok[l] == tok[l];
+    ok = ok && std::memcmp(g.cand, dbg.cand.data(), sizeof g.cand) == 0 && std::memcmp(g.unary, dbg.unary.data(), sizeof g.unary) == 0;
+    check("tree gather: anchor, picks, candidates, logits", ok, ok ? "" : fmt("anchor %.0f first pick %.0f vs %.0f", (double) g.anchor, (double) g.out_tok[0], (double) tok[0]));
+    // pred / succ rows: the pack's tensors, row by row
+    const uint16_t* pc = static_cast<const uint16_t*>(d.tensor("pred_cb"));
+    const uint16_t* sc = static_cast<const uint16_t*>(d.tensor("succ_cb"));
+    size_t bad = 0;
+    std::vector<uint16_t> row(kRank);
+    for (int r = 0; r < dt::kPredRows; ++r) {
+        const int32_t id = r == 0 ? g.anchor : g.cand[(r - 1) / dt::kTopK][(r - 1) % dt::kTopK];
+        g_q->memcpy(row.data(), pc + (size_t) id * kRank, kRank * 2).wait();
+        bad += std::memcmp(row.data(), g.pred[r], kRank * 2) != 0;
+    }
+    for (int l = 0; l < kDrafts; ++l) for (int c = 0; c < dt::kTopK; ++c) {
+        g_q->memcpy(row.data(), sc + (size_t) g.cand[l][c] * kRank, kRank * 2).wait();
+        bad += std::memcmp(row.data(), g.succ[l][c], kRank * 2) != 0;
+    }
+    check("tree gather: pred_cb / succ_cb rows", bad == 0, fmt("%.0f of %.0f rows differ", (double) bad, (double) (dt::kPredRows + kDrafts * dt::kTopK)));
+    // the host's walk over the gather = the device's walk
+    int row_i = 0, bad_pick = 0;
+    double perr = 0;
+    for (int l = 0; l < kDrafts; ++l) {
+        float s[dt::kTopK];
+        dt::scores(g, l, row_i, s);
+        int bj = 0;
+        for (int c = 1; c < dt::kTopK; ++c) if (s[c] > s[bj]) bj = c;
+        double den = 0;
+        for (int c = 0; c < dt::kTopK; ++c) den += std::exp((double) s[c] - (double) s[bj]);
+        bad_pick += g.cand[l][bj] != g.out_tok[l];
+        perr = std::max(perr, std::fabs(1.0 / den - (double) pr[(size_t) l]));
+        row_i = 1 + l * dt::kTopK + bj;
+    }
+    check("tree: host selector walk == the device's", bad_pick == 0 && perr < 1e-4, fmt("%.0f picks differ, prob err %.1e", (double) bad_pick, perr));
+    dt::Params p;
+    const auto nodes = dt::build(g, p);
+    const dt::Layout L = dt::layout(nodes);
+    bool spine = nodes.size() >= 8;
+    for (int i = 1; i <= kDrafts && spine; ++i) spine = nodes[(size_t) i].tok == g.out_tok[i - 1] && nodes[(size_t) i].parent == i - 1;
+    check("tree: built from the gather (spine = the walk, layout ok)", spine && L.ok && L.T == (int) nodes.size(), fmt("%.0f rows, slots %.0f", (double) nodes.size(), (double) L.slots));
+    std::printf("  tree from the random pack: %d rows (spine 7 + %d siblings / branches), checkpoint slots %d, deepest %d\n", (int) nodes.size(), (int) nodes.size() - 8, L.slots, L.max_depth);
+}
+
+// compact_stage: capture 14 distinct rows at positions that wrap the ring, keep a path, and the rows must sit at p0 + k bit for bit
+void test_compact_stage(Dflash& d) {
+    const int T = 14;
+    const int64_t p0 = kRing - 5;   // rows land in cells kRing - 5 .. kRing - 1, 0 .. 8
+    d.invalidate();
+    auto x = rvec((size_t) T * kN, 2.f);
+    float* dx = up(x);
+    int32_t* dpos = up(std::vector<int32_t>{(int32_t) p0});
+    for (int k = 0; k < kTaps; ++k) d.capture(*g_q, k, dx, T, dpos);
+    d.note_forward(p0, T);
+    g_q->wait();
+    std::vector<uint16_t> before, after;
+    const bool got0 = d.debug_stage_rows(*g_q, p0, T, before);
+    const int32_t path[6] = {0, 2, 3, 7, 8, 13};
+    d.compact_stage(*g_q, p0, path, 6);
+    g_q->wait();
+    const bool got1 = d.debug_stage_rows(*g_q, p0, T, after);
+    bool ok = got0 && got1;
+    size_t bad = 0;
+    const size_t rowe = (size_t) kTaps * kN;
+    for (int k = 0; ok && k < 6; ++k) bad += std::memcmp(after.data() + (size_t) k * rowe, before.data() + (size_t) path[k] * rowe, rowe * 2) != 0;
+    for (int r = 6; ok && r < T; ++r) bad += std::memcmp(after.data() + (size_t) r * rowe, before.data() + (size_t) r * rowe, rowe * 2) != 0;   // the rows past the kept ones stay as they were
+    check("compact_stage: kept rows at p0 + k across the ring's wrap", ok && bad == 0, fmt("%.0f rows differ", (double) bad));
+    d.invalidate();
+    sycl::free(dx, *g_q);
+    sycl::free(dpos, *g_q);
+}
+
 int whole(bool bench) {
     Bench* b = new Bench;
     std::string err;
@@ -578,6 +657,7 @@ int whole(bool bench) {
         idmap = nullptr;
     };
     b->d.set_hooks(*g_q, hk);
+    b->d.enable_tree(*g_q, true);   // the tree gather runs in this block pass (checked below); switched off again before the bench
     // 100 context rows captured through capture(): x rows of every tap
     const int T = 100;
     auto x = rvec((size_t) T * kN, 2.f);
@@ -601,6 +681,9 @@ int whole(bool bench) {
                 (double) dbg.hn.size(), hmax, (double) dbg.unary[0], (double) pr[0], (int) tok[0], (int) tok[1], (int) tok[2]);
     check("whole pass: block rows finite (random pack with a sane scale)", nonfinite == 0, fmt("%.0f non-finite", (double) nonfinite));
     check("whole pass on a random pack: 7 tokens in range", ok, fmt("n = %.0f context rows, first token %.0f", (double) n, (double) tok[0]));
+    test_tree_gather(b->d, tok, pr, dbg);
+    b->d.enable_tree(*g_q, false);
+    test_compact_stage(b->d);
     if (!bench) { batch_vs_singles(b->d); return 0; }
     // bytes a pass reads: the block's weights (every layer's q, o, gate, up, down, 2 kernel projections, its kv slice) + hproj; the context update's fc + kv_all
     auto w4 = [](int n_in, int n_out) { return (double) strata::q36xr::w4_bytes(n_in, n_out); };
