@@ -567,9 +567,12 @@ int whole(bool bench) {
     };
     hk.head = [&](const float* hn, int n, float* lg, int& nd, const int32_t*& idmap) {
         const int ndv = b->nd;
-        g_q->parallel_for(sycl::range<1>((size_t) n * ndv), [=](sycl::id<1> i) {   // a deterministic function of the row's first element, so the picks move with it
-            const uint64_t h = (uint64_t) i[0] * 0x9E3779B97F4A7C15ULL;
-            lg[i[0]] = ((float) ((h >> 40) & 0xFFFF) / 32768.f - 1.f) * 3.f + hn[(i[0] / ndv) * kN] * 0.01f;
+        g_q->parallel_for(sycl::range<1>((size_t) n * ndv), [=](sycl::id<1> i) {
+            // block invariant (the hash sees the row's index inside its block: a block of a batch pass gets what it gets alone) and content dependent (every logit
+            // takes one element of its own row of the final-normed rows, so the drafter's output moves the candidates)
+            const size_t row = i[0] / (size_t) ndv, col = i[0] % (size_t) ndv;
+            const uint64_t h = ((uint64_t) (row % kDrafts) * (uint64_t) ndv + col) * 0x9E3779B97F4A7C15ULL;
+            lg[i[0]] = ((float) ((h >> 40) & 0xFFFF) / 32768.f - 1.f) * 3.f + hn[row * kN + col % kN] * 0.5f;
         });
         nd = ndv;
         idmap = nullptr;
