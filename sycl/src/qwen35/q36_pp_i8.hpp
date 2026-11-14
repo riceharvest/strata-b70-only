@@ -45,4 +45,13 @@ bool gemm_w4_i8_gu_swiglu_pp2(const void* w_gate, const void* w_up,
                               void* xq8_out, float* dxT_out,
                               int n_in, int n_out, int T, void* stream);
 
+// PP3 (fatgemm-paced 256-GRF ping-pong W4I8 GEMM + fused FFN gate/up+SwiGLU+x128): gated by STRATA_Q36_PP3.
+bool pp3_enabled() noexcept;
+bool gemm_w4_i8_pp3(const void* weights, const void* xq8, const float* dxT, float* y,
+                    int n_in, int n_out, int T, void* stream);
+bool gemm_w4_i8_gu_swiglu_pp3(const void* w_gate, const void* w_up,
+                              const void* xq8_in, const float* dxT_in,
+                              void* xq8_out, float* dxT_out,
+                              int n_in, int n_out, int T, void* stream);
+
 }  // namespace strata::q36pp

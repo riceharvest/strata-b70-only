@@ -221,6 +221,8 @@ inline void apply_b70_defaults() {
         // #24: stopping prefill's early_copy at the first unpinned expert keeps FIFO ring order.  Card 2026-11-14 (served
         // UD-IQ1_S pack, caches off): default 1 of 36 pairs differs (long8), fix 36 of 36 bit-identical in 3 of 3 runs.
         {"STRATA_I24_FIX", "1"},
+        // PP3 fatgemm-ported prompt W4xI8 GEMM + fused FFN (Qwen3.8-27B).  Default off for clean A/B.
+        {"STRATA_Q36_PP3", "0"},
     };
     std::string applied;
     for (const auto& [k, v] : defaults) {

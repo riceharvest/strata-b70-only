@@ -3975,7 +3975,7 @@ struct Engine {
         x16 = dalloc_t<sycl::half>(T * (size_t)max_in);
         if (m->w4_mats > 0 || m->draft_w4 || (m->has_mtp && q36_draft_w4())) {
             const size_t base_dx = (((size_t)max_in + 127) / 128) * (size_t)((T + 127) & ~127);
-            pp_dxT = dalloc(strata::q36pp::pp2_enabled()
+            pp_dxT = dalloc((strata::q36pp::pp3_enabled() || strata::q36pp::pp2_enabled())
                                 ? std::max(base_dx * 2u, strata::q36pp::dxT_pp2_floats((int)max_in, T))
                                 : base_dx);
         }
@@ -4563,7 +4563,7 @@ struct Engine {
         if (mode <= 0 || mode == 2 || w.type != kW4Type || T <= w4_max_t() || !pp_dxT) return false;
         if (!strata::q36pp::handles_w4_i8(w.n_in, w.n_out, T)) return false;
         if (mode >= 3) return true;
-        if (strata::q36pp::pp2_enabled()) return ((int64_t)(w.n_out / 32) * ((T + 31) / 32)) >= 32;
+        if (strata::q36pp::pp3_enabled() || strata::q36pp::pp2_enabled()) return ((int64_t)(w.n_out / 32) * ((T + 31) / 32)) >= 32;
         return ((int64_t)(w.n_out / 256) * ((T + 127) / 128)) >= 16;
     }
     bool use_w4_f16(const Mat& w, int T) const {
@@ -4766,7 +4766,9 @@ struct Engine {
         if (T > kGemmT) {
             if (use_w4_i8(w, T)) {
                 ensure_pp_x128();
-                if (strata::q36pp::pp2_enabled()) {
+                if (strata::q36pp::pp3_enabled()) {
+                    if (strata::q36pp::gemm_w4_i8_pp3(w.d, q8, pp_dxT, out, w.n_in, w.n_out, T, st)) return;
+                } else if (strata::q36pp::pp2_enabled()) {
                     if (strata::q36pp::gemm_w4_i8_pp2(w.d, q8, pp_dxT, out, w.n_in, w.n_out, T, st)) return;
                 } else if (strata::q36pp::gemm_w4_i8(w.d, q8, pp_dxT, out, w.n_in, w.n_out, T, st)) {
                     return;
@@ -5544,15 +5546,23 @@ work-group size if needed.
         } else {
             prep(h, N, T, q8);
             bool did_fused_pp2 = false;
-            if (strata::q36pp::pp2_enabled() && strata::q36pp::pp2_fuse_enabled() &&
+            if ((strata::q36pp::pp3_enabled() || strata::q36pp::pp2_enabled()) && strata::q36pp::pp2_fuse_enabled() &&
                 use_w4_i8(L.ffn_gate, T) && use_w4_i8(L.ffn_up, T) && use_w4_i8(L.ffn_down, T) &&
                 pp_dxT != nullptr) {
                 ensure_pp_x128();
-                if (strata::q36pp::gemm_w4_i8_gu_swiglu_pp2(L.ffn_gate.d, L.ffn_up.d, q8, pp_dxT,
-                                                            static_cast<void*>(sg), su, N, FF, T, st)) {
+                const bool ok_gu = strata::q36pp::pp3_enabled()
+                    ? strata::q36pp::gemm_w4_i8_gu_swiglu_pp3(L.ffn_gate.d, L.ffn_up.d, q8, pp_dxT,
+                                                            static_cast<void*>(sg), su, N, FF, T, st)
+                    : strata::q36pp::gemm_w4_i8_gu_swiglu_pp2(L.ffn_gate.d, L.ffn_up.d, q8, pp_dxT,
+                                                            static_cast<void*>(sg), su, N, FF, T, st);
+                if (ok_gu) {
                     invalidate_pp();
-                    if (strata::q36pp::gemm_w4_i8_pp2(L.ffn_down.d, static_cast<const void*>(sg), su, sy,
-                                                      FF, N, T, st)) {
+                    const bool ok_down = strata::q36pp::pp3_enabled()
+                        ? strata::q36pp::gemm_w4_i8_pp3(L.ffn_down.d, static_cast<const void*>(sg), su, sy,
+                                                        FF, N, T, st)
+                        : strata::q36pp::gemm_w4_i8_pp2(L.ffn_down.d, static_cast<const void*>(sg), su, sy,
+                                                        FF, N, T, st);
+                    if (ok_down) {
                         q8_src = nullptr;
                         did_fused_pp2 = true;
                     }

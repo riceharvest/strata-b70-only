@@ -1142,12 +1142,8 @@ void gdn_ab_pp(const void* ab16, const float* h, const float* dt, const float* s
     else if (HV == 64) gdn_ab::launch_gdn_ab<4>(q, w, h, dt, ssm_a, al_out, be_out, n_in, T);
 }
 
-// ---------------------------------------------------------------------------
-// PP2: 256-GRF Card-Up Fat GEMM + Fused FFN Gate/Up+SwiGLU+QuantX128 (Xe2 BMG)
-// ---------------------------------------------------------------------------
-namespace pp2 {
-namespace {
-
+// Shared host/ESIMD helpers for PP2 and PP3
+namespace pp_util {
 struct RecipDiv {
     uint32_t d;
     uint64_t mul;
@@ -1190,6 +1186,97 @@ SYCL_ESIMD_FUNCTION inline simd<int, 32> quant_rnde32(simd<float, 32> x, float i
     r = (es::min)((es::max)(r, simd<float, 32>(-127.0f)), simd<float, 32>(127.0f));
     return convert<int>(r);
 }
+
+SYCL_ESIMD_FUNCTION inline void gu_swiglu_epilogue(
+    simd<float, 128> (&cg)[4],
+    simd<float, 128> (&cu)[4],
+    uint32_t* xq8_out,
+    uint32_t* dxT_out,
+    uint32_t lid,
+    uint32_t ri,
+    uint32_t ci,
+    uint32_t wgr,
+    uint32_t wgc,
+    uint32_t n_g_out,
+    uint32_t n_ct32,
+    uint32_t T) {
+    const uint32_t ct32_b = wgc * 4u;
+    #pragma unroll
+    for (int jt = 0; jt < 4; ++jt) {
+        const uint32_t ct32 = ct32_b + static_cast<uint32_t>(jt);
+        if (ct32 >= n_ct32) break;
+
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            simd<float, 16> vg  = cg[jt].template select<16, 1>(16 * r);
+            simd<float, 16> vu  = cu[jt].template select<16, 1>(16 * r);
+            simd<float, 16> sig = 1.0f / (1.0f + es::exp<float, 16>(-vg));
+            simd<float, 16> sw  = (vg * sig) * vu;
+            const uint32_t col32 = ci * 8u + static_cast<uint32_t>(r);
+            es::slm_block_store<float, 16>((col32 * 128u + 16u * ri) * 4u, sw, kAl16);
+            es::slm_scalar_store<float>(16384u + (col32 * 8u + ri) * 4u, hmax16_f(es::abs<float, 16>(sw)));
+        }
+        barrier();
+
+        const uint32_t col = ct32 * 32u + lid;
+        simd<uint32_t, 16> p0 = 0u, p1 = 0u;
+        float dx = 0.0f;
+        int sumx = 0;
+        if (col < T) {
+            simd<float, 8> am8 = es::slm_block_load<float, 8>(16384u + lid * 32u, kAl16);
+            const float amax   = hmax8_f(am8);
+            dx = amax / 127.0f;
+            const float inv    = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+            simd<float, 32> e0 = es::slm_block_load<float, 32>(lid * 512u + 0u,   kAl16);
+            simd<float, 32> o0 = es::slm_block_load<float, 32>(lid * 512u + 128u, kAl16);
+            simd<float, 32> e1 = es::slm_block_load<float, 32>(lid * 512u + 256u, kAl16);
+            simd<float, 32> o1 = es::slm_block_load<float, 32>(lid * 512u + 384u, kAl16);
+            simd<int, 32> qe0  = quant_rnde32(e0, inv);
+            simd<int, 32> qo0  = quant_rnde32(o0, inv);
+            simd<int, 32> qe1  = quant_rnde32(e1, inv);
+            simd<int, 32> qo1  = quant_rnde32(o1, inv);
+            sumx = hsum32_i(qe0) + hsum32_i(qo0) + hsum32_i(qe1) + hsum32_i(qo1);
+            simd<int8_t, 64> eo0, eo1;
+            eo0.template select<32, 2>(0) = convert<int8_t>(qe0);
+            eo0.template select<32, 2>(1) = convert<int8_t>(qo0);
+            eo1.template select<32, 2>(0) = convert<int8_t>(qe1);
+            eo1.template select<32, 2>(1) = convert<int8_t>(qo1);
+            p0 = eo0.template bit_cast_view<uint32_t>();
+            p1 = eo1.template bit_cast_view<uint32_t>();
+        }
+        barrier();
+
+        es::slm_block_store<uint32_t, 8>(0u    + lid * 32u, p0.template select<8, 1>(0), kAl16);
+        es::slm_block_store<uint32_t, 8>(1024u + lid * 32u, p0.template select<8, 1>(8), kAl16);
+        es::slm_block_store<uint32_t, 8>(2048u + lid * 32u, p1.template select<8, 1>(0), kAl16);
+        es::slm_block_store<uint32_t, 8>(3072u + lid * 32u, p1.template select<8, 1>(8), kAl16);
+        const uint32_t jc = lid >> 3, rc = lid & 7u;
+        es::slm_scalar_store<float>(4096u + (16u * jc + rc) * 4u, dx);
+        es::slm_scalar_store<int>(4096u + (16u * jc + 8u + rc) * 4u, sumx);
+        barrier();
+
+        uint32_t* xq_blk = xq8_out + static_cast<size_t>(ct32 * n_g_out + wgr) * 1024u;
+        uint32_t* dx_blk = dxT_out + static_cast<size_t>(ct32 * n_g_out + wgr) * 64u;
+        if (lid < 16u) {
+            simd<uint32_t, 64> out = es::slm_block_load<uint32_t, 64>(lid * 256u, kAl16);
+            es::block_store<uint32_t, 64>(xq_blk + lid * 64u, out, kAl16);
+        } else if (lid == 16u) {
+            simd<uint32_t, 64> dout = es::slm_block_load<uint32_t, 64>(4096u, kAl16);
+            es::block_store<uint32_t, 64>(dx_blk, dout, kAl16);
+        }
+        barrier();
+    }
+}
+}  // namespace pp_util
+
+// ---------------------------------------------------------------------------
+// PP2: 256-GRF Card-Up Fat GEMM + Fused FFN Gate/Up+SwiGLU+QuantX128 (Xe2 BMG)
+// ---------------------------------------------------------------------------
+namespace pp2 {
+namespace {
+using pp_util::RecipDiv;
+using pp_util::make_recip;
+using pp_util::fast_div;
 
 inline uint32_t env_pp2_wgs() noexcept {
     static const uint32_t v = []() -> uint32_t {
@@ -1578,71 +1665,8 @@ void launch_w4i8_gu_swiglu_pp2(sycl::queue& q, const uint32_t* w_gate, const uin
                     }
 
                     // Epilogue: SwiGLU + quantize_x128 (pp2 layout) per ct32 = ct32_b + jt.
-                    #pragma unroll
-                    for (int jt = 0; jt < 4; ++jt) {
-                        const uint32_t ct32 = ct32_b + static_cast<uint32_t>(jt);
-                        if (ct32 >= n_ct32) break;
-
-                        #pragma unroll
-                        for (int r = 0; r < 8; ++r) {
-                            simd<float, 16> vg  = cg[jt].template select<16, 1>(16 * r);
-                            simd<float, 16> vu  = cu[jt].template select<16, 1>(16 * r);
-                            simd<float, 16> sig = 1.0f / (1.0f + es::exp<float, 16>(-vg));
-                            simd<float, 16> sw  = (vg * sig) * vu;
-                            const uint32_t col32 = ci * 8u + static_cast<uint32_t>(r);
-                            es::slm_block_store<float, 16>((col32 * 128u + 16u * ri) * 4u, sw, kAl16);
-                            es::slm_scalar_store<float>(16384u + (col32 * 8u + ri) * 4u, hmax16_f(es::abs<float, 16>(sw)));
-                        }
-                        barrier();
-
-                        const uint32_t col = ct32 * 32u + lid;
-                        simd<uint32_t, 16> p0 = 0u, p1 = 0u;
-                        float dx = 0.0f;
-                        int sumx = 0;
-                        if (col < static_cast<uint32_t>(T)) {
-                            simd<float, 8> am8 = es::slm_block_load<float, 8>(16384u + lid * 32u, kAl16);
-                            const float amax   = hmax8_f(am8);
-                            dx = amax / 127.0f;
-                            const float inv    = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
-                            simd<float, 32> e0 = es::slm_block_load<float, 32>(lid * 512u + 0u,   kAl16);
-                            simd<float, 32> o0 = es::slm_block_load<float, 32>(lid * 512u + 128u, kAl16);
-                            simd<float, 32> e1 = es::slm_block_load<float, 32>(lid * 512u + 256u, kAl16);
-                            simd<float, 32> o1 = es::slm_block_load<float, 32>(lid * 512u + 384u, kAl16);
-                            simd<int, 32> qe0  = quant_rnde32(e0, inv);
-                            simd<int, 32> qo0  = quant_rnde32(o0, inv);
-                            simd<int, 32> qe1  = quant_rnde32(e1, inv);
-                            simd<int, 32> qo1  = quant_rnde32(o1, inv);
-                            sumx = hsum32_i(qe0) + hsum32_i(qo0) + hsum32_i(qe1) + hsum32_i(qo1);
-                            simd<int8_t, 64> eo0, eo1;
-                            eo0.template select<32, 2>(0) = convert<int8_t>(qe0);
-                            eo0.template select<32, 2>(1) = convert<int8_t>(qo0);
-                            eo1.template select<32, 2>(0) = convert<int8_t>(qe1);
-                            eo1.template select<32, 2>(1) = convert<int8_t>(qo1);
-                            p0 = eo0.template bit_cast_view<uint32_t>();
-                            p1 = eo1.template bit_cast_view<uint32_t>();
-                        }
-                        barrier();
-
-                        es::slm_block_store<uint32_t, 8>(0u    + lid * 32u, p0.template select<8, 1>(0), kAl16);
-                        es::slm_block_store<uint32_t, 8>(1024u + lid * 32u, p0.template select<8, 1>(8), kAl16);
-                        es::slm_block_store<uint32_t, 8>(2048u + lid * 32u, p1.template select<8, 1>(0), kAl16);
-                        es::slm_block_store<uint32_t, 8>(3072u + lid * 32u, p1.template select<8, 1>(8), kAl16);
-                        const uint32_t jc = lid >> 3, rc = lid & 7u;
-                        es::slm_scalar_store<float>(4096u + (16u * jc + rc) * 4u, dx);
-                        es::slm_scalar_store<int>(4096u + (16u * jc + 8u + rc) * 4u, sumx);
-                        barrier();
-
-                        uint32_t* xq_blk = xq8_out + static_cast<size_t>(ct32 * n_g_out + wgr) * 1024u;
-                        uint32_t* dx_blk = dxT_out + static_cast<size_t>(ct32 * n_g_out + wgr) * 64u;
-                        if (lid < 16u) {
-                            simd<uint32_t, 64> out = es::slm_block_load<uint32_t, 64>(lid * 256u, kAl16);
-                            es::block_store<uint32_t, 64>(xq_blk + lid * 64u, out, kAl16);
-                        } else if (lid == 16u) {
-                            simd<uint32_t, 64> dout = es::slm_block_load<uint32_t, 64>(4096u, kAl16);
-                            es::block_store<uint32_t, 64>(dx_blk, dout, kAl16);
-                        }
-                        barrier();
-                    }
+                    pp_util::gu_swiglu_epilogue(cg, cu, xq8_out, dxT_out, lid, ri, ci, wgr, wgc, n_g_out, n_ct32,
+                                                static_cast<uint32_t>(T));
                 }
             });
     });
@@ -1650,6 +1674,803 @@ void launch_w4i8_gu_swiglu_pp2(sycl::queue& q, const uint32_t* w_gate, const uin
 
 }  // namespace
 }  // namespace pp2
+
+// ---------------------------------------------------------------------------
+// PP3: Fatgemm-paced 256-GRF Ping-Pong W4I8 GEMM + Fused FFN (Xe2 BMG)
+// ---------------------------------------------------------------------------
+namespace pp3 {
+namespace {
+using pp_util::RecipDiv;
+using pp_util::make_recip;
+using pp_util::fast_div;
+
+SYCL_ESIMD_FUNCTION inline simd<sycl::half, 16> half_raw_of(simd<uint32_t, 16> h16) {
+    simd<uint16_t, 16> lo = h16.template bit_cast_view<uint16_t>().template select<16, 2>(0);
+    return lo.template bit_cast_view<sycl::half>();
+}
+
+inline uint32_t env_pp3_max_thr() noexcept {
+    static const uint32_t v = []() -> uint32_t {
+        const char* e = std::getenv("STRATA_Q36_PP3_THR");
+        const int x = e ? std::atoi(e) : 0;
+        return x > 0 ? static_cast<uint32_t>(x) : 1024u;
+    }();
+    return v;
+}
+
+// Column panel in columns (STRATA_Q36_PP3_PANEL, read once, default 1024: 18 MiB of activations at K = 17408, inside the 24 MiB LLC).
+inline uint32_t env_pp3_panel() noexcept {
+    static const uint32_t v = []() -> uint32_t {
+        const char* e = std::getenv("STRATA_Q36_PP3_PANEL");
+        const int x = e ? std::atoi(e) : 0;
+        return (x >= 128 && x <= 8192) ? static_cast<uint32_t>(x) : 1024u;
+    }();
+    return v;
+}
+
+class TagW4I8Pp3;
+class TagW4I8GuSwigluPp3;
+
+struct Pp3Grid {
+    uint32_t lgRT, lgCT, RT, CT;
+    uint32_t ncg, panel_wgs, nw, g_wgs;
+    RecipDiv div_pw, div_ncg;
+};
+
+inline void pick_pp3_grid(uint32_t n_rt32, uint32_t n_ct32, uint32_t max_thr,
+                          uint32_t& out_lgRT, uint32_t& out_lgCT) noexcept {
+    if (n_ct32 >= 16u && n_rt32 >= 4u) {
+        out_lgRT = 2u; out_lgCT = 3u;
+        return;
+    }
+    struct Cand { uint32_t lgr, lgc; };
+    static constexpr Cand kCands[] = {
+        {2u, 3u}, {3u, 2u}, {4u, 1u}, {3u, 1u}, {2u, 2u}, {2u, 1u}, {3u, 0u}, {4u, 0u},
+    };
+    double best = -1.0;
+    uint32_t blgr = 2u, blgc = 3u;
+    for (const auto& c : kCands) {
+        const uint32_t rt = 1u << c.lgr;
+        const uint32_t ct = 1u << c.lgc;
+        const uint32_t wg = rt * ct;
+        if (wg > max_thr) continue;
+        const uint32_t max_wgs = std::max<uint32_t>(1u, max_thr / wg);
+        const uint32_t nwgr    = (n_rt32 + rt - 1u) / rt;
+        const uint32_t nwgc    = (n_ct32 + ct - 1u) / ct;
+        const uint32_t nw      = nwgr * nwgc;
+        const uint32_t waves   = (nw + max_wgs - 1u) / max_wgs;
+        const double util = static_cast<double>(n_rt32 * n_ct32) /
+                            (0.75 * static_cast<double>(waves * max_thr) + 0.25 * static_cast<double>(nw * wg));
+        const double tie  = 2e-3 * (wg == 32u ? 1.0 : 0.0) + 1e-3 * static_cast<double>(c.lgc);
+        const double sc   = util + tie;
+        if (sc > best) {
+            best = sc;
+            blgr = c.lgr;
+            blgc = c.lgc;
+        }
+    }
+    out_lgRT = blgr;
+    out_lgCT = blgc;
+}
+
+inline Pp3Grid make_pp3_grid(uint32_t n_rt32, uint32_t n_ct32, bool force_ct4_rt8) noexcept {
+    Pp3Grid g{};
+    const uint32_t max_thr = env_pp3_max_thr();
+    if (force_ct4_rt8) {
+        g.lgRT = 3u;
+        g.lgCT = 2u;
+    } else {
+        pick_pp3_grid(n_rt32, n_ct32, max_thr, g.lgRT, g.lgCT);
+    }
+    g.RT = 1u << g.lgRT;
+    g.CT = 1u << g.lgCT;
+    const uint32_t wg_thr    = g.RT * g.CT;
+    const uint32_t max_wgs   = std::max<uint32_t>(1u, max_thr / wg_thr);
+    const uint32_t n_wgr     = (n_rt32 + g.RT - 1u) / g.RT;
+    const uint32_t n_wgc_tot = (n_ct32 + g.CT - 1u) / g.CT;
+    const uint32_t ncg_t     = std::max<uint32_t>(1u, (env_pp3_panel() / 32u) >> g.lgCT);  // default 1024 cols per panel
+    if (n_wgc_tot <= ncg_t) {
+        g.ncg       = std::max<uint32_t>(1u, n_wgc_tot);
+        g.panel_wgs = std::max<uint32_t>(1u, n_wgr * g.ncg);
+        g.nw        = g.panel_wgs;
+    } else {
+        g.ncg       = ncg_t;
+        const uint32_t n_cp = (n_wgc_tot + g.ncg - 1u) / g.ncg;
+        g.panel_wgs = n_wgr * g.ncg;
+        g.nw        = n_cp * g.panel_wgs;
+    }
+    g.div_pw  = make_recip(g.panel_wgs);
+    g.div_ncg = make_recip(g.ncg);
+    g.g_wgs   = std::min<uint32_t>(g.nw, max_wgs);
+    return g;
+}
+
+template <int S>
+SYCL_ESIMD_FUNCTION inline void pp3_w4_substep(
+    simd<int, 128> (&i_act)[2][4],
+    simd<int, 128> (&i_oth)[2][4],
+    simd<float, 128> (&c_acc)[2][4],
+    simd<int, 64> (&wr)[2][2],
+    simd<float, 16> (&s_scale)[2],
+    simd<float, 32>& dx_scale,
+    simd<uint32_t, 16>& m0_nxt,
+    simd<uint32_t, 16>& m1_nxt,
+    simd<uint32_t, 64>& dx_nxt,
+    const uint32_t* w0,
+    const uint32_t* w1,
+    uint32_t w_nxt_off,
+    const int* xp,
+    uint32_t xp_nxt_off,
+    const uint32_t* dxp,
+    uint32_t dxp_nxt_off,
+    float* y_base,
+    uint32_t kb,
+    uint32_t nv) {
+    constexpr int u  = S & 1;
+    constexpr int js = S & 3;
+
+    if constexpr (S == 0) {
+        es::prefetch<uint32_t, 32>(w0 + w_nxt_off + 512u, 0u, kPfL1);
+        es::prefetch<uint32_t, 32>(w1 + w_nxt_off + 512u, 0u, kPfL1);
+        es::prefetch<uint32_t, 64>(dxp + dxp_nxt_off, 0u, kPfL1);
+        es::prefetch<uint32_t, 64>(dxp + dxp_nxt_off + 64u, 0u, kPfL1);
+    }
+
+    const int* xp_s = xp + static_cast<size_t>(S) * 256u;
+    simd<int, 64> a0 = es::block_load<int, 64>(xp_s);
+    simd<int, 64> a1 = es::block_load<int, 64>(xp_s + 64u);
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        i_act[i][0] = xmx::dpas<8, 8, int, int, int, int,
+            xmx::dpas_argument_type::u4, xmx::dpas_argument_type::s8>(
+            i_act[i][0], wr[u][i], a0);
+    }
+    a0 = es::block_load<int, 64>(xp_s + 128u);
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        i_act[i][1] = xmx::dpas<8, 8, int, int, int, int,
+            xmx::dpas_argument_type::u4, xmx::dpas_argument_type::s8>(
+            i_act[i][1], wr[u][i], a1);
+    }
+    a1 = es::block_load<int, 64>(xp_s + 192u);
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        i_act[i][2] = xmx::dpas<8, 8, int, int, int, int,
+            xmx::dpas_argument_type::u4, xmx::dpas_argument_type::s8>(
+            i_act[i][2], wr[u][i], a0);
+    }
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        i_act[i][3] = xmx::dpas<8, 8, int, int, int, int,
+            xmx::dpas_argument_type::u4, xmx::dpas_argument_type::s8>(
+            i_act[i][3], wr[u][i], a1);
+    }
+
+    if constexpr (S < 6) {
+        constexpr uint32_t w_off = static_cast<uint32_t>(S + 2) * 64u;
+        wr[u][0] = es::block_load<int, 64>(reinterpret_cast<const int*>(w0 + w_off));
+        wr[u][1] = es::block_load<int, 64>(reinterpret_cast<const int*>(w1 + w_off));
+    } else {
+        constexpr uint32_t w_off = static_cast<uint32_t>(S - 6) * 64u;
+        wr[u][0] = es::block_load<int, 64>(reinterpret_cast<const int*>(w0 + w_nxt_off + w_off));
+        wr[u][1] = es::block_load<int, 64>(reinterpret_cast<const int*>(w1 + w_nxt_off + w_off));
+    }
+
+    const int* xp_pa = (S < 7) ? (xp + static_cast<size_t>(S + 1) * 256u) : (xp + xp_nxt_off);
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        es::prefetch<int, 64>(xp_pa + static_cast<uint32_t>(j) * 64u, 0u, kPfL1);
+    }
+
+    if constexpr (S < 4) {
+        constexpr uint32_t pf_off = static_cast<uint32_t>(S + 4) * 64u;
+        es::prefetch<uint32_t, 64>(w0 + pf_off, 0u, kPfL1);
+        es::prefetch<uint32_t, 64>(w1 + pf_off, 0u, kPfL1);
+    } else {
+        constexpr uint32_t pf_off = static_cast<uint32_t>(S - 4) * 64u;
+        es::prefetch<uint32_t, 64>(w0 + w_nxt_off + pf_off, 0u, kPfL1);
+        es::prefetch<uint32_t, 64>(w1 + w_nxt_off + pf_off, 0u, kPfL1);
+    }
+
+    const simd<float, 8> dxs_v = dx_scale.template select<8, 1>(8 * js);
+    const simd<int, 8>   sxn_v = dx_nxt.template select<8, 1>(16 * js + 8).template bit_cast_view<int>();
+    const simd<int16_t, 16> nz0 = simd<int16_t, 16>(0) - simd<int16_t, 16>(m0_nxt.template bit_cast_view<uint16_t>().template select<16, 2>(1));
+    const simd<int16_t, 16> nz1 = simd<int16_t, 16>(0) - simd<int16_t, 16>(m1_nxt.template bit_cast_view<uint16_t>().template select<16, 2>(1));
+    #pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const float d_r           = float(dxs_v[r]);
+        const simd<float, 16> sd0 = s_scale[0] * d_r;
+        const simd<float, 16> sd1 = s_scale[1] * d_r;
+        const simd<float, 16> f0  = simd<float, 16>(i_oth[0][js].template select<16, 1>(16 * r));
+        const simd<float, 16> f1  = simd<float, 16>(i_oth[1][js].template select<16, 1>(16 * r));
+        c_acc[0][js].template select<16, 1>(16 * r) += f0 * sd0;
+        c_acc[1][js].template select<16, 1>(16 * r) += f1 * sd1;
+        const int16_t sx_r = static_cast<int16_t>(sxn_v[r]);
+        i_oth[0][js].template select<16, 1>(16 * r) = simd<int, 16>(nz0) * static_cast<int>(sx_r);
+        i_oth[1][js].template select<16, 1>(16 * r) = simd<int, 16>(nz1) * static_cast<int>(sx_r);
+    }
+
+    if constexpr ((S & 1) == 1) {
+        if (kb * 8u + static_cast<uint32_t>(S) == nv) y_base[0] = 0.0f;
+    }
+}
+
+void launch_w4i8_pp3(sycl::queue& q, const uint32_t* w_base, const int* xq8_base,
+                     const uint32_t* dxT_base, float* y_base,
+                     int K, int R, int T) {
+    const uint32_t n_rt      = static_cast<uint32_t>(R) / 16u;
+    const uint32_t n_rt32    = (n_rt + 1u) / 2u;
+    const uint32_t n_kb      = static_cast<uint32_t>(K) / 256u;
+    const uint32_t n_grp     = n_kb * 2u;
+    const uint32_t n_steps   = n_kb * 8u;
+    const uint32_t n_ct32    = static_cast<uint32_t>(T + 31) / 32u;
+    const Pp3Grid  g         = make_pp3_grid(n_rt32, n_ct32, false);
+    const uint32_t n_wgc_tot = (n_ct32 + g.CT - 1u) / g.CT;
+    const uint32_t nv        = static_cast<uint32_t>(K) | 0x80000000u;
+    const uint32_t ct_mask   = g.CT - 1u;
+
+    auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for<TagW4I8Pp3>(
+            sycl::nd_range<1>(static_cast<size_t>(g.g_wgs) << (g.lgRT + g.lgCT),
+                              static_cast<size_t>(1) << (g.lgRT + g.lgCT)),
+            props,
+            [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+                const uint32_t wg0 = static_cast<uint32_t>(it.get_group(0));
+                const uint32_t l   = static_cast<uint32_t>(it.get_local_id(0));
+                const uint32_t ri  = l >> g.lgCT;
+                const uint32_t ci  = l & ct_mask;
+
+                for (uint32_t w = wg0; w < g.nw; w += g.g_wgs) {
+                    barrier();
+                    const uint32_t cp   = fast_div(w, g.div_pw);
+                    const uint32_t rem  = w - cp * g.panel_wgs;
+                    const uint32_t wgr  = fast_div(rem, g.div_ncg);
+                    const uint32_t cg   = rem - wgr * g.ncg;
+                    const uint32_t wgc  = cp * g.ncg + cg;
+                    const uint32_t rt0  = ((wgr << g.lgRT) + ri) * 2u;
+                    const uint32_t rt1  = rt0 + 1u;
+                    const uint32_t ct32 = (wgc << g.lgCT) + ci;
+                    if (wgc < n_wgc_tot && rt0 < n_rt && ct32 < n_ct32) {
+                        const uint32_t* w0  = w_base   + static_cast<size_t>(rt0)  * static_cast<size_t>(n_kb) * 544u;
+                        const uint32_t* w1  = (rt1 < n_rt) ? (w0 + static_cast<size_t>(n_kb) * 544u) : w0;
+                        const int*      xp  = xq8_base + static_cast<size_t>(ct32) * static_cast<size_t>(n_steps) * 256u;
+                        const uint32_t* dxp = dxT_base + static_cast<size_t>(ct32) * static_cast<size_t>(n_grp)   * 64u;
+
+                        simd<float, 128> c_acc[2][4];
+                        simd<int, 128>   i0[2][4], i1[2][4];
+                        #pragma unroll
+                        for (int i = 0; i < 2; ++i) {
+                            #pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                c_acc[i][j] = 0.0f;
+                                i1[i][j]    = 0;
+                            }
+                        }
+
+                        simd<int, 64> wr[2][2];
+                        wr[0][0] = es::block_load<int, 64>(reinterpret_cast<const int*>(w0));
+                        wr[0][1] = es::block_load<int, 64>(reinterpret_cast<const int*>(w1));
+                        wr[1][0] = es::block_load<int, 64>(reinterpret_cast<const int*>(w0 + 64u));
+                        wr[1][1] = es::block_load<int, 64>(reinterpret_cast<const int*>(w1 + 64u));
+
+                        #pragma unroll
+                        for (int s = 0; s < 2; ++s) {
+                            #pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                es::prefetch<int, 64>(xp + static_cast<uint32_t>(s) * 256u + static_cast<uint32_t>(j) * 64u, 0u, kPfL1);
+                            }
+                        }
+                        #pragma unroll
+                        for (int pf = 2; pf <= 5; ++pf) {
+                            es::prefetch<uint32_t, 64>(w0 + static_cast<uint32_t>(pf) * 64u, 0u, kPfL1);
+                            es::prefetch<uint32_t, 64>(w1 + static_cast<uint32_t>(pf) * 64u, 0u, kPfL1);
+                        }
+                        es::prefetch<uint32_t, 32>(w0 + 512u, 0u, kPfL1);
+                        es::prefetch<uint32_t, 32>(w1 + 512u, 0u, kPfL1);
+                        es::prefetch<uint32_t, 64>(dxp, 0u, kPfL1);
+                        es::prefetch<uint32_t, 64>(dxp + 64u, 0u, kPfL1);
+
+                        // Preload g=0 metadata and initialize i0 = -z * sx; prepare (s_dpas, dx_dpas) for g=0.
+                        simd<uint32_t, 16> m0_nxt = es::block_load<uint32_t, 16>(w0 + 512u, kAl16);
+                        simd<uint32_t, 16> m1_nxt = es::block_load<uint32_t, 16>(w1 + 512u, kAl16);
+                        simd<uint32_t, 64> dx_nxt = es::block_load<uint32_t, 64>(dxp, kAl16);
+
+                        simd<sycl::half, 32> s_dpas_h;
+                        simd<float, 16> s_scale[2];
+                        simd<float, 32> dx_dpas, dx_scale = 0.0f;
+                        s_scale[0] = 0.0f;
+                        s_scale[1] = 0.0f;
+                        s_dpas_h.template select<16, 1>(0)  = half_raw_of(m0_nxt);
+                        s_dpas_h.template select<16, 1>(16) = half_raw_of(m1_nxt);
+                        {
+                            const simd<int16_t, 16> nz0 = simd<int16_t, 16>(0) - simd<int16_t, 16>(m0_nxt.template bit_cast_view<uint16_t>().template select<16, 2>(1));
+                            const simd<int16_t, 16> nz1 = simd<int16_t, 16>(0) - simd<int16_t, 16>(m1_nxt.template bit_cast_view<uint16_t>().template select<16, 2>(1));
+                            #pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                dx_dpas.template select<8, 1>(8 * j) =
+                                    dx_nxt.template select<8, 1>(16 * j).template bit_cast_view<float>();
+                                const simd<int, 8> sx_v = dx_nxt.template select<8, 1>(16 * j + 8).template bit_cast_view<int>();
+                                #pragma unroll
+                                for (int r = 0; r < 8; ++r) {
+                                    const int16_t sx_r = static_cast<int16_t>(sx_v[r]);
+                                    i0[0][j].template select<16, 1>(16 * r) = simd<int, 16>(nz0) * static_cast<int>(sx_r);
+                                    i0[1][j].template select<16, 1>(16 * r) = simd<int, 16>(nz1) * static_cast<int>(sx_r);
+                                }
+                            }
+                        }
+
+                        // Preload g=1 metadata asynchronously before the kb loop.
+                        m0_nxt = es::block_load<uint32_t, 16>(w0 + 528u, kAl16);
+                        m1_nxt = es::block_load<uint32_t, 16>(w1 + 528u, kAl16);
+                        dx_nxt = es::block_load<uint32_t, 64>(dxp + 64u, kAl16);
+
+                        #pragma nounroll
+                        for (uint32_t kb = 0; kb < n_kb; ++kb) {
+                            const bool has_nxt         = (kb + 1u < n_kb);
+                            const uint32_t w_nxt_off   = has_nxt ? 544u  : 0u;
+                            const uint32_t xp_nxt_off  = has_nxt ? 2048u : 0u;
+                            const uint32_t dxp_nxt_off = has_nxt ? 128u  : 0u;
+
+                            pp3_w4_substep<0>(i0, i1, c_acc, wr, s_scale, dx_scale, m0_nxt, m1_nxt, dx_nxt,
+                                              w0, w1, w_nxt_off, xp, xp_nxt_off, dxp, dxp_nxt_off, y_base, kb, nv);
+                            pp3_w4_substep<1>(i0, i1, c_acc, wr, s_scale, dx_scale, m0_nxt, m1_nxt, dx_nxt,
+                                              w0, w1, w_nxt_off, xp, xp_nxt_off, dxp, dxp_nxt_off, y_base, kb, nv);
+                            pp3_w4_substep<2>(i0, i1, c_acc, wr, s_scale, dx_scale, m0_nxt, m1_nxt, dx_nxt,
+                                              w0, w1, w_nxt_off, xp, xp_nxt_off, dxp, dxp_nxt_off, y_base, kb, nv);
+                            pp3_w4_substep<3>(i0, i1, c_acc, wr, s_scale, dx_scale, m0_nxt, m1_nxt, dx_nxt,
+                                              w0, w1, w_nxt_off, xp, xp_nxt_off, dxp, dxp_nxt_off, y_base, kb, nv);
+
+                            // Handoff at end of g=2*kb: (s_dpas, dx_dpas) -> scale; m_nxt -> dpas; async load next (kb, g=0).
+                            s_scale[0] = simd<float, 16>(s_dpas_h.template select<16, 1>(0));
+                            s_scale[1] = simd<float, 16>(s_dpas_h.template select<16, 1>(16));
+                            dx_scale   = dx_dpas;
+                            s_dpas_h.template select<16, 1>(0)  = half_raw_of(m0_nxt);
+                            s_dpas_h.template select<16, 1>(16) = half_raw_of(m1_nxt);
+                            #pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                dx_dpas.template select<8, 1>(8 * j) =
+                                    dx_nxt.template select<8, 1>(16 * j).template bit_cast_view<float>();
+                            }
+                            m0_nxt = es::block_load<uint32_t, 16>(w0 + w_nxt_off + 512u, kAl16);
+                            m1_nxt = es::block_load<uint32_t, 16>(w1 + w_nxt_off + 512u, kAl16);
+                            dx_nxt = es::block_load<uint32_t, 64>(dxp + dxp_nxt_off, kAl16);
+
+                            pp3_w4_substep<4>(i1, i0, c_acc, wr, s_scale, dx_scale, m0_nxt, m1_nxt, dx_nxt,
+                                              w0, w1, w_nxt_off, xp, xp_nxt_off, dxp, dxp_nxt_off, y_base, kb, nv);
+                            pp3_w4_substep<5>(i1, i0, c_acc, wr, s_scale, dx_scale, m0_nxt, m1_nxt, dx_nxt,
+                                              w0, w1, w_nxt_off, xp, xp_nxt_off, dxp, dxp_nxt_off, y_base, kb, nv);
+                            pp3_w4_substep<6>(i1, i0, c_acc, wr, s_scale, dx_scale, m0_nxt, m1_nxt, dx_nxt,
+                                              w0, w1, w_nxt_off, xp, xp_nxt_off, dxp, dxp_nxt_off, y_base, kb, nv);
+                            pp3_w4_substep<7>(i1, i0, c_acc, wr, s_scale, dx_scale, m0_nxt, m1_nxt, dx_nxt,
+                                              w0, w1, w_nxt_off, xp, xp_nxt_off, dxp, dxp_nxt_off, y_base, kb, nv);
+
+                            // Handoff at end of g=2*kb+1: async load next (kb+1, g=1) if any.
+                            s_scale[0] = simd<float, 16>(s_dpas_h.template select<16, 1>(0));
+                            s_scale[1] = simd<float, 16>(s_dpas_h.template select<16, 1>(16));
+                            dx_scale   = dx_dpas;
+                            s_dpas_h.template select<16, 1>(0)  = half_raw_of(m0_nxt);
+                            s_dpas_h.template select<16, 1>(16) = half_raw_of(m1_nxt);
+                            #pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                dx_dpas.template select<8, 1>(8 * j) =
+                                    dx_nxt.template select<8, 1>(16 * j).template bit_cast_view<float>();
+                            }
+                            if (has_nxt) {
+                                m0_nxt = es::block_load<uint32_t, 16>(w0 + w_nxt_off + 528u, kAl16);
+                                m1_nxt = es::block_load<uint32_t, 16>(w1 + w_nxt_off + 528u, kAl16);
+                                dx_nxt = es::block_load<uint32_t, 64>(dxp + dxp_nxt_off + 64u, kAl16);
+                            }
+                            w0  += 544u;
+                            w1  += 544u;
+                            xp  += 2048u;
+                            dxp += 128u;
+                        }
+
+                        // Final scaling epilogue for the last group (g = 2*n_kb - 1 in i1).
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            const simd<float, 8> dxs_v = dx_scale.template select<8, 1>(8 * j);
+                            #pragma unroll
+                            for (int r = 0; r < 8; ++r) {
+                                const float d_r           = float(dxs_v[r]);
+                                const simd<float, 16> sd0 = s_scale[0] * d_r;
+                                const simd<float, 16> sd1 = s_scale[1] * d_r;
+                                c_acc[0][j].template select<16, 1>(16 * r) +=
+                                    simd<float, 16>(i1[0][j].template select<16, 1>(16 * r)) * sd0;
+                                c_acc[1][j].template select<16, 1>(16 * r) +=
+                                    simd<float, 16>(i1[1][j].template select<16, 1>(16 * r)) * sd1;
+                            }
+                        }
+
+                        const uint32_t row0     = rt0 * 16u;
+                        const bool has_r1       = (rt1 < n_rt);
+                        const uint32_t col_base = ct32 * 32u;
+                        if (col_base + 32u <= static_cast<uint32_t>(T) && has_r1) {
+                            #pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                #pragma unroll
+                                for (int r = 0; r < 8; ++r) {
+                                    float* yp = y_base + static_cast<size_t>(col_base + static_cast<uint32_t>(j * 8 + r)) * static_cast<size_t>(R) + row0;
+                                    simd<float, 32> out32;
+                                    out32.template select<16, 1>(0)  = c_acc[0][j].template select<16, 1>(16 * r);
+                                    out32.template select<16, 1>(16) = c_acc[1][j].template select<16, 1>(16 * r);
+                                    es::block_store<float, 32>(yp, out32, kAl16);
+                                }
+                            }
+                        } else {
+                            #pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                #pragma unroll
+                                for (int r = 0; r < 8; ++r) {
+                                    const uint32_t col = col_base + static_cast<uint32_t>(j * 8 + r);
+                                    if (col < static_cast<uint32_t>(T)) {
+                                        float* yp = y_base + static_cast<size_t>(col) * static_cast<size_t>(R) + row0;
+                                        if (has_r1) {
+                                            simd<float, 32> out32;
+                                            out32.template select<16, 1>(0)  = c_acc[0][j].template select<16, 1>(16 * r);
+                                            out32.template select<16, 1>(16) = c_acc[1][j].template select<16, 1>(16 * r);
+                                            es::block_store<float, 32>(yp, out32, kAl16);
+                                        } else {
+                                            es::block_store<float, 16>(yp, c_acc[0][j].template select<16, 1>(16 * r), kAl16);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+    });
+}
+
+template <int S>
+SYCL_ESIMD_FUNCTION inline void pp3_gu_substep(
+    simd<int, 128> (&ig_act)[4],
+    simd<int, 128> (&iu_act)[4],
+    simd<int, 128> (&ig_oth)[4],
+    simd<int, 128> (&iu_oth)[4],
+    simd<float, 128> (&cg)[4],
+    simd<float, 128> (&cu)[4],
+    simd<int, 64> (&wr_g)[2],
+    simd<int, 64> (&wr_u)[2],
+    simd<float, 16>& sg_scale,
+    simd<float, 16>& su_scale,
+    simd<float, 32>& dx_scale,
+    simd<uint32_t, 16>& mg_nxt,
+    simd<uint32_t, 16>& mu_nxt,
+    simd<uint32_t, 64>& dx_nxt,
+    const uint32_t* wg,
+    const uint32_t* wu,
+    const int* xp0,
+    const uint32_t* dxp0,
+    const simd<uint32_t, 4>& x_off_jt,
+    const simd<uint32_t, 4>& dx_off_jt,
+    bool has_nxt,
+    uint32_t* dxT_out,
+    uint32_t kb,
+    uint32_t nv) {
+    constexpr int u  = S & 1;
+    constexpr int js = S & 3;
+    const uint32_t w_nxt_off   = has_nxt ? 544u  : 0u;
+    const uint32_t dxp_nxt_off = has_nxt ? 128u  : 0u;
+
+    if constexpr (S == 0) {
+        es::prefetch<uint32_t, 32>(wg + w_nxt_off + 512u, 0u, kPfL1);
+        es::prefetch<uint32_t, 32>(wu + w_nxt_off + 512u, 0u, kPfL1);
+        #pragma unroll
+        for (int jt = 0; jt < 4; ++jt) {
+            const uint32_t doff = uint32_t(dx_off_jt[jt]);
+            es::prefetch<uint32_t, 16>(dxp0 + doff + dxp_nxt_off, 0u, kPfL1);
+            es::prefetch<uint32_t, 16>(dxp0 + doff + dxp_nxt_off + 64u, 0u, kPfL1);
+        }
+    }
+
+    const int* xp0_s = xp0 + static_cast<size_t>(S) * 256u;
+    simd<int, 64> a0 = es::block_load<int, 64>(xp0_s + static_cast<size_t>(uint32_t(x_off_jt[0])));
+    simd<int, 64> a1 = es::block_load<int, 64>(xp0_s + static_cast<size_t>(uint32_t(x_off_jt[1])));
+    ig_act[0] = xmx::dpas<8, 8, int, int, int, int,
+        xmx::dpas_argument_type::u4, xmx::dpas_argument_type::s8>(ig_act[0], wr_g[u], a0);
+    iu_act[0] = xmx::dpas<8, 8, int, int, int, int,
+        xmx::dpas_argument_type::u4, xmx::dpas_argument_type::s8>(iu_act[0], wr_u[u], a0);
+    a0 = es::block_load<int, 64>(xp0_s + static_cast<size_t>(uint32_t(x_off_jt[2])));
+    ig_act[1] = xmx::dpas<8, 8, int, int, int, int,
+        xmx::dpas_argument_type::u4, xmx::dpas_argument_type::s8>(ig_act[1], wr_g[u], a1);
+    iu_act[1] = xmx::dpas<8, 8, int, int, int, int,
+        xmx::dpas_argument_type::u4, xmx::dpas_argument_type::s8>(iu_act[1], wr_u[u], a1);
+    a1 = es::block_load<int, 64>(xp0_s + static_cast<size_t>(uint32_t(x_off_jt[3])));
+    ig_act[2] = xmx::dpas<8, 8, int, int, int, int,
+        xmx::dpas_argument_type::u4, xmx::dpas_argument_type::s8>(ig_act[2], wr_g[u], a0);
+    iu_act[2] = xmx::dpas<8, 8, int, int, int, int,
+        xmx::dpas_argument_type::u4, xmx::dpas_argument_type::s8>(iu_act[2], wr_u[u], a0);
+    ig_act[3] = xmx::dpas<8, 8, int, int, int, int,
+        xmx::dpas_argument_type::u4, xmx::dpas_argument_type::s8>(ig_act[3], wr_g[u], a1);
+    iu_act[3] = xmx::dpas<8, 8, int, int, int, int,
+        xmx::dpas_argument_type::u4, xmx::dpas_argument_type::s8>(iu_act[3], wr_u[u], a1);
+
+    if constexpr (S < 6) {
+        constexpr uint32_t w_off = static_cast<uint32_t>(S + 2) * 64u;
+        wr_g[u] = es::block_load<int, 64>(reinterpret_cast<const int*>(wg + w_off));
+        wr_u[u] = es::block_load<int, 64>(reinterpret_cast<const int*>(wu + w_off));
+    } else {
+        constexpr uint32_t w_off = static_cast<uint32_t>(S - 6) * 64u;
+        wr_g[u] = es::block_load<int, 64>(reinterpret_cast<const int*>(wg + w_nxt_off + w_off));
+        wr_u[u] = es::block_load<int, 64>(reinterpret_cast<const int*>(wu + w_nxt_off + w_off));
+    }
+
+    const size_t x_pa_off = (S < 7) ? (static_cast<size_t>(S + 1) * 256u)
+                                    : static_cast<size_t>(has_nxt ? 2048u : 0u);
+    #pragma unroll
+    for (int jt = 0; jt < 4; ++jt) {
+        es::prefetch<int, 64>(xp0 + static_cast<size_t>(uint32_t(x_off_jt[jt])) + x_pa_off, 0u, kPfL1);
+    }
+
+    if constexpr (S < 4) {
+        constexpr uint32_t pf_off = static_cast<uint32_t>(S + 4) * 64u;
+        es::prefetch<uint32_t, 64>(wg + pf_off, 0u, kPfL1);
+        es::prefetch<uint32_t, 64>(wu + pf_off, 0u, kPfL1);
+    } else {
+        constexpr uint32_t pf_off = static_cast<uint32_t>(S - 4) * 64u;
+        es::prefetch<uint32_t, 64>(wg + w_nxt_off + pf_off, 0u, kPfL1);
+        es::prefetch<uint32_t, 64>(wu + w_nxt_off + pf_off, 0u, kPfL1);
+    }
+
+    const simd<float, 8> dxs_v = dx_scale.template select<8, 1>(8 * js);
+    const simd<int, 8>   sxn_v = dx_nxt.template select<8, 1>(16 * js + 8).template bit_cast_view<int>();
+    const simd<int16_t, 16> nzg = simd<int16_t, 16>(0) - simd<int16_t, 16>(mg_nxt.template bit_cast_view<uint16_t>().template select<16, 2>(1));
+    const simd<int16_t, 16> nzu = simd<int16_t, 16>(0) - simd<int16_t, 16>(mu_nxt.template bit_cast_view<uint16_t>().template select<16, 2>(1));
+    #pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const float d_r           = float(dxs_v[r]);
+        const simd<float, 16> sdg = sg_scale * d_r;
+        const simd<float, 16> sdu = su_scale * d_r;
+        const simd<float, 16> fg  = simd<float, 16>(ig_oth[js].template select<16, 1>(16 * r));
+        const simd<float, 16> fu  = simd<float, 16>(iu_oth[js].template select<16, 1>(16 * r));
+        cg[js].template select<16, 1>(16 * r) += fg * sdg;
+        cu[js].template select<16, 1>(16 * r) += fu * sdu;
+        const int16_t sx_r = static_cast<int16_t>(sxn_v[r]);
+        ig_oth[js].template select<16, 1>(16 * r) = simd<int, 16>(nzg) * static_cast<int>(sx_r);
+        iu_oth[js].template select<16, 1>(16 * r) = simd<int, 16>(nzu) * static_cast<int>(sx_r);
+    }
+
+    if constexpr ((S & 1) == 1) {
+        if (kb * 8u + static_cast<uint32_t>(S) == nv) dxT_out[0] = 0u;
+    }
+}
+
+void launch_w4i8_gu_swiglu_pp3(sycl::queue& q, const uint32_t* w_gate, const uint32_t* w_up,
+                               const int* xq8_in, const uint32_t* dxT_in,
+                               uint32_t* xq8_out, uint32_t* dxT_out,
+                               int K, int R, int T) {
+    const uint32_t n_kb      = static_cast<uint32_t>(K) / 256u;
+    const uint32_t n_grp     = n_kb * 2u;
+    const uint32_t n_steps   = n_kb * 8u;
+    const uint32_t n_g_out   = static_cast<uint32_t>(R) / 128u;
+    const uint32_t n_ct32    = static_cast<uint32_t>(T + 31) / 32u;
+    const uint32_t n_wgc_tot = (n_ct32 + 3u) / 4u;
+    const uint32_t max_wgs   = std::max<uint32_t>(1u, env_pp3_max_thr() / 32u);
+    const uint32_t ncg_t     = std::max<uint32_t>(1u, env_pp3_panel() / 128u);   // WG-cols of 128 cols; default 8 = 1024 cols per panel
+    uint32_t ncg, panel_wgs, nw;
+    if (n_wgc_tot <= ncg_t) {
+        ncg       = std::max<uint32_t>(1u, n_wgc_tot);
+        panel_wgs = std::max<uint32_t>(1u, n_g_out * ncg);
+        nw        = panel_wgs;
+    } else {
+        ncg       = ncg_t;
+        const uint32_t n_cp = (n_wgc_tot + ncg - 1u) / ncg;
+        panel_wgs = n_g_out * ncg;
+        nw        = n_cp * panel_wgs;
+    }
+    const RecipDiv div_pw    = make_recip(panel_wgs);
+    const RecipDiv div_ncg   = make_recip(ncg);
+    const uint32_t g_wgs     = std::min<uint32_t>(nw, max_wgs);
+    const uint32_t nv        = static_cast<uint32_t>(K) | 0x80000000u;
+
+    auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for<TagW4I8GuSwigluPp3>(
+            sycl::nd_range<1>(static_cast<size_t>(g_wgs) * 32u, 32u), props,
+            [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+                slm_init<17408u>();
+                const uint32_t wg0 = static_cast<uint32_t>(it.get_group(0));
+                const uint32_t lid = static_cast<uint32_t>(it.get_local_id(0));
+                const uint32_t ri  = lid >> 2;
+                const uint32_t ci  = lid & 3u;
+
+                for (uint32_t w = wg0; w < nw; w += g_wgs) {
+                    barrier();
+                    const uint32_t cp   = fast_div(w, div_pw);
+                    const uint32_t rem  = w - cp * panel_wgs;
+                    const uint32_t wgr  = fast_div(rem, div_ncg);
+                    const uint32_t cg   = rem - wgr * ncg;
+                    const uint32_t wgc  = cp * ncg + cg;
+                    if (wgc >= n_wgc_tot) continue;
+
+                    const uint32_t rt       = wgr * 8u + ri;
+                    const uint32_t ct32_b   = wgc * 4u;
+                    const size_t w_off_tile = static_cast<size_t>(rt) * static_cast<size_t>(n_kb) * 544u;
+                    const uint32_t* wg      = w_gate + w_off_tile;
+                    const uint32_t* wu      = w_up   + w_off_tile;
+
+                    const int*      xp0     = xq8_in + static_cast<size_t>(ct32_b) * static_cast<size_t>(n_steps) * 256u + ci * 64u;
+                    const uint32_t* dxp0    = dxT_in + static_cast<size_t>(ct32_b) * static_cast<size_t>(n_grp)   * 64u  + ci * 16u;
+                    const uint32_t x_cstride  = n_steps * 256u;
+                    const uint32_t dx_cstride = n_grp * 64u;
+                    simd<uint32_t, 4> x_off_jt, dx_off_jt;
+                    #pragma unroll
+                    for (int jt = 0; jt < 4; ++jt) {
+                        const uint32_t k = (ct32_b + static_cast<uint32_t>(jt) < n_ct32)
+                                         ? static_cast<uint32_t>(jt)
+                                         : (n_ct32 - 1u - ct32_b);
+                        x_off_jt[jt]  = k * x_cstride;
+                        dx_off_jt[jt] = k * dx_cstride;
+                    }
+
+                    simd<float, 128> cg_acc[4], cu_acc[4];
+                    simd<int, 128>   ig0[4], iu0[4], ig1[4], iu1[4];
+                    #pragma unroll
+                    for (int jt = 0; jt < 4; ++jt) {
+                        cg_acc[jt] = 0.0f; cu_acc[jt] = 0.0f;
+                        ig1[jt]    = 0;    iu1[jt]    = 0;
+                    }
+
+                    simd<int, 64> wr_g[2], wr_u[2];
+                    wr_g[0] = es::block_load<int, 64>(reinterpret_cast<const int*>(wg));
+                    wr_u[0] = es::block_load<int, 64>(reinterpret_cast<const int*>(wu));
+                    wr_g[1] = es::block_load<int, 64>(reinterpret_cast<const int*>(wg + 64u));
+                    wr_u[1] = es::block_load<int, 64>(reinterpret_cast<const int*>(wu + 64u));
+
+                    #pragma unroll
+                    for (int s = 0; s < 2; ++s) {
+                        #pragma unroll
+                        for (int jt = 0; jt < 4; ++jt) {
+                            es::prefetch<int, 64>(xp0 + static_cast<size_t>(uint32_t(x_off_jt[jt])) + static_cast<size_t>(s) * 256u, 0u, kPfL1);
+                        }
+                    }
+                    #pragma unroll
+                    for (int pf = 2; pf <= 5; ++pf) {
+                        es::prefetch<uint32_t, 64>(wg + static_cast<uint32_t>(pf) * 64u, 0u, kPfL1);
+                        es::prefetch<uint32_t, 64>(wu + static_cast<uint32_t>(pf) * 64u, 0u, kPfL1);
+                    }
+                    es::prefetch<uint32_t, 32>(wg + 512u, 0u, kPfL1);
+                    es::prefetch<uint32_t, 32>(wu + 512u, 0u, kPfL1);
+                    #pragma unroll
+                    for (int jt = 0; jt < 4; ++jt) {
+                        const uint32_t doff = uint32_t(dx_off_jt[jt]);
+                        es::prefetch<uint32_t, 16>(dxp0 + doff, 0u, kPfL1);
+                        es::prefetch<uint32_t, 16>(dxp0 + doff + 64u, 0u, kPfL1);
+                    }
+
+                    simd<uint32_t, 16> mg_nxt = es::block_load<uint32_t, 16>(wg + 512u, kAl16);
+                    simd<uint32_t, 16> mu_nxt = es::block_load<uint32_t, 16>(wu + 512u, kAl16);
+                    simd<uint32_t, 64> dx_nxt;
+                    #pragma unroll
+                    for (int jt = 0; jt < 4; ++jt) {
+                        dx_nxt.template select<16, 1>(16 * jt) = es::block_load<uint32_t, 16>(
+                            dxp0 + static_cast<size_t>(uint32_t(dx_off_jt[jt])), kAl16);
+                    }
+
+                    simd<sycl::half, 32> sgu_dpas_h;
+                    sgu_dpas_h.template select<16, 1>(0)  = half_raw_of(mg_nxt);
+                    sgu_dpas_h.template select<16, 1>(16) = half_raw_of(mu_nxt);
+                    simd<float, 16> sg_scale = 0.0f, su_scale = 0.0f;
+                    simd<float, 32> dx_dpas, dx_scale = 0.0f;
+                    {
+                        const simd<int16_t, 16> nzg = simd<int16_t, 16>(0) - simd<int16_t, 16>(mg_nxt.template bit_cast_view<uint16_t>().template select<16, 2>(1));
+                        const simd<int16_t, 16> nzu = simd<int16_t, 16>(0) - simd<int16_t, 16>(mu_nxt.template bit_cast_view<uint16_t>().template select<16, 2>(1));
+                        #pragma unroll
+                        for (int jt = 0; jt < 4; ++jt) {
+                            dx_dpas.template select<8, 1>(8 * jt) =
+                                dx_nxt.template select<8, 1>(16 * jt).template bit_cast_view<float>();
+                            const simd<int, 8> sx_v = dx_nxt.template select<8, 1>(16 * jt + 8).template bit_cast_view<int>();
+                            #pragma unroll
+                            for (int r = 0; r < 8; ++r) {
+                                const int16_t sx_r = static_cast<int16_t>(sx_v[r]);
+                                ig0[jt].template select<16, 1>(16 * r) = simd<int, 16>(nzg) * static_cast<int>(sx_r);
+                                iu0[jt].template select<16, 1>(16 * r) = simd<int, 16>(nzu) * static_cast<int>(sx_r);
+                            }
+                        }
+                    }
+
+                    mg_nxt = es::block_load<uint32_t, 16>(wg + 528u, kAl16);
+                    mu_nxt = es::block_load<uint32_t, 16>(wu + 528u, kAl16);
+                    #pragma unroll
+                    for (int jt = 0; jt < 4; ++jt) {
+                        dx_nxt.template select<16, 1>(16 * jt) = es::block_load<uint32_t, 16>(
+                            dxp0 + static_cast<size_t>(uint32_t(dx_off_jt[jt])) + 64u, kAl16);
+                    }
+
+                    #pragma nounroll
+                    for (uint32_t kb = 0; kb < n_kb; ++kb) {
+                        const bool has_nxt         = (kb + 1u < n_kb);
+                        const uint32_t w_nxt_off   = has_nxt ? 544u : 0u;
+                        const uint32_t dxp_nxt_off = has_nxt ? 128u : 0u;
+
+                        pp3_gu_substep<0>(ig0, iu0, ig1, iu1, cg_acc, cu_acc, wr_g, wr_u, sg_scale, su_scale, dx_scale,
+                                          mg_nxt, mu_nxt, dx_nxt, wg, wu, xp0, dxp0, x_off_jt, dx_off_jt, has_nxt, dxT_out, kb, nv);
+                        pp3_gu_substep<1>(ig0, iu0, ig1, iu1, cg_acc, cu_acc, wr_g, wr_u, sg_scale, su_scale, dx_scale,
+                                          mg_nxt, mu_nxt, dx_nxt, wg, wu, xp0, dxp0, x_off_jt, dx_off_jt, has_nxt, dxT_out, kb, nv);
+                        pp3_gu_substep<2>(ig0, iu0, ig1, iu1, cg_acc, cu_acc, wr_g, wr_u, sg_scale, su_scale, dx_scale,
+                                          mg_nxt, mu_nxt, dx_nxt, wg, wu, xp0, dxp0, x_off_jt, dx_off_jt, has_nxt, dxT_out, kb, nv);
+                        pp3_gu_substep<3>(ig0, iu0, ig1, iu1, cg_acc, cu_acc, wr_g, wr_u, sg_scale, su_scale, dx_scale,
+                                          mg_nxt, mu_nxt, dx_nxt, wg, wu, xp0, dxp0, x_off_jt, dx_off_jt, has_nxt, dxT_out, kb, nv);
+
+                        sg_scale = simd<float, 16>(sgu_dpas_h.template select<16, 1>(0));
+                        su_scale = simd<float, 16>(sgu_dpas_h.template select<16, 1>(16));
+                        dx_scale = dx_dpas;
+                        sgu_dpas_h.template select<16, 1>(0)  = half_raw_of(mg_nxt);
+                        sgu_dpas_h.template select<16, 1>(16) = half_raw_of(mu_nxt);
+                        #pragma unroll
+                        for (int jt = 0; jt < 4; ++jt) {
+                            dx_dpas.template select<8, 1>(8 * jt) =
+                                dx_nxt.template select<8, 1>(16 * jt).template bit_cast_view<float>();
+                        }
+                        mg_nxt = es::block_load<uint32_t, 16>(wg + w_nxt_off + 512u, kAl16);
+                        mu_nxt = es::block_load<uint32_t, 16>(wu + w_nxt_off + 512u, kAl16);
+                        #pragma unroll
+                        for (int jt = 0; jt < 4; ++jt) {
+                            dx_nxt.template select<16, 1>(16 * jt) = es::block_load<uint32_t, 16>(
+                                dxp0 + static_cast<size_t>(uint32_t(dx_off_jt[jt])) + dxp_nxt_off, kAl16);
+                        }
+
+                        pp3_gu_substep<4>(ig1, iu1, ig0, iu0, cg_acc, cu_acc, wr_g, wr_u, sg_scale, su_scale, dx_scale,
+                                          mg_nxt, mu_nxt, dx_nxt, wg, wu, xp0, dxp0, x_off_jt, dx_off_jt, has_nxt, dxT_out, kb, nv);
+                        pp3_gu_substep<5>(ig1, iu1, ig0, iu0, cg_acc, cu_acc, wr_g, wr_u, sg_scale, su_scale, dx_scale,
+                                          mg_nxt, mu_nxt, dx_nxt, wg, wu, xp0, dxp0, x_off_jt, dx_off_jt, has_nxt, dxT_out, kb, nv);
+                        pp3_gu_substep<6>(ig1, iu1, ig0, iu0, cg_acc, cu_acc, wr_g, wr_u, sg_scale, su_scale, dx_scale,
+                                          mg_nxt, mu_nxt, dx_nxt, wg, wu, xp0, dxp0, x_off_jt, dx_off_jt, has_nxt, dxT_out, kb, nv);
+                        pp3_gu_substep<7>(ig1, iu1, ig0, iu0, cg_acc, cu_acc, wr_g, wr_u, sg_scale, su_scale, dx_scale,
+                                          mg_nxt, mu_nxt, dx_nxt, wg, wu, xp0, dxp0, x_off_jt, dx_off_jt, has_nxt, dxT_out, kb, nv);
+
+                        sg_scale = simd<float, 16>(sgu_dpas_h.template select<16, 1>(0));
+                        su_scale = simd<float, 16>(sgu_dpas_h.template select<16, 1>(16));
+                        dx_scale = dx_dpas;
+                        sgu_dpas_h.template select<16, 1>(0)  = half_raw_of(mg_nxt);
+                        sgu_dpas_h.template select<16, 1>(16) = half_raw_of(mu_nxt);
+                        #pragma unroll
+                        for (int jt = 0; jt < 4; ++jt) {
+                            dx_dpas.template select<8, 1>(8 * jt) =
+                                dx_nxt.template select<8, 1>(16 * jt).template bit_cast_view<float>();
+                        }
+                        if (has_nxt) {
+                            mg_nxt = es::block_load<uint32_t, 16>(wg + w_nxt_off + 528u, kAl16);
+                            mu_nxt = es::block_load<uint32_t, 16>(wu + w_nxt_off + 528u, kAl16);
+                            #pragma unroll
+                            for (int jt = 0; jt < 4; ++jt) {
+                                dx_nxt.template select<16, 1>(16 * jt) = es::block_load<uint32_t, 16>(
+                                    dxp0 + static_cast<size_t>(uint32_t(dx_off_jt[jt])) + 192u, kAl16);
+                            }
+                        }
+                        wg   += 544u;
+                        wu   += 544u;
+                        xp0  += 2048u;
+                        dxp0 += 128u;
+                    }
+
+                    #pragma unroll
+                    for (int jt = 0; jt < 4; ++jt) {
+                        const simd<float, 8> dxs_v = dx_scale.template select<8, 1>(8 * jt);
+                        #pragma unroll
+                        for (int r = 0; r < 8; ++r) {
+                            const float d_r           = float(dxs_v[r]);
+                            const simd<float, 16> sdg = sg_scale * d_r;
+                            const simd<float, 16> sdu = su_scale * d_r;
+                            cg_acc[jt].template select<16, 1>(16 * r) +=
+                                simd<float, 16>(ig1[jt].template select<16, 1>(16 * r)) * sdg;
+                            cu_acc[jt].template select<16, 1>(16 * r) +=
+                                simd<float, 16>(iu1[jt].template select<16, 1>(16 * r)) * sdu;
+                        }
+                    }
+
+                    pp_util::gu_swiglu_epilogue(cg_acc, cu_acc, xq8_out, dxT_out, lid, ri, ci, wgr, wgc, n_g_out, n_ct32,
+                                                static_cast<uint32_t>(T));
+                }
+            });
+    });
+}
+
+}  // namespace
+}  // namespace pp3
 
 bool gemm_w4_i8_pp2(const void* weights, const void* xq8, const float* dxT, float* y,
                     int n_in, int n_out, int T, void* stream) {
@@ -1680,6 +2501,53 @@ bool gemm_w4_i8_gu_swiglu_pp2(const void* w_gate, const void* w_up,
         (reinterpret_cast<uintptr_t>(xq8_out) & 15u) != 0u ||
         (reinterpret_cast<uintptr_t>(dxT_out) & 15u) != 0u) return false;
     pp2::launch_w4i8_gu_swiglu_pp2(*strata::q_of(stream),
+                                   static_cast<const uint32_t*>(w_gate),
+                                   static_cast<const uint32_t*>(w_up),
+                                   static_cast<const int*>(xq8_in),
+                                   reinterpret_cast<const uint32_t*>(dxT_in),
+                                   static_cast<uint32_t*>(xq8_out),
+                                   reinterpret_cast<uint32_t*>(dxT_out),
+                                   n_in, n_out, T);
+    return true;
+}
+
+bool pp3_enabled() noexcept {
+    static const bool on = []() {
+        const char* e = std::getenv("STRATA_Q36_PP3");
+        return e && std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+bool gemm_w4_i8_pp3(const void* weights, const void* xq8, const float* dxT, float* y,
+                    int n_in, int n_out, int T, void* stream) {
+    if (n_in <= 0 || n_out <= 0 || T <= 0 || (n_in % 256) != 0 || (n_out % 16) != 0) return false;
+    if (!weights || !xq8 || !dxT || !y) return false;
+    if ((reinterpret_cast<uintptr_t>(weights) & 15u) != 0u) return false;
+    if ((reinterpret_cast<uintptr_t>(xq8) & 15u) != 0u) return false;
+    if ((reinterpret_cast<uintptr_t>(dxT) & 15u) != 0u) return false;
+    if ((reinterpret_cast<uintptr_t>(y) & 15u) != 0u) return false;
+    pp3::launch_w4i8_pp3(*strata::q_of(stream),
+                         static_cast<const uint32_t*>(weights),
+                         static_cast<const int*>(xq8),
+                         reinterpret_cast<const uint32_t*>(dxT),
+                         y, n_in, n_out, T);
+    return true;
+}
+
+bool gemm_w4_i8_gu_swiglu_pp3(const void* w_gate, const void* w_up,
+                              const void* xq8_in, const float* dxT_in,
+                              void* xq8_out, float* dxT_out,
+                              int n_in, int n_out, int T, void* stream) {
+    if (n_in <= 0 || n_out <= 0 || T <= 0 || (n_in % 256) != 0 || (n_out % 128) != 0) return false;
+    if (!w_gate || !w_up || !xq8_in || !dxT_in || !xq8_out || !dxT_out) return false;
+    if ((reinterpret_cast<uintptr_t>(w_gate)  & 15u) != 0u ||
+        (reinterpret_cast<uintptr_t>(w_up)    & 15u) != 0u ||
+        (reinterpret_cast<uintptr_t>(xq8_in)  & 15u) != 0u ||
+        (reinterpret_cast<uintptr_t>(dxT_in)  & 15u) != 0u ||
+        (reinterpret_cast<uintptr_t>(xq8_out) & 15u) != 0u ||
+        (reinterpret_cast<uintptr_t>(dxT_out) & 15u) != 0u) return false;
+    pp3::launch_w4i8_gu_swiglu_pp3(*strata::q_of(stream),
                                    static_cast<const uint32_t*>(w_gate),
                                    static_cast<const uint32_t*>(w_up),
                                    static_cast<const int*>(xq8_in),

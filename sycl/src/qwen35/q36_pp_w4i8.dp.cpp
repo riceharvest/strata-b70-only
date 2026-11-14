@@ -680,7 +680,7 @@ bool pp2_enabled() noexcept {
 
 bool pp2_fuse_enabled() noexcept {
     static const bool on = []() {
-        if (!pp2_enabled()) return false;
+        if (!pp2_enabled() && !pp3_enabled()) return false;
         const char* e = std::getenv("STRATA_Q36_PP2_FUSE");
         return e ? (std::atoi(e) != 0) : true;
     }();
@@ -730,12 +730,12 @@ bool rms_pp2(float* x, const float* y, const float* w, float* h, void* xq8, floa
 
 bool handles_w4_i8(int n_in, int n_out, int T) noexcept {
     if (n_in <= 0 || n_out <= 0 || T <= 0) return false;
-    if (pp2_enabled()) return (n_in % 256) == 0 && (n_out % 16) == 0;
+    if (pp2_enabled() || pp3_enabled()) return (n_in % 256) == 0 && (n_out % 16) == 0;
     return (n_in % 256) == 0 && (n_out % 256) == 0;
 }
 
 void quantize_x128(const float* x, void* xq8, float* dxT, int K, int M, void* stream) {
-    if (pp2_enabled()) {
+    if (pp2_enabled() || pp3_enabled()) {
         quantize_x128_pp2(x, xq8, dxT, K, M, stream);
         return;
     }
@@ -743,7 +743,7 @@ void quantize_x128(const float* x, void* xq8, float* dxT, int K, int M, void* st
 }
 
 void swiglu_x128(const float* g, const float* u, void* xq8, float* dxT, int K, int M, void* stream) {
-    if (pp2_enabled()) {
+    if (pp2_enabled() || pp3_enabled()) {
         swiglu_x128_pp2(g, u, xq8, dxT, K, M, stream);
         return;
     }
@@ -763,7 +763,7 @@ bool gemm_w4_i8(const void* weights, const void* xq8, const float* dxT, float* y
 
 bool rms_pp(float* x, const float* y, const float* w, float* h, void* xq8, float* dxT,
             int n, int T, float eps, void* stream) {
-    if (pp2_enabled()) return rms_pp2(x, y, w, h, xq8, dxT, n, T, eps, stream);
+    if (pp2_enabled() || pp3_enabled()) return rms_pp2(x, y, w, h, xq8, dxT, n, T, eps, stream);
     if (!x || !w || !h || T <= 0 || n <= 0 || n > 8192 || (n % 128) != 0) return false;
     if (((uintptr_t)x & 15u) != 0u || ((uintptr_t)w & 15u) != 0u || ((uintptr_t)h & 15u) != 0u) return false;
     if (y && ((uintptr_t)y & 15u) != 0u) return false;
