@@ -3576,6 +3576,7 @@ struct Engine {
     // runs and the engine is as before.  On: every attention layer of the main model keeps its indexer's block keys (every forward) and its
     // rows of at most kGemmT tokens attend to their 512 best blocks + their own block (q36_qsa.dp.cpp).  The MTP block stays dense.
     bool qsa_on = false;
+    bool qsa_qall = false;                         // STRATA_Q36_QSA_QALL=1: a dense prompt chunk also projects the queries (the old behaviour, for comparison)
     bool qsa_prefill = false;                      // STRATA_Q36_QSA_PREFILL=1: prompt chunks (T > kGemmT) take the sparse attention too
     strata::q36qsa::Weights qsa_w;
     std::vector<strata::q36qsa::LayerState> qsa_st;   // per QSA layer, in qsa_w's order
@@ -3584,6 +3585,7 @@ struct Engine {
     int32_t* qsa_p0 = nullptr;                     // device scalar (a tree commit's root cell)
     std::string qsa_dump_dir;                      // STRATA_Q36_QSA_DUMP=<dir>: one decode step's tensors of one layer, for tools/qwen35/qsa_ref.py (needs --no-graph)
     int qsa_dump_layer = -1, qsa_dump_left = 0, qsa_dump_min = 2200;
+    bool qsa_dump_h = false;                       // STRATA_Q36_QSA_DUMP_H=1: also the dump layer's input rows of EVERY forward (hall.f32 + hall.txt), for qsa_ref.py --pool
     // ---- end QSA BLOCK 1
     uint32_t *xqb = nullptr, *xpb = nullptr;
     float *xqs = nullptr, *xsc = nullptr, *xsrow = nullptr;
@@ -5704,12 +5706,14 @@ work-group size if needed.
         if (!ok) { std::fprintf(stderr, "strata-q36: QSA: device allocation failed\n"); std::exit(1); }
         qsa_p0 = dalloc_t<int32_t>(1);
         qsa_prefill = std::getenv("STRATA_Q36_QSA_PREFILL") != nullptr && std::getenv("STRATA_Q36_QSA_PREFILL")[0] == '1';
+        qsa_qall = std::getenv("STRATA_Q36_QSA_QALL") != nullptr && std::getenv("STRATA_Q36_QSA_QALL")[0] == '1';
         qsa_on = true;
         if (const char* dd = std::getenv("STRATA_Q36_QSA_DUMP"); dd != nullptr && dd[0] != '\0') {
             qsa_dump_dir = dd;
             qsa_dump_layer = std::getenv("STRATA_Q36_QSA_DUMP_LAYER") ? std::atoi(std::getenv("STRATA_Q36_QSA_DUMP_LAYER")) : qsa_w.layer_ids[0];
             qsa_dump_left = std::getenv("STRATA_Q36_QSA_DUMP_COUNT") ? std::atoi(std::getenv("STRATA_Q36_QSA_DUMP_COUNT")) : 1;
             qsa_dump_min = std::getenv("STRATA_Q36_QSA_DUMP_MIN") ? std::atoi(std::getenv("STRATA_Q36_QSA_DUMP_MIN")) : 2200;
+            qsa_dump_h = std::getenv("STRATA_Q36_QSA_DUMP_H") != nullptr && std::getenv("STRATA_Q36_QSA_DUMP_H")[0] == '1';
             std::fprintf(stderr, "strata-q36: QSA dump: layer %d of the first %d decode step(s) from cell %d on go to %s%s\n", qsa_dump_layer, qsa_dump_left,
                          qsa_dump_min, qsa_dump_dir.c_str(), use_graph ? " (NEEDS --no-graph: nothing is written from a replayed graph)" : "");
         }
@@ -5738,7 +5742,17 @@ work-group size if needed.
     /// An attention layer's indexer work for the T rows whose normed input is h: projections, block keys, pooling.
     void qsa_index(size_t li, int T, const int32_t* dpos) {
         const int ord = qsa_ord[li];
-        strata::q36qsa::index_rows(qsa_w.w[(size_t) ord], qsa_st[(size_t) ord], qsa_sc, h, qsa_win(T, dpos), qsa_rope(), tree_mode, (void*) st);
+        strata::q36qsa::index_rows(qsa_w.w[(size_t) ord], qsa_st[(size_t) ord], qsa_sc, h, qsa_win(T, dpos), qsa_rope(), tree_mode, (void*) st,
+                                       T <= kGemmT || qsa_prefill || qsa_qall);   // (a dense prompt chunk needs the keys only)
+    }
+    /// STRATA_Q36_QSA_DUMP_H=1: the T rows (cells p0 ..) of the layer's normed input, appended to hall.f32; hall.txt gets one "p0 T" line.
+    void qsa_dump_rows(int T, int64_t p0) {
+        const size_t n = (size_t) T * m->g.n_embd;
+        std::vector<float> hb(n);
+        CK(DPCT_CHECK_ERROR(st->wait()));
+        CK(DPCT_CHECK_ERROR(st->memcpy(hb.data(), h, n * 4).wait()));
+        if (FILE* f = std::fopen((qsa_dump_dir + "/hall.f32").c_str(), "ab")) { std::fwrite(hb.data(), 4, n, f); std::fclose(f); }
+        if (FILE* f = std::fopen((qsa_dump_dir + "/hall.txt").c_str(), "a")) { std::fprintf(f, "%lld %d\n", (long long) p0, T); std::fclose(f); }
     }
     /// One decode step's tensors of layer li into qsa_dump_dir (raw binary files + meta.txt; tools/qwen35/qsa_ref.py reads them): the layer's input row,
     /// the main query and gate, the indexer's query, the pooled block keys, the scores, the selection, the output, the whole K / V allocations.
@@ -5861,6 +5875,7 @@ work-group size if needed.
         }
         // ---- QSA BLOCK 3 (attention layer): the indexer's keys every forward; the rows of a window attend sparsely
         if (qsa_on && !rows_mode && li < qsa_ord.size() && qsa_ord[li] >= 0) {
+            if (qsa_dump_h && !use_graph && (int) li == qsa_dump_layer) qsa_dump_rows(T, p0);
             qsa_index(li, T, dpos);
             if constexpr (std::is_same_v<KV, int8_t>) {
                 if (T <= kGemmT) {

@@ -108,8 +108,10 @@ struct Rope { float base = 1e7f; int n_rot = 64; float eps = 1e-6f; };
 /// Step 1, every forward: the indexer's projections of h [T][5120] (the layer's normed input, fp32), the per-row norms and rotation of
 /// the queries (-> sc.qidx), the raw keys (-> sc.raw, and the ring by cell, or lyr.traw for a tree window: tree = true) and the pooling
 /// of every block the rows complete (not for a tree window: pool_tree() does it after the commit).
+/// with_q = false: only the key's 128 outputs (a dense prompt chunk never reads the queries: 1/5 of the projection work; the keys are bitwise
+/// the same).
 void index_rows(const LayerWeights& w, const LayerState& lyr, const Scratch& sc, const float* h, const Win& win, const Rope& rp, bool tree,
-                void* stream);
+                void* stream, bool with_q = true);
 /// Step 2: scores of the window's rows over their visible blocks and each row's 512 best (sc.sel, sc.nsel).  For the rows
 /// [win.row0, win.row0 + win.nr) with qidx rows relative to win.row0 and the outputs (score, sel, nsel) relative to the call.
 void select_rows(const LayerState& lyr, const Scratch& sc, const Win& win, void* stream);

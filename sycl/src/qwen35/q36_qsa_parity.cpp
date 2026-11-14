@@ -199,6 +199,21 @@ void test_index(const Weights16& w, const LayerWeights& lw) {
         check(fmt("project+prep: %.0f rows bitwise the first rows of the 40-row call", Tn), same);
         free_scratch(s2, g_q); free_state(l2, g_q);
     }
+    {   // the key-only call (a dense prompt chunk): raw keys and pooled blocks bitwise those of the full call
+        Scratch s3;
+        LayerState l3;
+        alloc_scratch(s3, tmax, kMaxWin, ctx, g_q);
+        alloc_state(l3, ctx, g_q);
+        g_q->memcpy(l3.ring, ring0.data(), ring0.size() * 4).wait();
+        index_rows(lw, l3, s3, dh, win, rp, false, g_q, false);
+        g_q->wait();
+        const auto r3 = down(s3.raw, (size_t) T * kD);
+        const auto p3 = down(static_cast<const uint16_t*>(l3.pooled), (size_t) (p0 / kRatio + T / kRatio + 1) * kD);
+        const bool same = std::memcmp(r3.data(), raw.data(), r3.size() * 4) == 0 &&
+                          std::memcmp(p3.data() + (size_t) (p0 / kRatio) * kD, pooled.data() + (size_t) (p0 / kRatio) * kD, (size_t) (T / kRatio) * kD * 2) == 0;
+        check("project+prep: key-only call (with_q = false) bitwise the keys and blocks of the full call", same);
+        free_scratch(s3, g_q); free_state(l3, g_q);
+    }
     free_scratch(sc, g_q); free_state(ls, g_q);
 }
 

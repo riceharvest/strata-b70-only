@@ -11,6 +11,9 @@ indexer file and recomputes, in float64:
   3. the selection: top 512 by (score desc, block index asc), from the engine's scores AND from the recomputed ones
   4. the sparse attention over the selected blocks + the own block, from the engine's 8-bit K / V cache, times sigmoid(gate)  against att.f32
   5. (info) the dense attention over every cell, and how far the sparse output is from it.
+  6. with --pool: the pooled block keys of every complete block from the layer's input rows of the WHOLE sequence (STRATA_Q36_QSA_DUMP_H=1 wrote
+     hall.f32 / hall.txt; --no-graph), recomputed in float64 (raw key = rms(k_proj . h) * k_pre; block = rms(mean of 4) * k_norm, rotated to cell 4b),
+     against pooled.f16; and the selection from those scores against the engine's.
 Exit status 1 when a check fails.  The pooled keys themselves are not recomputed here (that needs every token's raw key): qsa_parity checks the
 pooling on the card against float64.
 """
@@ -59,6 +62,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump", required=True)
     ap.add_argument("--idx", required=True)
+    ap.add_argument("--pool", action="store_true", help="recompute the pooled keys from hall.f32 (needs STRATA_Q36_QSA_DUMP_H=1)")
     a = ap.parse_args()
     d = a.dump.rstrip("/") + "/"
     meta = dict(line.strip().split("=") for line in open(d + "meta.txt") if "=" in line)
@@ -104,6 +108,34 @@ def main():
     if nb > want:
         kth = np.sort(se)[::-1][want - 1]
         print("    512th score %.6f, 513th %.6f, selected-score min %.6f" % (kth, np.sort(se)[::-1][want], se[sel].min()))
+
+    # 6. (--pool) the pooled keys from the whole sequence's input rows
+    if a.pool:
+        import os
+        lines = [ln.split() for ln in open(d + "hall.txt")]
+        hb = np.fromfile(d + "hall.f32", dtype="<f4")
+        nemb = hb.size // sum(int(t) for _, t in lines)
+        hall = np.zeros((pos + 1, nemb))
+        off = 0
+        for p0s, ts in lines:   # (a cell written twice: the last forward wins)
+            p0i, ti = int(p0s), int(ts)
+            hall[p0i:p0i + ti] = hb[off * nemb:(off + ti) * nemb].reshape(ti, nemb)
+            off += ti
+        nbc = (pos + 1) // RATIO
+        kraw = rms(hall[:nbc * RATIO] @ w["k_proj"].T, w["k_pre"], 1e-6)               # [cells][128]
+        pm = rms(kraw.reshape(nbc, RATIO, KD).mean(1), w["k_norm"], 1e-6)
+        pm = rope(pm, (np.arange(nbc) * RATIO)[:, None].astype(np.float64), base, n_rot)
+        e = np.abs(pm - pooled[:nbc])
+        tol = np.abs(pm) / 1024.0 + 5e-4
+        nbad = int((e > tol).sum())
+        report("pooled keys vs float64 from the sequence (%d blocks)" % nbc, nbad == 0, "max |d| %.2e, %d of %d values over the fp16 bound" % (e.max(), nbad, e.size))
+        if nbad:
+            bb = np.nonzero((e > tol).any(1))[0]
+            print("    first bad blocks:", bb[:8].tolist(), " (of %d bad)" % len(bb))
+        sc2 = np.maximum(pm @ qi.T, 0).sum(-1) / np.sqrt(KD)
+        ord3 = np.sort(np.lexsort((np.arange(nbc), -sc2))[:want])
+        ov3 = len(set(sel.tolist()) & set(ord3.tolist()))
+        report("engine's selection vs the top %d of the float64 pooled scores" % want, ov3 >= want - 8, "%d of %d blocks in common" % (ov3, want))
 
     # 4. the sparse attention from the 8-bit cache
     kraw = np.fromfile(d + "kcache.bin", dtype=np.uint8)

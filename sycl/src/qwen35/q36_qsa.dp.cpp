@@ -245,14 +245,15 @@ void free_scratch(Scratch& s, void* stream) {
 namespace {
 
 // ---- project: proj[t][o] = W_o . h[t], o in 0..639 (q rows 0..511 of wq, then the key row of wk), 16 rows a tile -------------------
-void launch_project(sycl::queue& q, const half* wq, const half* wk, const float* h, int T, float* proj) {
+void launch_project(sycl::queue& q, const half* wq, const half* wk, const float* h, int T, float* proj, int o0) {
     const int tiles = (T + 15) / 16;
-    const int groups = tiles * (kProj / 4);   // 4 outputs (4 sub-groups of 16 lanes) a work-group
+    const int ng = (kProj - o0) / 4;   // work-groups of a tile: o0 = 0 all 640 outputs, o0 = 512 the key only
+    const int groups = tiles * ng;   // 4 outputs (4 sub-groups of 16 lanes) a work-group
     q.parallel_for<TagProj>(sycl::nd_range<1>((size_t) groups * 64, 64), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
         auto sg = it.get_sub_group();
         const int g = (int) it.get_group(0);
-        const int rt = g / (kProj / 4), og = g % (kProj / 4);
-        const int o = og * 4 + (int) sg.get_group_id()[0];
+        const int rt = g / ng, og = g % ng;
+        const int o = o0 + og * 4 + (int) sg.get_group_id()[0];
         const int l = (int) sg.get_local_id()[0];
         const half* w = o < kHeads * kD ? wq + (size_t) o * kEmbd : wk + (size_t) (o - kHeads * kD) * kEmbd;
         const int t0 = rt * 16;
@@ -296,13 +297,14 @@ void launch_project(sycl::queue& q, const half* wq, const half* wk, const float*
 
 // ---- prep: per row, 4 query heads (rms * q_norm, rotated -> qidx) and the key (rms * k_pre -> raw, and traw for a tree window) -------
 void launch_prep(sycl::queue& q, const float* proj, const float* qn, const float* kpre, Win win, Rope rp, bool tree, float* qidx, float* raw,
-                 float* traw) {
+                 float* traw, bool with_q) {
     const int T = win.T;
-    q.parallel_for<TagPrep>(sycl::nd_range<1>((size_t) T * 5 * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+    const int np = with_q ? 5 : 1;   // parts a row: the 4 query heads, then the key (alone when the queries are not wanted)
+    q.parallel_for<TagPrep>(sycl::nd_range<1>((size_t) T * np * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
         auto& sm = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[8]>(it.get_group());
         auto& buf = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[128]>(it.get_group());
         const int g = (int) it.get_group(0);
-        const int t = g / 5, part = g % 5;
+        const int t = g / np, part = with_q ? g % 5 : 4;
         const int i = (int) it.get_local_id(0);
         const float x = proj[(size_t) t * kProj + part * 128 + i];
         const float s = wg_sum128(it, x * x, sm);
@@ -762,10 +764,11 @@ void launch_ring_tree(sycl::queue& q, const float* traw, const int32_t* path, co
 
 // ================================================================================================================ public entry points
 
-void index_rows(const LayerWeights& w, const LayerState& lyr, const Scratch& sc, const float* h, const Win& win, const Rope& rp, bool tree, void* stream) {
+void index_rows(const LayerWeights& w, const LayerState& lyr, const Scratch& sc, const float* h, const Win& win, const Rope& rp, bool tree, void* stream,
+                bool with_q) {
     sycl::queue& q = Q(stream);
-    launch_project(q, static_cast<const half*>(w.wq), static_cast<const half*>(w.wk), h, win.T, sc.proj);
-    launch_prep(q, sc.proj, w.qn, w.kpre, win, rp, tree, sc.qidx, sc.raw, lyr.traw);
+    launch_project(q, static_cast<const half*>(w.wq), static_cast<const half*>(w.wk), h, win.T, sc.proj, with_q ? 0 : kHeads * kD);
+    launch_prep(q, sc.proj, w.qn, w.kpre, win, rp, tree, sc.qidx, sc.raw, lyr.traw, with_q);
     if (!tree) {
         launch_pool(q, sc.raw, lyr.ring, w.knorm, win.pos0, win.delta, win.T, rp, static_cast<half*>(lyr.pooled));
         launch_ring_update(q, sc.raw, win.pos0, win.T, lyr.ring);
