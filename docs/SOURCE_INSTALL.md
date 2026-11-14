@@ -86,8 +86,8 @@ cmake --build build --target strata -j8
 `native` builds for the GPUs in this PC. Name the card instead for another one: `75` (RTX 20), `86` (RTX 30), `89` (RTX 40),
 `120` (RTX 50), or a list such as `"86;120"`. Without the option the build is for RTX 50 only and the configure step says so.
 
-Run against the resulting binary and the matching model config. Use the build instructions for
-[HIP](AMD_HIP.md), [SYCL](INTEL_ARC.md) or [Metal](MAC.md) when changing those backends.
+Run against the resulting binary and the matching model config. On this fork only the [SYCL](INTEL_ARC.md) backend
+([INTEL.md](INTEL.md)) is active; the upstream HIP and Metal guides are not in this fork.
 Follow [contribution validation requirements](../CONTRIBUTING.md) before requesting review.
 
 For the Terminal monitor from a checkout:
@@ -105,15 +105,15 @@ Use an Apple Silicon Mac with macOS 15 or newer. Install Apple's Command Line To
 xcode-select --install
 ```
 
-Then run `./setup.sh` in the source folder. macOS uses its own setup implementation and builds the Metal engine;
-its options and model preparation differ from Windows/Linux. Read [MAC.md](MAC.md#install) and
-`./setup.sh --help`. The released app and Terminal do not require a compiler.
+Then run `./setup.sh` in the source folder. Upstream macOS used its own setup implementation for the Metal engine
+(removed in this fork together with `metal/` and the Mac guide). Use `./setup.sh --help`. The released app and
+Terminal do not require a compiler.
 
 ## AMD cards
 
-Use `START-HERE.bat` on Windows or `./setup.sh` on Linux. Source setup detects supported Radeon cards;
-`--backend hip` selects HIP explicitly on a mixed-vendor PC. Build dependencies, architecture support and
-measurements are in [AMD_HIP.md](AMD_HIP.md). Ryzen AI Max uses the [Strix Halo guide](STRIX_HALO.md).
+Use `START-HERE.bat` on Windows or `./setup.sh` on Linux. Upstream source setup detects supported Radeon cards;
+`--backend hip` selected HIP on a mixed-vendor PC (the upstream AMD/HIP and Strix Halo Linux guides are not in this
+fork).
 
 Do not assume every AMD card, quantization or feature has been validated. Follow the exact backend guide.
 Intel Arc is a separate Linux SYCL path with its own [model preparation instructions](INTEL_ARC.md).
@@ -127,7 +127,7 @@ Source setup uses `--gpus` to select multiple cards of the same supported backen
 ```
 
 Windows equivalent: `START-HERE.bat --gpus 0,1`. The installed Terminal instead uses
-`strata launch --gpu 0,1`. Main/Helper roles, memory limits and measurements are in [MULTI_GPU.md](MULTI_GPU.md).
+`strata launch --gpu 0,1` (the upstream multi-GPU guide is not in this fork).
 Several cards are not always faster than one; measure the workload you care about.
 
 ## Docker (Linux)
@@ -139,7 +139,7 @@ A container is a separate installation route. Intel model preparation and host d
 
 Ready-made x86 engines require AVX2. Source setup can build experimental AVX or SSE4.2 paths on older CPUs;
 this does not make every model pack compatible. Q2_0's CPU requirements differ from the i-quants.
-See the [CPU and build notes](DETAILS.md) and [older GPU guide](OLDER_GPUS.md) for the relevant hardware.
+See the [CPU and build notes](DETAILS.md) (the upstream older-GPU guide is not in this fork).
 Record the actual CPU, compiler, model and validation results when reporting an experimental build.
 
 ## Updating

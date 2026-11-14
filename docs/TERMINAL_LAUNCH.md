@@ -72,7 +72,7 @@ and test-starts it before using it.
 Keys: arrows choose, Enter goes on, Esc goes back, `?` explains the screen, `q` leaves.
 
 With two or more usable graphics cards the Model step also asks for a role per card (M main, H helper, O off). On the command
-line, `--gpu-roles 1=main,0=helper` does the same ([MULTI_GPU.md](MULTI_GPU.md)).
+line, `--gpu-roles 1=main,0=helper` does the same (upstream multi-GPU guide, not in this fork).
 
 ## Flags
 

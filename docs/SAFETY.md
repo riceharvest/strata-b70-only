@@ -112,7 +112,7 @@ The server also has browser protections (a host check, an origin check, no CORS 
    then it is checked to fit your PC.
 4. The new engine is test-started before Strata switches to it. If anything fails, you keep the engine you had.
 
-Updates never replace your models or saved tuning. The full description is in [packaging/UPDATES.md](../packaging/UPDATES.md).
+Updates never replace your models or saved tuning. (Upstream described this in `packaging/UPDATES.md`; `packaging/` is removed in this fork.)
 
 **The app.** Its updates are signed with a separate key (Tauri's minisign), and the public half is in the app
 (`apps/desktop/src-tauri/tauri.conf.json`). The updater refuses an installer whose signature does not match. The Terminal
@@ -149,7 +149,7 @@ your PC.
 
 **Code signing.** The Windows installer is not code-signed yet, so Windows shows "Windows protected your PC". The signing and
 Apple notarisation of the Mac builds is set up in `packaging/mac/` and runs on the maintainer's Mac. A Mac build that has not
-been notarised shows macOS's "damaged" warning ([MAC.md](MAC.md)).
+been notarised shows macOS's "damaged" warning (upstream Mac guide, removed in this fork).
 
 **What the checks do not cover.** They catch a damaged or swapped download and a feed nobody signed with the release key. They
 cannot protect you if someone who can publish a release (or who holds the signing key) publishes something harmful.

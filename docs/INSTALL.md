@@ -19,11 +19,11 @@ install does not need a source checkout or a startup `.bat` file.
 
 | Computer | Guide |
 | --- | --- |
-| Windows 10/11 or Linux x86-64 with an NVIDIA RTX GPU | Use the app or the Terminal. The engine for your card is downloaded for you. [Older NVIDIA cards](OLDER_GPUS.md) use the CUDA 12 engine. DeepSeek V4.1-Flash runs on RTX 30, 40 and 50 cards in the app and the Terminal. |
-| Windows or Linux x86-64 with a supported AMD Radeon | [AMD guide](AMD_HIP.md), including the card-to-package table. DeepSeek V4.1-Flash runs on the Radeon AI PRO R9700 under Linux, in the app and the Terminal. |
-| Linux x86-64 with Intel Arc | [Intel Arc guide](INTEL_ARC.md); install the driver/compute runtime and check model preparation requirements |
-| Apple Silicon Mac, macOS 15 or newer | [Mac guide](MAC.md). Intel Macs are not supported by the Mac package. |
-| AMD Ryzen AI Max / Strix Halo | [Strix Halo guide](STRIX_HALO.md) |
+| Windows 10/11 or Linux x86-64 with an NVIDIA RTX GPU | Upstream app/Terminal only (removed in this fork); older NVIDIA cards used upstream's CUDA 12 guide. DeepSeek V4.1-Flash runs on RTX 30, 40 and 50 cards upstream. |
+| Windows or Linux x86-64 with a supported AMD Radeon | Upstream AMD/HIP guide (removed in this fork). DeepSeek V4.1-Flash runs on the Radeon AI PRO R9700 under Linux upstream. |
+| Linux x86-64 with Intel Arc | [Intel Arc guide](INTEL_ARC.md), [SYCL build notes](INTEL.md), and [B70 branch notes](B70.md); this fork targets one Arc Pro B70 on Linux |
+| Apple Silicon Mac, macOS 15 or newer | Upstream Mac/Metal guide (removed in this fork). Intel Macs were not supported. |
+| AMD Ryzen AI Max / Strix Halo | Upstream Strix Halo Linux guide (removed in this fork; see [Windows notes](STRIX_HALO_WINDOWS.md) for upstream history) |
 
 Memory and disk needs depend on the **model, quantization, context and enabled features**. Check
 [which model fits](MODELS.md#pick-by-memory); download size is not the same as RAM use. Unified memory counts once.
@@ -43,7 +43,7 @@ On one B70, install through the Docker build in the [README](../README.md) or th
    - **Windows:** run `Strata-0.2.8-windows-x64-setup.exe`. It installs for your user and needs no administrator rights.
    - **Linux:** make `Strata-0.2.8-linux-x86_64.AppImage` executable, then open it. If FUSE is unavailable, run the
      downloaded file with `--appimage-extract-and-run`. [Linux help](TROUBLESHOOTING.md).
-   - **Mac:** open `Strata-0.2.8-macos-arm64.dmg`, drag Strata into Applications, then open it. [Mac help](MAC.md).
+   - **Mac:** open `Strata-0.2.8-macos-arm64.dmg`, drag Strata into Applications, then open it (upstream Mac guide, removed in this fork).
 3. On Windows and Linux the installer has no engine inside. On first start the app shows the engine for your
    graphics card with its size and one **Download** button, with progress and resume. If you already downloaded the
    engine file, choose **I already have the file** and it installs without internet. The Mac file keeps its small
@@ -118,11 +118,11 @@ config. Every flag and what was measured: [docs/INTEL.md](INTEL.md).
 
 - **What it needs:** `git`, a C++ compiler and `cmake` (setup installs the build tools through `sudo apt` on
   Debian and Ubuntu; elsewhere install them first), and the CUDA Toolkit for NVIDIA or ROCm with the HIP compiler for
-  a Radeon card ([AMD_HIP.md](AMD_HIP.md)). Python goes into `.venv` of the checkout.
+  a Radeon card (upstream AMD/HIP guide, removed in this fork). Python goes into `.venv` of the checkout.
 - **After you change the code:** run `./setup.sh` again. It compiles only what changed and starts the model. To
   update without starting: `git pull`, then `./update.sh`. By hand, the build folder is an ordinary CMake build:
-  `cmake --build build --target strata -j8` (`build-hip` for a Radeon card; the options are in
-  [AMD_HIP.md](AMD_HIP.md)).
+  `cmake --build build --target strata -j8` (`build-hip` for a Radeon card upstream; AMD/HIP guide removed in this
+  fork).
 - **To try a pull request:** `git fetch origin pull/<number>/head:pr-<number> && git checkout pr-<number>`, then
   `./setup.sh`. `git checkout main` goes back; the next `./setup.sh` rebuilds.
 - **Settings for the engine** (for example `STRATA_HIPBLASLT_TUNING=/path/to/table.txt`) go into the `"env"` object of
@@ -144,9 +144,8 @@ config. Every flag and what was measured: [docs/INTEL.md](INTEL.md).
 ## From source: Mac
 
 On an Apple Silicon Mac with macOS 15 or newer, install Apple's Command Line Tools once (`xcode-select --install`),
-then run `./setup.sh` in the Strata folder. It builds the Mac (Metal) engine on your Mac and asks the same
-questions. The app and the Terminal do not build anything. All of it, and what fits which memory size, is in
-[MAC.md](MAC.md).
+then run `./setup.sh` in the Strata folder (upstream Metal path; removed in this fork together with `metal/` and the
+Mac guide).
 
 ## AMD cards
 
@@ -160,8 +159,8 @@ On Linux setup uses a system ROCm 7 when there is one, or installs ROCm into `.v
 sudo), and compiles the engine on your PC for the card (10-20 minutes, once; it needs a C++ compiler and git:
 `sudo apt install build-essential git`). Several AMD cards share the model with `--gpus`, as on NVIDIA.
 
-What differs from NVIDIA for now: `--calibrate` is NVIDIA-only, and Unsloth's 4-bit model needs an NVIDIA card. Measurements per card, the
-build by hand and the tuning tables: [AMD_HIP.md](AMD_HIP.md).
+What differs from NVIDIA for now: `--calibrate` is NVIDIA-only, and Unsloth's 4-bit model needs an NVIDIA card. (The
+upstream AMD/HIP guide is not in this fork.)
 
 ## Two or three cards
 
@@ -170,7 +169,7 @@ asks whether to share the model across them (recommended when two can). An insta
 its next start. Or choose yourself: `START-HERE.bat --gpus 0,2` (both, remembered), `--gpus all`, or `--gpu 0` (one
 card, this start only). Each card keeps the experts of its own layers, and prompts flow through the cards in a
 pipeline: on an RTX 5080 + RTX 3090 prompts were read 18-20% faster than on the 5080 alone, decoding on par.
-Every card must be an RTX 20 series or newer with 8 GB or more. See [MULTI_GPU.md](MULTI_GPU.md).
+Every card must be an RTX 20 series or newer with 8 GB or more (upstream multi-GPU guide, removed in this fork).
 
 ## Docker (Linux)
 
@@ -243,6 +242,6 @@ See [model discovery](TERMINAL_LAUNCH.md#models-you-already-have).
 ## More options
 
 - [Build or run from a source checkout](SOURCE_INSTALL.md)
-- [Multiple GPUs](MULTI_GPU.md)
+- [B70 branch notes](B70.md)
 - [Troubleshooting and logs](TROUBLESHOOTING.md)
 - [Model compatibility](MODELS.md)

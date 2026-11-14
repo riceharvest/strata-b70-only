@@ -57,7 +57,7 @@ replaced (one generation, about 210 MiB). Source-checkout engines use a separate
 (#670). It is described in [source setup](SOURCE_INSTALL.md).
 
 **On a Mac: "Strata is damaged and can't be opened", "cannot be opened", or "unidentified developer".**
-Check first that the download is for Apple Silicon and that macOS is 15 or newer ([Mac installation](MAC.md#the-desktop-app-and-strata-launch-on-a-mac)).
+Check first that the download is for Apple Silicon and that macOS is 15 or newer (upstream's Mac guide, not in this fork).
 Nothing is wrong with the file if the message is only about the developer: macOS marks everything a browser downloads, and
 only lets a marked program run if Apple has checked it. Strata's release builds are checked by Apple ("notarised"): drag
 Strata onto Applications and open it; the first time, macOS asks "Are you sure you want to open it?" and you press Open. A
@@ -122,7 +122,7 @@ on top (a fragmented machine spent minutes compacting memory, #771); `STRATA_NO_
 
 **The NVIDIA driver is too old.**
 Use the driver required by the engine package. CUDA 13 needs driver 580 or newer; older cards use the
-[CUDA 12 route](OLDER_GPUS.md). Update it (NVIDIA App or [nvidia.com/drivers](https://www.nvidia.com/drivers)), restart the
+CUDA 12 route (upstream older-GPU guide, not in this fork). Update it (NVIDIA App or [nvidia.com/drivers](https://www.nvidia.com/drivers)), restart the
 PC if needed, then open the app or rerun `strata launch`.
 
 **Port 8080 is already in use, or I changed a running model's settings.**
@@ -338,12 +338,12 @@ in order, one at a time, and tell us what changed:
    test.
 
 **Large pinned host allocations fail on ROCm although RAM is free.**
-See [AMD_HIP.md](AMD_HIP.md#model-and-serving-configuration): the mapped expert mode avoids the full pinned arena.
+See upstream's AMD HIP guide (`model-and-serving-configuration`, not in this fork): the mapped expert mode avoids the full pinned arena.
 
 **"verify: timed out at layer N" or "no progress for 60 s" on AMD (Linux), mostly with `--mmap-experts`.**
 Two reports fixed it with `"GPU_PINNED_MIN_XFER_SIZE": "1048576"` (RX 6800) or `"HSA_USERPTR_FOR_PAGED_MEM": "0"` (two
 R9700) in the `env` block of the server JSON, then a restart. Experimental, one machine each; on a systemd unit use
-`MemoryMax`, not `MemoryHigh`. Details: [AMD_HIP.md](AMD_HIP.md#linux-verify-timeouts-while-the-kernel-reclaims-host-memory).
+`MemoryMax`, not `MemoryHigh`. Details: upstream's AMD HIP guide (`linux-verify-timeouts-while-the-kernel-reclaims-host-memory`, not in this fork).
 
 ## Source-checkout problems
 

@@ -154,8 +154,8 @@ picture). The rule is the same on NVIDIA and AMD.
 | `--vision off` | no pictures (also "No" in the app and in `strata launch`) |
 | `--vision cpu` / `--vision gpu` | choose the reader |
 
-- **AMD:** `strata-vision-hip` is the card's reader. If it cannot start, Strata uses the CPU reader ([AMD_HIP.md](AMD_HIP.md)).
-- **Mac:** pictures run on the GPU ([MAC.md](MAC.md)).
+- **AMD:** `strata-vision-hip` is the card's reader. If it cannot start, Strata uses the CPU reader (upstream AMD/HIP guide, not in this fork).
+- **Mac:** pictures run on the GPU (upstream Mac guide, not in this fork).
 - **Intel Arc:** an Arc with 24 GB or more keeps the CPU reader unless you pass `--vision gpu`. Pictures are on by default on every Arc card, a Battlemage card (B580, B70) included. The first picture on a B70 once reset the card and has not been looked at since ([INTEL.md](INTEL.md#pictures-on-an-arc), [B70.md](B70.md#pictures-on-one-b70-by-hand)).
 
 More: [Images](DETAILS.md#images-vision).
@@ -223,7 +223,7 @@ options and never setup's default. The download includes the 28 GB n-gram table.
 
 Gyro runs on NVIDIA and AMD (experimental), on Intel Arc under Linux, and on Apple Silicon Macs. It reads pictures.
 On an RTX 3060 12 GB and an R9700, Gyro-M decodes 16 to 21% slower than Q2_0. Details, measurements and credit:
-[GYRO.md](GYRO.md). Intel Arc: [INTEL_ARC.md](INTEL_ARC.md). Mac: [MAC.md](MAC.md#gyro-s-and-gyro-m-agentionais-trellis-experts).
+[GYRO.md](GYRO.md). Intel Arc: [INTEL_ARC.md](INTEL_ARC.md). Mac: removed in this fork.
 
 ```sh
 strata launch --family gyro --model Gyro-S
@@ -242,14 +242,14 @@ strata launch --family gyro --model Gyro-S
 | **NVFP4 (NVIDIA, trained for FP4)** | `NVFP4-QAD` | NVIDIA's retrained model, slightly faster on short prompts | 102 GB (+110 GB of disk to prepare) |
 
 All three need about 80 GB of RAM to keep every expert in RAM, run on NVIDIA cards only and read pictures. RTX 50 cards
-have FP4 tensor cores; other NVIDIA cards run NVFP4 at 8-bit precision. Details and measurements: [NVFP4.md](NVFP4.md).
+have FP4 tensor cores; other NVIDIA cards run NVFP4 at 8-bit precision (upstream NVFP4 guide, removed in this fork).
 
 **NVFP4-QAD** is NVIDIA's [Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local),
 retrained for 4-bit experts (quantization-aware distillation). Setup downloads NVIDIA's files as they are (102 GB) and
 turns them into a Strata pack on your PC once (20 to 40 minutes, about 110 GB more disk while it runs; the 102 GB can be
 deleted afterwards). Strata does not redistribute NVIDIA's weights. Pictures use the original model's reader file, which
 setup downloads with it. Licenses: NVIDIA Open Model Agreement and Qwen's Community License.
-More: [NVFP4.md](NVFP4.md#nvidias-fp4-local-checkpoint).
+(NVIDIA FP4 local checkpoint notes live in the upstream NVFP4 guide, removed in this fork.)
 
 ```sh
 strata launch --family nvfp4 --model NVFP4
@@ -284,7 +284,7 @@ the CPU.
 | Radeon AI PRO R9700 (32 GB) | 117.8 tokens/s |
 | RTX 3060 (12 GB), most experts on the CPU | 59.7 tokens/s |
 
-Pictures, parallel requests, full measurements and limits: [QWEN36.md](QWEN36.md).
+Upstream Qwen3.6 measurements and limits live in the upstream `QWEN36.md` guide (not in this fork; the B70 dense model here is [Qwen3.8-27B](Q36.md)).
 
 ```sh
 strata launch --family qwen36 --model UD-Q4_K_XL
@@ -306,7 +306,7 @@ checkout, not to the installed app.
 
 `--tune quick` and `--tune thorough` measure settings for the selected model, and the app offers tuning too. Results
 depend on the backend and machine. All speed measurements, long-context numbers and estimates for other cards are in
-[DETAILS.md](DETAILS.md#speed-measured). AMD measurements per card are in [AMD_HIP.md](AMD_HIP.md#rdna4-gfx1201).
+[DETAILS.md](DETAILS.md#speed-measured) (upstream AMD measurements lived in `AMD_HIP.md`, not in this fork).
 Measured Strata on your own PC? See [Community benchmark results](COMMUNITY_BENCHMARKS.md).
 
 <a id="how-fast-is-each-size"></a>

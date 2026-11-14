@@ -67,7 +67,7 @@ The [details](DETAILS.md#how-it-works) explain every part and its numbers, and t
 - Built with parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT). Ideas from
   [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and
   [HyperQwen](https://github.com/syv-ai/HyperQwen). More in the [details](DETAILS.md#credits-and-licenses).
-- The AMD (HIP) backend: [AMD_HIP.md](AMD_HIP.md) names the contributors and the machines it was validated on.
+- The AMD (HIP) backend: upstream `AMD_HIP.md` (removed in this fork) named the contributors and the machines it was validated on.
 
 ## License
 

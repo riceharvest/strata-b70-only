@@ -30,8 +30,8 @@ not additional top-level families.
 | Family | Availability evidence | Catalog and limits |
 | --- | --- | --- |
 | DeepSeekV4.1-Flash-1017 | `deepseek41` in `MULTI_FILE_FAMILIES` in [setup.py](../setup.py); Terminal since 0.2.4, desktop app since 0.2.5 | [MODELS.md](MODELS.md#deepseek-v41-flash): IST-DAS 1.75 bpw (239 GB), 2.00 bpw (257 GB) and 2.25 bpw (274 GB), 8K context, a Speed choice (Faster or Full quality). NVIDIA RTX 30, 40 and 50 (Windows, Linux), AMD Radeon AI PRO R9700 (Linux) and Ryzen AI Max / Strix Halo (Windows, gfx1151). Not on Mac, Intel Arc or Strix Halo on Linux yet. |
-| Qwen3.8-Flash-Next | Catalog entries in [setup.py](../setup.py), model guides and backend documentation | [MODELS.md](MODELS.md), [QUANTS.md](QUANTS.md), [GYRO.md](GYRO.md), [NVFP4.md](NVFP4.md), [ORCA.md](ORCA.md) |
-| Qwen3.6-35B-A3B | `qwen36` in `OWN_PATH_FAMILIES` in [setup.py](../setup.py) | [QWEN36.md](QWEN36.md): NVIDIA and AMD; not the Intel or Mac engine |
+| Qwen3.8-Flash-Next | Catalog entries in [setup.py](../setup.py), model guides and backend documentation | [MODELS.md](MODELS.md), [QUANTS.md](QUANTS.md), [GYRO.md](GYRO.md), [ORCA.md](ORCA.md) (upstream `NVFP4.md` is not in this fork) |
+| Qwen3.6-35B-A3B | `qwen36` in `OWN_PATH_FAMILIES` in [setup.py](../setup.py) | Upstream `QWEN36.md` (not in this fork): NVIDIA and AMD, not the Intel or Mac engine. This fork builds dense Qwen3.8-27B ([Q36.md](Q36.md)) |
 
 Do not reuse Qwen quant names, model sizes or performance figures for DeepSeek. A field this page does not state is
 **unknown**, not zero and not unsupported. DeepSeek Harness is a coding tool; its presence does not establish support
@@ -79,11 +79,11 @@ does not imply that every model or feature works on it.
 | Backend / hardware | Source |
 | --- | --- |
 | NVIDIA RTX / CUDA | [INSTALL.md](INSTALL.md#what-you-need) |
-| AMD Radeon / HIP | [AMD_HIP.md](AMD_HIP.md); RX 6000 validation differs from newer cards |
-| Intel Arc / SYCL | [INTEL_ARC.md](INTEL_ARC.md); released Linux SYCL engine (Ubuntu 24.04 or newer), with model preparation and per-card limits. [INTEL.md](INTEL.md) records source-port details |
-| Apple Silicon / Metal | [MAC.md](MAC.md); no DeepSeek yet |
-| AMD Ryzen AI Max / Strix Halo | [STRIX_HALO.md](STRIX_HALO.md) |
-| Multiple GPUs and older hardware | [MULTI_GPU.md](MULTI_GPU.md), [OLDER_GPUS.md](OLDER_GPUS.md) |
+| AMD Radeon / HIP | Upstream `AMD_HIP.md` (removed in this fork); RX 6000 validation differed from newer cards |
+| Intel Arc / SYCL | [B70.md](B70.md), [INTEL.md](INTEL.md), [INTEL_ARC.md](INTEL_ARC.md); Linux SYCL engine targeting one Arc Pro B70 |
+| Apple Silicon / Metal | Upstream `MAC.md` (removed in this fork) |
+| AMD Ryzen AI Max / Strix Halo | Upstream `STRIX_HALO.md` (removed in this fork; historical Windows notes in [STRIX_HALO_WINDOWS.md](STRIX_HALO_WINDOWS.md)) |
+| Multiple GPUs and older hardware | Upstream `MULTI_GPU.md` and `OLDER_GPUS.md` (removed in this fork) |
 
 Use the model's actual memory and disk requirements. RAM, VRAM, unified memory, download size and temporary
 conversion space are different quantities. Count unified memory once. Do not carry the smallest Qwen model's

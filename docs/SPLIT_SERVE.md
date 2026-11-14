@@ -14,7 +14,7 @@ engines, an RTX 3070 reading the prompt and two MI50 cards making the answer, wi
 
 ## What it does
 
-A normal two-card setup ([MULTI_GPU.md](MULTI_GPU.md)) cuts the model into layers and every card works on both stages. Split
+A normal two-card setup (upstream `MULTI_GPU.md`, not in this fork) cuts the model into layers and every card works on both stages. Split
 serving does not cut the model. It starts two engines, each on one card, each with the whole model:
 
 - the **prefill engine** reads the prompt and stops just before the first answer token;

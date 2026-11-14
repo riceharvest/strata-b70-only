@@ -104,7 +104,8 @@ def parser() -> argparse.ArgumentParser:
     profile_rollback.add_argument("--to", required=True, metavar="REVISION")
     profile_rollback.add_argument("--output", choices=("human", "json"), default="human")
 
-    repair = sp.add_parser("repair-access", help="give you back Strata files that a run as administrator locked (Windows)")
+    # Windows-only ACL recovery subcommand; omit help= so top-level `strata --help` hides its row without printing ==SUPPRESS==.
+    repair = sp.add_parser("repair-access")
     repair.add_argument("--output", choices=("human", "json"), default="human")
     doctor = sp.add_parser("doctor", help="read-only check of installed engine components")
     doctor.add_argument("--profile", help="saved profile name or run config JSON path")

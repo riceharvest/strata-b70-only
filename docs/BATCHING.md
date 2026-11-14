@@ -10,7 +10,7 @@ conversations at the same time instead of waiting for each other.
 It is opt-in and changes nothing when the options are absent (#465; the engine part is PR #559).
 
 **Qwen3.6-35B-A3B** has the same option on its own engine path (`"parallel": N`, `--batch N`, `--batch-mtp`, up to 8 slots, the same
-engine protocol and the same server): its numbers, what a slot costs and where setup recommends it are in [QWEN36.md](QWEN36.md).
+engine protocol and the same server): its numbers, what a slot costs and where setup recommends it live in upstream `QWEN36.md` (not in this fork; the B70 dense model here is [Q36.md](Q36.md)).
 
 ## Turning it on
 
