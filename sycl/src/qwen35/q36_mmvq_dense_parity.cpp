@@ -2176,6 +2176,471 @@ int xatt_bench(const char* tl_s, int cells, int ns) {   // ns 4: K as the engine
     return bad ? 1 : 0;
 }
 
+struct Pp2DecodedAct {
+    std::vector<double> xd;     // [T * n_in]
+    std::vector<int32_t> sumx;  // [T * n_grp]
+    int bad_pad  = 0;
+    int bad_sumx = 0;
+};
+
+Pp2DecodedAct decode_pp2_act(const std::vector<uint8_t>& hq8, const std::vector<float>& hdx, int n_in, int T) {
+    Pp2DecodedAct out;
+    const int n_grp  = n_in / 128;
+    const int n_ct32 = (T + 31) / 32;
+    const uint32_t* xq_u32 = reinterpret_cast<const uint32_t*>(hq8.data());
+    const uint32_t* dx_u32 = reinterpret_cast<const uint32_t*>(hdx.data());
+    out.xd.assign((size_t) T * n_in, 0.0);
+    out.sumx.assign((size_t) T * n_grp, 0);
+
+    for (int ct32 = 0; ct32 < n_ct32; ++ct32) {
+        for (int g = 0; g < n_grp; ++g) {
+            const uint32_t* xqp = xq_u32 + ((size_t) ct32 * n_grp + g) * 1024u;
+            const uint32_t* dxp = dx_u32 + ((size_t) ct32 * n_grp + g) * 64u;
+            for (int j = 0; j < 4; ++j) {
+                for (int r = 0; r < 8; ++r) {
+                    const int col = ct32 * 32 + j * 8 + r;
+                    float dx = 0.0f;
+                    int32_t sx = 0;
+                    std::memcpy(&dx, &dxp[16 * j + r], 4);
+                    std::memcpy(&sx, &dxp[16 * j + 8 + r], 4);
+                    if (col >= T) {
+                        if (dx != 0.0f || sx != 0) ++out.bad_pad;
+                        for (int s4 = 0; s4 < 4; ++s4)
+                            for (int da = 0; da < 8; ++da)
+                                if (xqp[s4 * 256 + j * 64 + r * 8 + da] != 0u) ++out.bad_pad;
+                        continue;
+                    }
+                    int32_t acc_s = 0;
+                    for (int s4 = 0; s4 < 4; ++s4) {
+                        const int pair = s4 >> 1;
+                        const int sub  = s4 & 1;
+                        for (int da = 0; da < 8; ++da) {
+                            const uint32_t dw = xqp[s4 * 256 + j * 64 + r * 8 + da];
+                            const int8_t b0 = static_cast<int8_t>(dw & 0xffu);
+                            const int8_t b1 = static_cast<int8_t>((dw >> 8) & 0xffu);
+                            const int8_t b2 = static_cast<int8_t>((dw >> 16) & 0xffu);
+                            const int8_t b3 = static_cast<int8_t>((dw >> 24) & 0xffu);
+                            const int k_base = g * 128 + pair * 64 + sub * 16 + 2 * da;
+                            out.xd[(size_t) col * n_in + (k_base + 0)]  = (double) dx * (double) b0;
+                            out.xd[(size_t) col * n_in + (k_base + 32)] = (double) dx * (double) b1;
+                            out.xd[(size_t) col * n_in + (k_base + 1)]  = (double) dx * (double) b2;
+                            out.xd[(size_t) col * n_in + (k_base + 33)] = (double) dx * (double) b3;
+                            acc_s += (int32_t) b0 + (int32_t) b1 + (int32_t) b2 + (int32_t) b3;
+                        }
+                    }
+                    if (acc_s != sx) ++out.bad_sumx;
+                    out.sumx[(size_t) col * n_grp + g] = sx;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+std::vector<int> make_sample_idx(int total, int want) {
+    std::vector<int> out;
+    if (total <= want) {
+        for (int i = 0; i < total; ++i) out.push_back(i);
+        return out;
+    }
+    for (int i = 0; i < 8; ++i) out.push_back(i);
+    for (int i = 0; i < want - 16; ++i) out.push_back((int)((long long)(i + 1) * (total - 16) / (want - 15)) + 8);
+    for (int i = total - 8; i < total; ++i) out.push_back(i);
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+int pp2_bench(const char* ncols_s, const std::string& ssel, bool full_bench) {
+    const std::vector<int> ncl = parse_list(ncols_s);
+    sycl::queue q(sycl::gpu_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()});
+    struct Pp2Shape { int n_in, n_out; const char* name; };
+    const Pp2Shape shapes[] = {
+        { 5120,  17408, "27gu"  },
+        {17408,   5120, "27down"},
+        { 5120,  10240, "27qkv" },
+        { 5120,  12288, "27q"   },
+        { 6144,   5120, "27out" },
+        { 5120,   6144, "27gate"},
+        { 5120,   1024, "27kv"  },
+        { 5120, 248320, "27head"},
+    };
+    std::vector<Pp2Shape> matched;
+    int maxT = 0, maxIn = 17408, maxOut = 0;
+    for (int c : ncl) maxT = std::max(maxT, c);
+    for (const auto& sh : shapes) {
+        if (ssel == "all" || ssel == "27" || ssel == sh.name) {
+            matched.push_back(sh);
+            maxOut = std::max(maxOut, sh.n_out);
+            maxIn  = std::max(maxIn, sh.n_in);
+        }
+    }
+    if (matched.empty() || maxT <= 0) {
+        std::printf("pp2: nothing matched (ncols=%s shape=%s)\n", ncols_s, ssel.c_str());
+        return 2;
+    }
+
+    const size_t REC = 544, POOL_DW = ((size_t) 704 << 20) / 4 / REC * REC;   // ~704 MiB (> 64 MiB and > 27head)
+    std::vector<uint32_t> hpool(POOL_DW);
+    {
+        uint64_t st = 0x9E3779B97F4A7C15ull;
+        auto xr = [&] { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
+        for (size_t i = 0; i < POOL_DW; i += 2) {
+            const uint64_t v = xr();
+            hpool[i] = static_cast<uint32_t>(v);
+            hpool[i + 1] = static_cast<uint32_t>(v >> 32);
+        }
+        for (size_t r = 0; r < POOL_DW / REC; ++r) {
+            for (int k = 0; k < 32; ++k) {
+                const uint64_t v = xr();
+                hpool[r * REC + 512 + k] = (0x1400u | static_cast<uint32_t>(v & 0x3ffu)) |
+                                           ((1u + static_cast<uint32_t>((v >> 20) & 15u)) << 16);
+            }
+        }
+    }
+
+    const int bufT = std::max(maxT, 4096);
+    const size_t max_act_floats = (size_t) bufT * maxIn;    // >= 285 MB (> 64 MiB)
+    const size_t max_q8_bytes   = (size_t) maxIn * ((bufT + 127) & ~127) + 4096;
+    const size_t max_dx_floats  = strata::q36pp::dxT_pp2_floats(maxIn, (bufT + 127) & ~127);
+
+    uint32_t* dpool  = static_cast<uint32_t*>(sycl::aligned_alloc_device(4096, POOL_DW * 4, q));
+    float* dx        = static_cast<float*>(sycl::aligned_alloc_device(4096, max_act_floats * 4, q));
+    float* du        = static_cast<float*>(sycl::aligned_alloc_device(4096, max_act_floats * 4, q));
+    float* dh        = static_cast<float*>(sycl::aligned_alloc_device(4096, max_act_floats * 4, q));
+    float* dw        = static_cast<float*>(sycl::aligned_alloc_device(4096, (size_t) maxIn * 4, q));
+    uint8_t* dq8     = static_cast<uint8_t*>(sycl::aligned_alloc_device(4096, max_q8_bytes, q));
+    uint8_t* dq8_b   = static_cast<uint8_t*>(sycl::aligned_alloc_device(4096, max_q8_bytes, q));
+    float* ddx       = static_cast<float*>(sycl::aligned_alloc_device(4096, max_dx_floats * 4, q));
+    float* ddx_b     = static_cast<float*>(sycl::aligned_alloc_device(4096, max_dx_floats * 4, q));
+    float* dy        = static_cast<float*>(sycl::aligned_alloc_device(4096, (size_t) maxT * maxOut * 4, q));
+    float* dy_v1     = static_cast<float*>(sycl::aligned_alloc_device(4096, (size_t) maxT * maxOut * 4, q));
+    if (!dpool || !dx || !du || !dh || !dw || !dq8 || !dq8_b || !ddx || !ddx_b || !dy || !dy_v1) {
+        std::printf("pp2: device allocation failed\n");
+        return 1;
+    }
+    q.memcpy(dpool, hpool.data(), POOL_DW * 4).wait();
+
+    std::vector<float> hx(max_act_floats), hu(max_act_floats), hw(maxIn);
+    {
+        uint64_t st = 0xD1B54A32D192ED03ull;
+        auto rf = [&] {
+            st ^= st >> 12; st ^= st << 25; st ^= st >> 27;
+            uint64_t z = st * 0x2545F4914F6CDD1Dull;
+            return ((int32_t)(z >> 40) / 8388608.0f) * 0.7f;
+        };
+        for (size_t i = 0; i < max_act_floats; ++i) { hx[i] = rf(); hu[i] = rf(); }
+        for (int i = 0; i < maxIn; ++i) hw[i] = 0.5f + 0.5f * std::fabs(rf());
+    }
+    q.memcpy(dx, hx.data(), max_act_floats * 4).wait();
+    q.memcpy(du, hu.data(), max_act_floats * 4).wait();
+    q.memcpy(dw, hw.data(), (size_t) maxIn * 4).wait();
+
+    // Warm GPU clocks for 0.4 s before timing or verification.
+    q.parallel_for(sycl::range<1>(8192), [=](sycl::id<1> i) {
+        volatile uint32_t* p = reinterpret_cast<volatile uint32_t*>(dw);
+        (void) p[i[0] % (uint32_t) maxIn];
+    }).wait();
+    const double t_warm = time_graph_warm(q, 1, [&](int) {
+        strata::q36pp::quantize_x128_pp2(dx, dq8, ddx, 5120, std::min(bufT, 4096), &q);
+    }, 1, 0.4);
+    (void) t_warm;
+
+    std::printf("q36_mmvq_dense_parity --pp2%s on %s (B70 peak 367 TOPS, target 300 TOPS / >=280 TOPS, mem floor 590/414 GB/s)\n",
+                full_bench ? "-bench" : "", q.get_device().get_info<sycl::info::device::name>().c_str());
+    std::printf("contract: PP2 group integer diff=(i_acc - z*sumx) fits <2^19 (<2^24 exact FP32); "
+                "not guaranteed bitwise to TagW4I8 due to -O3 FMA contraction (rel <= gamma(K/128+2) ~8.2e-6).\n");
+
+    int bad = 0;
+    const std::vector<uint8_t> hpool_u8(reinterpret_cast<const uint8_t*>(hpool.data()),
+                                        reinterpret_cast<const uint8_t*>(hpool.data()) + POOL_DW * 4);
+
+    // 1. Parity & Throughput per (shape, T)
+    std::printf("\n[GEMM] shape     n_in x n_out    T |   pp2 us   TOPS (%%pk) |    v1 us  v1_TOPS   vs_v1 |  q_f64_rel  v1_rel  unq_rel | status\n");
+    for (const auto& sh : matched) {
+        const size_t wb  = (size_t) (sh.n_out / 16) * (sh.n_in / 256) * REC * 4;
+        const size_t wdw = wb / 4;
+        const int ndist  = std::max(1, (int) (POOL_DW / wdw));
+        const size_t q_slot_bytes = (size_t) sh.n_in * ((maxT + 31) & ~31);
+
+        for (int T : ncl) {
+            const double flops = 2.0 * sh.n_in * sh.n_out * T;
+            const double q_bound = (double) (sh.n_in / 128 + 2) * 1.5e-7;
+
+            // Parity check against float64 quantized dot + legacy TagW4I8
+            strata::q36pp::quantize_x128_pp2(dx, dq8, ddx, sh.n_in, T, &q);
+            if (!strata::q36pp::gemm_w4_i8_pp2(dpool, dq8, ddx, dy, sh.n_in, sh.n_out, T, &q)) {
+                throw std::runtime_error("gemm_w4_i8_pp2 declined shape");
+            }
+            q.wait();
+
+            const int n_ct32 = (T + 31) / 32;
+            const size_t xq_bytes = (size_t) n_ct32 * 32 * sh.n_in;
+            const size_t dx_floats = strata::q36pp::dxT_pp2_floats(sh.n_in, T);
+            std::vector<uint8_t> hq8(xq_bytes);
+            std::vector<float> hdx(dx_floats);
+            q.memcpy(hq8.data(), dq8, xq_bytes);
+            q.memcpy(hdx.data(), ddx, dx_floats * 4);
+            q.wait();
+
+            const Pp2DecodedAct dec = decode_pp2_act(hq8, hdx, sh.n_in, T);
+            if (dec.bad_pad != 0 || dec.bad_sumx != 0) ++bad;
+
+            const std::vector<int> srows = make_sample_idx(sh.n_out, 64);
+            const std::vector<int> scols = make_sample_idx(T, 32);
+            std::vector<double> xq_samp((size_t) scols.size() * sh.n_in), xf_samp((size_t) scols.size() * sh.n_in);
+            std::vector<float> hy_samp((size_t) scols.size() * sh.n_out);
+            for (size_t ci = 0; ci < scols.size(); ++ci) {
+                const int col = scols[ci];
+                std::memcpy(&xq_samp[ci * sh.n_in], &dec.xd[(size_t) col * sh.n_in], (size_t) sh.n_in * 8);
+                for (int k = 0; k < sh.n_in; ++k) xf_samp[ci * sh.n_in + k] = (double) hx[(size_t) col * sh.n_in + k];
+                q.memcpy(&hy_samp[ci * sh.n_out], dy + (size_t) col * sh.n_out, (size_t) sh.n_out * 4);
+            }
+            q.wait();
+
+            std::vector<double> ref_q, ref_f;
+            const std::vector<uint8_t> w_slice(hpool_u8.begin(), hpool_u8.begin() + wb);
+            pp_ref_rows(1004, w_slice, sh.n_in, sh.n_out, srows, xq_samp, (int) scols.size(), ref_q);
+            pp_ref_rows(1004, w_slice, sh.n_in, sh.n_out, srows, xf_samp, (int) scols.size(), ref_f);
+
+            double q_ss = 0.0, q_sd = 0.0, f_ss = 0.0, f_sd = 0.0;
+            long long n_nf = 0;
+            for (size_t ci = 0; ci < scols.size(); ++ci) {
+                for (size_t ri = 0; ri < srows.size(); ++ri) {
+                    const float got = hy_samp[ci * sh.n_out + srows[ri]];
+                    if (!std::isfinite(got)) { ++n_nf; continue; }
+                    const double rq = ref_q[ci * srows.size() + ri];
+                    const double rf = ref_f[ci * srows.size() + ri];
+                    q_ss += rq * rq;
+                    q_sd += ((double) got - rq) * ((double) got - rq);
+                    f_ss += rf * rf;
+                    f_sd += ((double) got - rf) * ((double) got - rf);
+                }
+            }
+            const double q_f64_rel = std::sqrt(q_sd / std::max(q_ss, 1e-30));
+            const double unq_rel   = std::sqrt(f_sd / std::max(f_ss, 1e-30));
+
+            double v1_rel = 0.0;
+            const bool has_v1 = (sh.n_out % 256) == 0;
+            if (has_v1) {
+                if (getenv("STRATA_Q36_PP2") && std::atoi(getenv("STRATA_Q36_PP2")) != 0) {
+                    throw std::runtime_error("run --pp2 with STRATA_Q36_PP2=0 so v1 path is testable alongside *_pp2");
+                }
+                strata::q36pp::quantize_x128(dx, dq8_b, ddx_b, sh.n_in, T, &q);
+                strata::q36pp::gemm_w4_i8(dpool, dq8_b, ddx_b, dy_v1, sh.n_in, sh.n_out, T, &q);
+                q.wait();
+                double v_ss = 0.0, v_sd = 0.0;
+                std::vector<float> hv_col(sh.n_out);
+                for (size_t ci = 0; ci < scols.size(); ++ci) {
+                    q.memcpy(hv_col.data(), dy_v1 + (size_t) scols[ci] * sh.n_out, (size_t) sh.n_out * 4).wait();
+                    for (int r = 0; r < sh.n_out; ++r) {
+                        const float g2 = hy_samp[ci * sh.n_out + r], g1 = hv_col[r];
+                        if (!std::isfinite(g2) || !std::isfinite(g1)) { ++n_nf; continue; }
+                        v_ss += (double) g1 * g1;
+                        v_sd += ((double) g2 - g1) * ((double) g2 - g1);
+                    }
+                }
+                v1_rel = std::sqrt(v_sd / std::max(v_ss, 1e-30));
+            }
+
+            // Timing (> 64 MiB working set, 0.4 s warm-up, device timestamps)
+            const int nmat = (wb >= (128ULL << 20)) ? 2 : std::max(4, std::min(ndist, (int) std::max<size_t>(8, (128ULL << 20) / wb)));
+            const int reps = full_bench ? 9 : 3;
+            const double u_pp2 = time_graph_warm(q, nmat, [&](int m) {
+                strata::q36pp::gemm_w4_i8_pp2(dpool + (size_t) (m % ndist) * wdw, dq8, ddx, dy, sh.n_in, sh.n_out, T, &q);
+            }, reps, full_bench ? 0.4 : 0.08);
+            const double top_pp2 = flops / u_pp2 / 1e6;
+
+            double u_v1 = 0.0, top_v1 = 0.0;
+            if (has_v1 && full_bench) {
+                u_v1 = time_graph_warm(q, nmat, [&](int m) {
+                    strata::q36pp::gemm_w4_i8(dpool + (size_t) (m % ndist) * wdw, dq8_b, ddx_b, dy_v1, sh.n_in, sh.n_out, T, &q);
+                }, reps, 0.4);
+                top_v1 = flops / u_v1 / 1e6;
+            }
+            (void) q_slot_bytes;
+
+            const bool ok = (n_nf == 0 && dec.bad_pad == 0 && dec.bad_sumx == 0 &&
+                             q_f64_rel <= q_bound && (!has_v1 || v1_rel < 5e-5));
+            if (!ok) ++bad;
+            std::printf("PP2    %-6s %5d x %6d %4d | %8.1f %6.1f (%4.1f%%) | %8.1f %7.1f %6.2fx | %9.2e %8.2e %7.2e | %s\n",
+                        sh.name, sh.n_in, sh.n_out, T,
+                        u_pp2, top_pp2, 100.0 * top_pp2 / 367.0,
+                        u_v1, top_v1, (u_pp2 > 0 && u_v1 > 0) ? (u_v1 / u_pp2) : 0.0,
+                        q_f64_rel, v1_rel, unq_rel, ok ? "ok" : "FAIL");
+            std::fflush(stdout);
+        }
+    }
+
+    // 2. Producers (quantize_x128_pp2, swiglu_x128_pp2, rms_pp2) parity + >64 MiB bandwidth
+    std::printf("\n[PRODUCERS & FUSED FFN] (R+W floor vs 590R/414W)\n");
+    for (int T : ncl) {
+        for (int K : {5120, 6144, 17408}) {
+            // swiglu_x128_pp2 parity vs float64
+            strata::q36pp::swiglu_x128_pp2(dx, du, dq8, ddx, K, T, &q);
+            q.wait();
+            const size_t xq_bytes  = (size_t) ((T + 31) / 32) * 32 * K;
+            const size_t dx_floats = strata::q36pp::dxT_pp2_floats(K, T);
+            std::vector<uint8_t> hq8(xq_bytes);
+            std::vector<float> hdx(dx_floats);
+            q.memcpy(hq8.data(), dq8, xq_bytes);
+            q.memcpy(hdx.data(), ddx, dx_floats * 4);
+            q.wait();
+            const Pp2DecodedAct dec = decode_pp2_act(hq8, hdx, K, T);
+            double ss = 0.0, sd = 0.0;
+            for (int col : make_sample_idx(T, 32)) {
+                for (int k = 0; k < K; ++k) {
+                    const double gv = hx[(size_t) col * K + k], uv = hu[(size_t) col * K + k];
+                    const double sw = (gv / (1.0 + std::exp(-gv))) * uv;
+                    const double got = dec.xd[(size_t) col * K + k];
+                    ss += sw * sw;
+                    sd += (got - sw) * (got - sw);
+                }
+            }
+            const double sw_rel = std::sqrt(sd / std::max(ss, 1e-30));
+            const bool sw_ok = (dec.bad_pad == 0 && dec.bad_sumx == 0 && sw_rel < 1.5e-2);
+            if (!sw_ok) ++bad;
+
+            // Rotate across >= 128 MiB pool slots of input if slot < 128 MiB
+            const size_t slot_elems = (size_t) T * K;
+            const int nd_x = std::max(1, (int) (max_act_floats / slot_elems));
+            const int nmat = std::max(2, std::min(nd_x, (int) std::max<size_t>(4, (128ULL << 20) / (slot_elems * 4))));
+            const double r_bytes = 2.0 * slot_elems * 4.0;
+            const double w_bytes = (double) xq_bytes + (double) dx_floats * 4.0;
+            const double tot_mb  = (r_bytes + w_bytes) / 1e6;
+            const double u_q_pp2 = time_graph_warm(q, nmat, [&](int m) {
+                strata::q36pp::quantize_x128_pp2(dx + (size_t) (m % nd_x) * slot_elems, dq8, ddx, K, T, &q);
+            }, full_bench ? 9 : 3, full_bench ? 0.4 : 0.05);
+            const double u_s_pp2 = time_graph_warm(q, nmat, [&](int m) {
+                const size_t off = (size_t) (m % nd_x) * slot_elems;
+                strata::q36pp::swiglu_x128_pp2(dx + off, du + off, dq8, ddx, K, T, &q);
+            }, full_bench ? 9 : 3, full_bench ? 0.4 : 0.05);
+            const double q_gbs = (slot_elems * 4.0 + w_bytes) / u_q_pp2 / 1e3;
+            const double s_gbs = (r_bytes + w_bytes) / u_s_pp2 / 1e3;
+            std::printf("quant/sw K=%5d T=%4d | q_pp2 %6.1f us (%5.1f GB/s) | sw_pp2 %6.1f us (%5.1f GB/s, %.1f MB) sw_rel %.2e %s\n",
+                        K, T, u_q_pp2, q_gbs, u_s_pp2, s_gbs, tot_mb, sw_rel, sw_ok ? "ok" : "FAIL");
+        }
+
+        // rms_pp2 parity (ADD=false and ADD=true, HAS_X128=true, n=5120)
+        for (int do_add : {0, 1}) {
+            q.memcpy(dh, hx.data(), (size_t) T * 5120 * 4).wait();
+            if (!strata::q36pp::rms_pp2(dh, do_add ? du : nullptr, dw, dx, dq8, ddx, 5120, T, 1e-6f, &q)) {
+                throw std::runtime_error("rms_pp2 declined n=5120");
+            }
+            q.wait();
+            const size_t xq_bytes  = (size_t) ((T + 31) / 32) * 32 * 5120;
+            const size_t dx_floats = strata::q36pp::dxT_pp2_floats(5120, T);
+            std::vector<uint8_t> hq8(xq_bytes);
+            std::vector<float> hdx_out(dx_floats), h_out((size_t) T * 5120), x_out((size_t) T * 5120);
+            q.memcpy(hq8.data(), dq8, xq_bytes);
+            q.memcpy(hdx_out.data(), ddx, dx_floats * 4);
+            q.memcpy(h_out.data(), dx, (size_t) T * 5120 * 4);
+            if (do_add) q.memcpy(x_out.data(), dh, (size_t) T * 5120 * 4);
+            q.wait();
+            const Pp2DecodedAct dec = decode_pp2_act(hq8, hdx_out, 5120, T);
+            double h_ss = 0.0, h_sd = 0.0, q_sd = 0.0;
+            for (int col : make_sample_idx(T, 32)) {
+                double ssq = 0.0;
+                for (int k = 0; k < 5120; ++k) {
+                    const double xv = (double) hx[(size_t) col * 5120 + k] + (do_add ? (double) hu[(size_t) col * 5120 + k] : 0.0);
+                    ssq += xv * xv;
+                }
+                const double ir = 1.0 / std::sqrt(ssq / 5120.0 + 1e-6);
+                for (int k = 0; k < 5120; ++k) {
+                    const double xv = (double) hx[(size_t) col * 5120 + k] + (do_add ? (double) hu[(size_t) col * 5120 + k] : 0.0);
+                    const double hv = xv * ir * (double) hw[k];
+                    const double gh = h_out[(size_t) col * 5120 + k];
+                    const double gq = dec.xd[(size_t) col * 5120 + k];
+                    h_ss += hv * hv;
+                    h_sd += (gh - hv) * (gh - hv);
+                    q_sd += (gq - hv) * (gq - hv);
+                }
+            }
+            const double h_rel = std::sqrt(h_sd / std::max(h_ss, 1e-30));
+            const double q_rel = std::sqrt(q_sd / std::max(h_ss, 1e-30));
+            const bool rms_ok = (dec.bad_pad == 0 && dec.bad_sumx == 0 && h_rel < 2e-6 && q_rel < 1.5e-2);
+            if (!rms_ok) ++bad;
+
+            const size_t slot_elems = (size_t) T * 5120;
+            const int nd_x = std::max(1, (int) (max_act_floats / slot_elems));
+            const int nmat = std::max(2, std::min(nd_x, (int) std::max<size_t>(4, (128ULL << 20) / (slot_elems * 4))));
+            const double rw_bytes = (do_add ? 4.0 : 2.0) * slot_elems * 4.0 + (double) xq_bytes + (double) dx_floats * 4.0;
+            const double u_r_pp2 = time_graph_warm(q, nmat, [&](int m) {
+                const size_t off = (size_t) (m % nd_x) * slot_elems;
+                strata::q36pp::rms_pp2(dh + off, do_add ? (du + off) : nullptr, dw, dx + off, dq8, ddx, 5120, T, 1e-6f, &q);
+            }, full_bench ? 9 : 3, full_bench ? 0.4 : 0.05);
+            const double r_gbs = rw_bytes / u_r_pp2 / 1e3;
+            std::printf("rms5120 add=%d T=%4d    | pp2 %6.1f us (%5.1f GB/s, %.1f MB) | h_rel %.2e q_rel %.2e %s\n",
+                        do_add, T, u_r_pp2, r_gbs, rw_bytes / 1e6, h_rel, q_rel, rms_ok ? "ok" : "FAIL");
+            q.memcpy(dx, hx.data(), max_act_floats * 4).wait();
+        }
+
+        // 3. Fused FFN (gemm_w4_i8_gu_swiglu_pp2 + down gemm_w4_i8_pp2) vs unfused + float64 ref
+        {
+            const int N = 5120, FF = 17408;
+            const size_t gu_dw = (size_t) (FF / 16) * (N / 256) * REC;
+            const size_t dn_dw = (size_t) (N / 16) * (FF / 256) * REC;
+            const uint32_t* w_gate = dpool;
+            const uint32_t* w_up   = dpool + gu_dw;
+            const uint32_t* w_dn   = dpool + 2 * gu_dw;
+
+            strata::q36pp::quantize_x128_pp2(dx, dq8, ddx, N, T, &q);
+            // Fused: (q8, ddx) -> (dq8_b, ddx_b) -> dy
+            if (!strata::q36pp::gemm_w4_i8_gu_swiglu_pp2(w_gate, w_up, dq8, ddx, dq8_b, ddx_b, N, FF, T, &q)) {
+                throw std::runtime_error("gemm_w4_i8_gu_swiglu_pp2 declined");
+            }
+            strata::q36pp::gemm_w4_i8_pp2(w_dn, dq8_b, ddx_b, dy, FF, N, T, &q);
+            // Unfused: gemm(gate)->dh, gemm(up)->du, swiglu_pp2(dh,du)->dq8_b,ddx_b, gemm(down)->dy_v1
+            strata::q36pp::gemm_w4_i8_pp2(w_gate, dq8, ddx, dh, N, FF, T, &q);
+            strata::q36pp::gemm_w4_i8_pp2(w_up,   dq8, ddx, du, N, FF, T, &q);
+            strata::q36pp::swiglu_x128_pp2(dh, du, dq8_b, ddx_b, FF, T, &q);
+            strata::q36pp::gemm_w4_i8_pp2(w_dn, dq8_b, ddx_b, dy_v1, FF, N, T, &q);
+            q.wait();
+
+            std::vector<float> hy_f((size_t) T * N), hy_u((size_t) T * N);
+            q.memcpy(hy_f.data(), dy,    hy_f.size() * 4);
+            q.memcpy(hy_u.data(), dy_v1, hy_u.size() * 4);
+            q.wait();
+            double u_ss = 0.0, u_sd = 0.0;
+            for (size_t i = 0; i < hy_f.size(); ++i) {
+                const double d = (double) hy_f[i] - hy_u[i];
+                u_ss += (double) hy_u[i] * hy_u[i];
+                u_sd += d * d;
+            }
+            const double fused_rel = std::sqrt(u_sd / std::max(u_ss, 1e-30));
+            const bool f_ok = (fused_rel < 2e-5);
+            if (!f_ok) ++bad;
+
+            const double ffn_flops = 3.0 * 2.0 * N * FF * T;
+            const double u_ffn_fused = time_graph_warm(q, 4, [&](int m) {
+                const size_t off_g = (size_t) (m % 4) * (gu_dw + dn_dw);
+                strata::q36pp::gemm_w4_i8_gu_swiglu_pp2(dpool + off_g, dpool + off_g + gu_dw,
+                                                          dq8, ddx, dh, ddx_b, N, FF, T, &q);
+                strata::q36pp::gemm_w4_i8_pp2(dpool + off_g + 2 * gu_dw, dh, ddx_b, dy, FF, N, T, &q);
+            }, full_bench ? 9 : 3, full_bench ? 0.4 : 0.05);
+            const double u_ffn_unfused = time_graph_warm(q, 4, [&](int m) {
+                const size_t off_g = (size_t) (m % 4) * (gu_dw + dn_dw);
+                strata::q36pp::gemm_w4_i8_pp2(dpool + off_g,         dq8,   ddx,   dh, N, FF, T, &q);
+                strata::q36pp::gemm_w4_i8_pp2(dpool + off_g + gu_dw, dq8,   ddx,   du, N, FF, T, &q);
+                strata::q36pp::swiglu_x128_pp2(dh, du, dq8_b, ddx_b, FF, T, &q);
+                strata::q36pp::gemm_w4_i8_pp2(dpool + off_g + 2 * gu_dw, dq8_b, ddx_b, dy, FF, N, T, &q);
+            }, full_bench ? 9 : 3, full_bench ? 0.4 : 0.05);
+            std::printf("ffn_27  T=%4d          | fused %7.1f us (%5.1f TOPS) vs unfused %7.1f us (%5.1f TOPS, %.2fx) | vs_unfused %.2e %s\n",
+                        T, u_ffn_fused, ffn_flops / u_ffn_fused / 1e6,
+                        u_ffn_unfused, ffn_flops / u_ffn_unfused / 1e6,
+                        u_ffn_unfused / u_ffn_fused, fused_rel, f_ok ? "ok" : "FAIL");
+            q.memcpy(dx, hx.data(), max_act_floats * 4).wait();
+            q.memcpy(du, hu.data(), max_act_floats * 4).wait();
+        }
+        std::fflush(stdout);
+    }
+
+    sycl::free(dpool, q); sycl::free(dx, q); sycl::free(du, q); sycl::free(dh, q); sycl::free(dw, q);
+    sycl::free(dq8, q); sycl::free(dq8_b, q); sycl::free(ddx, q); sycl::free(ddx_b, q);
+    sycl::free(dy, q); sycl::free(dy_v1, q);
+    return bad ? 1 : 0;
+}
+
 namespace strata::q36df { int parity_main(int argc, char** argv); }   // q36_dflash_parity.cpp: the DFlash 2 drafter's kernels
 
 int main(int argc, char** argv) try {
@@ -2191,6 +2656,12 @@ int main(int argc, char** argv) try {
         const std::string ssel = argc > 4 ? argv[4] : "27";
         const int ks_ovr       = argc > 5 ? std::atoi(argv[5]) : 0;
         return w4x_bench(mode, ncols_s, ssel, ks_ovr);
+    }
+    if (argc > 1 && (std::string(argv[1]) == "--pp2" || std::string(argv[1]) == "--pp2-bench")) {
+        const bool is_bench = std::string(argv[1]) == "--pp2-bench";
+        const char* ncols_s = argc > 2 ? argv[2] : (is_bench ? "4096" : "259,4096");
+        const std::string ssel = argc > 3 ? argv[3] : "all";
+        return pp2_bench(ncols_s, ssel, is_bench);
     }
     if (argc > 1 && (std::string(argv[1]) == "--pp" || std::string(argv[1]) == "--pp-bench")) {
         const bool is_pp_bench = std::string(argv[1]) == "--pp-bench";
