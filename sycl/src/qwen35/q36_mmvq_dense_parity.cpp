@@ -1818,6 +1818,7 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
     auto* dtmask = (uint32_t*) dev(TM * sizeof(uint32_t));
     auto* dqb = (uint32_t*) dev(xa::qb2_dwords(HKV) * 4);
     auto* dqs = (float*) dev(xa::qs2_floats(HKV) * 4);
+    auto* d_dbg_flag = (uint32_t*) dev(64);
     const size_t rows_m = (size_t) TM * H;
     auto* dpa = (float*) dev(rows_m * NSEG_MAX * HD * 4);
     auto* dpm = (float*) dev(rows_m * NSEG_MAX * 4);
@@ -1825,6 +1826,7 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
     auto* dout = (float*) dev(rows_m * HD * 4);
     auto* dgate = (float*) dev(rows_m * HD * 4);
     auto* dq = (float*) dev(rows_m * HD * 4);
+    q.memset(d_dbg_flag, 0, 4).wait();
 
     std::vector<float> Q(rows_m * HD), G(rows_m * HD);
     for (auto& v : Q) v = nrm() * 1.5f;
@@ -1935,82 +1937,226 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
         rq_out += eq; rx_out += ex; nrm2_out += n2;
     };
 
-    // ---- Stage 1: Functional parity (first context, odd unaligned kstride=cells tail guard + all forms + u8/u16 + tree mask + 4-slot batch)
-    {
-        const int cells = cl.empty() ? 25123 : (cl[0] | 3);   // force non-multiple-of-32 to exercise tail OOB guard
-        const int ctx = cells, ctxp = xa::ctx_pad(ctx);      // kstride == ctx (no tail padding on K!)
-        std::vector<float> K((size_t) HKV * cells * HD), V(K.size());
-        for (auto& v : K) v = nrm() * 1.5f;
-        for (auto& v : V) v = nrm();
-        for (size_t c = 0; c < (size_t) HKV * cells; ++c) {
+    // Helper: quantize synthetic K/V for parity and allocate matching device buffers.
+    struct ParityKv {
+        int cells = 0, ctx = 0, ctxp = 0;
+        std::vector<float> K, V, hks, hvs;
+        std::vector<uint32_t> hk8, hv8;
+        std::vector<uint16_t> hk16;
+        int8_t* k8b = nullptr;
+        int8_t* v8b = nullptr;
+        uint32_t* dk8 = nullptr;
+        uint32_t* dv8 = nullptr;
+        float* dks = nullptr;
+        float* dvs = nullptr;
+        uint16_t* dk16 = nullptr;
+    };
+    auto build_kv = [&](int cells_in) -> ParityKv {
+        ParityKv p{};
+        p.cells = cells_in;
+        p.ctx = cells_in;
+        p.ctxp = xa::ctx_pad(p.ctx);
+        p.K.resize((size_t) HKV * p.cells * HD);
+        p.V.resize(p.K.size());
+        for (auto& v : p.K) v = nrm() * 1.5f;
+        for (auto& v : p.V) v = nrm();
+        for (size_t c = 0; c < (size_t) HKV * p.cells; ++c) {
             const float a = 0.5f + (float) (xr() & 1023) / 512.0f;
-            for (int d = 0; d < HD; ++d) V[c * HD + d] *= a;
+            for (int d = 0; d < HD; ++d) p.V[c * HD + d] *= a;
         }
-        std::vector<uint32_t> hk8((size_t) HKV * ctx * 64, 0), hv8(xa::v8t_dwords(HKV, ctxp), 0);
-        std::vector<float> hks((size_t) HKV * ctx, 0.f), hvs(xa::sc_floats(HKV, ctxp), 0.f);
-        std::vector<uint16_t> hk16((size_t) HKV * ctx * 4, 0);
-        auto* k8b = reinterpret_cast<int8_t*>(hk8.data());
-        auto* v8b = reinterpret_cast<int8_t*>(hv8.data());
+        p.hk8.assign((size_t) HKV * p.ctx * 64, 0);
+        p.hv8.assign(xa::v8t_dwords(HKV, p.ctxp), 0);
+        p.hks.assign((size_t) HKV * p.ctx, 0.f);
+        p.hvs.assign(xa::sc_floats(HKV, p.ctxp), 0.f);
+        p.hk16.assign((size_t) HKV * p.ctx * 4, 0);
+        p.k8b = reinterpret_cast<int8_t*>(p.hk8.data());
+        p.v8b = reinterpret_cast<int8_t*>(p.hv8.data());
         for (int h = 0; h < HKV; ++h)
-            for (int c = 0; c < cells; ++c) {
-                const float* k = &K[((size_t) h * cells + c) * HD];
-                const float* v = &V[((size_t) h * cells + c) * HD];
+            for (int c = 0; c < p.cells; ++c) {
+                const float* k = &p.K[((size_t) h * p.cells + c) * HD];
+                const float* v = &p.V[((size_t) h * p.cells + c) * HD];
                 float mk = 0.f, mv = 0.f;
                 for (int d = 0; d < HD; ++d) { mk = std::max(mk, std::fabs(k[d])); mv = std::max(mv, std::fabs(v[d])); }
                 const float sk = mk / 127.0f, sv = mv / 127.0f;
-                hks[(size_t) h * ctx + c] = sk;
-                hvs[(size_t) h * ctxp + c] = sv;
+                p.hks[(size_t) h * p.ctx + c] = sk;
+                p.hvs[(size_t) h * p.ctxp + c] = sv;
                 float sg[4];
                 for (int g4 = 0; g4 < 4; ++g4) {
                     float mg = 0.f;
                     for (int d = 0; d < 64; ++d) mg = std::max(mg, std::fabs(k[64 * g4 + d]));
                     const uint16_t hb = FB::f16_from_f32(mg / 127.0f);
-                    hk16[((size_t) h * ctx + c) * 4 + g4] = hb;
+                    p.hk16[((size_t) h * p.ctx + c) * 4 + g4] = hb;
                     sg[g4] = FB::f32_from_f16(hb);
                 }
                 for (int d = 0; d < HD; ++d) {
-                    k8b[((size_t) h * ctx + c) * HD + d] = ns == 4 ? code(k[d], sg[d / 64]) : code(k[d], sk);
-                    v8b[(((size_t) h * (ctxp / 32) + c / 32) * 256 + d) * 32 + c % 32] = code(v[d], sv);
+                    p.k8b[((size_t) h * p.ctx + c) * HD + d] = ns == 4 ? code(k[d], sg[d / 64]) : code(k[d], sk);
+                    p.v8b[(((size_t) h * (p.ctxp / 32) + c / 32) * 256 + d) * 32 + c % 32] = code(v[d], sv);
                 }
             }
-        auto* dk8 = (uint32_t*) dev(hk8.size() * 4);
-        auto* dv8 = (uint32_t*) dev(hv8.size() * 4);
-        auto* dks = (float*) dev(hks.size() * 4);
-        auto* dvs = (float*) dev(hvs.size() * 4);
-        auto* dk16 = (uint16_t*) dev(hk16.size() * 2);
-        q.memcpy(dk8, hk8.data(), hk8.size() * 4);
-        q.memcpy(dv8, hv8.data(), hv8.size() * 4);
-        q.memcpy(dks, hks.data(), hks.size() * 4);
-        q.memcpy(dvs, hvs.data(), hvs.size() * 4);
-        q.memcpy(dk16, hk16.data(), hk16.size() * 2);
+        p.dk8 = (uint32_t*) dev(p.hk8.size() * 4);
+        p.dv8 = (uint32_t*) dev(p.hv8.size() * 4);
+        p.dks = (float*) dev(p.hks.size() * 4);
+        p.dvs = (float*) dev(p.hvs.size() * 4);
+        p.dk16 = (uint16_t*) dev(p.hk16.size() * 2);
+        q.memcpy(p.dk8, p.hk8.data(), p.hk8.size() * 4);
+        q.memcpy(p.dv8, p.hv8.data(), p.hv8.size() * 4);
+        q.memcpy(p.dks, p.hks.data(), p.hks.size() * 4);
+        q.memcpy(p.dvs, p.hvs.data(), p.hvs.size() * 4);
+        q.memcpy(p.dk16, p.hk16.data(), p.hk16.size() * 2);
         q.wait();
+        return p;
+    };
+    auto free_kv = [&](ParityKv& p) {
+        sycl::free(p.dk8, q); sycl::free(p.dv8, q); sycl::free(p.dks, q); sycl::free(p.dvs, q); sycl::free(p.dk16, q);
+    };
+    auto set_dbg_caps = [&](xa::Call2& c, const ParityKv& p, int T_call) {
+        c.dbg_flag = d_dbg_flag;
+        c.dbg_q_floats = rows_m * HD;
+        c.dbg_k8_dwords = p.hk8.size();
+        c.dbg_ks_floats = p.hks.size();
+        c.dbg_ks16_u16 = p.hk16.size();
+        c.dbg_v8t_dwords = p.hv8.size();
+        c.dbg_vs_floats = p.hvs.size();
+        c.dbg_out_floats = (size_t) T_call * H * HD;
+    };
+
+    // ---- Stage 0: Single small diagnostic case (T=1, cells=4096, form=S1) + host-side max-index vs alloc-size printout
+    {
+        const int cells = 4096;
+        ParityKv p = build_kv(cells);
+        const int T = 1, pos0_val = cells - 1;
+        const int nblk = (cells + xa::kBlk - 1) / xa::kBlk;
+        const int nseg = std::min(std::min(NSEG_MAX, 256 / HKV), std::max(1, nblk / 2));
+        const int nseg_stride = ((nseg + 3) & ~3) <= NSEG_MAX ? ((nseg + 3) & ~3) : nseg;
+        const int blk_end = ((cells + xa::kBlk - 1) / xa::kBlk);   // 128
+
+        std::printf("xatt2 small diagnostic (T=1, cells=%d, kstride=%d, ctxp=%d, ns=%d, form=S1, nseg=%d, stride=%d):\n",
+                    cells, p.ctx, p.ctxp, ns, nseg, nseg_stride);
+        std::printf("  Host bounds check (max touched elem/byte vs allocated elems/bytes):\n");
+        std::printf("    TagXa2Q    q: max=%zu / alloc=%zu floats | qb: max=%zu / alloc=%zu dwords | qs: max=%zu / alloc=%zu floats | SLM=4096 / 131072 B\n",
+                    (size_t) H * HD - 1, rows_m * HD,
+                    (((size_t) (HKV - 1) * 8u + 7u) * xa::kMaxBatchGroups2 + 0u) * 128u + 127u, p.ctx ? xa::qb2_dwords(HKV) : 0,
+                    ((size_t) (HKV - 1) * xa::kMaxBatchGroups2 + 0u) * 16u + 15u, xa::qs2_floats(HKV));
+        std::printf("    TagXa2S1   pos0: max=0 / alloc=%d int32 | qb: max=%zu / alloc=%zu dw | qs: max=%zu / alloc=%zu fl | SLM=0 / 131072 B\n",
+                    TM,
+                    (((size_t) (HKV - 1) * 8u + 7u) * xa::kMaxBatchGroups2 + 0u) * 128u + 127u, xa::qb2_dwords(HKV),
+                    ((size_t) (HKV - 1) * xa::kMaxBatchGroups2 + 0u) * 16u + 7u, xa::qs2_floats(HKV));
+        std::printf("               k8: max=%zu / alloc=%zu dw | ks16: max=%zu / alloc=%zu u16 | ks: max=%zu / alloc=%zu fl\n",
+                    ((size_t) (HKV - 1) * p.ctx + (cells - 1)) * 64u + 63u, p.hk8.size(),
+                    ((size_t) (HKV - 1) * p.ctx + (cells - 1)) * 4u + 3u, p.hk16.size(),
+                    (size_t) (HKV - 1) * p.ctx + (cells - 1), p.hks.size());
+        std::printf("               v8t: max=%zu / alloc=%zu dw (max_blk=%d/%d) | vs: max=%zu / alloc=%zu fl\n",
+                    ((size_t) (HKV - 1) * (p.ctxp / xa::kBlk) + (blk_end - 1)) * 2048u + 2047u, p.hv8.size(),
+                    blk_end - 1, p.ctxp / xa::kBlk,
+                    (size_t) (HKV - 1) * p.ctxp + (blk_end - 1) * xa::kBlk + 31u, p.hvs.size());
+        std::printf("               pacc: max=%zu / alloc=%zu fl | pm/pl: max=%zu / alloc=%zu fl\n",
+                    ((size_t) (H - 1) * nseg_stride + (nseg - 1)) * HD + HD - 1, rows_m * NSEG_MAX * HD,
+                    (size_t) (H - 1) * nseg_stride + (nseg - 1), rows_m * NSEG_MAX);
+        std::printf("    TagXa2Merge pm/pl: max=%zu / alloc=%zu fl | pacc: max=%zu / alloc=%zu fl | out: max=%zu / alloc=%zu fl\n",
+                    (size_t) (H - 1) * nseg_stride + (nseg - 1), rows_m * NSEG_MAX,
+                    ((size_t) (H - 1) * nseg_stride + (nseg - 1)) * HD + HD - 1, rows_m * NSEG_MAX * HD,
+                    (size_t) H * HD - 1, rows_m * HD);
+        std::fflush(stdout);
+
+        std::vector<float> host_out((size_t) T * H * HD, 0.0f);
+        uint32_t h_dbg = 0;
+        bool taken = false;
+        std::string exc_msg;
+        try {
+            q.memcpy(dpos, &pos0_val, 4);
+            q.memset(d_dbg_flag, 0, 4);
+            q.wait();
+            xa::Call2 c{};
+            c.q = dq; c.pos0 = dpos; c.t0 = 0; c.nt = T; c.H = H; c.HKV = HKV; c.scale = 1.0f / 16.0f;
+            c.k8 = p.dk8; c.ks = p.dks; c.ks16 = p.dk16; c.v8t = p.dv8; c.vs = p.dvs;
+            c.ns = ns; c.kstride = p.ctx; c.ctxp = p.ctxp; c.pos_hint = pos0_val + T;
+            c.qb = dqb; c.qs = dqs; c.pacc = dpa; c.pm = dpm; c.pl = dpl;
+            c.out = dout; c.form_override = 0; c.u16_override = 1;
+            set_dbg_caps(c, p, T);
+            taken = xa::attend2(c, &q);
+            q.wait();
+            q.memcpy(host_out.data(), dout, (size_t) T * H * HD * 4);
+            q.memcpy(&h_dbg, d_dbg_flag, 4);
+            q.wait();
+        } catch (const sycl::exception& exc) {
+            exc_msg = exc.what();
+        }
+        double eq = 0, ex = 0, n2 = 0;
+        for (int row : {0, 5, 7, H - 1}) {
+            ref_row(row / (H / HKV), &Q[(size_t) row * HD], pos0_val + 1, 0xffffffffu, 0x3fffffff,
+                    p.ctx, p.ctxp, ns, true, 1.f, p.K, p.V, p.k8b, p.hks.data(), p.hk16.data(),
+                    p.v8b, p.hvs.data(), p.cells, eq, ex, &host_out[(size_t) row * HD], n2);
+        }
+        const double rq = std::sqrt(eq / n2), rx = std::sqrt(ex / n2);
+        const bool ok = exc_msg.empty() && h_dbg == 0 && taken && rq < 3e-4;
+        if (!ok) ++bad;
+        std::printf("  small T= 1 form=S1 u16=1 pos0=%d | vs q_f64=%.2e (bound 3.0e-04) vs fp64=%.2e dbg=%u %s%s%s\n",
+                    pos0_val, rq, rx, h_dbg, ok ? "ok" : "FAIL", exc_msg.empty() ? "" : " EXC=", exc_msg.c_str());
+        std::fflush(stdout);
+        free_kv(p);
+        if (!exc_msg.empty()) {
+            std::fprintf(stderr, "xatt2 small case threw sycl::exception; aborting further tests\n");
+            return 1;
+        }
+        if (const char* so = std::getenv("STRATA_Q36_XATT2_SMALL_ONLY"); so && so[0] == '1') {
+            sycl::free(dpos, q); sycl::free(dtp0, q); sycl::free(dtmask, q);
+            sycl::free(dqb, q); sycl::free(dqs, q); sycl::free(d_dbg_flag, q);
+            sycl::free(dpa, q); sycl::free(dpm, q); sycl::free(dpl, q);
+            sycl::free(dout, q); sycl::free(dgate, q); sycl::free(dq, q);
+            return bad ? 1 : 0;
+        }
+    }
+
+    // ---- Stage 1: Functional parity (first context, odd unaligned kstride=cells tail guard + all forms + u8/u16 + tree mask + 4-slot batch)
+    {
+        const int cells = cl.empty() ? 25123 : (cl[0] | 3);   // force non-multiple-of-32 to exercise tail OOB guard
+        ParityKv p = build_kv(cells);
+        const int ctx = p.ctx, ctxp = p.ctxp;
+        auto& K = p.K; auto& V = p.V; auto& hk8 = p.hk8; auto& hv8 = p.hv8;
+        auto& hks = p.hks; auto& hvs = p.hvs; auto& hk16 = p.hk16;
+        auto* k8b = p.k8b; auto* v8b = p.v8b;
+        auto* dk8 = p.dk8; auto* dv8 = p.dv8; auto* dks = p.dks; auto* dvs = p.dvs; auto* dk16 = p.dk16;
 
         std::printf("xatt2 parity (ns=%d, cells=%d, kstride=%d tail test):\n", ns, cells, ctx);
         std::printf("  bound contract: NOT bitwise to XATT1 (per-32-cell V-scale quant + online softmax); "
                     "expected RMS vs float64 quantized ref <= 3.0e-4 (u16), <= 2.5e-2 (u8)\n");
+        std::fflush(stdout);
         std::vector<float> host_out(rows_m * HD);
         auto run_check = [&](int T, int form, int u16, bool use_tmask, int pos0_val) {
-            q.memcpy(dpos, &pos0_val, 4).wait();
             std::vector<uint32_t> htm(TM, 0xffffffffu);
             int p0_tree = pos0_val;
-            if (use_tmask) {
-                for (int t = 0; t < T; ++t) htm[t] = (1u << (t + 1)) - 1u;
-                if (T >= 4) htm[2] &= ~(1u << 1);   // non-linear tree branch
-                q.memcpy(dtmask, htm.data(), TM * 4);
-                q.memcpy(dtp0, &p0_tree, 4);
+            std::fill(host_out.begin(), host_out.end(), 0.0f);
+            uint32_t h_dbg = 0;
+            bool taken = false;
+            std::string exc_msg;
+            try {
+                q.memcpy(dpos, &pos0_val, 4);
+                q.memset(d_dbg_flag, 0, 4);
                 q.wait();
+                if (use_tmask) {
+                    for (int t = 0; t < T; ++t) htm[t] = (1u << (t + 1)) - 1u;
+                    if (T >= 4) htm[2] &= ~(1u << 1);   // non-linear tree branch
+                    q.memcpy(dtmask, htm.data(), TM * 4);
+                    q.memcpy(dtp0, &p0_tree, 4);
+                    q.wait();
+                }
+                xa::Call2 c{};
+                c.q = dq; c.pos0 = dpos; c.t0 = 0; c.nt = T; c.H = H; c.HKV = HKV; c.scale = 1.0f / 16.0f;
+                c.k8 = dk8; c.ks = dks; c.ks16 = dk16; c.v8t = dv8; c.vs = dvs;
+                c.ns = ns; c.kstride = ctx; c.ctxp = ctxp; c.pos_hint = pos0_val + T;
+                c.qb = dqb; c.qs = dqs; c.pacc = dpa; c.pm = dpm; c.pl = dpl;
+                c.out = dout;
+                if (use_tmask) { c.tmask = dtmask; c.tp0 = dtp0; }
+                c.form_override = form; c.u16_override = u16;
+                set_dbg_caps(c, p, T);
+                taken = xa::attend2(c, &q);
+                q.wait();
+                q.memcpy(host_out.data(), dout, (size_t) T * H * HD * 4);
+                q.memcpy(&h_dbg, d_dbg_flag, 4);
+                q.wait();
+            } catch (const sycl::exception& exc) {
+                exc_msg = exc.what();
             }
-            xa::Call2 c{};
-            c.q = dq; c.pos0 = dpos; c.t0 = 0; c.nt = T; c.H = H; c.HKV = HKV; c.scale = 1.0f / 16.0f;
-            c.k8 = dk8; c.ks = dks; c.ks16 = dk16; c.v8t = dv8; c.vs = dvs;
-            c.ns = ns; c.kstride = ctx; c.ctxp = ctxp; c.pos_hint = pos0_val + T;
-            c.qb = dqb; c.qs = dqs; c.pacc = dpa; c.pm = dpm; c.pl = dpl;
-            c.out = dout;
-            if (use_tmask) { c.tmask = dtmask; c.tp0 = dtp0; }
-            c.form_override = form; c.u16_override = u16;
-            const bool taken = xa::attend2(c, &q);
-            q.wait();
-            q.memcpy(host_out.data(), dout, (size_t) T * H * HD * 4).wait();
             double eq = 0, ex = 0, n2 = 0;
             const int samp[] = {0, 5, 7, H - 1, (T - 1) * H + 3, T * H - 1};
             for (int row : samp) {
@@ -2023,10 +2169,12 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
             }
             const double rq = std::sqrt(eq / n2), rx = std::sqrt(ex / n2);
             const double limit = u16 ? 3e-4 : 2.5e-2;
-            const bool ok = taken && rq < limit;
+            const bool ok = exc_msg.empty() && h_dbg == 0 && taken && rq < limit;
             if (!ok) ++bad;
-            std::printf("  T=%2d form=%-2s u16=%d tmask=%d pos0=%d | vs q_f64=%.2e (bound %.1e) vs fp64=%.2e %s\n",
-                        T, xa::xatt2_form_name(form), u16, use_tmask ? 1 : 0, pos0_val, rq, limit, rx, ok ? "ok" : "FAIL");
+            std::printf("  T=%2d form=%-2s u16=%d tmask=%d pos0=%d | vs q_f64=%.2e (bound %.1e) vs fp64=%.2e dbg=%u %s%s%s\n",
+                        T, xa::xatt2_form_name(form), u16, use_tmask ? 1 : 0, pos0_val, rq, limit, rx, h_dbg,
+                        ok ? "ok" : "FAIL", exc_msg.empty() ? "" : " EXC=", exc_msg.c_str());
+            std::fflush(stdout);
         };
         for (int T : tl) {
             if (T < 1 || T > TM || cells < T + 8) continue;
@@ -2085,10 +2233,23 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
             cb.nt = r0;
             cb.qb = dqb; cb.qs = dqs; cb.pacc = dpa; cb.pm = dpm; cb.pl = dpl;
             cb.out = dout; cb.gate = dgate;
-            q.memcpy(dpos, hrc, (size_t) r0 * 4).wait();
-            const bool taken = xa::attend2(cb, &q);
-            q.wait();
-            q.memcpy(host_out.data(), dout, (size_t) r0 * H * HD * 4).wait();
+            set_dbg_caps(cb, p, r0);
+            uint32_t h_dbg = 0;
+            bool taken = false;
+            std::string exc_msg;
+            std::fill(host_out.begin(), host_out.end(), 0.0f);
+            try {
+                q.memcpy(dpos, hrc, (size_t) r0 * 4);
+                q.memset(d_dbg_flag, 0, 4);
+                q.wait();
+                taken = xa::attend2(cb, &q);
+                q.wait();
+                q.memcpy(host_out.data(), dout, (size_t) r0 * H * HD * 4);
+                q.memcpy(&h_dbg, d_dbg_flag, 4);
+                q.wait();
+            } catch (const sycl::exception& exc) {
+                exc_msg = exc.what();
+            }
             // Reference with gate: multiply un-gated ref by sigm(G) on a host check copy:
             double eq = 0, ex = 0, n2 = 0;
             for (int gi = 0; gi < ngrp; ++gi) {
@@ -2107,14 +2268,15 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
                 }
             }
             const double rq = std::sqrt(eq / n2), rx = std::sqrt(ex / n2);
-            const bool ok = taken && rq < 3e-4;
+            const bool ok = exc_msg.empty() && h_dbg == 0 && taken && rq < 3e-4;
             if (!ok) ++bad;
-            std::printf("  batch ngrp=%d nt=%d (single launch + fused gate) | vs q_f64=%.2e vs fp64=%.2e %s\n",
-                        ngrp, cb.nt, rq, rx, ok ? "ok" : "FAIL");
+            std::printf("  batch ngrp=%d nt=%d (single launch + fused gate) | vs q_f64=%.2e vs fp64=%.2e dbg=%u %s%s%s\n",
+                        ngrp, cb.nt, rq, rx, h_dbg, ok ? "ok" : "FAIL", exc_msg.empty() ? "" : " EXC=", exc_msg.c_str());
+            std::fflush(stdout);
             sycl::free(k_blob, q); sycl::free(v_blob, q);
             sycl::free(d_ktab, q); sycl::free(d_vtab, q); sycl::free(d_mtab, q);
         }
-        sycl::free(dk8, q); sycl::free(dv8, q); sycl::free(dks, q); sycl::free(dvs, q); sycl::free(dk16, q);
+        free_kv(p);
     }
 
     // ---- Stage 2: Timing benchmark across context lengths (>= 64 MiB rotating buffers, 0.4 s warmup, device timestamps)
@@ -2272,7 +2434,7 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
     }
 
     sycl::free(dpos, q); sycl::free(dtp0, q); sycl::free(dtmask, q);
-    sycl::free(dqb, q); sycl::free(dqs, q);
+    sycl::free(dqb, q); sycl::free(dqs, q); sycl::free(d_dbg_flag, q);
     sycl::free(dpa, q); sycl::free(dpm, q); sycl::free(dpl, q);
     sycl::free(dout, q); sycl::free(dgate, q); sycl::free(dq, q);
     return bad ? 1 : 0;

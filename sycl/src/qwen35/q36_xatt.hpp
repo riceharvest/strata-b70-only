@@ -130,6 +130,16 @@ struct Call2 {
     int nseg_override = 0;               // 0=auto/env, >0=fixed segments per KV head
     int u16_override = -1;               // -1=auto/env (default 1), 0=u8 P, 1=u16 P
     int zero_fence = 0;                  // runtime 0 for anti-hoist fencing
+
+    // Optional bounds-check debug mode (active under STRATA_Q36_XATT2_DBG=1):
+    uint32_t* dbg_flag = nullptr;        // device uint32 (zeroed by caller; set non-zero on clamped OOB)
+    size_t dbg_q_floats = 0;             // allocated capacity of `q` in floats (0 = derive from Call2)
+    size_t dbg_k8_dwords = 0;            // allocated capacity of `k8` per slot in dwords (0 = derive)
+    size_t dbg_ks_floats = 0;            // allocated capacity of `ks` per slot in floats (0 = derive)
+    size_t dbg_ks16_u16 = 0;             // allocated capacity of `ks16` per slot in uint16s (0 = derive)
+    size_t dbg_v8t_dwords = 0;           // allocated capacity of `v8t` per slot in dwords (0 = derive)
+    size_t dbg_vs_floats = 0;            // allocated capacity of `vs` per slot in floats (0 = derive)
+    size_t dbg_out_floats = 0;           // allocated capacity of `out`/`gate` in floats (0 = derive)
 };
 
 /// Returns the form name string ("S1", "D2", "S8", "L8").

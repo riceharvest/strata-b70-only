@@ -602,15 +602,62 @@ SYCL_ESIMD_FUNCTION inline simd<float, 64> sigm64(simd<float, 64> x) {
     return sp;
 }
 
-struct AttnGrp2 {
-    uint8_t slot = 0;
-    uint8_t r0 = 0;
-    uint8_t cnt = 0;
-    uint8_t ls0 = 0;
-    uint8_t nrg = 1;
-    uint8_t nseg = 1;
-    uint16_t pad = 0;
-};
+inline bool xatt2_dbg_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_Q36_XATT2_DBG");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
+SYCL_ESIMD_FUNCTION inline float xatt2_nan_f32() {
+    simd<uint32_t, 1> nu(0x7fc00000u);
+    return nu.template bit_cast_view<float>()[0];
+}
+
+SYCL_ESIMD_FUNCTION inline void xatt2_mark_oob(uint32_t* dbg_flag, uint32_t code, float* fallback_nan) {
+    if (dbg_flag) dbg_flag[0] = code;
+    if (fallback_nan) fallback_nan[0] = xatt2_nan_f32();
+}
+
+SYCL_ESIMD_FUNCTION inline uint32_t unpack_u8_16(uint64_t lo, uint64_t hi, int idx) {
+    const uint64_t w = (idx < 8) ? lo : hi;
+    return (uint32_t) ((w >> ((uint32_t) (idx & 7) * 8u)) & 0xffu);
+}
+
+SYCL_ESIMD_FUNCTION inline uint32_t unpack_grp_u32(
+    int gi, uint64_t g0, uint64_t g1, uint64_t g2, uint64_t g3,
+    uint64_t g4, uint64_t g5, uint64_t g6, uint64_t g7) {
+    uint64_t w = g0;
+    const int p = gi >> 1;
+    if (p == 1) w = g1;
+    else if (p == 2) w = g2;
+    else if (p == 3) w = g3;
+    else if (p == 4) w = g4;
+    else if (p == 5) w = g5;
+    else if (p == 6) w = g6;
+    else if (p == 7) w = g7;
+    return (gi & 1) ? (uint32_t) (w >> 32) : (uint32_t) (w & 0xffffffffull);
+}
+
+inline uint32_t pack_grp_u32(int slot, int r0, int cnt, int ls0, int nrg, int nseg) {
+    return (uint32_t) (slot & 0xff)
+         | ((uint32_t) (r0 & 0xf) << 8)
+         | ((uint32_t) ((cnt - 1) & 0xf) << 12)
+         | ((uint32_t) (ls0 & 0xf) << 16)
+         | ((uint32_t) ((nrg - 1) & 0x7) << 20)
+         | ((uint32_t) (nseg & 0x1ff) << 23);
+}
+
+SYCL_ESIMD_FUNCTION inline void decode_grp_u32(
+    uint32_t w, int& slot, int& r0, int& cnt, int& ls0, int& nrg, int& nseg) {
+    slot = (int) (w & 0xffu);
+    r0 = (int) ((w >> 8) & 0xfu);
+    cnt = (int) (((w >> 12) & 0xfu) + 1u);
+    ls0 = (int) ((w >> 16) & 0xfu);
+    nrg = (int) (((w >> 20) & 0x7u) + 1u);
+    nseg = (int) ((w >> 23) & 0x1ffu);
+}
 
 struct QPlan2 {
     int32_t ngrp = 1;
@@ -620,13 +667,18 @@ struct QPlan2 {
     int32_t HKV = 4;
     int32_t per_tok_pos = 0;
     float scale = 1.0f / 16.0f;
+    uint32_t dbg = 0;
     const float* q = nullptr;
     uint32_t* qb = nullptr;
     float* qs = nullptr;
-    uint8_t g_r0[kMaxBatchGroups2]{};
-    uint8_t g_cnt[kMaxBatchGroups2]{};
-    uint8_t ls_grp[kMaxBatchGroups2]{};
-    uint8_t ls_loc[kMaxBatchGroups2]{};
+    uint32_t* dbg_flag = nullptr;
+    uint64_t q_floats = 0;
+    uint64_t qb_dwords = 0;
+    uint64_t qs_floats = 0;
+    uint64_t g_r0_cnt_lo = 0;
+    uint64_t g_r0_cnt_hi = 0;
+    uint64_t ls_gl_lo = 0;
+    uint64_t ls_gl_hi = 0;
 };
 
 struct AttnPlan2 {
@@ -646,6 +698,7 @@ struct AttnPlan2 {
     float* pacc = nullptr;
     float* pm = nullptr;
     float* pl = nullptr;
+    uint32_t* dbg_flag = nullptr;
     int32_t kst = 0;
     int32_t ctxp = 0;
     int32_t wg_threads = 1;
@@ -656,13 +709,19 @@ struct AttnPlan2 {
     int32_t H = 24;
     int32_t HKV = 4;
     float scale = 1.0f / 16.0f;
-    uint8_t ngrp = 1;
-    uint8_t total_tasks = 1;
-    uint8_t per_tok_pos = 0;
-    uint8_t pad = 0;
-    AttnGrp2 g[kMaxBatchGroups2]{};
-    uint8_t task_grp[kMaxSegs2]{};
-    uint8_t task_seg[kMaxSegs2]{};
+    uint32_t dbg = 0;
+    uint32_t k8_max_cells = 0;
+    uint32_t v8t_max_blks = 0;
+    uint32_t vs_max_cells = 0;
+    uint64_t qb_dwords = 0;
+    uint64_t qs_floats = 0;
+    uint64_t p_elems = 0;
+    uint64_t pacc_elems = 0;
+    int32_t ngrp = 1;
+    int32_t total_tasks = 1;
+    int32_t per_tok_pos = 0;
+    uint64_t gp0 = 0, gp1 = 0, gp2 = 0, gp3 = 0;
+    uint64_t gp4 = 0, gp5 = 0, gp6 = 0, gp7 = 0;
 };
 
 struct MPlan2 {
@@ -670,13 +729,21 @@ struct MPlan2 {
     int32_t H = 24;
     int32_t ngrp = 1;
     int32_t nseg_stride = 1;
+    float inv_H = 1.0f / 24.0f;
+    uint32_t dbg = 0;
     float* pacc = nullptr;
     float* pm = nullptr;
     float* pl = nullptr;
     const float* gate = nullptr;
     float* out = nullptr;
-    uint8_t g_nseg[kMaxBatchGroups2]{};
-    uint8_t tok_grp[kMaxBatchGroups2]{};
+    uint32_t* dbg_flag = nullptr;
+    uint64_t p_elems = 0;
+    uint64_t pacc_elems = 0;
+    uint64_t out_elems = 0;
+    uint64_t g_nseg_lo = 0;
+    uint64_t g_nseg_hi = 0;
+    uint64_t tok_grp_lo = 0;
+    uint64_t tok_grp_hi = 0;
 };
 
 struct HostPlan2 {
@@ -687,42 +754,38 @@ struct HostPlan2 {
 };
 
 template <int NS>
-SYCL_ESIMD_FUNCTION inline void load_grp_ptrs(
-    const AttnPlan2& pl, int gi, int kvh,
+SYCL_ESIMD_FUNCTION inline void load_grp_ptrs_raw(
+    const uint32_t* k8, const float* ks, const uint16_t* ks16, const uint32_t* v8t, const float* vs,
+    void* const* k_tab, void* const* v_tab, const void* const* mir_tab,
+    int HKV, int kst, int ctxp, int slot, int kvh,
     const uint32_t*& kb, const float*& ksb, const uint32_t*& ks16b,
     const uint32_t*& vb, const float*& vsb) {
-    const uint32_t* k8 = pl.k8;
-    const float* ks = pl.ks;
-    const uint16_t* ks16 = pl.ks16;
-    const uint32_t* v8t = pl.v8t;
-    const float* vs = pl.vs;
     if (!k8) {
-        const int slot = (int) pl.g[gi].slot;
-        if (pl.k_tab) {
-            const int8_t* kp = reinterpret_cast<const int8_t*>(pl.k_tab[slot]);
+        if (k_tab) {
+            const int8_t* kp = reinterpret_cast<const int8_t*>(k_tab[slot]);
             k8 = reinterpret_cast<const uint32_t*>(kp);
-            ks16 = reinterpret_cast<const uint16_t*>(kp + (size_t) pl.HKV * (size_t) pl.kst * kHD);
-        } else if (pl.mir_tab) {
+            ks16 = reinterpret_cast<const uint16_t*>(kp + (size_t) HKV * (size_t) kst * kHD);
+        } else if (mir_tab) {
             const size_t b = (size_t) slot * 4u;
-            k8 = reinterpret_cast<const uint32_t*>(pl.mir_tab[b + 0]);
-            if constexpr (NS == 1) ks = reinterpret_cast<const float*>(pl.mir_tab[b + 1]);
-            else ks16 = reinterpret_cast<const uint16_t*>(pl.mir_tab[b + 1]);
+            k8 = reinterpret_cast<const uint32_t*>(mir_tab[b + 0]);
+            if constexpr (NS == 1) ks = reinterpret_cast<const float*>(mir_tab[b + 1]);
+            else ks16 = reinterpret_cast<const uint16_t*>(mir_tab[b + 1]);
         }
-        if (pl.v_tab) {
-            const int8_t* vp = reinterpret_cast<const int8_t*>(pl.v_tab[slot]);
+        if (v_tab) {
+            const int8_t* vp = reinterpret_cast<const int8_t*>(v_tab[slot]);
             v8t = reinterpret_cast<const uint32_t*>(vp);
-            vs = reinterpret_cast<const float*>(vp + v8t_dwords(pl.HKV, pl.ctxp) * 4);
-        } else if (pl.mir_tab) {
+            vs = reinterpret_cast<const float*>(vp + v8t_dwords(HKV, ctxp) * 4);
+        } else if (mir_tab) {
             const size_t b = (size_t) slot * 4u;
-            v8t = reinterpret_cast<const uint32_t*>(pl.mir_tab[b + 2]);
-            vs = reinterpret_cast<const float*>(pl.mir_tab[b + 3]);
+            v8t = reinterpret_cast<const uint32_t*>(mir_tab[b + 2]);
+            vs = reinterpret_cast<const float*>(mir_tab[b + 3]);
         }
     }
-    kb = k8 + (size_t) kvh * pl.kst * 64;
-    ksb = (NS == 1 && ks) ? (ks + (size_t) kvh * pl.kst) : nullptr;
-    ks16b = (NS == 4 && ks16) ? (reinterpret_cast<const uint32_t*>(ks16) + (size_t) kvh * pl.kst * 2) : nullptr;
-    vb = v8t + (size_t) kvh * (pl.ctxp / kBlk) * 256 * 8;
-    vsb = vs + (size_t) kvh * pl.ctxp;
+    kb = k8 + (size_t) kvh * kst * 64;
+    ksb = (NS == 1 && ks) ? (ks + (size_t) kvh * kst) : nullptr;
+    ks16b = (NS == 4 && ks16) ? (reinterpret_cast<const uint32_t*>(ks16) + (size_t) kvh * kst * 2) : nullptr;
+    vb = v8t + (size_t) kvh * (ctxp / kBlk) * 256 * 8;
+    vsb = vs + (size_t) kvh * ctxp;
 }
 
 SYCL_ESIMD_FUNCTION inline void seg_block_range(int ub, int seg, int nseg, int& blk_a, int& blk_b) {
@@ -755,20 +818,32 @@ SYCL_ESIMD_FUNCTION inline void seg_block_range(int ub, int seg, int nseg, int& 
 
 // Quantize queries into 16-row DPAS operand format per (kvh, ls_global), zeroing unused rows.
 struct TagXa2Q;
-void launch_queries2(sycl::queue& q, const QPlan2& pl, int total_ls) {
+void launch_queries2(sycl::queue& q, const QPlan2& p, int total_ls) {
+    const int nt = p.nt, t0 = p.t0, H = p.H, HKV = p.HKV, per_tok_pos = p.per_tok_pos;
+    const float scale = p.scale;
+    const uint32_t dbg = p.dbg;
+    const float* pq = p.q;
+    uint32_t* qb = p.qb;
+    float* qs = p.qs;
+    uint32_t* dbg_flag = p.dbg_flag;
+    const uint64_t q_floats = p.q_floats, qb_dwords = p.qb_dwords, qs_floats = p.qs_floats;
+    const uint64_t g_r0_cnt_lo = p.g_r0_cnt_lo, g_r0_cnt_hi = p.g_r0_cnt_hi;
+    const uint64_t ls_gl_lo = p.ls_gl_lo, ls_gl_hi = p.ls_gl_hi;
     q.submit([&](sycl::handler& h) {
         h.parallel_for<TagXa2Q>(
-            sycl::nd_range<3>(sycl::range<3>((size_t) pl.HKV, (size_t) total_ls, 16),
+            sycl::nd_range<3>(sycl::range<3>((size_t) HKV, (size_t) total_ls, 16),
                               sycl::range<3>(1, 1, 16)),
             [=](sycl::nd_item<3> it) SYCL_ESIMD_KERNEL {
                 slm_init<16u * 64u * 4u>();
                 const int kvh = (int) it.get_global_id(0);
                 const int lsg = (int) it.get_global_id(1);
                 const int lane = (int) it.get_local_id(2);
-                const int gi = (int) pl.ls_grp[lsg];
-                const int ls_loc = (int) pl.ls_loc[lsg];
-                const int gp_r0 = (int) pl.g_r0[gi];
-                const int gp_cnt = (int) pl.g_cnt[gi];
+                const uint32_t lsb = unpack_u8_16(ls_gl_lo, ls_gl_hi, lsg);
+                const int gi = (int) (lsb >> 4);
+                const int ls_loc = (int) (lsb & 0xfu);
+                const uint32_t grb = unpack_u8_16(g_r0_cnt_lo, g_r0_cnt_hi, gi);
+                const int gp_r0 = (int) (grb >> 4);
+                const int gp_cnt = (int) ((grb & 0xfu) + 1u);
                 const int r = ls_loc * 16 + lane;
                 const int k = (r * 43691) >> 18;
                 const int hd = r - k * kG;
@@ -776,37 +851,50 @@ void launch_queries2(sycl::queue& q, const QPlan2& pl, int total_ls) {
 
                 simd<uint32_t, 64> w(0u);
                 float qsv = 0.0f;
+                bool q_oob = false;
                 if (live) {
-                    const int qt = pl.per_tok_pos ? (gp_r0 + k) : (pl.t0 + k);
-                    const float* src = pl.q + ((size_t) qt * pl.H + kvh * kG + hd) * kHD;
-                    simd<float, 64> x[4];
-                    float mx = 0.0f;
+                    const int qt = per_tok_pos ? (gp_r0 + k) : (t0 + k);
+                    const size_t src_off = ((size_t) qt * H + kvh * kG + hd) * kHD;
+                    if (dbg && (src_off + (size_t) kHD > q_floats)) {
+                        q_oob = true;
+                        xatt2_mark_oob(dbg_flag, 101u, nullptr);
+                    } else {
+                        const float* src = pq + src_off;
+                        simd<float, 64> x[4];
+                        float mx = 0.0f;
 #pragma unroll
-                    for (int i = 0; i < 4; ++i) {
-                        x[i] = block_load<float, 64>(src + 64 * i);
-                        const float m1 = hmax<float>(es::abs(x[i]));
-                        mx = m1 > mx ? m1 : mx;
-                    }
-                    const float sc = mx / 127.0f;
-                    const float inv = sc > 0.0f ? 1.0f / sc : 0.0f;
+                        for (int i = 0; i < 4; ++i) {
+                            x[i] = block_load<float, 64>(src + 64 * i);
+                            const float m1 = hmax<float>(es::abs(x[i]));
+                            mx = m1 > mx ? m1 : mx;
+                        }
+                        const float sc = mx / 127.0f;
+                        const float inv = sc > 0.0f ? 1.0f / sc : 0.0f;
 #pragma unroll
-                    for (int i = 0; i < 4; ++i) {
-                        simd<float, 64> y = x[i] * inv;
-                        simd<float, 64> half(0.5f);
-                        half.merge(simd<float, 64>(-0.5f), y < 0.0f);
-                        simd<int, 64> ci = convert<int>(y + half);
-                        ci = (es::min)((es::max)(ci, simd<int, 64>(-127)), simd<int, 64>(127));
-                        simd<uint32_t, 64> cu = ci.template bit_cast_view<uint32_t>();
-                        simd<uint32_t, 16> b0 = cu.template select<16, 4>(0);
-                        simd<uint32_t, 16> b1 = cu.template select<16, 4>(1);
-                        simd<uint32_t, 16> b2 = cu.template select<16, 4>(2);
-                        simd<uint32_t, 16> b3 = cu.template select<16, 4>(3);
-                        w.template select<16, 1>(16 * i) = (b0 & 255u) | ((b1 & 255u) << 8) | ((b2 & 255u) << 16) | (b3 << 24);
+                        for (int i = 0; i < 4; ++i) {
+                            simd<float, 64> y = x[i] * inv;
+                            simd<float, 64> half(0.5f);
+                            half.merge(simd<float, 64>(-0.5f), y < 0.0f);
+                            simd<int, 64> ci = convert<int>(y + half);
+                            ci = (es::min)((es::max)(ci, simd<int, 64>(-127)), simd<int, 64>(127));
+                            simd<uint32_t, 64> cu = ci.template bit_cast_view<uint32_t>();
+                            simd<uint32_t, 16> b0 = cu.template select<16, 4>(0);
+                            simd<uint32_t, 16> b1 = cu.template select<16, 4>(1);
+                            simd<uint32_t, 16> b2 = cu.template select<16, 4>(2);
+                            simd<uint32_t, 16> b3 = cu.template select<16, 4>(3);
+                            w.template select<16, 1>(16 * i) = (b0 & 255u) | ((b1 & 255u) << 8) | ((b2 & 255u) << 16) | (b3 << 24);
+                        }
+                        qsv = sc * scale;
                     }
-                    qsv = sc * pl.scale;
                 }
                 slm_block_store<uint32_t, 64>((uint32_t) lane * 256u, w, kAl16);
-                pl.qs[((size_t) kvh * kMaxBatchGroups2 + (size_t) lsg) * 16u + (size_t) lane] = qsv;
+                const size_t qs_off = ((size_t) kvh * kMaxBatchGroups2 + (size_t) lsg) * 16u + (size_t) lane;
+                if (dbg && (q_oob || qs_off >= qs_floats)) {
+                    xatt2_mark_oob(dbg_flag, 102u, qs_floats > 0 ? qs : nullptr);
+                    if (qs_off < qs_floats) qs[qs_off] = xatt2_nan_f32();
+                } else {
+                    qs[qs_off] = qsv;
+                }
                 barrier();
 
                 // Thread `lane` handles slice `s = lane >> 1`, 4 dwords `d0 = (lane & 1) * 4`, 16 lanes = 64 dwords.
@@ -819,63 +907,152 @@ void launch_queries2(sycl::queue& q, const QPlan2& pl, int total_ls) {
                     const uint32_t col_off = (uint32_t) (8 * s + d0 + dd) * 4u;
                     out64.template select<16, 1>(16 * dd) = slm_gather<uint32_t, 16>(row_off + col_off);
                 }
-                uint32_t* dst = pl.qb + (((size_t) kvh * 8u + (size_t) s) * kMaxBatchGroups2 + (size_t) lsg) * 128u + (size_t) d0 * 16u;
-                block_store<uint32_t, 64>(dst, out64);
+                const size_t dst_off = (((size_t) kvh * 8u + (size_t) s) * kMaxBatchGroups2 + (size_t) lsg) * 128u + (size_t) d0 * 16u;
+                if (dbg && (dst_off + 64u > qb_dwords)) {
+                    xatt2_mark_oob(dbg_flag, 103u, qs_floats > 0 ? qs : nullptr);
+                } else {
+                    block_store<uint32_t, 64>(qb + dst_off, out64);
+                }
             });
     });
 }
 
-// Helper: compute valid-cell upper bound and per-row [0, hi) lengths for 8-row or 16-row groups.
-template <int R>
-SYCL_ESIMD_FUNCTION inline void load_row_bounds(
-    const AttnPlan2& pl, int gi, int r_base,
-    simd<int, R>& hi_v, simd<uint32_t, R>& tmk_v, int& ub, bool& has_tmask, int& p0_tree) {
-    const AttnGrp2& gp = pl.g[gi];
-    int tok_len[16];
-    ub = 0;
-#pragma unroll
-    for (int k = 0; k < 16; ++k) {
-        if (k < (int) gp.cnt) {
-            const int len = pl.per_tok_pos ? (pl.pos0[(int) gp.r0 + k] + 1) : (pl.pos0[0] + pl.t0 + 1 + k);
-            tok_len[k] = len;
-            if (len > ub) ub = len;
-        } else {
-            tok_len[k] = 0;
-        }
+// Helper: decode task -> (gi, seg, slot, r0, cnt, ls0, nrg, nseg) with zero C-array/alloca/stack spills.
+SYCL_ESIMD_FUNCTION inline void decode_task_grp(
+    int task, int ngrp,
+    uint64_t gp0, uint64_t gp1, uint64_t gp2, uint64_t gp3,
+    uint64_t gp4, uint64_t gp5, uint64_t gp6, uint64_t gp7,
+    int& gi_out, int& seg_out, int& slot, int& r0, int& cnt, int& ls0, int& nrg, int& nseg) {
+    if (ngrp == 1) {
+        gi_out = 0;
+        seg_out = task;
+        decode_grp_u32((uint32_t) (gp0 & 0xffffffffull), slot, r0, cnt, ls0, nrg, nseg);
+        return;
     }
-    has_tmask = (pl.tmask != nullptr) && (pl.ngrp == 1);
-    p0_tree = has_tmask ? (pl.tp0 ? pl.tp0[0] : pl.pos0[0]) : 0x3fffffff;
+    int rem = task;
+    gi_out = 0;
+    seg_out = 0;
+    uint32_t found = (uint32_t) (gp0 & 0xffffffffull);
+    for (int i = 0; i < 16; ++i) {
+        if (i >= ngrp) break;
+        const uint32_t w = unpack_grp_u32(i, gp0, gp1, gp2, gp3, gp4, gp5, gp6, gp7);
+        const int ns_i = (int) ((w >> 23) & 0x1ffu);
+        if (rem < ns_i) {
+            gi_out = i;
+            seg_out = rem;
+            found = w;
+            break;
+        }
+        rem -= ns_i;
+    }
+    decode_grp_u32(found, slot, r0, cnt, ls0, nrg, nseg);
+}
+
+// Helper: compute valid-cell upper bound and per-row [0, hi) lengths without host/stack arrays.
+template <int R>
+SYCL_ESIMD_FUNCTION inline void load_row_bounds_raw(
+    const int32_t* pos0, const uint32_t* tmask, const int32_t* tp0,
+    int t0, int ngrp, int per_tok_pos, int gp_r0, int gp_cnt, int r_base,
+    simd<int, R>& hi_v, simd<uint32_t, R>& tmk_v, int& ub, bool& has_tmask, int& p0_tree) {
+    const int pos0_base = pos0[0] + t0 + 1;
+    if (per_tok_pos) {
+        ub = 0;
+        for (int k = 0; k < gp_cnt; ++k) {
+            const int len = pos0[gp_r0 + k] + 1;
+            if (len > ub) ub = len;
+        }
+    } else {
+        ub = gp_cnt > 0 ? (pos0_base + gp_cnt - 1) : 0;
+    }
+    has_tmask = (tmask != nullptr) && (ngrp == 1);
+    p0_tree = has_tmask ? (tp0 ? tp0[0] : pos0[0]) : 0x3fffffff;
+    const int tok0 = (r_base * 43691) >> 18;
+    int l0 = 0, l1 = 0, l2 = 0, l3 = 0;
+    uint32_t m0 = 0xffffffffu, m1 = 0xffffffffu, m2 = 0xffffffffu, m3 = 0xffffffffu;
+    if (tok0 + 0 < gp_cnt) {
+        l0 = per_tok_pos ? (pos0[gp_r0 + tok0 + 0] + 1) : (pos0_base + tok0 + 0);
+        if (has_tmask) m0 = tmask[t0 + tok0 + 0];
+    }
+    if (tok0 + 1 < gp_cnt) {
+        l1 = per_tok_pos ? (pos0[gp_r0 + tok0 + 1] + 1) : (pos0_base + tok0 + 1);
+        if (has_tmask) m1 = tmask[t0 + tok0 + 1];
+    }
+    if (tok0 + 2 < gp_cnt) {
+        l2 = per_tok_pos ? (pos0[gp_r0 + tok0 + 2] + 1) : (pos0_base + tok0 + 2);
+        if (has_tmask) m2 = tmask[t0 + tok0 + 2];
+    }
+    if (tok0 + 3 < gp_cnt) {
+        l3 = per_tok_pos ? (pos0[gp_r0 + tok0 + 3] + 1) : (pos0_base + tok0 + 3);
+        if (has_tmask) m3 = tmask[t0 + tok0 + 3];
+    }
 #pragma unroll
     for (int lane = 0; lane < R; ++lane) {
         const int r = r_base + lane;
-        const int tok = (r * 43691) >> 18;
-        if (tok < (int) gp.cnt) {
-            hi_v[lane] = tok_len[tok];
-            tmk_v[lane] = has_tmask ? pl.tmask[pl.t0 + tok] : 0xffffffffu;
-        } else {
-            hi_v[lane] = 0;
-            tmk_v[lane] = 0u;
-        }
+        const int dt = ((r * 43691) >> 18) - tok0;
+        int lv = 0;
+        uint32_t mv = 0u;
+        if (dt == 0) { lv = l0; mv = m0; }
+        else if (dt == 1) { lv = l1; mv = m1; }
+        else if (dt == 2) { lv = l2; mv = m2; }
+        else if (dt == 3) { lv = l3; mv = m3; }
+        hi_v[lane] = lv;
+        tmk_v[lane] = mv;
     }
 }
 
+// Helper: clamp segment & KV cell bounds under STRATA_Q36_XATT2_DBG=1 so any OOB turns into NaN/FAIL instead of GPU fault.
+SYCL_ESIMD_FUNCTION inline bool dbg_clamp_seg_bounds_raw(
+    uint32_t dbg, uint32_t* dbg_flag, int HKV,
+    uint32_t k8_max_cells, uint32_t v8t_max_blks, uint32_t vs_max_cells,
+    uint64_t qb_dwords, uint64_t qs_floats,
+    int kvh, int ls_idx, int& ub, int& blk_a, int& blk_b) {
+    if (dbg == 0) return false;
+    bool oob = false;
+    uint32_t code = 0u;
+    if ((size_t) kvh >= (size_t) HKV || (size_t) ls_idx >= kMaxBatchGroups2) {
+        oob = true; code = 1u;
+    }
+    const size_t qb_need = (((size_t) kvh * 8u + 7u) * kMaxBatchGroups2 + (size_t) ls_idx) * 128u + 128u;
+    const size_t qs_need = ((size_t) kvh * kMaxBatchGroups2 + (size_t) ls_idx) * 16u + 16u;
+    if (qb_need > qb_dwords) { oob = true; code = 2u; }
+    if (qs_need > qs_floats) { oob = true; code = 3u; }
+    if (ub < 0) { oob = true; code = 4u; ub = 0; }
+    if (ub > (int) k8_max_cells) { oob = true; code = 5u; ub = (int) k8_max_cells; }
+    const int vs_cells = (int) vs_max_cells;
+    const int v8t_cells = (int) (v8t_max_blks * (uint32_t) kBlk);
+    const int max_v_cells = vs_cells < v8t_cells ? vs_cells : v8t_cells;
+    if (ub > max_v_cells) { oob = true; code = 6u; ub = max_v_cells; }
+    if (blk_b > blk_a) {
+        const int max_full_blks = max_v_cells >> 5;
+        if (blk_b > max_full_blks) { oob = true; code = 7u; blk_b = max_full_blks; }
+        if (blk_a < 0) { oob = true; code = 8u; blk_a = 0; }
+        if (blk_a > blk_b) blk_b = blk_a;
+    }
+    if (oob) xatt2_mark_oob(dbg_flag, code, nullptr);
+    return oob;
+}
+
 // Helper: store 8-row outputs (o[32] of [ag=0..31][dim8][row8]) + pm/pl into split-K partials.
-SYCL_ESIMD_FUNCTION inline void store_partials_r8(
-    const AttnPlan2& pl, int gi, int seg, int kvh, int r_base,
-    simd<float, 64> o[32], simd<float, 8> m, simd<float, 8> l) {
-    const AttnGrp2& gp = pl.g[gi];
-    const int nseg_s = pl.nseg_stride;
+SYCL_ESIMD_FUNCTION inline void store_partials_r8_raw(
+    float* pacc, float* pm, float* pl, uint32_t dbg, uint32_t* dbg_flag,
+    uint64_t p_elems, uint64_t pacc_elems, int H, int nseg_stride,
+    int gp_r0, int gp_cnt, int seg, int kvh, int r_base,
+    simd<float, 64> o[32], simd<float, 8> m, simd<float, 8> l, bool oob = false) {
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int rg = r_base + r;
         const int tok = (rg * 43691) >> 18;
-        if (tok < (int) gp.cnt) {
+        if (tok < gp_cnt) {
             const int hd = rg - tok * kG;
-            const size_t row = (size_t) ((int) gp.r0 + tok) * (size_t) pl.H + (size_t) (kvh * kG + hd);
-            const size_t p_idx = row * (size_t) nseg_s + (size_t) seg;
-            pl.pm[p_idx] = m[r];
-            pl.pl[p_idx] = l[r];
-            float* pout = pl.pacc + p_idx * (size_t) kHD;
+            const size_t row = (size_t) (gp_r0 + tok) * (size_t) H + (size_t) (kvh * kG + hd);
+            const size_t p_idx = row * (size_t) nseg_stride + (size_t) seg;
+            if (dbg && (oob || p_idx >= p_elems || p_idx * (size_t) kHD + (size_t) kHD > pacc_elems)) {
+                xatt2_mark_oob(dbg_flag, oob ? 10u : 11u, (p_idx < p_elems) ? (pm + p_idx) : (p_elems > 0 ? pm : nullptr));
+                continue;
+            }
+            pm[p_idx] = m[r];
+            pl[p_idx] = l[r];
+            float* pout = pacc + p_idx * (size_t) kHD;
 #pragma unroll
             for (int c4 = 0; c4 < 4; ++c4) {
                 simd<float, 64> v64;
@@ -968,9 +1145,12 @@ SYCL_ESIMD_FUNCTION inline void softmax_v_r8_blk(
     simd<int, 128> bh = bhi.template bit_cast_view<int>();
 #pragma unroll
     for (int ag = 0; ag < 32; ++ag) {
-        simd<uint32_t, 64> wv = FROM_SLM
-            ? slm_block_load<uint32_t, 64>(v_slm_base + (uint32_t) ag * 256u, kAl16)
-            : block_load<uint32_t, 64>(vp + (size_t) ag * 64u);
+        simd<uint32_t, 64> wv;
+        if constexpr (FROM_SLM) {
+            wv = slm_block_load<uint32_t, 64>(v_slm_base + (uint32_t) ag * 256u, kAl16);
+        } else {
+            wv = block_load<uint32_t, 64>(vp + (size_t) ag * 64u);
+        }
         simd<int, 64> av = wv.template bit_cast_view<int>();
         simd<int, 128> alo = xmx::dpas<8, 8, int, int, int, int, xmx::dpas_argument_type::u8, xmx::dpas_argument_type::s8>(simd<int, 128>(0), bl, av);
         simd<int, 64> lo64;
@@ -1113,55 +1293,84 @@ SYCL_ESIMD_FUNCTION inline void prefetch_blk_kv(
 // Form 0: S1 (<= 8 rows per group, 1 thread per WG, no SLM/barriers).
 template <int NS, int U16> struct TagXa2S1;
 template <int NS, int U16> void launch_s1(sycl::queue& q, const AttnPlan2& pl) {
+    const uint32_t* k8 = pl.k8;
+    const float* ks = pl.ks;
+    const uint16_t* ks16 = pl.ks16;
+    const uint32_t* v8t = pl.v8t;
+    const float* vs = pl.vs;
+    const int32_t* pos0 = pl.pos0;
+    const uint32_t* tmask = pl.tmask;
+    const int32_t* tp0 = pl.tp0;
+    void* const* k_tab = pl.k_tab;
+    void* const* v_tab = pl.v_tab;
+    const void* const* mir_tab = pl.mir_tab;
+    uint32_t* qb = pl.qb;
+    float* qs = pl.qs;
+    float* pacc = pl.pacc;
+    float* pm = pl.pm;
+    float* pl_ptr = pl.pl;
+    uint32_t* dbg_flag = pl.dbg_flag;
+    const int kst = pl.kst, ctxp = pl.ctxp, pfd = pl.pfd, zero_fence = pl.zero_fence;
+    const int nseg_stride = pl.nseg_stride, t0 = pl.t0, H = pl.H, HKV = pl.HKV;
+    const uint32_t dbg = pl.dbg, k8_max_cells = pl.k8_max_cells, v8t_max_blks = pl.v8t_max_blks, vs_max_cells = pl.vs_max_cells;
+    const uint64_t qb_dwords = pl.qb_dwords, qs_floats = pl.qs_floats, p_elems = pl.p_elems, pacc_elems = pl.pacc_elems;
+    const int ngrp = pl.ngrp, per_tok_pos = pl.per_tok_pos;
+    const uint64_t gp0 = pl.gp0, gp1 = pl.gp1, gp2 = pl.gp2, gp3 = pl.gp3;
+    const uint64_t gp4 = pl.gp4, gp5 = pl.gp5, gp6 = pl.gp6, gp7 = pl.gp7;
     q.submit([&](sycl::handler& h) {
         h.parallel_for<TagXa2S1<NS, U16>>(
-            sycl::nd_range<3>(sycl::range<3>(1, (size_t) pl.HKV, (size_t) pl.total_tasks),
+            sycl::nd_range<3>(sycl::range<3>(1, (size_t) HKV, (size_t) pl.total_tasks),
                               sycl::range<3>(1, 1, 1)),
             [=](sycl::nd_item<3> it) SYCL_ESIMD_KERNEL {
                 const int kvh = (int) it.get_global_id(1);
                 const int task = (int) it.get_global_id(2);
-                const int gi = (int) pl.task_grp[task];
-                const int seg = (int) pl.task_seg[task];
-                const AttnGrp2& gp = pl.g[gi];
+                int gi = 0, seg = 0, gp_slot = 0, gp_r0 = 0, gp_cnt = 0, gp_ls0 = 0, gp_nrg = 0, gp_nseg = 0;
+                decode_task_grp(task, ngrp, gp0, gp1, gp2, gp3, gp4, gp5, gp6, gp7,
+                                gi, seg, gp_slot, gp_r0, gp_cnt, gp_ls0, gp_nrg, gp_nseg);
 
                 const uint32_t* kb = nullptr;
                 const float* ksb = nullptr;
                 const uint32_t* ks16b = nullptr;
                 const uint32_t* vb = nullptr;
                 const float* vsb = nullptr;
-                load_grp_ptrs<NS>(pl, gi, kvh, kb, ksb, ks16b, vb, vsb);
+                load_grp_ptrs_raw<NS>(k8, ks, ks16, v8t, vs, k_tab, v_tab, mir_tab,
+                                      HKV, kst, ctxp, gp_slot, kvh, kb, ksb, ks16b, vb, vsb);
 
                 simd<int, 8> hi_v;
                 simd<uint32_t, 8> tmk_v;
                 int ub = 0, p0_tree = 0;
                 bool has_tmask = false;
-                load_row_bounds<8>(pl, gi, 0, hi_v, tmk_v, ub, has_tmask, p0_tree);
+                load_row_bounds_raw<8>(pos0, tmask, tp0, t0, ngrp, per_tok_pos, gp_r0, gp_cnt, 0,
+                                       hi_v, tmk_v, ub, has_tmask, p0_tree);
 
                 int blk_a = 0, blk_b = 0;
-                seg_block_range(ub, seg, (int) gp.nseg, blk_a, blk_b);
+                seg_block_range(ub, seg, gp_nseg, blk_a, blk_b);
+                const bool oob = dbg_clamp_seg_bounds_raw(
+                    dbg, dbg_flag, HKV, k8_max_cells, v8t_max_blks, vs_max_cells,
+                    qb_dwords, qs_floats, kvh, gp_ls0, ub, blk_a, blk_b);
 
                 simd<float, 64> o[32];
 #pragma unroll
                 for (int k = 0; k < 32; ++k) o[k] = 0.0f;
                 simd<float, 8> m(kNeg), l(0.0f);
 
-                if (blk_a < blk_b) {
-                    const uint32_t* qbb = pl.qb + ((size_t) kvh * 8u) * kMaxBatchGroups2 * 128u + (size_t) gp.ls0 * 128u;
-                    const simd<float, 8> qsc = block_load<float, 8>(pl.qs + ((size_t) kvh * kMaxBatchGroups2 + (size_t) gp.ls0) * 16u);
+                if (blk_a < blk_b && !oob) {
+                    const uint32_t* qbb = qb + ((size_t) kvh * 8u) * kMaxBatchGroups2 * 128u + (size_t) gp_ls0 * 128u;
+                    const simd<float, 8> qsc = block_load<float, 8>(qs + ((size_t) kvh * kMaxBatchGroups2 + (size_t) gp_ls0) * 16u);
 
-                    for (int pb = 0; pb < pl.pfd && blk_a + pb < blk_b; ++pb) prefetch_blk_kv(kb, vb, blk_a + pb, ub);
+                    for (int pb = 0; pb < pfd && blk_a + pb < blk_b; ++pb) prefetch_blk_kv(kb, vb, blk_a + pb, ub);
 
                     for (int blk = blk_a; blk < blk_b; ++blk) {
-                        if (blk + pl.pfd < blk_b) prefetch_blk_kv(kb, vb, blk + pl.pfd, ub);
+                        if (blk + pfd < blk_b) prefetch_blk_kv(kb, vb, blk + pfd, ub);
                         const int p0 = blk * kBlk;
                         simd<float, 64> sc[4];
                         simd<float, 8> m_blk;
-                        score_dram_r8_blk<NS>(qbb, 0, qsc, kb, ksb, ks16b, p0, ub, has_tmask, p0_tree, hi_v, tmk_v, pl.zero_fence, pl.pl, sc, m_blk);
+                        score_dram_r8_blk<NS>(qbb, 0, qsc, kb, ksb, ks16b, p0, ub, has_tmask, p0_tree, hi_v, tmk_v, zero_fence, pl_ptr, sc, m_blk);
                         const simd<float, 32> vs32 = block_load<float, 32>(vsb + p0);
-                        softmax_v_r8_blk<U16, false>(sc, m_blk, vs32, vb, (size_t) blk * 2048u, pl.zero_fence, pl.pl, o, m, l);
+                        softmax_v_r8_blk<U16, false>(sc, m_blk, vs32, vb, (size_t) blk * 2048u, zero_fence, pl_ptr, o, m, l);
                     }
                 }
-                store_partials_r8(pl, gi, seg, kvh, 0, o, m, l);
+                store_partials_r8_raw(pacc, pm, pl_ptr, dbg, dbg_flag, p_elems, pacc_elems, H, nseg_stride, gp_r0, gp_cnt, seg, kvh, 0, o, m, l, oob);
             });
     });
 }
@@ -1173,9 +1382,33 @@ template <int NG, int NS, int U16> void launch_d2(sycl::queue& q, const AttnPlan
     constexpr uint32_t kHalfKv = 16384u;                  // 8 KiB K + 8 KiB V
     constexpr uint32_t kSlmScOff = 2u * kHalfKv;         // 32768 B
     constexpr uint32_t kSlmBytes = kSlmScOff + (uint32_t) NG * 4096u;
+    const uint32_t* k8 = pl.k8;
+    const float* ks = pl.ks;
+    const uint16_t* ks16 = pl.ks16;
+    const uint32_t* v8t = pl.v8t;
+    const float* vs = pl.vs;
+    const int32_t* pos0 = pl.pos0;
+    const uint32_t* tmask = pl.tmask;
+    const int32_t* tp0 = pl.tp0;
+    void* const* k_tab = pl.k_tab;
+    void* const* v_tab = pl.v_tab;
+    const void* const* mir_tab = pl.mir_tab;
+    uint32_t* qb = pl.qb;
+    float* qs = pl.qs;
+    float* pacc = pl.pacc;
+    float* pm = pl.pm;
+    float* pl_ptr = pl.pl;
+    uint32_t* dbg_flag = pl.dbg_flag;
+    const int kst = pl.kst, ctxp = pl.ctxp, pfd = pl.pfd, zero_fence = pl.zero_fence;
+    const int nseg_stride = pl.nseg_stride, t0 = pl.t0, H = pl.H, HKV = pl.HKV;
+    const uint32_t dbg = pl.dbg, k8_max_cells = pl.k8_max_cells, v8t_max_blks = pl.v8t_max_blks, vs_max_cells = pl.vs_max_cells;
+    const uint64_t qb_dwords = pl.qb_dwords, qs_floats = pl.qs_floats, p_elems = pl.p_elems, pacc_elems = pl.pacc_elems;
+    const int ngrp = pl.ngrp, per_tok_pos = pl.per_tok_pos;
+    const uint64_t gp0 = pl.gp0, gp1 = pl.gp1, gp2 = pl.gp2, gp3 = pl.gp3;
+    const uint64_t gp4 = pl.gp4, gp5 = pl.gp5, gp6 = pl.gp6, gp7 = pl.gp7;
     q.submit([&](sycl::handler& h) {
         h.parallel_for<TagXa2D2<NG, NS, U16>>(
-            sycl::nd_range<3>(sycl::range<3>(1, (size_t) pl.HKV, (size_t) pl.total_tasks * W),
+            sycl::nd_range<3>(sycl::range<3>(1, (size_t) HKV, (size_t) pl.total_tasks * W),
                               sycl::range<3>(1, 1, (size_t) W)),
             [=](sycl::nd_item<3> it) SYCL_ESIMD_KERNEL {
                 slm_init<kSlmBytes>();
@@ -1185,34 +1418,39 @@ template <int NG, int NS, int U16> void launch_d2(sycl::queue& q, const AttnPlan
                 const int ls = tid >> 1;
                 const int td = tid & 1;
 
-                const int gi = (int) pl.task_grp[task];
-                const int seg = (int) pl.task_seg[task];
-                const AttnGrp2& gp = pl.g[gi];
-                const bool active_ls = (ls < (int) gp.nrg);
+                int gi = 0, seg = 0, gp_slot = 0, gp_r0 = 0, gp_cnt = 0, gp_ls0 = 0, gp_nrg = 0, gp_nseg = 0;
+                decode_task_grp(task, ngrp, gp0, gp1, gp2, gp3, gp4, gp5, gp6, gp7,
+                                gi, seg, gp_slot, gp_r0, gp_cnt, gp_ls0, gp_nrg, gp_nseg);
+                const bool active_ls = (ls < gp_nrg);
 
                 const uint32_t* kb = nullptr;
                 const float* ksb = nullptr;
                 const uint32_t* ks16b = nullptr;
                 const uint32_t* vb = nullptr;
                 const float* vsb = nullptr;
-                load_grp_ptrs<NS>(pl, gi, kvh, kb, ksb, ks16b, vb, vsb);
+                load_grp_ptrs_raw<NS>(k8, ks, ks16, v8t, vs, k_tab, v_tab, mir_tab,
+                                      HKV, kst, ctxp, gp_slot, kvh, kb, ksb, ks16b, vb, vsb);
 
                 simd<int, 16> hi_v;
                 simd<uint32_t, 16> tmk_v;
                 int ub = 0, p0_tree = 0;
                 bool has_tmask = false;
-                load_row_bounds<16>(pl, gi, ls * 16, hi_v, tmk_v, ub, has_tmask, p0_tree);
+                load_row_bounds_raw<16>(pos0, tmask, tp0, t0, ngrp, per_tok_pos, gp_r0, gp_cnt, ls * 16,
+                                        hi_v, tmk_v, ub, has_tmask, p0_tree);
 
                 int blk_a = 0, blk_b = 0;
-                seg_block_range(ub, seg, (int) gp.nseg, blk_a, blk_b);
+                seg_block_range(ub, seg, gp_nseg, blk_a, blk_b);
+                const bool oob = dbg_clamp_seg_bounds_raw(
+                    dbg, dbg_flag, HKV, k8_max_cells, v8t_max_blks, vs_max_cells,
+                    qb_dwords, qs_floats, kvh, active_ls ? (gp_ls0 + ls) : gp_ls0, ub, blk_a, blk_b);
 
                 simd<float, 128> o[16];
 #pragma unroll
                 for (int k = 0; k < 16; ++k) o[k] = 0.0f;
                 simd<float, 16> m(kNeg), l(0.0f);
 
-                if (blk_a < blk_b) {
-                    const uint32_t* qbb = pl.qb + ((size_t) kvh * 8u) * kMaxBatchGroups2 * 128u + (size_t) ((int) gp.ls0 + ls) * 128u;
+                if (blk_a < blk_b && !oob) {
+                    const uint32_t* qbb = qb + ((size_t) kvh * 8u) * kMaxBatchGroups2 * 128u + (size_t) (gp_ls0 + ls) * 128u;
                     simd<int, 128> bq[4];
                     if (active_ls) {
 #pragma unroll
@@ -1226,10 +1464,10 @@ template <int NG, int NS, int U16> void launch_d2(sycl::queue& q, const AttnPlan
                         }
                     }
                     const simd<float, 16> qsc = active_ls
-                        ? block_load<float, 16>(pl.qs + ((size_t) kvh * kMaxBatchGroups2 + (size_t) ((int) gp.ls0 + ls)) * 16u)
+                        ? block_load<float, 16>(qs + ((size_t) kvh * kMaxBatchGroups2 + (size_t) (gp_ls0 + ls)) * 16u)
                         : simd<float, 16>(0.0f);
 
-                    for (int pb = 0; pb < pl.pfd && blk_a + pb < blk_b; ++pb) {
+                    for (int pb = 0; pb < pfd && blk_a + pb < blk_b; ++pb) {
                         const int p_blk = blk_a + pb;
                         const int pf0 = p_blk * kBlk;
                         if (pf0 + kBlk <= ub) {
@@ -1248,24 +1486,24 @@ template <int NG, int NS, int U16> void launch_d2(sycl::queue& q, const AttnPlan
 
                         if (full_blk) {
                             for (int c = tid; c < 32; c += W) {
-                                const simd<uint32_t, 64> kd = block_load<uint32_t, 64>(kb + (size_t) (p0 + c) * 64u + (size_t) pl.zero_fence);
+                                const simd<uint32_t, 64> kd = block_load<uint32_t, 64>(kb + (size_t) (p0 + c) * 64u + (size_t) zero_fence);
                                 slm_block_store<uint32_t, 64>(slm_k + (uint32_t) c * 256u, kd, kAl16);
-                                const simd<uint32_t, 64> vd = block_load<uint32_t, 64>(vb + (size_t) blk * 2048u + (size_t) c * 64u + (size_t) pl.zero_fence);
+                                const simd<uint32_t, 64> vd = block_load<uint32_t, 64>(vb + (size_t) blk * 2048u + (size_t) c * 64u + (size_t) zero_fence);
                                 slm_block_store<uint32_t, 64>(slm_v + (uint32_t) c * 256u, vd, kAl16);
                             }
                         } else {
                             for (int c = tid; c < 32; c += W) {
                                 const simd<uint32_t, 64> kd = (p0 + c < ub)
-                                    ? block_load<uint32_t, 64>(kb + (size_t) (p0 + c) * 64u + (size_t) pl.zero_fence)
+                                    ? block_load<uint32_t, 64>(kb + (size_t) (p0 + c) * 64u + (size_t) zero_fence)
                                     : simd<uint32_t, 64>(0u);
                                 slm_block_store<uint32_t, 64>(slm_k + (uint32_t) c * 256u, kd, kAl16);
-                                const simd<uint32_t, 64> vd = block_load<uint32_t, 64>(vb + (size_t) blk * 2048u + (size_t) c * 64u + (size_t) pl.zero_fence);
+                                const simd<uint32_t, 64> vd = block_load<uint32_t, 64>(vb + (size_t) blk * 2048u + (size_t) c * 64u + (size_t) zero_fence);
                                 slm_block_store<uint32_t, 64>(slm_v + (uint32_t) c * 256u, vd, kAl16);
                             }
                         }
 
-                        if (blk + pl.pfd < blk_b) {
-                            const int p_blk = blk + pl.pfd;
+                        if (blk + pfd < blk_b) {
+                            const int p_blk = blk + pfd;
                             const int pf0 = p_blk * kBlk;
                             if (pf0 + kBlk <= ub) {
                                 for (int c = tid; c < 32; c += W) {
@@ -1346,7 +1584,7 @@ template <int NG, int NS, int U16> void launch_d2(sycl::queue& q, const AttnPlan
                                     slm_block_store<float, 64>(my_off, sf.template select<64, 1>(0), kAl16);
                                     slm_block_store<float, 64>(my_off + 256u, sf.template select<64, 1>(64), kAl16);
                                 }
-                                if (pl.zero_fence == -20 - j) pl.pl[0] = 0.0f;
+                                if (zero_fence == -20 - j) pl_ptr[0] = 0.0f;
                             }
                         }
                         barrier();
@@ -1392,7 +1630,7 @@ template <int NG, int NS, int U16> void launch_d2(sycl::queue& q, const AttnPlan
                                         vv.merge(simd<float, 16>(0.0f), off);
                                         vmx = (es::max)(vmx, vv);
                                     }
-                                    if (pl.zero_fence == -40 - (j * 2 + h2)) pl.pl[0] = 0.0f;
+                                    if (zero_fence == -40 - (j * 2 + h2)) pl_ptr[0] = 0.0f;
                                 }
                             }
 
@@ -1454,7 +1692,7 @@ template <int NG, int NS, int U16> void launch_d2(sycl::queue& q, const AttnPlan
                                             bhi.template select<16, 1>(16 * (2 * j + h2)) =
                                                 (q0 >> 8) | ((q1 >> 8) << 8) | ((q2 >> 8) << 16) | ((q3 >> 8) << 24);
                                         }
-                                        if (pl.zero_fence == -50 - (j * 2 + h2)) pl.pl[0] = 0.0f;
+                                        if (zero_fence == -50 - (j * 2 + h2)) pl_ptr[0] = 0.0f;
                                     }
                                 }
                                 l = l * alpha + l_blk;
@@ -1486,7 +1724,7 @@ template <int NG, int NS, int U16> void launch_d2(sycl::queue& q, const AttnPlan
                                     } else {
                                         o[ag] = o[ag] * alpha128 + fl * srw128;
                                     }
-                                    if ((ag & 1) == 1 && pl.zero_fence == -70 - ag) pl.pl[0] = 0.0f;
+                                    if ((ag & 1) == 1 && zero_fence == -70 - ag) pl_ptr[0] = 0.0f;
                                 }
                             }
                         }
@@ -1494,21 +1732,25 @@ template <int NG, int NS, int U16> void launch_d2(sycl::queue& q, const AttnPlan
                 }
 
                 if (active_ls) {
-                    const int nseg_s = pl.nseg_stride;
+                    const int nseg_s = nseg_stride;
                     const int d0 = td * 128;
 #pragma unroll
                     for (int r = 0; r < 16; ++r) {
                         const int rg = ls * 16 + r;
                         const int tok = (rg * 43691) >> 18;
-                        if (tok < (int) gp.cnt) {
+                        if (tok < gp_cnt) {
                             const int hd = rg - tok * kG;
-                            const size_t row = (size_t) ((int) gp.r0 + tok) * (size_t) pl.H + (size_t) (kvh * kG + hd);
+                            const size_t row = (size_t) (gp_r0 + tok) * (size_t) H + (size_t) (kvh * kG + hd);
                             const size_t p_idx = row * (size_t) nseg_s + (size_t) seg;
-                            if (td == 0) {
-                                pl.pm[p_idx] = m[r];
-                                pl.pl[p_idx] = l[r];
+                            if (dbg && (oob || p_idx >= p_elems || p_idx * (size_t) kHD + (size_t) kHD > pacc_elems)) {
+                                xatt2_mark_oob(dbg_flag, oob ? 12u : 13u, (p_idx < p_elems) ? (pm + p_idx) : (p_elems > 0 ? pm : nullptr));
+                                continue;
                             }
-                            float* pout = pl.pacc + p_idx * (size_t) kHD + (size_t) d0;
+                            if (td == 0) {
+                                pm[p_idx] = m[r];
+                                pl_ptr[p_idx] = l[r];
+                            }
+                            float* pout = pacc + p_idx * (size_t) kHD + (size_t) d0;
 #pragma unroll
                             for (int h2 = 0; h2 < 2; ++h2) {
                                 simd<float, 64> v64;
@@ -1528,9 +1770,33 @@ template <int NS, int U16> struct TagXa2S8;
 template <int NS, int U16> void launch_s8(sycl::queue& q, const AttnPlan2& pl) {
     const int W = pl.wg_threads;
     constexpr uint32_t kHalfKv = 16384u;
+    const uint32_t* k8 = pl.k8;
+    const float* ks = pl.ks;
+    const uint16_t* ks16 = pl.ks16;
+    const uint32_t* v8t = pl.v8t;
+    const float* vs = pl.vs;
+    const int32_t* pos0 = pl.pos0;
+    const uint32_t* tmask = pl.tmask;
+    const int32_t* tp0 = pl.tp0;
+    void* const* k_tab = pl.k_tab;
+    void* const* v_tab = pl.v_tab;
+    const void* const* mir_tab = pl.mir_tab;
+    uint32_t* qb = pl.qb;
+    float* qs = pl.qs;
+    float* pacc = pl.pacc;
+    float* pm = pl.pm;
+    float* pl_ptr = pl.pl;
+    uint32_t* dbg_flag = pl.dbg_flag;
+    const int kst = pl.kst, ctxp = pl.ctxp, pfd = pl.pfd, zero_fence = pl.zero_fence;
+    const int nseg_stride = pl.nseg_stride, t0 = pl.t0, H = pl.H, HKV = pl.HKV;
+    const uint32_t dbg = pl.dbg, k8_max_cells = pl.k8_max_cells, v8t_max_blks = pl.v8t_max_blks, vs_max_cells = pl.vs_max_cells;
+    const uint64_t qb_dwords = pl.qb_dwords, qs_floats = pl.qs_floats, p_elems = pl.p_elems, pacc_elems = pl.pacc_elems;
+    const int ngrp = pl.ngrp, per_tok_pos = pl.per_tok_pos;
+    const uint64_t gp0 = pl.gp0, gp1 = pl.gp1, gp2 = pl.gp2, gp3 = pl.gp3;
+    const uint64_t gp4 = pl.gp4, gp5 = pl.gp5, gp6 = pl.gp6, gp7 = pl.gp7;
     q.submit([&](sycl::handler& h) {
         h.parallel_for<TagXa2S8<NS, U16>>(
-            sycl::nd_range<3>(sycl::range<3>(1, (size_t) pl.HKV, (size_t) pl.total_tasks * (size_t) W),
+            sycl::nd_range<3>(sycl::range<3>(1, (size_t) HKV, (size_t) pl.total_tasks * (size_t) W),
                               sycl::range<3>(1, 1, (size_t) W)),
             [=](sycl::nd_item<3> it) SYCL_ESIMD_KERNEL {
                 slm_init<2u * kHalfKv>();
@@ -1538,42 +1804,47 @@ template <int NS, int U16> void launch_s8(sycl::queue& q, const AttnPlan2& pl) {
                 const int task = (int) it.get_group(2);
                 const int tid = (int) it.get_local_id(2);
 
-                const int gi = (int) pl.task_grp[task];
-                const int seg = (int) pl.task_seg[task];
-                const AttnGrp2& gp = pl.g[gi];
+                int gi = 0, seg = 0, gp_slot = 0, gp_r0 = 0, gp_cnt = 0, gp_ls0 = 0, gp_nrg = 0, gp_nseg = 0;
+                decode_task_grp(task, ngrp, gp0, gp1, gp2, gp3, gp4, gp5, gp6, gp7,
+                                gi, seg, gp_slot, gp_r0, gp_cnt, gp_ls0, gp_nrg, gp_nseg);
                 const int r_base = tid * 8;
-                const bool active = r_base < (int) gp.cnt * kG;
+                const bool active = r_base < gp_cnt * kG;
 
                 const uint32_t* kb = nullptr;
                 const float* ksb = nullptr;
                 const uint32_t* ks16b = nullptr;
                 const uint32_t* vb = nullptr;
                 const float* vsb = nullptr;
-                load_grp_ptrs<NS>(pl, gi, kvh, kb, ksb, ks16b, vb, vsb);
+                load_grp_ptrs_raw<NS>(k8, ks, ks16, v8t, vs, k_tab, v_tab, mir_tab,
+                                      HKV, kst, ctxp, gp_slot, kvh, kb, ksb, ks16b, vb, vsb);
 
                 simd<int, 8> hi_v;
                 simd<uint32_t, 8> tmk_v;
                 int ub = 0, p0_tree = 0;
                 bool has_tmask = false;
-                load_row_bounds<8>(pl, gi, r_base, hi_v, tmk_v, ub, has_tmask, p0_tree);
+                load_row_bounds_raw<8>(pos0, tmask, tp0, t0, ngrp, per_tok_pos, gp_r0, gp_cnt, r_base,
+                                       hi_v, tmk_v, ub, has_tmask, p0_tree);
 
                 int blk_a = 0, blk_b = 0;
-                seg_block_range(ub, seg, (int) gp.nseg, blk_a, blk_b);
+                seg_block_range(ub, seg, gp_nseg, blk_a, blk_b);
+                const bool oob = dbg_clamp_seg_bounds_raw(
+                    dbg, dbg_flag, HKV, k8_max_cells, v8t_max_blks, vs_max_cells,
+                    qb_dwords, qs_floats, kvh, active ? (gp_ls0 + (r_base >> 4)) : gp_ls0, ub, blk_a, blk_b);
 
                 simd<float, 64> o[32];
 #pragma unroll
                 for (int k = 0; k < 32; ++k) o[k] = 0.0f;
                 simd<float, 8> m(kNeg), l(0.0f);
 
-                if (blk_a < blk_b) {
+                if (blk_a < blk_b && !oob) {
                     const int ls_loc = r_base >> 4;
                     const int half_off = r_base & 8;
-                    const uint32_t* qbb = pl.qb + ((size_t) kvh * 8u) * kMaxBatchGroups2 * 128u + (size_t) ((int) gp.ls0 + ls_loc) * 128u;
+                    const uint32_t* qbb = qb + ((size_t) kvh * 8u) * kMaxBatchGroups2 * 128u + (size_t) (gp_ls0 + ls_loc) * 128u;
                     const simd<float, 8> qsc = active
-                        ? block_load<float, 8>(pl.qs + ((size_t) kvh * kMaxBatchGroups2 + (size_t) ((int) gp.ls0 + ls_loc)) * 16u + (size_t) half_off)
+                        ? block_load<float, 8>(qs + ((size_t) kvh * kMaxBatchGroups2 + (size_t) (gp_ls0 + ls_loc)) * 16u + (size_t) half_off)
                         : simd<float, 8>(0.0f);
 
-                    for (int pb = 0; pb < pl.pfd && blk_a + pb < blk_b; ++pb) {
+                    for (int pb = 0; pb < pfd && blk_a + pb < blk_b; ++pb) {
                         const int p_blk = blk_a + pb;
                         const int pf0 = p_blk * kBlk;
                         if (pf0 + kBlk <= ub) {
@@ -1592,14 +1863,14 @@ template <int NS, int U16> void launch_s8(sycl::queue& q, const AttnPlan2& pl) {
 
                         for (int c = tid; c < 32; c += W) {
                             const simd<uint32_t, 64> kd = (full_blk || p0 + c < ub)
-                                ? block_load<uint32_t, 64>(kb + (size_t) (p0 + c) * 64u + (size_t) pl.zero_fence)
+                                ? block_load<uint32_t, 64>(kb + (size_t) (p0 + c) * 64u + (size_t) zero_fence)
                                 : simd<uint32_t, 64>(0u);
                             slm_block_store<uint32_t, 64>(slm_k + (uint32_t) c * 256u, kd, kAl16);
-                            const simd<uint32_t, 64> vd = block_load<uint32_t, 64>(vb + (size_t) blk * 2048u + (size_t) c * 64u + (size_t) pl.zero_fence);
+                            const simd<uint32_t, 64> vd = block_load<uint32_t, 64>(vb + (size_t) blk * 2048u + (size_t) c * 64u + (size_t) zero_fence);
                             slm_block_store<uint32_t, 64>(slm_v + (uint32_t) c * 256u, vd, kAl16);
                         }
-                        if (blk + pl.pfd < blk_b) {
-                            const int p_blk = blk + pl.pfd;
+                        if (blk + pfd < blk_b) {
+                            const int p_blk = blk + pfd;
                             const int pf0 = p_blk * kBlk;
                             if (pf0 + kBlk <= ub) {
                                 for (int c = tid; c < 32; c += W) {
@@ -1678,7 +1949,7 @@ template <int NS, int U16> void launch_s8(sycl::queue& q, const AttnPlan2& pl) {
                                             acc = 0;
                                         }
                                     }
-                                    if ((s & 1) == 1 && pl.zero_fence == -90 - (j * 8 + s)) pl.pl[0] = 0.0f;
+                                    if ((s & 1) == 1 && zero_fence == -90 - (j * 8 + s)) pl_ptr[0] = 0.0f;
                                 }
 #pragma unroll
                                 for (int c8 = 0; c8 < 8; ++c8) {
@@ -1702,15 +1973,15 @@ template <int NS, int U16> void launch_s8(sycl::queue& q, const AttnPlan2& pl) {
                                     m_blk = (es::max)(m_blk, sv);
                                     sc[j].template select<8, 1>(8 * c8) = sv;
                                 }
-                                if (pl.zero_fence == -80 - j) pl.pl[0] = 0.0f;
+                                if (zero_fence == -80 - j) pl_ptr[0] = 0.0f;
                             }
 
                             const simd<float, 32> vs32 = block_load<float, 32>(vsb + p0);
-                            softmax_v_r8_blk<U16, true>(sc, m_blk, vs32, nullptr, (size_t) slm_v, pl.zero_fence, pl.pl, o, m, l);
+                            softmax_v_r8_blk<U16, true>(sc, m_blk, vs32, nullptr, (size_t) slm_v, zero_fence, pl_ptr, o, m, l);
                         }
                     }
                 }
-                if (active) store_partials_r8(pl, gi, seg, kvh, r_base, o, m, l);
+                if (active) store_partials_r8_raw(pacc, pm, pl_ptr, dbg, dbg_flag, p_elems, pacc_elems, H, nseg_stride, gp_r0, gp_cnt, seg, kvh, r_base, o, m, l, oob);
             });
     });
 }
@@ -1719,62 +1990,91 @@ template <int NS, int U16> void launch_s8(sycl::queue& q, const AttnPlan2& pl) {
 template <int NS, int U16> struct TagXa2L8;
 template <int NS, int U16> void launch_l8(sycl::queue& q, const AttnPlan2& pl) {
     const int W = pl.wg_threads;
+    const uint32_t* k8 = pl.k8;
+    const float* ks = pl.ks;
+    const uint16_t* ks16 = pl.ks16;
+    const uint32_t* v8t = pl.v8t;
+    const float* vs = pl.vs;
+    const int32_t* pos0 = pl.pos0;
+    const uint32_t* tmask = pl.tmask;
+    const int32_t* tp0 = pl.tp0;
+    void* const* k_tab = pl.k_tab;
+    void* const* v_tab = pl.v_tab;
+    const void* const* mir_tab = pl.mir_tab;
+    uint32_t* qb = pl.qb;
+    float* qs = pl.qs;
+    float* pacc = pl.pacc;
+    float* pm = pl.pm;
+    float* pl_ptr = pl.pl;
+    uint32_t* dbg_flag = pl.dbg_flag;
+    const int kst = pl.kst, ctxp = pl.ctxp, pfd = pl.pfd, zero_fence = pl.zero_fence;
+    const int nseg_stride = pl.nseg_stride, t0 = pl.t0, H = pl.H, HKV = pl.HKV;
+    const uint32_t dbg = pl.dbg, k8_max_cells = pl.k8_max_cells, v8t_max_blks = pl.v8t_max_blks, vs_max_cells = pl.vs_max_cells;
+    const uint64_t qb_dwords = pl.qb_dwords, qs_floats = pl.qs_floats, p_elems = pl.p_elems, pacc_elems = pl.pacc_elems;
+    const int ngrp = pl.ngrp, per_tok_pos = pl.per_tok_pos;
+    const uint64_t gp0 = pl.gp0, gp1 = pl.gp1, gp2 = pl.gp2, gp3 = pl.gp3;
+    const uint64_t gp4 = pl.gp4, gp5 = pl.gp5, gp6 = pl.gp6, gp7 = pl.gp7;
     q.submit([&](sycl::handler& h) {
         h.parallel_for<TagXa2L8<NS, U16>>(
-            sycl::nd_range<3>(sycl::range<3>(1, (size_t) pl.HKV, (size_t) pl.total_tasks * (size_t) W),
+            sycl::nd_range<3>(sycl::range<3>(1, (size_t) HKV, (size_t) pl.total_tasks * (size_t) W),
                               sycl::range<3>(1, 1, (size_t) W)),
             [=](sycl::nd_item<3> it) SYCL_ESIMD_KERNEL {
                 const int kvh = (int) it.get_global_id(1);
                 const int task = (int) it.get_group(2);
                 const int tid = (int) it.get_local_id(2);
 
-                const int gi = (int) pl.task_grp[task];
-                const int seg = (int) pl.task_seg[task];
-                const AttnGrp2& gp = pl.g[gi];
+                int gi = 0, seg = 0, gp_slot = 0, gp_r0 = 0, gp_cnt = 0, gp_ls0 = 0, gp_nrg = 0, gp_nseg = 0;
+                decode_task_grp(task, ngrp, gp0, gp1, gp2, gp3, gp4, gp5, gp6, gp7,
+                                gi, seg, gp_slot, gp_r0, gp_cnt, gp_ls0, gp_nrg, gp_nseg);
                 const int r_base = tid * 8;
-                if (r_base >= (int) gp.cnt * kG) return;
+                if (r_base >= gp_cnt * kG) return;
 
                 const uint32_t* kb = nullptr;
                 const float* ksb = nullptr;
                 const uint32_t* ks16b = nullptr;
                 const uint32_t* vb = nullptr;
                 const float* vsb = nullptr;
-                load_grp_ptrs<NS>(pl, gi, kvh, kb, ksb, ks16b, vb, vsb);
+                load_grp_ptrs_raw<NS>(k8, ks, ks16, v8t, vs, k_tab, v_tab, mir_tab,
+                                      HKV, kst, ctxp, gp_slot, kvh, kb, ksb, ks16b, vb, vsb);
 
                 simd<int, 8> hi_v;
                 simd<uint32_t, 8> tmk_v;
                 int ub = 0, p0_tree = 0;
                 bool has_tmask = false;
-                load_row_bounds<8>(pl, gi, r_base, hi_v, tmk_v, ub, has_tmask, p0_tree);
+                load_row_bounds_raw<8>(pos0, tmask, tp0, t0, ngrp, per_tok_pos, gp_r0, gp_cnt, r_base,
+                                       hi_v, tmk_v, ub, has_tmask, p0_tree);
 
                 int blk_a = 0, blk_b = 0;
-                seg_block_range(ub, seg, (int) gp.nseg, blk_a, blk_b);
+                seg_block_range(ub, seg, gp_nseg, blk_a, blk_b);
+                const bool oob = dbg_clamp_seg_bounds_raw(
+                    dbg, dbg_flag, HKV, k8_max_cells, v8t_max_blks, vs_max_cells,
+                    qb_dwords, qs_floats, kvh, gp_ls0 + (r_base >> 4), ub, blk_a, blk_b);
 
                 simd<float, 64> o[32];
 #pragma unroll
                 for (int k = 0; k < 32; ++k) o[k] = 0.0f;
                 simd<float, 8> m(kNeg), l(0.0f);
 
-                if (blk_a < blk_b) {
+                if (blk_a < blk_b && !oob) {
                     const int ls_loc = r_base >> 4;
                     const int half_off = r_base & 8;
-                    const uint32_t* qbb = pl.qb + ((size_t) kvh * 8u) * kMaxBatchGroups2 * 128u + (size_t) ((int) gp.ls0 + ls_loc) * 128u;
-                    const simd<float, 8> qsc = block_load<float, 8>(pl.qs + ((size_t) kvh * kMaxBatchGroups2 + (size_t) ((int) gp.ls0 + ls_loc)) * 16u + (size_t) half_off);
+                    const uint32_t* qbb = qb + ((size_t) kvh * 8u) * kMaxBatchGroups2 * 128u + (size_t) (gp_ls0 + ls_loc) * 128u;
+                    const simd<float, 8> qsc = block_load<float, 8>(qs + ((size_t) kvh * kMaxBatchGroups2 + (size_t) (gp_ls0 + ls_loc)) * 16u + (size_t) half_off);
 
                     if (tid == 0) {
-                        for (int pb = 0; pb < pl.pfd && blk_a + pb < blk_b; ++pb) prefetch_blk_kv(kb, vb, blk_a + pb, ub);
+                        for (int pb = 0; pb < pfd && blk_a + pb < blk_b; ++pb) prefetch_blk_kv(kb, vb, blk_a + pb, ub);
                     }
                     for (int blk = blk_a; blk < blk_b; ++blk) {
-                        if (tid == 0 && blk + pl.pfd < blk_b) prefetch_blk_kv(kb, vb, blk + pl.pfd, ub);
+                        if (tid == 0 && blk + pfd < blk_b) prefetch_blk_kv(kb, vb, blk + pfd, ub);
                         const int p0 = blk * kBlk;
                         simd<float, 64> sc[4];
                         simd<float, 8> m_blk;
-                        score_dram_r8_blk<NS>(qbb, half_off, qsc, kb, ksb, ks16b, p0, ub, has_tmask, p0_tree, hi_v, tmk_v, pl.zero_fence, pl.pl, sc, m_blk);
+                        score_dram_r8_blk<NS>(qbb, half_off, qsc, kb, ksb, ks16b, p0, ub, has_tmask, p0_tree, hi_v, tmk_v, zero_fence, pl_ptr, sc, m_blk);
                         const simd<float, 32> vs32 = block_load<float, 32>(vsb + p0);
-                        softmax_v_r8_blk<U16, false>(sc, m_blk, vs32, vb, (size_t) blk * 2048u, pl.zero_fence, pl.pl, o, m, l);
+                        softmax_v_r8_blk<U16, false>(sc, m_blk, vs32, vb, (size_t) blk * 2048u, zero_fence, pl_ptr, o, m, l);
                     }
                 }
-                store_partials_r8(pl, gi, seg, kvh, r_base, o, m, l);
+                store_partials_r8_raw(pacc, pm, pl_ptr, dbg, dbg_flag, p_elems, pacc_elems, H, nseg_stride, gp_r0, gp_cnt, seg, kvh, r_base, o, m, l, oob);
             });
     });
 }
@@ -1783,6 +2083,18 @@ template <int NS, int U16> void launch_l8(sycl::queue& q, const AttnPlan2& pl) {
 template <int HAS_GATE> struct TagXa2Merge;
 template <int HAS_GATE> void launch_merge2(sycl::queue& q, const MPlan2& pl) {
     const int rows = pl.nt * pl.H;
+    const int H = pl.H, ngrp = pl.ngrp, nseg_stride = pl.nseg_stride;
+    const float inv_H = pl.inv_H;
+    const uint32_t dbg = pl.dbg;
+    float* pacc = pl.pacc;
+    float* pm = pl.pm;
+    float* pl_ptr = pl.pl;
+    const float* gate = pl.gate;
+    float* out_ptr = pl.out;
+    uint32_t* dbg_flag = pl.dbg_flag;
+    const uint64_t p_elems = pl.p_elems, pacc_elems = pl.pacc_elems, out_elems = pl.out_elems;
+    const uint64_t g_nseg_lo = pl.g_nseg_lo, g_nseg_hi = pl.g_nseg_hi;
+    const uint64_t tok_grp_lo = pl.tok_grp_lo, tok_grp_hi = pl.tok_grp_hi;
     q.submit([&](sycl::handler& h) {
         h.parallel_for<TagXa2Merge<HAS_GATE>>(
             sycl::nd_range<2>(sycl::range<2>((size_t) rows, 4u),
@@ -1791,21 +2103,35 @@ template <int HAS_GATE> void launch_merge2(sycl::queue& q, const MPlan2& pl) {
                 const int row = (int) it.get_global_id(0);
                 const int d_chk = (int) it.get_local_id(1);
                 const int d0 = d_chk * 64;
-                const int tok = row / pl.H;
-                const int gi = (int) pl.tok_grp[tok];
-                if (gi >= pl.ngrp) return;
-                const int nseg = (int) pl.g_nseg[gi];
-                const size_t stride = (size_t) pl.nseg_stride;
+                int tok = (int) ((float) row * inv_H);
+                if ((tok + 1) * H <= row) ++tok;
+                if (tok * H > row) --tok;
+                const int gi = (int) unpack_u8_16(tok_grp_lo, tok_grp_hi, tok);
+                if (gi >= ngrp) return;
+                const int nseg = (int) unpack_u8_16(g_nseg_lo, g_nseg_hi, gi);
+                const size_t stride = (size_t) nseg_stride;
                 const size_t row_off = (size_t) row * stride;
+                const size_t gi_off = (size_t) row * (size_t) kHD + (size_t) d0;
+                if (dbg) {
+                    const size_t max_p = row_off + (size_t) nseg;
+                    if (nseg <= 0 || max_p > p_elems || max_p * (size_t) kHD > pacc_elems || gi_off + 64u > out_elems) {
+                        xatt2_mark_oob(dbg_flag, 201u, nullptr);
+                        if (gi_off + 64u <= out_elems) {
+                            simd<float, 64> nv(xatt2_nan_f32());
+                            block_store<float, 64>(out_ptr + gi_off, nv);
+                        }
+                        return;
+                    }
+                }
 
                 simd<float, 16> mx(kNeg);
                 const simd<int, 16> lane(0, 1);
                 for (int s0 = 0; s0 < nseg; s0 += 16) {
                     simd<float, 16> mv(kNeg);
-                    if (s0 + 16 <= nseg) {
-                        mv = block_load<float, 16>(pl.pm + row_off + (size_t) s0);
+                    if (s0 + 16 <= nseg && (((row_off + (size_t) s0) & 3u) == 0u)) {
+                        mv = block_load<float, 16>(pm + row_off + (size_t) s0);
                     } else {
-                        for (int k = 0; k < 16 && s0 + k < nseg; ++k) mv[k] = pl.pm[row_off + (size_t) (s0 + k)];
+                        for (int k = 0; k < 16 && s0 + k < nseg; ++k) mv[k] = pm[row_off + (size_t) (s0 + k)];
                     }
                     mx = (es::max)(mx, mv);
                 }
@@ -1815,19 +2141,19 @@ template <int HAS_GATE> void launch_merge2(sycl::queue& q, const MPlan2& pl) {
                 float den = 0.0f;
                 for (int s0 = 0; s0 < nseg; s0 += 16) {
                     simd<float, 16> mv(kNeg), lv(0.0f);
-                    if (s0 + 16 <= nseg) {
-                        mv = block_load<float, 16>(pl.pm + row_off + (size_t) s0);
-                        lv = block_load<float, 16>(pl.pl + row_off + (size_t) s0);
+                    if (s0 + 16 <= nseg && (((row_off + (size_t) s0) & 3u) == 0u)) {
+                        mv = block_load<float, 16>(pm + row_off + (size_t) s0);
+                        lv = block_load<float, 16>(pl_ptr + row_off + (size_t) s0);
                     } else {
                         for (int k = 0; k < 16 && s0 + k < nseg; ++k) {
-                            mv[k] = pl.pm[row_off + (size_t) (s0 + k)];
-                            lv[k] = pl.pl[row_off + (size_t) (s0 + k)];
+                            mv[k] = pm[row_off + (size_t) (s0 + k)];
+                            lv[k] = pl_ptr[row_off + (size_t) (s0 + k)];
                         }
                     }
                     simd<float, 16> w = exp16((es::max)(mv - m_all, simd<float, 16>(-87.0f)));
                     w.merge(simd<float, 16>(0.0f), (mv <= -1e29f) | ((s0 + lane) >= nseg));
                     den += hsum16_f(w * lv);
-                    const float* pa_base = pl.pacc + (row_off + (size_t) s0) * (size_t) kHD + (size_t) d0;
+                    const float* pa_base = pacc + (row_off + (size_t) s0) * (size_t) kHD + (size_t) d0;
                     for (int k = 0; k < 16 && s0 + k < nseg; ++k) {
                         const float wk = w[k];
                         if (wk != 0.0f) {
@@ -1837,14 +2163,19 @@ template <int HAS_GATE> void launch_merge2(sycl::queue& q, const MPlan2& pl) {
                     }
                 }
                 simd<float, 64> out = (den > 0.0f) ? (num * (1.0f / den)) : simd<float, 64>(0.0f);
-                const size_t gi_off = (size_t) row * (size_t) kHD + (size_t) d0;
                 if constexpr (HAS_GATE) {
-                    const simd<float, 64> g = block_load<float, 64>(pl.gate + gi_off);
+                    const simd<float, 64> g = block_load<float, 64>(gate + gi_off);
                     out = out * sigm64(g);
                 }
-                block_store<float, 64>(pl.out + gi_off, out);
+                block_store<float, 64>(out_ptr + gi_off, out);
             });
     });
+}
+
+inline void pack_u8_16(uint64_t& lo, uint64_t& hi, int idx, uint8_t val) {
+    uint64_t& w = (idx < 8) ? lo : hi;
+    const uint32_t sh = (uint32_t) (idx & 7) * 8u;
+    w = (w & ~(0xffull << sh)) | ((uint64_t) val << sh);
 }
 
 int build_plan2(const Call2& c, HostPlan2& hp, int& form_out, int& ng_d2_out, int& u16_out) {
@@ -1852,6 +2183,7 @@ int build_plan2(const Call2& c, HostPlan2& hp, int& form_out, int& ng_d2_out, in
     static const int env_segs = [] { const char* e = std::getenv("STRATA_Q36_XATT2_SEGS"); return e && *e ? std::atoi(e) : 0; }();
     static const int env_u16 = [] { const char* e = std::getenv("STRATA_Q36_XATT2_U16"); return e && *e ? std::atoi(e) : 1; }();
     static const int env_pfd = [] { const char* e = std::getenv("STRATA_Q36_XATT2_PFD"); return e && *e ? std::atoi(e) : 2; }();
+    const uint32_t dbg_on = xatt2_dbg_on() ? 1u : 0u;
 
     if (c.nt < 1 || c.nt > 16 || c.H != kG * c.HKV || (c.ns != 1 && c.ns != 4)) return -1;
     if (!c.q || !c.pos0 || !c.qb || !c.qs || !c.pacc || !c.pm || !c.pl) return -1;
@@ -1880,6 +2212,8 @@ int build_plan2(const Call2& c, HostPlan2& hp, int& form_out, int& ng_d2_out, in
     pl.pacc = c.pacc;
     pl.pm = c.pm;
     pl.pl = c.pl;
+    pl.dbg = dbg_on;
+    pl.dbg_flag = c.dbg_flag;
 
     qp.nt = c.nt;
     qp.t0 = c.t0;
@@ -1889,25 +2223,38 @@ int build_plan2(const Call2& c, HostPlan2& hp, int& form_out, int& ng_d2_out, in
     qp.q = c.q;
     qp.qb = c.qb;
     qp.qs = c.qs;
+    qp.dbg = dbg_on;
+    qp.dbg_flag = c.dbg_flag;
 
     mp.nt = c.nt;
     mp.H = c.H;
+    mp.inv_H = 1.0f / (float) c.H;
     mp.pacc = c.pacc;
     mp.pm = c.pm;
     mp.pl = c.pl;
     mp.gate = c.gate;
     mp.out = c.out;
+    mp.dbg = dbg_on;
+    mp.dbg_flag = c.dbg_flag;
 
     int grp_hint[kMaxBatchGroups2]{};
+    int g_slot[kMaxBatchGroups2]{};
+    int g_r0[kMaxBatchGroups2]{};
+    int g_cnt[kMaxBatchGroups2]{};
+    int g_ls0[kMaxBatchGroups2]{};
+    int g_nrg[kMaxBatchGroups2]{};
+    int g_nseg[kMaxBatchGroups2]{};
+
     if (c.ngrp > 0) {
         if (c.ngrp > kMaxBatchGroups2) return -1;
-        pl.ngrp = (uint8_t) c.ngrp;
+        pl.ngrp = c.ngrp;
         pl.per_tok_pos = 1;
         for (int i = 0; i < c.ngrp; ++i) {
-            if (c.grp[i].slot < 0 || c.grp[i].r0 < 0 || c.grp[i].cnt <= 0) return -1;
-            pl.g[i].slot = (uint8_t) c.grp[i].slot;
-            pl.g[i].r0 = (uint8_t) c.grp[i].r0;
-            pl.g[i].cnt = (uint8_t) c.grp[i].cnt;
+            if (c.grp[i].slot < 0 || c.grp[i].slot > 255 || c.grp[i].r0 < 0 || c.grp[i].cnt <= 0) return -1;
+            if (c.grp[i].r0 + c.grp[i].cnt > kMaxBatchGroups2) return -1;
+            g_slot[i] = c.grp[i].slot;
+            g_r0[i] = c.grp[i].r0;
+            g_cnt[i] = c.grp[i].cnt;
             grp_hint[i] = c.grp[i].cell_hint;
         }
     } else {
@@ -1921,39 +2268,38 @@ int build_plan2(const Call2& c, HostPlan2& hp, int& form_out, int& ng_d2_out, in
         pl.ks16 = c.ks16;
         pl.v8t = c.v8t;
         pl.vs = c.vs;
-        pl.g[0].slot = 0;
-        pl.g[0].r0 = 0;
-        pl.g[0].cnt = (uint8_t) c.nt;
+        g_slot[0] = 0;
+        g_r0[0] = 0;
+        g_cnt[0] = c.nt;
         grp_hint[0] = c.pos_hint;
     }
 
-    qp.ngrp = (int32_t) pl.ngrp;
-    qp.per_tok_pos = (int32_t) pl.per_tok_pos;
-    mp.ngrp = (int32_t) pl.ngrp;
+    qp.ngrp = pl.ngrp;
+    qp.per_tok_pos = pl.per_tok_pos;
+    mp.ngrp = pl.ngrp;
+    mp.tok_grp_lo = ~0ull;
+    mp.tok_grp_hi = ~0ull;
 
     int max_rows = 0;
     int ls_cur = 0;
-    std::fill_n(mp.tok_grp, kMaxBatchGroups2, (uint8_t) 0xff);
-    for (int i = 0; i < (int) pl.ngrp; ++i) {
-        const int cnt_i = (int) pl.g[i].cnt;
-        const int r0_i = (int) pl.g[i].r0;
+    for (int i = 0; i < pl.ngrp; ++i) {
+        const int cnt_i = g_cnt[i];
+        const int r0_i = g_r0[i];
         const int rows = cnt_i * kG;
         if (rows < 1 || rows > kMaxRows) return -1;
         if (rows > max_rows) max_rows = rows;
         const int nrg = (rows + 15) / 16;
         if (ls_cur + nrg > kMaxBatchGroups2) return -1;
-        pl.g[i].ls0 = (uint8_t) ls_cur;
-        pl.g[i].nrg = (uint8_t) nrg;
-        qp.g_r0[i] = pl.g[i].r0;
-        qp.g_cnt[i] = pl.g[i].cnt;
+        g_ls0[i] = ls_cur;
+        g_nrg[i] = nrg;
+        pack_u8_16(qp.g_r0_cnt_lo, qp.g_r0_cnt_hi, i, (uint8_t) (((r0_i & 0xf) << 4) | ((cnt_i - 1) & 0xf)));
         for (int l = 0; l < nrg; ++l) {
-            qp.ls_grp[ls_cur + l] = (uint8_t) i;
-            qp.ls_loc[ls_cur + l] = (uint8_t) l;
+            pack_u8_16(qp.ls_gl_lo, qp.ls_gl_hi, ls_cur + l, (uint8_t) (((i & 0xf) << 4) | (l & 0xf)));
         }
         ls_cur += nrg;
         for (int k = 0; k < cnt_i; ++k) {
             const int tok = r0_i + k;
-            if (tok < kMaxBatchGroups2) mp.tok_grp[tok] = (uint8_t) i;
+            if (tok < kMaxBatchGroups2) pack_u8_16(mp.tok_grp_lo, mp.tok_grp_hi, tok, (uint8_t) i);
         }
     }
     hp.total_ls = ls_cur;
@@ -1979,9 +2325,10 @@ int build_plan2(const Call2& c, HostPlan2& hp, int& form_out, int& ng_d2_out, in
     int total_tasks = 0;
     int max_nseg = 1;
     const int tgt_threads = 256;
-    const int ngrp_i = (int) pl.ngrp;
+    const int ngrp_i = pl.ngrp;
     const int budget_per_kv = std::max(ngrp_i, std::min(seg_cap, std::max(1, tgt_threads / (pl.HKV * w))));
 
+    uint64_t* gp_words[8] = {&pl.gp0, &pl.gp1, &pl.gp2, &pl.gp3, &pl.gp4, &pl.gp5, &pl.gp6, &pl.gp7};
     for (int i = 0; i < ngrp_i; ++i) {
         const int hint = grp_hint[i] > 0 ? grp_hint[i] : (c.pos_hint > 0 ? c.pos_hint : 256);
         const int nblk = std::max(1, (hint + kBlk - 1) / kBlk);
@@ -1995,18 +2342,49 @@ int build_plan2(const Call2& c, HostPlan2& hp, int& form_out, int& ng_d2_out, in
         }
         if (ns_i < 1) ns_i = 1;
         if (total_tasks + ns_i > seg_cap) ns_i = std::max(1, seg_cap - total_tasks);
-        pl.g[i].nseg = (uint8_t) ns_i;
-        mp.g_nseg[i] = (uint8_t) ns_i;
+        g_nseg[i] = ns_i;
+        pack_u8_16(mp.g_nseg_lo, mp.g_nseg_hi, i, (uint8_t) ns_i);
+        const uint32_t packed = pack_grp_u32(g_slot[i], g_r0[i], g_cnt[i], g_ls0[i], g_nrg[i], ns_i);
+        const uint32_t sh = (uint32_t) (i & 1) * 32u;
+        *gp_words[i >> 1] |= ((uint64_t) packed << sh);
         if (ns_i > max_nseg) max_nseg = ns_i;
-        for (int s = 0; s < ns_i && total_tasks < kMaxSegs2; ++s) {
-            pl.task_grp[total_tasks] = (uint8_t) i;
-            pl.task_seg[total_tasks] = (uint8_t) s;
-            ++total_tasks;
-        }
+        total_tasks += ns_i;
     }
-    pl.total_tasks = (uint8_t) total_tasks;
-    pl.nseg_stride = max_nseg;
-    mp.nseg_stride = max_nseg;
+    pl.total_tasks = total_tasks;
+    int aligned_stride = max_nseg;
+    if (c.out != nullptr && aligned_stride > 1) {
+        const int a4 = (aligned_stride + 3) & ~3;
+        if (a4 <= seg_cap) aligned_stride = a4;
+    }
+    pl.nseg_stride = aligned_stride;
+    mp.nseg_stride = aligned_stride;
+
+    const size_t q_cap = c.dbg_q_floats ? c.dbg_q_floats : ((size_t) (c.t0 + c.nt) * (size_t) c.H * (size_t) kHD);
+    const size_t qb_cap = qb2_dwords(c.HKV);
+    const size_t qs_cap = qs2_floats(c.HKV);
+    const size_t k8_cells_cap = c.dbg_k8_dwords ? (c.dbg_k8_dwords / ((size_t) c.HKV * 64u)) : (size_t) pl.kst;
+    const size_t ks_cells_cap = (c.ns == 1)
+        ? (c.dbg_ks_floats ? (c.dbg_ks_floats / (size_t) c.HKV) : (size_t) pl.kst)
+        : (c.dbg_ks16_u16 ? (c.dbg_ks16_u16 / ((size_t) c.HKV * 4u)) : (size_t) pl.kst);
+    const size_t v8t_blks_cap = c.dbg_v8t_dwords ? (c.dbg_v8t_dwords / ((size_t) c.HKV * 2048u)) : (size_t) (pl.ctxp / kBlk);
+    const size_t vs_cells_cap = c.dbg_vs_floats ? (c.dbg_vs_floats / (size_t) c.HKV) : (size_t) pl.ctxp;
+    const size_t p_cap = (size_t) c.nt * (size_t) c.H * (size_t) seg_cap;
+    const size_t pacc_cap = p_cap * (size_t) kHD;
+    const size_t out_cap = c.dbg_out_floats ? c.dbg_out_floats : ((size_t) c.nt * (size_t) c.H * (size_t) kHD);
+
+    qp.q_floats = q_cap;
+    qp.qb_dwords = qb_cap;
+    qp.qs_floats = qs_cap;
+    pl.qb_dwords = qb_cap;
+    pl.qs_floats = qs_cap;
+    pl.k8_max_cells = (uint32_t) std::min<size_t>(k8_cells_cap, ks_cells_cap);
+    pl.v8t_max_blks = (uint32_t) v8t_blks_cap;
+    pl.vs_max_cells = (uint32_t) vs_cells_cap;
+    pl.p_elems = p_cap;
+    pl.pacc_elems = pacc_cap;
+    mp.p_elems = p_cap;
+    mp.pacc_elems = pacc_cap;
+    mp.out_elems = out_cap;
     return 0;
 }
 
