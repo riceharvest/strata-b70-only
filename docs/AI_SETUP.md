@@ -4,7 +4,8 @@ Use this guide when a user asks an AI agent to install Strata (version 0.2.5). T
 one; do not start from a source checkout.
 
 - **The Terminal and `strata launch`** (below). This is the route for an agent that has a shell.
-- **The desktop app.** One installer per system: `Strata-0.2.8-windows-x64-setup.exe`,
+- **The desktop app.** Not in this fork - it ships no app; on one B70 use the Terminal route or the
+  [README](../README.md). Upstream's route, for other cards: one installer per system: `Strata-0.2.8-windows-x64-setup.exe`,
   `Strata-0.2.8-linux-x86_64.AppImage`, `Strata-0.2.8-macos-arm64.dmg`, from the
   [latest release](https://github.com/Niko1221/Strata/releases/latest). The Windows and Linux installers carry no
   engine: on first start the app shows the engine for the user's graphics card and downloads it, or installs a file the
@@ -35,6 +36,9 @@ Model availability, provider preference and API details are in [AI_REFERENCE.md]
 
 The installer downloads a private Python runtime and Control, verifies the release checksums and signed feed, and
 installs into the user's home folder. The engine and model are acquired during launch.
+
+**Upstream's one-line installers** - this fork publishes none; on one B70 build the engine in the container from
+the [README](../README.md).
 
 **Linux / Mac:**
 

@@ -20,6 +20,9 @@ strata launch --stop
 
 ## Install (one line)
 
+**Upstream's one-line installers.** This fork publishes no `install.sh` or `install.ps1`; on one B70 build the
+engine in the container from the [README](../README.md). The commands below install upstream's Terminal.
+
 Linux and Mac:
 
 ```sh

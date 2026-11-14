@@ -19,6 +19,9 @@ acquire or build an engine. Check [model requirements](MODELS.md) before downloa
 
 ## From source: Windows
 
+**Upstream's Windows route.** This fork builds on Linux for one Intel Arc Pro B70; see the
+[README](../README.md). The steps below describe upstream's source tree.
+
 1. Clone the [repository](https://github.com/Niko1221/Strata) or download and extract its source archive.
 2. Open the source folder and run `START-HERE.bat`.
 3. Choose a supported model, storage folder and settings. Keep the window open while setup works.
@@ -64,8 +67,8 @@ nix develop -c ./setup.sh
 ### Build from git on Linux (to try a pull request or change the code)
 
 ```bash
-git clone https://github.com/Niko1221/Strata.git
-cd Strata
+git clone -b b70 https://github.com/riceharvest/strata-b70-only
+cd strata-b70-only
 ./setup.sh --build --no-start
 ```
 

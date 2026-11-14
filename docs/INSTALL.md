@@ -8,7 +8,7 @@ install does not need a source checkout or a startup `.bat` file.
 
 | I want | Do this |
 | --- | --- |
-| A window with chat | Download the installer from the [latest release](https://github.com/Niko1221/Strata/releases/latest) ([steps](#the-app)) |
+| A window with chat | This fork ships no desktop app. Use the [Terminal route](#the-terminal), or the README's Docker build for a B70 |
 | The terminal, or my coding tool | Run the one-line install, then `strata launch` ([steps](#the-terminal)) |
 | DeepSeek V4.1-Flash | Pick it in the app, or run `strata launch --family deepseek41` ([model page](MODELS.md#deepseek-v41-flash)) |
 
@@ -34,6 +34,9 @@ older NVIDIA cards use CUDA 12. AMD and Intel requirements are in their guides. 
 hardware drivers. Models and updates need an internet connection to download.
 
 ## The app
+
+**This fork has no desktop app** - the fork deleted it. Everything in this section is upstream's, for other cards.
+On one B70, install through the Docker build in the [README](../README.md) or the source route below.
 
 1. Open the [latest release](https://github.com/Niko1221/Strata/releases/latest).
 2. Download the one installer for your system. There is one per system, not one per graphics card:
@@ -62,6 +65,10 @@ Current app recommendations can differ; choose the model explicitly when you wan
 ## The Terminal
 
 Install once, then use `strata launch`. The Terminal includes Python and downloads the engine for your computer.
+
+**These are upstream's one-line installers.** This fork publishes no `install.sh` or `install.ps1` - its releases
+carry a built engine binary for one machine. On a B70 use the Docker build in the [README](../README.md), or
+[build from git](#build-from-git-on-linux-to-try-a-pull-request-or-change-the-code) below.
 
 **Linux / Mac**
 
@@ -101,9 +108,13 @@ You do not need the app or the AppImage for this: the source install builds the 
 everything in the checkout, so you can edit, rebuild and test.
 
 ```bash
-git clone https://github.com/Niko1221/Strata.git && cd Strata
+git clone -b b70 https://github.com/riceharvest/strata-b70-only && cd strata-b70-only
 ./setup.sh              # first run: .venv, the engine build (build/, or build-hip/ on a Radeon), the model, then it serves
 ```
+
+On one B70 the engine is built inside the oneAPI container the [README](../README.md) describes (the SYCL route),
+not by a plain `./setup.sh` host build; `./setup.sh --backend sycl` then fetches the model and writes the run
+config. Every flag and what was measured: [docs/INTEL.md](INTEL.md).
 
 - **What it needs:** `git`, a C++ compiler and `cmake` (setup installs the build tools through `sudo apt` on
   Debian and Ubuntu; elsewhere install them first), and the CUDA Toolkit for NVIDIA or ROCm with the HIP compiler for
