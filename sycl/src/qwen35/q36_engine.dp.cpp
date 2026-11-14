@@ -35,6 +35,7 @@
 #include "q36_mmvq_dense.hpp"
 #include "q36_xr_dense.hpp"
 #include "q36_xatt.hpp"
+#include "q36_darb.hpp"
 #include "q36_pp_i8.hpp"
 #include "q36_gdn_wy.hpp"
 #include "q36_dflash.hpp"   // DFlash 2 block drafter (STRATA_Q36_DFLASH=<pack>; off: nothing of it runs)
@@ -3649,6 +3650,7 @@ struct Engine {
     bool df_tree = false;
     int df_tree_rows = 16;               // STRATA_Q36_DFLASH_TREE_NODES draft nodes + the root (default 15 + 1)
     bool df_tree_force = false;          // STRATA_Q36_DFLASH_TREE_FORCE=1: a chain-only tree also goes through the tree verify (the invariant check: same drafts / text as the linear arm)
+    int df_tree_long_rows = 0;           // STRATA_Q36_DFLASH_TREE_LONG_ROWS=n (default 0 = off): from the cell count where the matrix-engine attention takes the window (STRATA_Q36_XATT_MIN, 4096) a tree window has at most n rows
     float df_tree_minlp = -3.912023f;    // STRATA_Q36_DFLASH_TREE_MINP (default 0.02): a pending node below this cumulative probability is not added
     strata::q36dt::Gather* df_tg_h = nullptr;   // pinned host image of the last draft's scores (dflash_draft fills it when the tree is on)
     /// DFlash drafts are usable for a step now (single session, graphs, no pictures).
@@ -9057,7 +9059,8 @@ work-group size if needed.
     /// The rows a tree window may have this step (as spec_step_tree: the attention's scratch caps a window of rows) and the draft budget.
     int dtree_rows() const {
         const int xatt_cap = (xatt_ready && pos >= xatt_min) ? std::max(1, xls_max * 16 / strata::q36xatt::kG) : kVerify;
-        return std::min({kVerify, df_tree_rows, xatt_cap, strata::q36dt::kRows});
+        const int long_cap = (df_tree_long_rows > 0 && xatt_ready && pos >= xatt_min) ? df_tree_long_rows : strata::q36dt::kRows;   // (the attention's scratch passes a window of R rows takes grow with ceil(6 R / 16))
+        return std::min({kVerify, df_tree_rows, xatt_cap, long_cap, strata::q36dt::kRows});
     }
     /// DFLASH TREE: the window of the drafter's tree L (q36_dtree.hpp: rows in DFS order, row 0 = x) is verified in one pass with the checkpointed GDN verify of spec_step_tree;
     /// the accepted path is walked as there (greedy: the child that is the target's pick; sampled: the child that is the exact draw of the row, sample_window_row), the
@@ -9802,6 +9805,7 @@ struct DfRule {
     int n = 0, ri = 0, off = 0, fails = 0;
     long long switches = 0, fb_steps = 0, offered = 0, hist[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     int first_rows = -1, first_need = 0;
+    strata::q36da::Arb arb;   // STRATA_Q36_DFLASH_ARB=1: the throughput arbiter (q36_darb.hpp); replaces the tokens-a-step rule (min_tok) below
     DfRule() {
         static const struct Cfg { double t; int w, b, l; } c = [] {
             auto env = [](const char* k, double d) { const char* v = std::getenv(k); return v && v[0] ? std::atof(v) : d; };
@@ -9809,6 +9813,7 @@ struct DfRule {
                        std::max(1, (int) env("STRATA_Q36_DFLASH_BACKOFF", 16)), std::max(0, (int) env("STRATA_Q36_DFLASH_LOOKUP", 0))};
         }();
         min_tok = c.t; win = c.w; back = c.b; lookup_min = c.l;
+        if (arb.on()) min_tok = 0;   // (the arbiter decides the arm; note() below does nothing)
     }
     /// A drafter step gave `toks` tokens (accepted drafts + the window's own).  true: the fallback starts.
     bool note(int toks) {
@@ -10596,7 +10601,10 @@ struct Serve {
                 // STRATA_Q36_DFLASH_LOOKUP=n offers a lookup copy of n or more tokens first (a copy costs no draft call).
                 bool df_step = false;
                 const bool df_avail = E.df_on();
-                const bool df_fb = df_avail && dfr.off > 0;   // this step is one of the fallback's
+                const bool arb_on = df_avail && dfr.arb.on();   // STRATA_Q36_DFLASH_ARB: the arbiter picks the arm of this step
+                const bool df_fb = df_avail && (arb_on ? dfr.arb.pick() == strata::q36da::Arb::kMtp : dfr.off > 0);   // this step is one of the fallback's (or the arbiter's MTP arm)
+                const auto arb_t0 = Clock::now();
+                const size_t arb_g0 = E.row_graphs.size() + E.df_graphs.size();
                 if (df_avail && !df_fb) {
                     const int Dd = std::min({max_drafts, strata::q36df::kDrafts, E.lookup_depth()});
                     bool lk = false;
@@ -10671,11 +10679,13 @@ struct Serve {
                     depth_cap = q36_next_cap(D, a, E.mtp_d, E.pos);
                     look.observe(drafts, a, picks[a]);
                 }
+                if (arb_on)   // the step's host time (draft + verify; it has waited for its picks): a sample of the arm that RAN (a declined drafter step ran the MTP arm); a step that recorded a graph is not one
+                    dfr.arb.note(df_step ? strata::q36da::Arb::kDf : strata::q36da::Arb::kMtp, a + 1, ms_since(arb_t0), E.row_graphs.size() + E.df_graphs.size() == arb_g0);
                 offered += D;
                 accepted += a;
                 if (df_fb) {   // DFLASH BLOCK: a step of the fallback is done
                     ++dfr.fb_steps;
-                    if (--dfr.off == 0) std::fprintf(stderr, "strata serve: dflash: the fallback ends, the drafter is tried again\n");
+                    if (!arb_on && --dfr.off == 0) std::fprintf(stderr, "strata serve: dflash: the fallback ends, the drafter is tried again\n");
                 }
                 ss.live.push_back(nx);
                 if (s < (int) E.kv_live.size()) E.kv_live[(size_t) s].push_back(nx);
@@ -10732,6 +10742,12 @@ struct Serve {
             std::fprintf(stderr, "strata serve: dflash: drafts offered a step %.2f; accepted per step: 0:%lld 1:%lld 2:%lld 3:%lld 4:%lld 5:%lld 6:%lld 7:%lld; context rows at the first block %d of %d; "
                                  "fallbacks %lld (%lld steps on the lookup / MTP path)\n", (double) dfr.offered / (double) df_steps, dfr.hist[0], dfr.hist[1], dfr.hist[2], dfr.hist[3],
                          dfr.hist[4], dfr.hist[5], dfr.hist[6], dfr.hist[7], dfr.first_rows, dfr.first_need, dfr.switches, dfr.fb_steps);
+            if (dfr.arb.on())   // STRATA_Q36_DFLASH_ARB: what the arbiter did (rates in tokens a ms; the ms a step are the host clock around the step)
+                std::fprintf(stderr, "strata serve: dflash arbiter: ended on the %s arm; steps: drafter %lld, MTP / lookup %lld (probes %lld, flips %lld, steps that recorded a graph %lld); "
+                                     "tokens a ms: drafter %.4f (%.2f tokens, %.1f ms a step, %d samples), MTP / lookup %.4f (%.2f tokens, %.1f ms a step, %d samples); probe period %d\n",
+                             dfr.arb.chosen() == strata::q36da::Arb::kDf ? "drafter" : "MTP", dfr.arb.steps(0), dfr.arb.steps(1), dfr.arb.probes(), dfr.arb.flips(), dfr.arb.invalid(),
+                             dfr.arb.rate(0), dfr.arb.rate(0) * dfr.arb.ms_step(0), dfr.arb.ms_step(0), dfr.arb.samples(0), dfr.arb.rate(1), dfr.arb.rate(1) * dfr.arb.ms_step(1), dfr.arb.ms_step(1),
+                             dfr.arb.samples(1), dfr.arb.period());
             if (E.df_tree)   // DFLASH TREE (always printed with the switch on: an arm whose tree never ran must not look like an arm whose tree did not help)
                 std::fprintf(stderr, "strata serve: dflash tree: %lld of %lld steps verified a tree (mean %.2f rows a window, %.2f drafts accepted a tree step), %lld went the linear way (the tree was only "
                                      "the chain), %lld could not take a tree (tree_ok / candidate kernels); graphs recorded during this request: %zu verify / fallback, %zu drafter\n", dt_steps, df_steps,
@@ -11047,18 +11063,19 @@ int strata::qwen35::run(int argc, char** argv) {
         if (df_bat_env) { E.df_cap = true; E.df_batch = true; }   // (needs --batch-mtp too: checked where bmtp is known, below)
         {   // the fallback to MTP needs the MTP block's cache whole: it reads the drafter steps' rows too (a hole otherwise).  MIN_TOK = 0: off, nothing extra runs
             const char* mt = std::getenv("STRATA_Q36_DFLASH_MIN_TOK");
-            E.df_keep_mtp = (mt == nullptr || mt[0] == '\0' ? 3.0 : std::atof(mt)) > 0.0;
+            E.df_keep_mtp = (mt == nullptr || mt[0] == '\0' ? 3.0 : std::atof(mt)) > 0.0 || strata::q36da::Arb::env_cfg().on;   // (the arbiter probes the MTP arm: its cache must be whole)
         }
         if (const char* te = std::getenv("STRATA_Q36_DFLASH_TREE"); te != nullptr && std::atoi(te) != 0 && E.df_cap && !E.df_batch) {   // DFLASH TREE (single stream only)
             E.df_tree_force = std::getenv("STRATA_Q36_DFLASH_TREE_FORCE") != nullptr && std::atoi(std::getenv("STRATA_Q36_DFLASH_TREE_FORCE")) != 0;
             if (const char* tn = std::getenv("STRATA_Q36_DFLASH_TREE_NODES"); tn != nullptr && tn[0] != '\0') E.df_tree_rows = std::max(3, std::min(16, std::atoi(tn) + 1));
+            if (const char* tl = std::getenv("STRATA_Q36_DFLASH_TREE_LONG_ROWS"); tl != nullptr && tl[0] != '\0') E.df_tree_long_rows = std::max(0, std::min(16, std::atoi(tl)));
             if (const char* tp = std::getenv("STRATA_Q36_DFLASH_TREE_MINP"); tp != nullptr && tp[0] != '\0') E.df_tree_minlp = std::atof(tp) > 0.0 ? (float) std::log(std::atof(tp)) : -1.0e9f;
             if (dflash.enable_tree(*E.st, true)) {
                 E.df_tg_h = sycl::malloc_host<strata::q36dt::Gather>(1, *E.st);
                 E.df_tree = E.df_tg_h != nullptr;
             }
-            std::fprintf(stderr, "strata-q36: dflash tree: %s (up to %d rows a window, floor %.4f of cumulative probability); T >= 9 windows take the W4A16 products (a16), their numerics differ from the 8-row window's\n",
-                         E.df_tree ? "on" : "NOT on (no device / host memory)", E.df_tree_rows, (double) std::exp(E.df_tree_minlp));
+            std::fprintf(stderr, "strata-q36: dflash tree: %s (up to %d rows a window, %d at long context, floor %.4f of cumulative probability); T >= 9 windows take the W4A16 products (a16), their numerics differ from the 8-row window's\n",
+                         E.df_tree ? "on" : "NOT on (no device / host memory)", E.df_tree_rows, E.df_tree_long_rows > 0 ? E.df_tree_long_rows : E.df_tree_rows, (double) std::exp(E.df_tree_minlp));
         }
         if (!E.df_cap) std::fprintf(stderr, "strata-q36: dflash: off with --batch (STRATA_Q36_DFLASH_BATCH=1 with --batch N --batch-mtp turns it on) / --vision / hybrid experts\n");
         if (const char* dd = std::getenv("STRATA_Q36_DFLASH_DUMP"); dd != nullptr && dd[0] != '\0') {

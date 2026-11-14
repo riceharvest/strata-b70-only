@@ -1,12 +1,14 @@
 // dflash_tree_test.cpp - host-only test of q36_dtree.hpp (no GPU): the tree built from the drafter's candidates, its DFS layout and the
 // checkpoint slots.  The GDN verify is simulated with a hash as the "state": the state a row reads must be the state after its parent,
 // with the kernel's rules (ld loads slot (ld - 1) & 1 before the row, sv saves the state after the row into slot (sv - 1) & 1; two slots).
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
 #include <string>
 
 #include "q36_dtree.hpp"
+#include "q36_darb.hpp"
 
 using namespace strata::q36dt;
 
@@ -236,11 +238,124 @@ static void test_mismatch_ok() {
     delete g;
 }
 
+// ---- the throughput arbiter (q36_darb.hpp): a simulated request, no card.  Arm 0 / 1 give (tokens a step ~ mean m, noise) in a fixed step time.
+static double geo_p(double mean) {   // E[t] = (1 - p^8) / (1 - p) for t clamped to 1..8: solve for p by bisection
+    double lo = 0.0, hi = 0.9999;
+    for (int i = 0; i < 60; ++i) {
+        const double p = 0.5 * (lo + hi);
+        const double m = (1.0 - std::pow(p, 8)) / (1.0 - p);
+        (m < mean ? lo : hi) = p;
+    }
+    return 0.5 * (lo + hi);
+}
+struct SimArm { double mean_tok, ms; };
+struct SimOut { long long steps[2]; double tokens, ms; strata::q36da::Arb* arb; };
+static SimOut simulate(const strata::q36da::ArbCfg& cfg, SimArm a0, SimArm a1, int n, std::mt19937_64& rng, int switch_at = -1, SimArm b0 = {0, 0}, SimArm b1 = {0, 0}, double graph_ms = 0) {
+    static strata::q36da::Arb* keep = nullptr;
+    delete keep;
+    keep = new strata::q36da::Arb(cfg);
+    SimOut o{{0, 0}, 0, 0, keep};
+    SimArm arms[2] = {a0, a1};
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    bool seen[2] = {false, false};
+    for (int i = 0; i < n; ++i) {
+        if (i == switch_at) { arms[0] = b0; arms[1] = b1; }
+        const int arm = keep->pick();
+        // tokens: 1 + geometric-ish accepted count with the arm's mean (clamped 1..8)
+        const double p = geo_p(arms[arm].mean_tok);   // success probability of "one more accepted" (the mean of the clamped 1..8 count is mean_tok)
+        int t = 1;
+        while (t < 8 && u(rng) < p) ++t;
+        double ms = arms[arm].ms * (0.97 + 0.06 * u(rng));
+        bool valid = true;
+        if (!seen[arm]) { seen[arm] = true; ms += graph_ms; valid = graph_ms == 0; }   // the first step of an arm records a graph
+        keep->note(arm, t, ms, valid);
+        ++o.steps[arm];
+        o.tokens += t;
+        o.ms += ms;
+    }
+    return o;
+}
+
+static void test_arbiter() {
+    using strata::q36da::Arb;
+    using strata::q36da::ArbCfg;
+    std::mt19937_64 rng(7);
+    ArbCfg c;
+    c.on = true;
+    // off: always the drafter, nothing changes
+    {
+        ArbCfg off;
+        Arb a(off);
+        for (int i = 0; i < 100; ++i) { check(a.pick() == 0, "arb off picks the drafter"); a.note(0, 1, 100.0, true); }
+        check(a.flips() == 0 && a.probes() == 0, "arb off: no flips, no probes");
+    }
+    // 1-3. mean over 100 simulated requests of 700 steps: the throughput against the better arm alone and against staying on the drafter.  The token counts are a clamped
+    //      geometric draw (1 .. 8 a step, as a verify step's 1 + accepted drafts), so a few steps of an arm are a noisy reading: single requests can pick the wrong arm,
+    //      the mean is the claim.
+    struct Case { const char* name; SimArm d, m; int best; double need; };
+    const Case cases[] = {
+        {"drafter +30%", {6.0, 38.0}, {4.5, 36.0}, 0, 0.96},
+        {"drafter +15%", {5.0, 38.0}, {4.4, 36.0}, 0, 0.95},
+        {"equal", {4.0, 40.0}, {4.0, 40.0}, 0, 0.97},
+        {"MTP +15%", {3.3, 50.0}, {3.7, 48.0}, 1, 0.94},
+        {"MTP +30%", {3.3, 50.0}, {3.8, 44.0}, 1, 0.94},
+    };
+    for (const Case& k : cases) {
+        double frac = 0, fixed = 0;
+        long long probes = 0, other = 0;
+        for (int rep = 0; rep < 100; ++rep) {
+            const SimOut o = simulate(c, k.d, k.m, 700, rng);
+            const double best = std::max(k.d.mean_tok / k.d.ms, k.m.mean_tok / k.m.ms);
+            frac += (o.tokens / o.ms) / best;
+            fixed += (k.d.mean_tok / k.d.ms) / best;
+            other += o.steps[1 - k.best];
+            probes += o.arb->probes();
+        }
+        std::printf("  arbiter %-13s: %.3f of the better arm (staying on the drafter: %.3f), %.1f%% of the steps on the worse arm\n", k.name, frac / 100, fixed / 100,
+                    100.0 * (double) other / 70000.0);
+        check(frac / 100 >= k.need, (std::string("arbiter ") + k.name + ": mean throughput near the better arm").c_str(), std::to_string(frac / 100));
+        if (k.best == 1) check(frac / 100 > fixed / 100 + 0.05, (std::string("arbiter ") + k.name + ": beats staying on the drafter").c_str());
+    }
+    // 4. the regime changes at step 300 (the drafter's acceptance falls: code -> prose): the arbiter follows
+    for (int rep = 0; rep < 20; ++rep) {
+        const SimOut o = simulate(c, {6.0, 38.0}, {4.5, 36.0}, 1200, rng, 300, {2.8, 48.0}, {4.0, 36.0});
+        check(o.arb->chosen() == 1, "regime change: ends on MTP");
+        check(o.arb->flips() >= 1, "regime change: flipped");
+    }
+    // 5. graph recording steps (first step of an arm +60 ms) are not samples: the estimates are not poisoned
+    for (int rep = 0; rep < 20; ++rep) {
+        const SimOut o = simulate(c, {6.0, 38.0}, {4.5, 36.0}, 400, rng, -1, {0, 0}, {0, 0}, 60.0);
+        check(o.arb->invalid() == 2, "graph steps are invalid samples", std::to_string(o.arb->invalid()));
+        check(o.arb->chosen() == 0, "graph steps do not flip a better drafter");
+        check(std::fabs(o.arb->ms_step(1) - 36.0) < 4.0, "the MTP estimate is the real step time, not the graph's", std::to_string(o.arb->ms_step(1)));
+    }
+    // 6. a probe that never gets a clean step is given up after 3 tries, the request goes on on its arm
+    {
+        Arb a(c);
+        for (int i = 0; i < c.init; ++i) { check(a.pick() == 0, "arb: drafter first"); a.note(0, 5, 38.0, true); }
+        check(a.pick() == 1, "arb: first probe after init steps");
+        for (int i = 0; i < 3; ++i) a.note(1, 4, 200.0, false);
+        check(a.pick() == 0, "arb: a probe of 3 invalid steps is given up");
+    }
+    // 7. a step that the drafter declined (the arm taken is not the one picked) is a sample of the arm it ran
+    {
+        Arb a(c);
+        a.note(1, 3, 40.0, true);
+        check(a.samples(1) == 1 && a.samples(0) == 0, "arb: a declined drafter step counts for the MTP arm");
+    }
+    // 8. the probe cost on a long run on the better arm falls with the back-off: steps on the other arm over 3000 steps
+    {
+        const SimOut o = simulate(c, {6.0, 38.0}, {3.0, 36.0}, 3000, rng);
+        check(o.steps[1] < 3000 / 16 / 2, "back-off: probes well under 1 in 32 on a long run", std::to_string(o.steps[1]));
+    }
+}
+
 int main() {
     test_shapes();
     test_random_layouts();
     test_build();
     test_mismatch_ok();
+    test_arbiter();
     std::printf("dflash_tree_test: %s (%d checks, %d failed)\n", g_bad ? "FAIL" : "OK", g_n, g_bad);
     return g_bad ? 1 : 0;
 }
