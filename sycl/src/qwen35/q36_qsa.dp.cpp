@@ -421,6 +421,8 @@ void launch_select(sycl::queue& q, const float* score, Win win, int nb_cap, int3
         auto grp = it.get_group();
         auto& hist = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[256]>(grp);
         auto& sh = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[2]>(grp);
+        auto sg = it.get_sub_group();
+        const int lane = (int) sg.get_local_id()[0];
         const int t = (int) it.get_group(0);
         const int tid = (int) it.get_local_id(0);
         const int c = sycl::min(row_vis_blocks(win, t), nb_cap);
@@ -437,11 +439,29 @@ void launch_select(sycl::queue& q, const float* score, Win win, int nb_cap, int3
             const int shift = 24 - 8 * pass;
             if (tid < 256) hist[tid] = 0;
             sycl::group_barrier(grp);
-            for (int i = tid; i < c; i += 1024) {
-                const uint32_t u = skey(sc[i]);
-                if (pass == 0 || (u >> (shift + 8)) == prefix) {
-                    sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::generic_space>
-                        a(hist[(u >> shift) & 255u]);
+            // The first two digits are low in entropy (the scores of a row share their exponent: nearly all of the 64K elements fall in a
+            // few bins), so there a sub-group first counts the lanes of equal bin and the lowest of them adds the count once; passes 2 and 3
+            // see only the elements that match the prefix.  (Every lane takes the same trips: the shuffles are convergent.)
+            for (int base = 0; base < c; base += 1024) {
+                const int i = base + tid;
+                int bin = -1;
+                if (i < c) {
+                    const uint32_t u = skey(sc[i]);
+                    if (pass == 0 || (u >> (shift + 8)) == prefix) bin = (int) ((u >> shift) & 255u);
+                }
+                if (pass < 2) {
+                    int cnt = 0, first = 16;
+#pragma unroll
+                    for (int k = 0; k < 16; ++k) {
+                        const int ob = sycl::select_from_group(sg, bin, sycl::id<1>(k));
+                        if (ob == bin) { ++cnt; if (first == 16) first = k; }
+                    }
+                    if (bin >= 0 && first == lane) {
+                        sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::generic_space> a(hist[bin]);
+                        a.fetch_add(cnt);
+                    }
+                } else if (bin >= 0) {
+                    sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::generic_space> a(hist[bin]);
                     a.fetch_add(1);
                 }
             }
