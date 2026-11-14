@@ -907,7 +907,7 @@ void test_rng_hand() {
             r[kSpecTopM + i] = __builtin_bit_cast(int32_t, v);
         }
     }
-    int bad = 0, cases = 0;
+    int bad = 0, cases = 0, partial = 0;
     for (unsigned long long seed = 1; seed <= 60; ++seed) {
         // drafts: the row's first candidate for a few rows, then a miss
         std::vector<int32_t> drafts((size_t) D);
@@ -927,11 +927,12 @@ void test_rng_hand() {
                 if (p != picks[t]) { ++bad; std::printf("pick mismatch seed %llu t %d a %d\n", seed, t, a); }
             }
             ++cases;
+            if (shown < a + 1) ++partial;   // a stop inside the window: it drew more rows than were shown
             if (hand != plain) { ++bad; std::printf("stream mismatch seed %llu shown %d\n", seed, shown); }
             if (shown == a + 1 && wr != hand) { ++bad; std::printf("window stream mismatch seed %llu a %d\n", seed, a); }   // every draw shown: the window's own stream
         }
     }
-    check(cases >= 60 && bad == 0, "stream before the window + shown draws = the plain loop's stream, and the picks agree");
+    check(cases >= 60 && partial > 0 && bad == 0, "stream before the window + shown draws = the plain loop's stream, and the picks agree (some cases cut inside the window)");
 }
 
 }  // namespace

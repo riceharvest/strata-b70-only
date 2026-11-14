@@ -151,15 +151,20 @@ class Completions(unittest.TestCase):
         self.start("a<|im_end|>b")
         out = self.ok({"prompt": "p", "max_tokens": 32})
         self.assertEqual((out["choices"][0]["text"], out["choices"][0]["finish_reason"]), ("a", "stop"))
+        # the script goes on past its first end token; it then ends by itself: the reply ends at an end token, so "stop"
         out = self.ok({"prompt": "p", "max_tokens": 32, "ignore_eos": True})
-        self.assertEqual((out["choices"][0]["text"], out["choices"][0]["finish_reason"]), ("ab", "length"))
+        self.assertEqual((out["choices"][0]["text"], out["choices"][0]["finish_reason"]), ("ab", "stop"))
         self.assertEqual(out["usage"]["completion_tokens"], 4)          # a, <|im_end|>, b, the script's own end
+        out = self.ok({"prompt": "p", "max_tokens": 3, "ignore_eos": True})    # max_tokens reached after "b": "length"
+        self.assertEqual((out["choices"][0]["text"], out["choices"][0]["finish_reason"]), ("ab", "length"))
         chat = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 32, "reasoning_effort": "none"}
         status, raw = self.post(chat, "/v1/chat/completions")
         self.assertEqual(json.loads(raw)["choices"][0]["message"]["content"], "a")
         status, raw = self.post({**chat, "ignore_eos": True}, "/v1/chat/completions")
         body = json.loads(raw)
-        self.assertEqual((body["choices"][0]["message"]["content"], body["choices"][0]["finish_reason"]), ("ab", "length"))
+        self.assertEqual((body["choices"][0]["message"]["content"], body["choices"][0]["finish_reason"]), ("ab", "stop"))
+        status, raw = self.post({**chat, "ignore_eos": True, "max_tokens": 3}, "/v1/chat/completions")
+        self.assertEqual(json.loads(raw)["choices"][0]["finish_reason"], "length")
 
     def test_ignore_eos_is_a_key_for_the_engine_only_when_true(self):
         self.assertEqual(StrataEngine.sampling_keys({"ignore_eos": True}), " ignore_eos=1")
