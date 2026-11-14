@@ -36,6 +36,7 @@
 #include "q36_xr_dense.hpp"
 #include "q36_xatt.hpp"
 #include "q36_pp_i8.hpp"
+#include "q36_gdn_wy.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -3534,6 +3535,9 @@ struct Engine {
     // its GDN recurrence on the register-resident kernel (STRATA_Q36_GDN_XE=0: k_gdn_seq_cols).  Set in init().
     bool pattn_flash = false;
     bool gdn_xe = false;
+    bool gdn_wy = false;
+    void* gdn_wy_ws = nullptr;
+    int gdn_wy_tmax = 0;
 #ifdef STRATA_Q36_TLA
     // LP3: the 8-bit cache's prompt chunks on vllm-xpu-kernels' chunk_prefill (q36_prefill.dp.hpp's tla_prompt_attn_q8;
     // STRATA_Q36_PATTN=lp2: flash_prompt_attn_q8), and its segment buffers.  Set in init().
@@ -3880,6 +3884,25 @@ struct Engine {
             gdn_xe = !(gx && gx[0] == '0') &&
                      q36pf::gdn_xe_ok(*st, (int) g.ssm_state_size, (int) g.ssm_k_heads, (int) g.ssm_v_heads,
                                       (int) g.ssm_conv_channels);
+            const char* gwy = std::getenv("STRATA_Q36_GDN_WY");
+            const bool gwy_ok = !(gwy && gwy[0] == '0') &&
+                                strata::q36wy::ok(*st, (int) g.ssm_state_size, (int) g.ssm_k_heads, (int) g.ssm_v_heads,
+                                                  (int) g.ssm_conv_channels);
+            if (gwy_ok && T > kGemmT) {
+                size_t wfr = 0, wtot = 0;
+                dpct::get_current_device().get_memory_info(wfr, wtot);
+                const size_t sess_all = (size_t) std::max(1, n_sess) * q36_sess_bytes(*m, ctx);
+                const int try_t[2] = {std::min((int) T, 4096), std::min((int) T, 1024)};
+                for (const int wt : try_t) {
+                    const size_t wb = strata::q36wy::workspace_bytes(wt);
+                    if (wfr >= sess_all + wb + ((size_t) 512 << 20)) {
+                        gdn_wy_ws = sycl::malloc_device(wb, *st);
+                        gdn_wy_tmax = wt;
+                        gdn_wy = gdn_wy_ws != nullptr;
+                        break;
+                    }
+                }
+            }
             bool tla_on = false;
 #ifdef STRATA_Q36_TLA
             tla_on = pattn_tla;
@@ -3893,7 +3916,7 @@ struct Engine {
                          : pattn_flash ? (kv_q8 ? "flash (XMX, 64-cell blocks, int8 K / V dequantized in local memory)"
                                               : "flash (XMX, 64-cell blocks)")
                                      : "GEMM (scores in memory)",
-                         gdn_xe ? "register-resident" : "column kernel");
+                         gdn_wy ? "chunkwise C=64 WY XMX" : (gdn_xe ? "register-resident" : "column kernel"));
         }
         // the GEMM path's scores (the flash path has none: 0.38 GB less; kAttScoreFloats then says 16 M so that
         // place_experts finds nothing to shrink, and attn_core allocates them if the GEMM path ever runs)
@@ -6044,7 +6067,12 @@ work-group size if needed.
                     */
                     // M4b: the register-resident recurrence (q36_prefill.dp.hpp, the 27B's geometry), the same layouts and
                     // per-element arithmetic, other row-sum order; STRATA_Q36_GDN_XE=0: the column kernel
-                    if (gdn_xe) q36pf::gdn_xe_rg(*st, S[li], hc_b, al_b, be_b, gdn_y, T);
+                    static const int wy_min_t = [] {
+                        const char* e = std::getenv("STRATA_Q36_GDN_WY");
+                        return (e && e[0] == '2') ? 17 : 64;
+                    }();
+                    if (gdn_wy && T >= wy_min_t) strata::q36wy::forward(*st, gdn_wy_ws, gdn_wy_tmax, S[li], hc_b, al_b, be_b, gdn_y, T);
+                    else if (gdn_xe) q36pf::gdn_xe_rg(*st, S[li], hc_b, al_b, be_b, gdn_y, T);
                     else
                     {
                         auto exp_props =
