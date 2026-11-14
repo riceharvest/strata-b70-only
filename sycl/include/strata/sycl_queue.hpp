@@ -218,6 +218,8 @@ inline void apply_b70_defaults() {
         {"STRATA_SPEC_PROB", "1"},
         {"STRATA_SPEC_COUPLED", "1"},
         {"STRATA_SPEC_PROB_GATE", "top"},
+        // #24: stopping prefill's early_copy at the first unpinned expert keeps FIFO ring order (opt-in diagnostic fix)
+        {"STRATA_I24_FIX", "0"},
     };
     std::string applied;
     for (const auto& [k, v] : defaults) {
