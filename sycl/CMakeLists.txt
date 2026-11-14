@@ -684,7 +684,8 @@ if(STRATA_BUILD_Q36)
   # executable's AOT link compiles about 1,500), and they take their own register-file size (STRATA_Q36_W4_GRF=128 at
   # configure time: without -doubleGRF).
   add_library(q36_w4 SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4.dp.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xatt.dp.cpp
-              ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4h.dp.cpp)
+              ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4h.dp.cpp
+              ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_pp_i8.dp.cpp)
   target_include_directories(q36_w4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35 ${CMAKE_CURRENT_SOURCE_DIR}/include)
   set_target_properties(q36_w4 PROPERTIES CXX_EXTENSIONS ON)
   if(STRATA_SYCL_AOT)
@@ -767,7 +768,7 @@ if(STRATA_BUILD_Q36)
                    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense.dp.cpp
                    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xr_dense.dp.cpp)
     target_include_directories(q36_mmvq_dense_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
-    target_link_libraries(q36_mmvq_dense_parity PRIVATE strata_kernels q36_w4)
+    target_link_libraries(q36_mmvq_dense_parity PRIVATE strata_kernels strata_prefill q36_w4)
     set_target_properties(q36_mmvq_dense_parity PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
     add_test(NAME q36_mmvq_dense_parity COMMAND q36_mmvq_dense_parity --selftest)
   endif()

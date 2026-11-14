@@ -37,10 +37,16 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/kernels/f16_bits.hpp"
+#include <dpct/blas_utils.hpp>
 #include "strata/kernels/native_mmvq.hpp"
 #include "q36_mmvq_dense.hpp"
 #include "q36_xr_dense.hpp"
 #include "q36_xatt.hpp"
+#include "q36_pp_i8.hpp"
+
+namespace strata::kernels {
+void dequant_f16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out, void* stream);
+}
 
 #include <algorithm>
 #include <cmath>
@@ -940,6 +946,387 @@ int bench(const char* types_s, const char* ncols_s, const std::string& ssel) {
     return bad ? 1 : 0;
 }
 
+// --pp / --pp-bench [types] [ncols] [shape]: prompt-path (T > 16) int8 DPAS GEMM (q36pp::gemm) parity & throughput on 27B
+// shapes vs float64 (sampled rows & columns) and vs dequant_f16 + oneMKL FP16 GEMM (including B70W4 = 1004).
+struct PpFormat {
+    int type;
+    const char* name;
+    int blk_bytes_256;
+};
+const PpFormat kPpFormats[] = {
+    {1004, "B70W4",  136},
+    {  12, "Q4_K",   144},
+    {  13, "Q5_K",   176},
+    {  23, "IQ4_XS", 136},
+    {  14, "Q6_K",   210},
+    {  11, "Q3_K",   110},
+    {  20, "IQ4_NL", 144},
+    {   8, "Q8_0",   272},
+};
+const PpFormat* pp_format_of(int t) {
+    for (const PpFormat& f : kPpFormats) if (f.type == t) return &f;
+    return nullptr;
+}
+void fill_pp_pool(int t, std::vector<uint8_t>& h) {
+    if (t == 1004) {
+        const size_t nrec = h.size() / 2176;
+        uint32_t* dw = reinterpret_cast<uint32_t*>(h.data());
+        for (size_t i = 0; i < (nrec * 544) / 2; ++i) {
+            const uint64_t v = xr();
+            dw[2 * i]     = (uint32_t) v;
+            dw[2 * i + 1] = (uint32_t) (v >> 32);
+        }
+        for (size_t r = 0; r < nrec; ++r) {
+            for (int k = 0; k < 32; ++k) {
+                const uint64_t v = xr();
+                dw[r * 544 + 512 + k] = (0x1400u | (uint32_t) (v & 0x3ff)) | ((1u + (uint32_t) ((v >> 20) & 15)) << 16);
+            }
+        }
+        return;
+    }
+    if (const Format* f = format_of(t)) {
+        fill_pool(*f, h);
+        return;
+    }
+    // Q8_0 (272 B per 256 weights = 8 x 34-B blocks, half d at +34*b)
+    uint64_t* p = (uint64_t*) h.data();
+    for (size_t i = 0; i < h.size() / 8; ++i) p[i] = xr();
+    const size_t nb = h.size() / 272;
+    for (size_t b = 0; b < nb; ++b)
+        for (int sb = 0; sb < 8; ++sb) {
+            const uint16_t d = (uint16_t) (0x1400 | (xr() & 0x3ff));
+            std::memcpy(&h[b * 272 + (size_t) sb * 34], &d, 2);
+        }
+}
+void pp_ref_rows(int t, const std::vector<uint8_t>& w_all, int n_in, int n_out, const std::vector<int>& sample_rows,
+                 const std::vector<double>& x_samp, int ns_cols, std::vector<double>& out_ref) {
+    const int nsb = n_in / 256;
+    const int nr = (int) sample_rows.size();
+    if (t == 1004) {
+        out_ref.assign((size_t) ns_cols * nr, 0.0);
+        const uint32_t* wdw = reinterpret_cast<const uint32_t*>(w_all.data());
+        for (int ri = 0; ri < nr; ++ri) {
+            const int o = sample_rows[ri], tile = o / 16, row_i = o % 16;
+            for (int c = 0; c < ns_cols; ++c) {
+                double acc = 0.0;
+                const double* xc = &x_samp[(size_t) c * n_in];
+                for (int kb = 0; kb < nsb; ++kb) {
+                    const uint32_t* rec = wdw + ((size_t) tile * nsb + kb) * 544;
+                    for (int sb = 0; sb < 8; ++sb) {
+                        const int pr = sb >> 1, g = sb >> 2;
+                        const uint32_t meta = rec[512 + 16 * g + row_i];
+                        const double sc = (double) (float) sycl::bit_cast<sycl::half>((uint16_t) (meta & 0xffff));
+                        const int zero = (int) (meta >> 16);
+                        for (int l = 0; l < 32; ++l) {
+                            const uint32_t by = (rec[128 * pr + 16 * (l >> 2) + row_i] >> (8 * (l & 3))) & 0xff;
+                            const int qv = (sb & 1) ? (int) (by >> 4) : (int) (by & 15);
+                            acc += sc * (double) (qv - zero) * xc[(size_t) kb * 256 + sb * 32 + l];
+                        }
+                    }
+                }
+                out_ref[(size_t) c * nr + ri] = acc;
+            }
+        }
+        return;
+    }
+    const PpFormat* pf = pp_format_of(t);
+    const size_t rowb = (size_t) nsb * pf->blk_bytes_256;
+    std::vector<uint8_t> w_sub((size_t) nr * rowb);
+    for (int i = 0; i < nr; ++i) {
+        std::memcpy(&w_sub[(size_t) i * rowb], &w_all[(size_t) sample_rows[i] * rowb], rowb);
+    }
+    if (t != 8) {
+        std::vector<double> mag, mag2;
+        reference(t, w_sub, n_in, nr, 0, nr, x_samp, ns_cols, out_ref, mag, mag2);
+        return;
+    }
+    out_ref.assign((size_t) ns_cols * nr, 0.0);
+    const int nb32 = n_in / 32;
+    for (int r = 0; r < nr; ++r) {
+        const uint8_t* row = &w_sub[(size_t) r * rowb];
+        for (int c = 0; c < ns_cols; ++c) {
+            double acc = 0.0;
+            const double* xc = &x_samp[(size_t) c * n_in];
+            for (int b = 0; b < nb32; ++b) {
+                const uint8_t* blk = row + (size_t) b * 34;
+                uint16_t dh;
+                std::memcpy(&dh, blk, 2);
+                const double d = (double) (float) sycl::bit_cast<sycl::half>(dh);
+                for (int l = 0; l < 32; ++l) {
+                    acc += d * (double) (int8_t) blk[2 + l] * xc[(size_t) b * 32 + l];
+                }
+            }
+            out_ref[(size_t) c * nr + r] = acc;
+        }
+    }
+}
+
+int pp_bench(const char* types_s, const char* ncols_s, const std::string& ssel, bool full_bench) {
+    const std::vector<int> types = parse_list(types_s);
+    const std::vector<int> ncl   = parse_list(ncols_s);
+    sycl::queue q(sycl::gpu_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()});
+    dpct::blas::descriptor_ptr blas = new dpct::blas::descriptor();
+    blas->set_queue(&q);
+
+    struct PpShape { int n_in, n_out; const char* name; };
+    const PpShape shapes[] = {
+        { 5120,  17408, "27gu"  },
+        {17408,   5120, "27down"},
+        { 5120,  10240, "27qkv" },
+        { 5120,  12288, "27q"   },
+        { 6144,   5120, "27out" },
+        { 5120, 248320, "27head"},
+        { 5120,   6144, "27gate"},
+        { 5120,   1024, "27kv"  },
+    };
+    auto shape_in_27 = [](const std::string& n) {
+        return n == "27gu" || n == "27down" || n == "27qkv" || n == "27q" || n == "27out" || n == "27head";
+    };
+    int max_in = 0, max_out = 0, max_T = 0;
+    size_t max_wb = 0;
+    for (const PpShape& sh : shapes) {
+        const bool match = (ssel == "27" && shape_in_27(sh.name)) || ssel == "all" || ssel == sh.name;
+        if (!match) continue;
+        max_in  = std::max(max_in,  sh.n_in);
+        max_out = std::max(max_out, sh.n_out);
+        for (int t : types) {
+            if (const PpFormat* pf = pp_format_of(t)) {
+                max_wb = std::max(max_wb, (size_t) sh.n_out * (sh.n_in / 256) * pf->blk_bytes_256);
+            }
+        }
+    }
+    for (int nc : ncl) max_T = std::max(max_T, nc);
+    if (max_wb == 0 || max_T <= 0) {
+        std::printf("pp_bench: nothing matched (types=%s ncols=%s shape=%s)\n", types_s, ncols_s, ssel.c_str());
+        return 2;
+    }
+
+    const size_t pool_bytes = std::max(max_wb, (size_t) 512u << 20);
+    const size_t max_slice_rows = std::min<size_t>(max_out, 16384);
+    const size_t dw16_elems = std::max<size_t>(max_slice_rows * (size_t) max_in, (size_t) 17408 * 5120);
+    std::vector<uint8_t> hpool(pool_bytes);
+    uint8_t*   dpool = sycl::malloc_device<uint8_t>(pool_bytes, q);
+    uint16_t*  dw16  = sycl::malloc_device<uint16_t>(dw16_elems, q);
+    float*     y     = sycl::malloc_device<float>((size_t) max_T * max_out, q);
+    float*     dx    = sycl::malloc_device<float>((size_t) max_T * max_in, q);
+    uint16_t*  dx16  = sycl::malloc_device<uint16_t>((size_t) max_T * max_in, q);
+    void*      xq    = sycl::malloc_device(k::native_q8_1_bytes((size_t) max_T * max_in, 1) + 256, q);
+    if (!dpool || !dw16 || !y || !dx || !dx16 || !xq) {
+        std::printf("pp: device allocation failed\n");
+        return 1;
+    }
+
+    std::vector<float> hx((size_t) max_T * max_in);
+    std::mt19937 rng(202611);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (auto& v : hx) v = nd(rng);
+    q.memcpy(dx, hx.data(), hx.size() * 4).wait();
+
+    std::printf("q36_mmvq_dense_parity --pp%s on %s\n", full_bench ? "-bench" : "",
+                q.get_device().get_info<sycl::info::device::name>().c_str());
+    std::printf("%-6s %-6s %5s x %6s %4s | %9s %8s %7s | %9s %8s %7s %5s | %9s %10s %10s\n",
+                "type", "shape", "K", "N", "T",
+                "f16_us", "f16_GB/s", "f16_TF",
+                "i8_us", "i8_GB/s", "i8_TF", "gain",
+                "f64_rms", "f16_rms", "f16_max");
+    std::fflush(stdout);
+
+    int bad = 0;
+    for (int t : types) {
+        const PpFormat* pf = pp_format_of(t);
+        if (!pf) { std::printf("type %d unsupported by --pp\n", t); continue; }
+        fill_pp_pool(t, hpool);
+        q.memcpy(dpool, hpool.data(), pool_bytes).wait();
+
+        for (const PpShape& sh : shapes) {
+            const bool match = (ssel == "27" && shape_in_27(sh.name)) || ssel == "all" || ssel == sh.name;
+            if (!match) continue;
+            const size_t wb = (size_t) sh.n_out * (sh.n_in / 256) * pf->blk_bytes_256;
+            const bool has_f16 = (t != 1004) || ((size_t) sh.n_out * sh.n_in <= dw16_elems);
+            const int ndist = (int) std::max<size_t>(1, std::min<size_t>(32, pool_bytes / wb));
+            const int nmat  = full_bench ? std::max(ndist, (wb > (200u << 20) ? 3 : 7)) : 1;
+            const int reps  = full_bench ? (wb > (200u << 20) ? 3 : 7) : 1;
+
+            std::vector<int> srows;
+            const int n_edge = std::min(16, sh.n_out);
+            for (int i = 0; i < n_edge; ++i) srows.push_back(i);
+            if (sh.n_out > 16) {
+                const int b0 = std::max(n_edge, sh.n_out - 16);
+                for (int i = b0; i < sh.n_out; ++i) srows.push_back(i);
+            }
+
+            for (const int T : ncl) {
+                if (T <= 0 || T > max_T) continue;
+                const size_t n_act = (size_t) T * sh.n_in;
+                q.parallel_for(sycl::range<1>(n_act), [=](sycl::id<1> i) { dx16[i] = (uint16_t) sycl::bit_cast<uint16_t>(sycl::half(dx[i])); });
+                k::native_quantize_q8_1(dx, xq, (int) n_act, 1, &q);
+                q.wait();
+
+                std::vector<int> scols;
+                for (int c : {0, 1, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, T / 2, T - 4, T - 2, T - 1}) {
+                    if (c >= 0 && c < T && std::find(scols.begin(), scols.end(), c) == scols.end()) scols.push_back(c);
+                }
+
+                auto run_f16 = [&](const uint8_t* wptr) {
+                    const float alpha = 1.0f, beta = 0.0f;
+                    if (t == 1004) {
+                        strata::q36xr::w4_dequant_f16(wptr, dw16, sh.n_in, sh.n_out, &q);
+                        dpct::blas::gemm(blas, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
+                                         sh.n_out, T, sh.n_in, &alpha, dw16, dpct::library_data_t::real_half, sh.n_in,
+                                         dx16, dpct::library_data_t::real_half, sh.n_in, &beta,
+                                         y, dpct::library_data_t::real_float, sh.n_out, dpct::compute_type::f32);
+                        return;
+                    }
+                    const int slice = (int) std::min<size_t>(sh.n_out, dw16_elems / sh.n_in);
+                    for (int r0 = 0; r0 < sh.n_out; r0 += slice) {
+                        const int rn = std::min(slice, sh.n_out - r0);
+                        k::dequant_f16(t, wptr, r0, rn, sh.n_in, dw16, &q);
+                        dpct::blas::gemm(blas, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
+                                         rn, T, sh.n_in, &alpha, dw16, dpct::library_data_t::real_half, sh.n_in,
+                                         dx16, dpct::library_data_t::real_half, sh.n_in, &beta,
+                                         y + r0, dpct::library_data_t::real_float, sh.n_out, dpct::compute_type::f32);
+                    }
+                };
+                auto run_i8 = [&](const uint8_t* wptr) {
+                    if (!strata::q36pp::gemm(t, wptr, xq, y, sh.n_in, sh.n_out, T, &q)) {
+                        throw std::runtime_error("q36pp::gemm declined a --pp case");
+                    }
+                };
+
+                const size_t check_slot = (size_t) ((nmat - 1) % ndist) * wb;
+                std::vector<float> hy_f16, hy_i8((size_t) T * sh.n_out);
+                if (has_f16) {
+                    hy_f16.resize((size_t) T * sh.n_out);
+                    run_f16(dpool + check_slot);
+                    q.wait();
+                    q.memcpy(hy_f16.data(), y, hy_f16.size() * 4).wait();
+                }
+
+                run_i8(dpool + check_slot);
+                q.wait();
+                q.memcpy(hy_i8.data(), y, hy_i8.size() * 4).wait();
+
+                const size_t row_qb = (size_t) (sh.n_in / 32) * 36;
+                std::vector<uint8_t> xq_samp(scols.size() * row_qb);
+                for (size_t ci = 0; ci < scols.size(); ++ci) {
+                    q.memcpy(&xq_samp[ci * row_qb], (const uint8_t*) xq + (size_t) scols[ci] * row_qb, row_qb);
+                }
+                q.wait();
+                std::vector<double> x_samp, ref_samp;
+                dequant_q8_1(xq_samp.data(), sh.n_in, (int) scols.size(), x_samp);
+                std::vector<uint8_t> w_check(wb);
+                std::memcpy(w_check.data(), &hpool[check_slot], wb);
+                pp_ref_rows(t, w_check, sh.n_in, sh.n_out, srows, x_samp, (int) scols.size(), ref_samp);
+
+                double f64_ss = 0.0, f64_sd = 0.0;
+                long long nonfinite = 0;
+                const int nr_samp = (int) srows.size();
+                for (size_t ci = 0; ci < scols.size(); ++ci) {
+                    for (int ri = 0; ri < nr_samp; ++ri) {
+                        const float got = hy_i8[(size_t) scols[ci] * sh.n_out + srows[ri]];
+                        const double rf = ref_samp[ci * nr_samp + ri];
+                        if (!std::isfinite(got)) { ++nonfinite; continue; }
+                        f64_ss += rf * rf;
+                        f64_sd += ((double) got - rf) * ((double) got - rf);
+                    }
+                }
+                const double f64_rel = std::sqrt(f64_sd / std::max(f64_ss, 1e-30));
+
+                double f16_ss = 0.0, f16_sd = 0.0, f16_max = 0.0;
+                if (has_f16) {
+                    for (size_t i = 0; i < hy_i8.size(); ++i) {
+                        if (!std::isfinite(hy_i8[i]) || !std::isfinite(hy_f16[i])) { ++nonfinite; continue; }
+                        const double dlt = (double) hy_i8[i] - hy_f16[i];
+                        f16_ss += (double) hy_f16[i] * hy_f16[i];
+                        f16_sd += dlt * dlt;
+                        f16_max = std::max(f16_max, std::fabs(dlt));
+                    }
+                }
+                const double f16_rel = has_f16 ? std::sqrt(f16_sd / std::max(f16_ss, 1e-30)) : 0.0;
+
+                const double u_f16 = has_f16 ? time_graph(q, nmat, [&](int m) { run_f16(dpool + (size_t) (m % ndist) * wb); }, reps) : 0.0;
+                const double u_i8  = time_graph(q, nmat, [&](int m) { run_i8(dpool + (size_t) (m % ndist) * wb); }, reps);
+
+                const double xb    = (double) T * (sh.n_in / 32) * 36;
+                const double bytes = (double) wb + xb;
+                const double flops = 2.0 * (double) T * sh.n_out * sh.n_in;
+                const double f16_gbs = has_f16 ? bytes / u_f16 / 1e3 : 0.0, i8_gbs = bytes / u_i8 / 1e3;
+                const double f16_tf  = has_f16 ? flops / u_f16 / 1e6 : 0.0, i8_tf  = flops / u_i8 / 1e6;
+                const bool ok = (nonfinite == 0 && f64_rel < 5e-4);
+                if (!ok) ++bad;
+                std::printf("%-6s %-6s %5d x %6d %4d | %9.1f %8.1f %7.2f | %9.1f %8.1f %7.2f %4.2fx | %9.2e %10.2e %10.3g %s\n",
+                            pf->name, sh.name, sh.n_in, sh.n_out, T,
+                            u_f16, f16_gbs, f16_tf,
+                            u_i8,  i8_gbs,  i8_tf, has_f16 ? (u_f16 / u_i8) : 0.0,
+                            f64_rel, f16_rel, f16_max, ok ? "ok" : "FAIL");
+
+                if (t == 1004) {
+                    auto run_w4f16 = [&](const uint8_t* wptr) {
+                        if (!strata::q36pp::gemm_w4_f16(wptr, dx16, y, sh.n_in, sh.n_out, T, &q)) {
+                            throw std::runtime_error("q36pp::gemm_w4_f16 declined a --pp case");
+                        }
+                    };
+                    std::vector<float> hy_w4((size_t) T * sh.n_out);
+                    run_w4f16(dpool + check_slot);
+                    q.wait();
+                    q.memcpy(hy_w4.data(), y, hy_w4.size() * 4).wait();
+
+                    std::vector<uint16_t> x16_h(scols.size() * (size_t) sh.n_in);
+                    for (size_t ci = 0; ci < scols.size(); ++ci) {
+                        q.memcpy(&x16_h[ci * (size_t) sh.n_in], dx16 + (size_t) scols[ci] * sh.n_in, (size_t) sh.n_in * 2);
+                    }
+                    q.wait();
+                    std::vector<double> x16_samp(x16_h.size()), ref16_samp;
+                    for (size_t i = 0; i < x16_h.size(); ++i) {
+                        x16_samp[i] = (double) (float) sycl::bit_cast<sycl::half>(x16_h[i]);
+                    }
+                    pp_ref_rows(1004, w_check, sh.n_in, sh.n_out, srows, x16_samp, (int) scols.size(), ref16_samp);
+
+                    double w4_ss = 0.0, w4_sd = 0.0;
+                    long long w4_nf = 0;
+                    for (size_t ci = 0; ci < scols.size(); ++ci) {
+                        for (int ri = 0; ri < nr_samp; ++ri) {
+                            const float got = hy_w4[(size_t) scols[ci] * sh.n_out + srows[ri]];
+                            const double rf = ref16_samp[ci * nr_samp + ri];
+                            if (!std::isfinite(got)) { ++w4_nf; continue; }
+                            w4_ss += rf * rf;
+                            w4_sd += ((double) got - rf) * ((double) got - rf);
+                        }
+                    }
+                    const double w4_f64_rel = std::sqrt(w4_sd / std::max(w4_ss, 1e-30));
+
+                    double w4_f16_ss = 0.0, w4_f16_sd = 0.0, w4_f16_max = 0.0;
+                    if (has_f16) {
+                        for (size_t i = 0; i < hy_w4.size(); ++i) {
+                            if (!std::isfinite(hy_w4[i]) || !std::isfinite(hy_f16[i])) { ++w4_nf; continue; }
+                            const double dlt = (double) hy_w4[i] - hy_f16[i];
+                            w4_f16_ss += (double) hy_f16[i] * hy_f16[i];
+                            w4_f16_sd += dlt * dlt;
+                            w4_f16_max = std::max(w4_f16_max, std::fabs(dlt));
+                        }
+                    }
+                    const double w4_f16_rel = has_f16 ? std::sqrt(w4_f16_sd / std::max(w4_f16_ss, 1e-30)) : 0.0;
+                    const double u_w4 = time_graph(q, nmat, [&](int m) { run_w4f16(dpool + (size_t) (m % ndist) * wb); }, reps);
+                    const double w4_bytes = (double) wb + (double) T * sh.n_in * 2.0;
+                    const double w4_gbs = w4_bytes / u_w4 / 1e3;
+                    const double w4_tf  = flops / u_w4 / 1e6;
+                    const bool ok_w4 = (w4_nf == 0 && w4_f64_rel < 5e-4);
+                    if (!ok_w4) ++bad;
+                    std::printf("%-6s %-6s %5d x %6d %4d | %9.1f %8.1f %7.2f | %9.1f %8.1f %7.2f %4.2fx | %9.2e %10.2e %10.3g %s\n",
+                                "W4F16", sh.name, sh.n_in, sh.n_out, T,
+                                u_f16, f16_gbs, f16_tf,
+                                u_w4,  w4_gbs,  w4_tf, has_f16 ? (u_f16 / u_w4) : 0.0,
+                                w4_f64_rel, w4_f16_rel, w4_f16_max, ok_w4 ? "ok" : "FAIL");
+                }
+                std::fflush(stdout);
+            }
+        }
+    }
+    delete blas;
+    sycl::free(dpool, q); sycl::free(dw16, q); sycl::free(y, q); sycl::free(dx, q); sycl::free(dx16, q); sycl::free(xq, q);
+    return bad ? 1 : 0;
+}
+
 }  // namespace
 
 // --w4 [ncols] [shape]: the B70W4 form (q36_xr_dense.dp.cpp, tools/qwen35/b70w4_pack.py's records) on random packs: us per
@@ -1386,6 +1773,16 @@ int main(int argc, char** argv) try {
     if (argc > 1 && std::string(argv[1]) == "--floor") return floor_bench();
     if (argc > 1 && std::string(argv[1]) == "--xatt") return xatt_bench(argc > 2 ? argv[2] : "1,5,6,16", argc > 3 ? std::atoi(argv[3]) : 25120, argc > 4 ? std::atoi(argv[4]) : 1);
     if (argc > 1 && std::string(argv[1]) == "--w4") return w4_bench(argc > 2 ? argv[2] : "1,4,5,6,8", argc > 3 ? argv[3] : "27");
+    if (argc > 1 && (std::string(argv[1]) == "--pp" || std::string(argv[1]) == "--pp-bench")) {
+        const bool is_pp_bench = std::string(argv[1]) == "--pp-bench";
+        int idx = 2;
+        bool bench_flag = is_pp_bench;
+        if (idx < argc && std::string(argv[idx]) == "--bench") { bench_flag = true; ++idx; }
+        const char* types_s = idx < argc ? argv[idx++] : "1004,12,13,23,14,11,20,8";
+        const char* ncols_s = idx < argc ? argv[idx++] : "256,1024,2048";
+        const std::string ssel = idx < argc ? argv[idx++] : "27";
+        return pp_bench(types_s, ncols_s, ssel, bench_flag);
+    }
     if (argc > 1 && std::string(argv[1]) == "--bench")
         return bench(argc > 2 ? argv[2] : "12,13,14,23", argc > 3 ? argv[3] : "1,2,3,4,6", argc > 4 ? argv[4] : "all");
     for (int i = 1; i < argc; ++i) {

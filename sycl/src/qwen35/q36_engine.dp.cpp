@@ -35,6 +35,7 @@
 #include "q36_mmvq_dense.hpp"
 #include "q36_xr_dense.hpp"
 #include "q36_xatt.hpp"
+#include "q36_pp_i8.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -4329,8 +4330,66 @@ struct Engine {
             apply(w, q, out, T);
         }
     }
+    const float* pp_cur_src = nullptr;
+    int pp_cur_n = 0, pp_cur_T = 0;
+    const float* pp_x16_src = nullptr;
+    int pp_x16_n = 0, pp_x16_T = 0;
+    const float* pp_q8_src = nullptr;
+    int pp_q8_n = 0, pp_q8_T = 0;
+    static int pp_i8_mode() {
+        static const int v = [] {
+            const char* e = std::getenv("STRATA_Q36_PP_I8");
+            return e ? std::atoi(e) : 1;
+        }();
+        return v;
+    }
+    static int pp_w4_mode() {
+        static const int v = [] {
+            const char* e = std::getenv("STRATA_Q36_PP_W4");
+            return e ? std::atoi(e) : 1;
+        }();
+        return v;
+    }
+    bool use_w4_f16(const Mat& w, int T) const {
+        const int mode = pp_w4_mode();
+        if (mode == 0 || w.type != kW4Type || T <= kGemmT) return false;
+        if (!strata::q36pp::handles_w4_f16(w.n_in, w.n_out, T)) return false;
+        if (mode >= 2) return true;
+        if ((int64_t) w.n_in * w.n_out > w4_f16_elems) return true;
+        if (w.n_out < 4096) return T >= 192 && T <= 768;
+        if (w.n_in >= 16384) return T <= 2048;
+        return T <= 1280;
+    }
+    static bool use_pp_i8(const Mat& w, int T) {
+        const int mode = pp_i8_mode();
+        if (mode == 0 || w.type == kW4Type || T <= kGemmT) return false;
+        if (!strata::q36pp::handles(w.type, w.n_in, w.n_out, T)) return false;
+        if (mode >= 2) return true;
+        return w.n_out >= 4096 && T <= 384;
+    }
+    void invalidate_pp() { pp_x16_src = nullptr; pp_q8_src = nullptr; }
+    void ensure_pp_x16() {
+        if (pp_x16_src == pp_cur_src && pp_x16_n == pp_cur_n && pp_x16_T == pp_cur_T) return;
+        auto exp_props = sycl::ext::oneapi::experimental::properties{};
+        const float* xin = pp_cur_src;
+        const int64_t nt = (int64_t) pp_cur_n * pp_cur_T;
+        ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
+            auto x16_ct1 = x16;
+            cgh.parallel_for<dpct_kernel_name<class k_to_f16_a77384>>(
+                sycl::nd_range<3>(sycl::range(1, 1, grid1(nt)) * sycl::range(1, 1, kThreads),
+                                  sycl::range(1, 1, kThreads)),
+                exp_props, [=](sycl::nd_item<3>) { k_to_f16(xin, x16_ct1, nt); });
+        });
+        pp_x16_src = pp_cur_src; pp_x16_n = pp_cur_n; pp_x16_T = pp_cur_T;
+    }
+    void ensure_pp_q8() {
+        if (pp_q8_src == pp_cur_src && pp_q8_n == pp_cur_n && pp_q8_T == pp_cur_T) return;
+        quant(pp_cur_src, pp_cur_n, pp_cur_T, q8);
+        pp_q8_src = pp_cur_src; pp_q8_n = pp_cur_n; pp_q8_T = pp_cur_T;
+    }
+
     void mm(const Mat& w, const float* xin, float* out, int T) {
-        if (T > kGemmT && w.type == kW4Type && (int64_t) w.n_in * w.n_out > w4_f16_elems) {
+        if (T > kGemmT && w.type == kW4Type && !use_w4_f16(w, T) && (int64_t) w.n_in * w.n_out > w4_f16_elems) {
             q8_src = nullptr;
             for (int c0 = 0; c0 < T; c0 += kGemmT) {
                 mm(w, xin + (size_t) c0 * w.n_in, out + (size_t) c0 * w.n_out, std::min(kGemmT, T - c0));
@@ -4451,29 +4510,37 @@ struct Engine {
     static_assert(kDecT >= kGemmT && kDecT >= kVerify, "the decode GDN kernels take every decode-side row count");
     void prep(const float* xin, int n, int T, void* q) {
         if (T > kGemmT) {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{};
-            
-
-            ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
-                auto x16_ct1 = x16;
-                auto int64_t_n_T_ct2 = (int64_t)n * T;
-
-                cgh.parallel_for<dpct_kernel_name<class k_to_f16_a77384>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, grid1((int64_t)n * T)) *
-                                          sycl::range(1, 1, kThreads),
-                                      sycl::range(1, 1, kThreads)),
-                    exp_props, [=](sycl::nd_item<3> item_ct1) {
-                        k_to_f16(xin, x16_ct1, int64_t_n_T_ct2);
-                    });
-            });
-            } else quant(xin, n, T, q);
+            invalidate_pp();
+            pp_cur_src = xin;
+            pp_cur_n = n;
+            pp_cur_T = T;
+        } else quant(xin, n, T, q);
     }
     void apply(const Mat& w, const void* q, float* out, int T) {
         if (T > kGemmT) {
-            if (w.type == kW4Type) {   // the pack as FP16, then the FP16 GEMM
+            if (use_w4_f16(w, T)) {
+                ensure_pp_x16();
+                if (strata::q36pp::gemm_w4_f16(w.d, x16, out, w.n_in, w.n_out, T, st)) return;
+            }
+            if (w.type == kW4Type) {
+                if ((int64_t) w.n_in * w.n_out > w4_f16_elems) {
+                    q8_src = nullptr;
+                    for (int c0 = 0; c0 < T; c0 += kGemmT) {
+                        mm(w, pp_cur_src + (size_t) c0 * w.n_in, out + (size_t) c0 * w.n_out, std::min(kGemmT, T - c0));
+                    }
+                    return;
+                }
+                ensure_pp_x16();
                 strata::q36xr::w4_dequant_f16(w.d, w4_f16, w.n_in, w.n_out, st);
                 gemm.f16((const uint16_t*) x16, w4_f16, out, T, w.n_out, w.n_in);
+            } else if (use_pp_i8(w, T)) {
+                ensure_pp_q8();
+                if (!strata::q36pp::gemm(w.type, w.d, q8, out, w.n_in, w.n_out, T, st)) {
+                    ensure_pp_x16();
+                    gemm.native((const uint16_t*) x16, w.type, w.d, out, T, w.n_out, w.n_in);
+                }
             } else {
+                ensure_pp_x16();
                 gemm.native((const uint16_t*) x16, w.type, w.d, out, T, w.n_out, w.n_in);
             }
         } else mmq(w, q, out, T);
@@ -5199,28 +5266,16 @@ work-group size if needed.
             mmq(L.ffn_down, q8, sy, T);
             }
         } else {
-            {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{};
-                
-
-                ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
-                    const float *h_ct0 = h;
-                    auto x16_ct1 = x16;
-                    auto int64_t_N_T_ct2 = (int64_t)N * T;
-
-                    cgh.parallel_for<dpct_kernel_name<class k_to_f16_3a08c5>>(
-                        sycl::nd_range<3>(
-                            sycl::range(1, 1, grid1((int64_t)N * T)) *
-                                sycl::range(1, 1, kThreads),
-                            sycl::range(1, 1, kThreads)),
-                        exp_props, [=](sycl::nd_item<3> item_ct1) {
-                            k_to_f16(h_ct0, x16_ct1, int64_t_N_T_ct2);
-                        });
-                });
-            }
+            prep(h, N, T, q8);
             apply(L.ffn_gate, nullptr, sg, T);
             apply(L.ffn_up, nullptr, su, T);
-            {
+            invalidate_pp();
+            if (use_pp_i8(L.ffn_down, T)) {
+                q8_src = nullptr;
+                K::native_swiglu_quantize_q8_1(sg, su, q8, FF * T, 1, st);
+                pp_cur_src = sg; pp_cur_n = FF; pp_cur_T = T;
+                pp_q8_src = sg; pp_q8_n = FF; pp_q8_T = T;
+            } else {
                 // M3a: SwiGLU straight into ffn_down's FP16 operand (x16; the in-order queue runs it after the gate / up
                 // GEMMs read x16): k_swiglu + k_to_f16's values in one pass
                 const float *sg_ct0 = sg;
@@ -5230,6 +5285,8 @@ work-group size if needed.
                 ((sycl::queue *)(st))->parallel_for<dpct_kernel_name<class k_swiglu16_m3a>>(
                     sycl::nd_range<3>(sycl::range(1, 1, grid1(n_ct3)) * sycl::range(1, 1, kThreads), sycl::range(1, 1, kThreads)),
                     [=](sycl::nd_item<3>) { k_swiglu16(sg_ct0, su_ct1, x16_ct2, n_ct3); });
+                pp_cur_src = sg; pp_cur_n = FF; pp_cur_T = T;
+                pp_x16_src = sg; pp_x16_n = FF; pp_x16_T = T;
             }
             apply(L.ffn_down, nullptr, sy, T);
         }
@@ -6142,24 +6199,7 @@ work-group size if needed.
                                      std::min<int64_t>(n_ent, g.n_expert), n_ent, xq, escr, eparts, st);
         }
         // the shared expert, scaled by sigmoid(w . h)
-        if (T > kGemmT) {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{};
-            
-
-            ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
-                const float *h_ct0 = h;
-                auto x16_ct1 = x16;
-                auto int64_t_N_T_ct2 = (int64_t)N * T;
-
-                cgh.parallel_for<dpct_kernel_name<class k_to_f16_78cee1>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, grid1((int64_t)N * T)) *
-                                          sycl::range(1, 1, kThreads),
-                                      sycl::range(1, 1, kThreads)),
-                    exp_props, [=](sycl::nd_item<3> item_ct1) {
-                        k_to_f16(h_ct0, x16_ct1, int64_t_N_T_ct2);
-                    });
-            });
-        }
+        if (T > kGemmT) prep(h, N, T, xq);
         if (T <= kGemmT) {
             if (!shared_gu(L, T)) {
                 apply(L.sh_gate, xq, sg, T);
