@@ -64,4 +64,77 @@ struct Call {
 /// false: the shape is not taken (the caller runs k_attn_gqa).
 bool attend(const Call& c, void* stream);
 
+// ---- XATT2 (STRATA_Q36_XATT2=1): single-pass online-softmax ESIMD+DPAS split-K attention + fast ESIMD merge.
+constexpr int kMaxBatchGroups2 = 16;   // max slot groups in one batched rows_mode launch (total tokens <= 16)
+constexpr int kMaxSegs2 = 96;          // fits inside Engine::n_chunk = 96 partials allocation
+
+inline std::size_t qb2_dwords(int hkv) { return (std::size_t) hkv * 8 * kMaxBatchGroups2 * 128; }
+inline std::size_t qs2_floats(int hkv) { return (std::size_t) hkv * kMaxBatchGroups2 * 16; }
+
+struct BatchGroup2 {
+    int32_t slot = 0;   // index into k_tab / v_tab / mir_tab
+    int32_t r0 = 0;     // starting token index in q [0..nt) and out [0..nt)
+    int32_t cnt = 0;    // consecutive tokens of this slot
+    int32_t cell_hint = 0;   // host estimate of cell0 (optional, for sizing only)
+};
+
+struct Call2 {
+    const float* q = nullptr;            // [nt, H, 256] queries (from t0=0)
+    const int32_t* pos0 = nullptr;       // single-session: *pos0; batch (ngrp > 0): device [nt] d_rcell
+    int t0 = 0, nt = 1;                  // tokens [0, nt), nt <= 16
+    int H = 24, HKV = 4;                 // H == 6 * HKV, HD == 256
+    float scale = 1.0f / 16.0f;          // 1 / sqrt(256)
+
+    // Single-session KV pointers (used when ngrp == 0):
+    const uint32_t* k8 = nullptr;        // [HKV][kstride][64 dwords]
+    const float* ks = nullptr;           // ns == 1: [HKV][kstride]
+    const uint16_t* ks16 = nullptr;      // ns == 4: [HKV][kstride][4]
+    const uint32_t* v8t = nullptr;       // [HKV][ctxp/32][256][8 dwords]
+    const float* vs = nullptr;           // [HKV][ctxp]
+
+    // Batch-mode KV tables (used when ngrp > 0):
+    // When kv_vt (ns == 4): k_tab[slot] -> k8 (+ HKV*ctx*256 -> ks16), v_tab[slot] -> v8t (+ v8t_dwords*4 -> vs).
+    // When !kv_vt: mir_tab[slot * 4 + {0..3}] = {xk8, xks_or_ks16, xv8t, xvs}.
+    void* const* k_tab = nullptr;
+    void* const* v_tab = nullptr;
+    const void* const* mir_tab = nullptr;
+    int ngrp = 0;
+    BatchGroup2 grp[kMaxBatchGroups2]{};
+
+    int ns = 1;                          // 1 or 4
+    int ctx = 0;                         // kstride for ns==4 via k_tab
+    int kstride = 0;                     // cells per KV head of K (0 -> ctxp)
+    int ctxp = 0;                        // ctx_pad(ctx)
+    int pos_hint = 0;                    // host cell count estimate for auto nseg selection
+    int nseg_max = kMaxSegs2;            // max segments allocated in pacc/pm/pl
+
+    // Tiny query scratch (NO xsc, xpb, or xsrow required!):
+    uint32_t* qb = nullptr;              // >= qb2_dwords(HKV) dwords
+    float* qs = nullptr;                 // >= qs2_floats(HKV) floats
+
+    // Split-K partials [row][nseg][256 / 1] (fits in pacc/pm/pl):
+    float* pacc = nullptr;
+    float* pm = nullptr;
+    float* pl = nullptr;
+
+    // Optional final output + gate (when out != nullptr, attend2 runs k_xatt2_merge directly):
+    const float* gate = nullptr;         // optional [nt * H * 256]
+    float* out = nullptr;                // optional [nt * H * 256]
+
+    // Optional tree verify mask (single-session only):
+    const uint32_t* tmask = nullptr;
+    const int32_t* tp0 = nullptr;
+
+    // Tuning / sweep overrides (-1 = use env/default):
+    int form_override = -1;              // -1=auto/env, 0=S1, 1=D2, 2=S8(SLM), 3=L8(noSLM)
+    int nseg_override = 0;               // 0=auto/env, >0=fixed segments per KV head
+    int u16_override = -1;               // -1=auto/env (default 1), 0=u8 P, 1=u16 P
+    int zero_fence = 0;                  // runtime 0 for anti-hoist fencing
+};
+
+/// Returns the form name string ("S1", "D2", "S8", "L8").
+const char* xatt2_form_name(int form);
+/// Single-pass online-softmax attention (+ merge when c.out != nullptr).
+bool attend2(const Call2& c, void* stream);
+
 }   // namespace strata::q36xatt

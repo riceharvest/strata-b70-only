@@ -1186,6 +1186,14 @@ inline bool q36_xatt_batch_on() {
     }();
     return on;
 }
+/// Single-pass online-softmax ESIMD+DPAS split-K decode attention (q36_xatt.dp.cpp's attend2). Read once; default off (0).
+inline bool q36_xatt2_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_Q36_XATT2");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
 /// Bytes of one cache allocation (one layer's K, or its V) of n = HKV * ctx * HD values: the codes and their scales.
 inline size_t q36_kv_alloc_bytes(size_t n) {
     return q36_kv() == kKvF32 ? n * 4 : q36_kv() == kKvQ8 ? n + n / 64 * 2 : n * 2;
@@ -3554,6 +3562,8 @@ struct Engine {
     bool xbatch_xatt_any = false;
     uint32_t *xqb = nullptr, *xpb = nullptr;
     float *xqs = nullptr, *xsc = nullptr, *xsrow = nullptr;
+    bool xatt2_on = false;
+    const void** d_xmir_tab = nullptr;
     bool kv_f32 = false;           // the cache in FP32 (STRATA_Q36_KV=f32)
     bool kv_q8 = false;            // the cache in int8 (q36_kv_set: past 131072 cells, STRATA_Q36_KV=q8, --kv int8), else FP16
     bool attn_head = false;        // STRATA_Q36_ATTN_HEAD=1: the rows' attention per query head (M1's k_attn_part)
@@ -4069,6 +4079,7 @@ struct Engine {
             const bool xwant = xsw.want;
             const bool batch_ok = n_sess == 1 || q36_xatt_batch_on();
             const bool xshape = batch_ok && !attn_head && (int) g.head_dim == xa::kHD && (int) g.n_head == xa::kG * (int) g.n_head_kv;
+            xatt2_on = q36_xatt2_on();
             if (xwant && xshape) {
                 // the 8-bit cache then stores V transposed (kv_vt) for all sessions and needs no mirror; if the fit fails
                 // below it goes back to the plain layout (kv_vt = false), so V is transposed only when XATT is active
@@ -4090,11 +4101,18 @@ struct Engine {
                 dpct::get_current_device().get_memory_info(vfr, vtot);
                 int ls = 0;
                 size_t scratch = 0;
-                for (const int t : {6, 3, 2}) {
-                    scratch = (xa::score_floats(hkv, n_chunk, xcapc, t) + xa::pb_dwords(hkv, n_chunk, xcapc, t)) * 4;
+                if (xatt2_on) {
+                    scratch = (xa::qb2_dwords(hkv) + xa::qs2_floats(hkv)) * 4;
                     const bool fits_2g = vfr >= total_mir + scratch + total_cache + ((size_t) 2 << 30);
                     const bool fits_xe = xe && (n_sess == 1 || vfr > total_mir + scratch + total_cache);
-                    if (fits_2g || fits_xe) { ls = t; break; }
+                    if (fits_2g || fits_xe) ls = 6;
+                } else {
+                    for (const int t : {6, 3, 2}) {
+                        scratch = (xa::score_floats(hkv, n_chunk, xcapc, t) + xa::pb_dwords(hkv, n_chunk, xcapc, t)) * 4;
+                        const bool fits_2g = vfr >= total_mir + scratch + total_cache + ((size_t) 2 << 30);
+                        const bool fits_xe = xe && (n_sess == 1 || vfr > total_mir + scratch + total_cache);
+                        if (fits_2g || fits_xe) { ls = t; break; }
+                    }
                 }
                 if (ls == 0) {
                     kv_vt = false;   // (no attention reads a transposed V: all sessions keep the plain layout)
@@ -4108,17 +4126,24 @@ struct Engine {
                 } else {
                     if (const char* e = std::getenv("STRATA_Q36_XATT_MIN")) xatt_min = std::max(64, std::atoi(e));
                     xls_max = ls;
-                    xqb = reinterpret_cast<uint32_t*>(dalloc(xa::qb_dwords(hkv)));
-                    xqs = dalloc(xa::qs_floats(hkv));
-                    xsc = dalloc(xa::score_floats(hkv, n_chunk, xcapc, ls));
-                    xpb = reinterpret_cast<uint32_t*>(dalloc(xa::pb_dwords(hkv, n_chunk, xcapc, ls)));
-                    xsrow = dalloc(xa::srow_floats(hkv, n_chunk));
+                    if (xatt2_on) {
+                        xqb = reinterpret_cast<uint32_t*>(dalloc(xa::qb2_dwords(hkv)));
+                        xqs = dalloc(xa::qs2_floats(hkv));
+                    } else {
+                        xqb = reinterpret_cast<uint32_t*>(dalloc(xa::qb_dwords(hkv)));
+                        xqs = dalloc(xa::qs_floats(hkv));
+                        xsc = dalloc(xa::score_floats(hkv, n_chunk, xcapc, ls));
+                        xpb = reinterpret_cast<uint32_t*>(dalloc(xa::pb_dwords(hkv, n_chunk, xcapc, ls)));
+                        xsrow = dalloc(xa::srow_floats(hkv, n_chunk));
+                    }
                     xpos_d = reinterpret_cast<int32_t*>(dalloc(4));
                     xatt_ready = true;
                     char btag[32] = "";
                     if (n_sess > 1) std::snprintf(btag, sizeof btag, ", %d slots", n_sess);
-                    std::fprintf(stderr, "strata-q36: decode attention on the matrix engine from %d cells on (%s, transposed int8 V; windows of up "
-                                         "to %d tokens%s): %.2f GiB of VRAM\n", xatt_min,
+                    std::fprintf(stderr, "strata-q36: decode attention on %s from %d cells on (%s, transposed int8 V; windows of up "
+                                         "to %d tokens%s): %.2f GiB of VRAM\n",
+                                 xatt2_on ? "XATT2 single-pass matrix engine" : "the matrix engine",
+                                 xatt_min,
                                  kv_vt ? "the 8-bit cache as it is: its K" : xatt_kq8 ? "the 8-bit cache's K" : "int8 K",
                                  ls * 16 / xa::kG, btag, (double) (total_mir + scratch) / 1073741824.0);
                 }
@@ -4239,6 +4264,20 @@ struct Engine {
                         .memcpy((void *)*tb.first, tb.second->data(),
                                 tb.second->size() * sizeof(float *))
                         .wait()));
+            }
+            if (xatt2_on && xatt_ready && !kv_vt) {
+                std::vector<const void*> hm(ns * (size_t) n_sess * 4u, nullptr);
+                for (size_t li = 0; li < ns; ++li)
+                    for (int s_ = 0; s_ < n_sess; ++s_) {
+                        const Sess& ss = sess[(size_t) s_];
+                        const size_t b = (li * (size_t) n_sess + (size_t) s_) * 4u;
+                        hm[b + 0] = (!xatt_kq8 && li < ss.xk8.size()) ? ss.xk8[li] : nullptr;
+                        hm[b + 1] = (!xatt_kq8 && li < ss.xks.size()) ? ss.xks[li] : nullptr;
+                        hm[b + 2] = (li < ss.xv8t.size()) ? ss.xv8t[li] : nullptr;
+                        hm[b + 3] = (li < ss.xvs.size()) ? ss.xvs[li] : nullptr;
+                    }
+                CK(DPCT_CHECK_ERROR(d_xmir_tab = sycl::malloc_device<const void*>(hm.size(), q_ct1)));
+                CK(DPCT_CHECK_ERROR(q_ct1.memcpy((void*) d_xmir_tab, hm.data(), hm.size() * sizeof(const void*)).wait()));
             }
             d_rcell = dalloc_t<int32_t>(kVerify);
             d_rslot = dalloc_t<int32_t>(kVerify);
@@ -5884,6 +5923,80 @@ work-group size if needed.
             // summed them in another order, and the MTP answer on code-v1 left the plain one at token 70 (44 at 6+
             // drafts).  A window of 3+ tokens at G = 6 takes ceil(T / 2) row groups, each reading the K / V once.)
             (void) slm64;
+            if (xatt2_on) {
+                bool xatt2_merged = false;
+                if (rows_mode && xbatch_xatt_any && t0 == 0 && nt == T) {
+                    strata::q36xatt::Call2 cb{};
+                    cb.q = qq;
+                    cb.pos0 = d_rcell;
+                    cb.t0 = 0;
+                    cb.nt = nt;
+                    cb.H = H; cb.HKV = HKV; cb.scale = scale;
+                    cb.ns = xatt_kq8 ? 4 : 1;
+                    cb.ctx = ctx;
+                    cb.kstride = xatt_kq8 ? ctx : xctxp;
+                    cb.ctxp = xctxp;
+                    cb.nseg_max = nch;
+                    if (xatt_kq8) cb.k_tab = reinterpret_cast<void* const*>(d_kc_tab + li * n_sess);
+                    if (kv_vt) cb.v_tab = reinterpret_cast<void* const*>(d_vc_tab + li * n_sess);
+                    if (!kv_vt) cb.mir_tab = d_xmir_tab ? (d_xmir_tab + (li * n_sess) * 4) : nullptr;
+                    cb.qb = xqb; cb.qs = xqs;
+                    cb.pacc = pa; cb.pm = pmx; cb.pl = psum;
+                    cb.gate = gg; cb.out = oo;
+                    int max_cell = 0;
+                    for (const XBatchSlot& bs : xbatch_slots) {
+                        if (bs.xatt) {
+                            if (cb.ngrp >= strata::q36xatt::kMaxBatchGroups2) { cb.ngrp = 0; break; }
+                            const int ch = (int) (bs.cell0 + bs.cnt);
+                            cb.grp[cb.ngrp++] = {bs.slot, bs.r0, bs.cnt, ch};
+                            if (ch > max_cell) max_cell = ch;
+                        }
+                    }
+                    cb.pos_hint = max_cell;
+                    if (cb.ngrp > 0 && strata::q36xatt::attend2(cb, st)) {
+                        for (const XBatchSlot& bs : xbatch_slots) {
+                            if (!bs.xatt) {
+                                run_range(bs.r0, bs.cnt);
+                                st->parallel_for<dpct_kernel_name<class k_attn_merge_gqa_x2fb, KV>>(
+                                    sycl::nd_range<3>(sycl::range(1, 1, bs.cnt * H) * sycl::range(1, 1, HD), sycl::range(1, 1, HD)),
+                                    [=](sycl::nd_item<3> item_ct1) {
+                                        k_attn_merge_gqa(pa, pmx, psum, gg, dpos, bs.r0, bs.cnt, H, nch, oo, rs);
+                                    });
+                            }
+                        }
+                        xatt2_merged = true;
+                    }
+                } else if (!rows_mode && xatt_ready && xatt_now && t0 == 0 && nt == T && nt <= 16) {
+                    const Sess& bss = sess[(size_t) cur];
+                    if (kv_vt || (li < bss.xv8t.size() && bss.xv8t[li] != nullptr)) {
+                        strata::q36xatt::Call2 c2{};
+                        c2.q = qq; c2.pos0 = dpos; c2.t0 = 0; c2.nt = nt;
+                        c2.H = H; c2.HKV = HKV; c2.scale = scale;
+                        if (xatt_kq8) {
+                            c2.k8 = reinterpret_cast<const uint32_t*>(kcl);
+                            c2.ks16 = reinterpret_cast<const uint16_t*>(reinterpret_cast<const int8_t*>(kcl) + (size_t) HKV * ctx * HD);
+                            c2.ns = 4; c2.kstride = ctx;
+                        } else {
+                            c2.k8 = bss.xk8[li]; c2.ks = bss.xks[li]; c2.ns = 1; c2.kstride = xctxp;
+                        }
+                        if (kv_vt) {
+                            c2.v8t = reinterpret_cast<const uint32_t*>(vcl);
+                            c2.vs = reinterpret_cast<const float*>(reinterpret_cast<const int8_t*>(vcl) + strata::q36xatt::v8t_dwords(HKV, xctxp) * 4);
+                        } else {
+                            c2.v8t = bss.xv8t[li]; c2.vs = bss.xvs[li];
+                        }
+                        c2.ctxp = xctxp;
+                        c2.pos_hint = (int) (p0 + nt);
+                        c2.nseg_max = nch;
+                        c2.qb = xqb; c2.qs = xqs; c2.pacc = pa; c2.pm = pmx; c2.pl = psum;
+                        c2.gate = gg; c2.out = oo;
+                        c2.tmask = tree_mode ? d_tmask : nullptr;
+                        c2.tp0 = tree_mode ? tree_tp0 : nullptr;
+                        if (strata::q36xatt::attend2(c2, st)) xatt2_merged = true;
+                    }
+                }
+                if (xatt2_merged) continue;
+            }
             if (rows_mode && xbatch_xatt_any && t0 == 0 && nt == T) {
                 for (const XBatchSlot& bs : xbatch_slots) {
                     const Sess& bss = sess[(size_t) bs.slot];
