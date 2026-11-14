@@ -588,6 +588,7 @@ if(STRATA_BUILD_Q36)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense.dp.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xr_dense.dp.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_dflash.dp.cpp   # the DFlash 2 block drafter (STRATA_Q36_DFLASH; off: never called)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_qsa.dp.cpp      # Qwen Sparse Attention: indexer, block selection, sparse attention (STRATA_Q36_QSA=<file>; unset: never called)
     ${STRATA_ROOT}/src/qwen35/q36_requant.cpp)
   target_compile_definitions(strata PRIVATE STRATA_Q36_PORT=1)
   # Host-only test of the DFlash drafter's verify tree (q36_dtree.hpp): best-first growth, DFS layout, the 2 GDN checkpoint slots simulated.
@@ -700,7 +701,9 @@ if(STRATA_BUILD_Q36)
                    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense.dp.cpp
                    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xr_dense.dp.cpp
                    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_dflash.dp.cpp
-                   ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_dflash_parity.cpp)
+                   ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_dflash_parity.cpp
+                   ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_qsa.dp.cpp
+                   ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_qsa_parity.cpp)   # --qsa
     target_include_directories(q36_mmvq_dense_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
     target_link_libraries(q36_mmvq_dense_parity PRIVATE strata_kernels strata_prefill q36_w4 q36_pp)
     set_target_properties(q36_mmvq_dense_parity PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
