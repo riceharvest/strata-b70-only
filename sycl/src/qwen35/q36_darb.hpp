@@ -28,7 +28,7 @@ struct ArbCfg {
     static ArbCfg from_env() {
         auto num = [](const char* k, double d) { const char* v = std::getenv(k); return v != nullptr && v[0] != '\0' ? std::atof(v) : d; };
         ArbCfg c;
-        c.on = num("STRATA_Q36_DFLASH_ARB", 0.0) != 0.0;
+        c.on = num("STRATA_Q36_DFLASH_ARB", 1.0) != 0.0;   // default on with the drafter (card 2026-11-14)
         c.period = std::max(2, (int) num("STRATA_Q36_DFLASH_ARB_PERIOD", 16));
         c.max_period = std::max(c.period, (int) num("STRATA_Q36_DFLASH_ARB_MAX_PERIOD", 256));
         c.init = std::max(1, (int) num("STRATA_Q36_DFLASH_ARB_INIT", 6));

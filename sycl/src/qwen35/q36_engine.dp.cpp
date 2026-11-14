@@ -11190,9 +11190,10 @@ int strata::qwen35::run(int argc, char** argv) {
             const char* mt = std::getenv("STRATA_Q36_DFLASH_MIN_TOK");
             E.df_keep_mtp = (mt == nullptr || mt[0] == '\0' ? 3.0 : std::atof(mt)) > 0.0 || strata::q36da::Arb::env_cfg().on;   // (the arbiter probes the MTP arm: its cache must be whole)
         }
-        if (const char* te = std::getenv("STRATA_Q36_DFLASH_TREE"); te != nullptr && std::atoi(te) != 0 && E.df_cap && !E.df_batch) {   // DFLASH TREE (single stream only)
+        if (const char* te = std::getenv("STRATA_Q36_DFLASH_TREE"); (te == nullptr || std::atoi(te) != 0) && E.df_cap && !E.df_batch) {   // default on with the drafter   // DFLASH TREE (single stream only)
             E.df_tree_force = std::getenv("STRATA_Q36_DFLASH_TREE_FORCE") != nullptr && std::atoi(std::getenv("STRATA_Q36_DFLASH_TREE_FORCE")) != 0;
             if (const char* tn = std::getenv("STRATA_Q36_DFLASH_TREE_NODES"); tn != nullptr && tn[0] != '\0') E.df_tree_rows = std::max(3, std::min(16, std::atoi(tn) + 1));
+            else E.df_tree_rows = 11;   // 10 draft nodes: the card's best (16 rows cost more than they gain)
             if (const char* tl = std::getenv("STRATA_Q36_DFLASH_TREE_LONG_ROWS"); tl != nullptr && tl[0] != '\0') E.df_tree_long_rows = std::max(0, std::min(16, std::atoi(tl)));
             if (const char* tp = std::getenv("STRATA_Q36_DFLASH_TREE_MINP"); tp != nullptr && tp[0] != '\0') E.df_tree_minlp = std::atof(tp) > 0.0 ? (float) std::log(std::atof(tp)) : -1.0e9f;
             if (dflash.enable_tree(*E.st, true)) {
