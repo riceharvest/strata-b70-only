@@ -3,7 +3,6 @@
 #   No target: builds `strata` only. The kernel parity programs, tests and benches are not part of it:
 #   configure with PARITY=ON (a new build folder, or an existing one: the switch is applied to it) and name them, e.g.
 #   PARITY=ON sycl/tools/build.sh gdn_parity   (or PARITY=ON sycl/tools/build.sh all  for every one of them)
-#   The DeepSeek-V4.1 path (strata-dsv41) is not maintained and is off: DSV41=ON adds it.
 #   The dense Qwen3.8-27B (GGUF architecture qwen35) is a model family of the same `strata` binary (docs/Q36.md) and is built in:
 #   Q36=OFF builds the Flash-Next-only strata. With AOT=bmg-g31 the family's long-prompt attention (LP3, libq36_tla.so) needs the
 #   two projects bash sycl/tools/get-q36-tla.sh fetches into third_party/: without them the build goes on without LP3 and says so
@@ -76,12 +75,11 @@ if [[ ! "${Q36:-ON}" =~ ^(OFF|off|0|FALSE|false|NO|no)$ ]] && [[ "${Q36_TLA:-AUT
 fi
 [ -f $b/build.ninja ] || cmake -S $repo/sycl -B $b -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
     -DSTRATA_SYCL_AOT="${AOT:-}" -DSTRATA_SYCL_SPIN_MAX="${SPIN_MAX:-}" -DSTRATA_SYCL_I8_ESIMD="${I8_ESIMD:-AUTO}" -DSTRATA_SYCL_IQ_DECODE_FAST="${IQ_DECODE_FAST:-ON}" \
-    -DSTRATA_HOST_MARCH="${HOST_MARCH:-}" -DSTRATA_SYCL_PARITY="${PARITY:-OFF}" -DSTRATA_BUILD_DSV41="${DSV41:-OFF}" -DSTRATA_BUILD_Q36="${Q36:-ON}" -DSTRATA_Q36_TLA="${Q36_TLA:-AUTO}" 2>&1 | tail -15
+    -DSTRATA_HOST_MARCH="${HOST_MARCH:-}" -DSTRATA_SYCL_PARITY="${PARITY:-OFF}" -DSTRATA_BUILD_Q36="${Q36:-ON}" -DSTRATA_Q36_TLA="${Q36_TLA:-AUTO}" 2>&1 | tail -15
 # an existing build folder keeps its cache: a switch given now reaches it (only this one, so AOT and the rest stay as configured)
 [ -z "${I8_ESIMD:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_SYCL_I8_ESIMD="$I8_ESIMD" >/dev/null 2>&1
 [ -z "${HOST_MARCH+x}" ] || cmake -S $repo/sycl -B $b -DSTRATA_HOST_MARCH="$HOST_MARCH" >/dev/null 2>&1
 [ -z "${PARITY:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_SYCL_PARITY="$PARITY" >/dev/null 2>&1
-[ -z "${DSV41:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_BUILD_DSV41="$DSV41" >/dev/null 2>&1
 [ -z "${Q36:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_BUILD_Q36="$Q36" 2>&1 | grep -E 'CMake Error|needs third_party|get-q36-tla' | head -5
 [ -z "${Q36_TLA:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_Q36_TLA="$Q36_TLA" 2>&1 | grep -E 'CMake Error|needs third_party|get-q36-tla' | head -5
 # which families this build holds (a folder configured before the dense family was built in keeps its cache: Q36=ON reaches it)

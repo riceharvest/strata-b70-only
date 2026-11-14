@@ -47,8 +47,6 @@ endif()
 set(_sycl_flags -fsycl)
 if(STRATA_SYCL_AOT MATCHES "^(bmg|lnl)")
   add_compile_definitions(STRATA_XMX_SG16=1)   # the grouped XMX kernels on sub-group 16, joint_matrix 8x16x16 (Xe2)
-elseif(STRATA_SYCL_AOT MATCHES "^pvc")
-  add_compile_definitions(STRATA_NO_DG2_XMX=1)   # the grouped XMX kernels (sub-group 8, 8x8x16) do not compile for Xe2 / Xe-HPC
 endif()
 # The fused int8 DPAS expert kernels (src/prefill/esimd_moe.dp.cpp, ESIMD, s8 8x16x32).  AUTO: built for the JIT build and for an AOT build of
 # Xe2 (bmg, lnl); stubs for an AOT build of any other device.  OFF: stubs everywhere, available() is false and the prompt's experts take the
@@ -492,18 +490,8 @@ if(STRATA_SYCL_PARITY)
   target_link_libraries(qsa_decode_select_bench PRIVATE strata_kernels)
   add_executable(fused_gr_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/fused_gr_bench.cpp)   # #4185: the multi-token GR read, hashes across switches
   target_link_libraries(fused_gr_bench PRIVATE strata_kernels)
-  add_executable(sycl_router_fast ${CMAKE_CURRENT_SOURCE_DIR}/probe/router_fast.cpp)
-  target_link_libraries(sycl_router_fast PRIVATE strata_kernels)
-  add_test(NAME sycl_router_fast COMMAND sycl_router_fast)
-  set_tests_properties(sycl_router_fast PROPERTIES ENVIRONMENT "STRATA_SYCL_A770_FAST=1")
-  add_executable(sycl_payload_pairs ${CMAKE_CURRENT_SOURCE_DIR}/probe/payload_pairs.cpp)
-  target_link_libraries(sycl_payload_pairs PRIVATE strata_kernels)
-  add_test(NAME sycl_payload_pairs COMMAND sycl_payload_pairs)
-  set_tests_properties(sycl_payload_pairs PROPERTIES ENVIRONMENT "STRATA_SYCL_A770_FAST=1;STRATA_DOORBELL_CHECK=1")   # opt-in paths; publish_res copies x only with the check
   add_executable(xmx_gemm_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/xmx_gemm_bench.cpp)   # XMX quantized GEMM vs dequant+oneMKL
   target_link_libraries(xmx_gemm_bench PRIVATE strata_kernels strata_prefill)   # -qmkl for the oneMKL reference
-  add_executable(xmx_group_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/xmx_group_parity.cpp)   # A770: fused grouped XMX
-  target_link_libraries(xmx_group_parity PRIVATE strata_kernels strata_prefill)
   add_executable(esimd_moe_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/esimd_moe_parity.cpp)   # 151-b70: fused int8 expert products vs dequant+oneMKL and FP64
   target_link_libraries(esimd_moe_parity PRIVATE strata_kernels strata_prefill)
   add_test(NAME esimd_moe_parity COMMAND esimd_moe_parity 60 8 2)   # 151-b70: skips (exit 0) on a device without the s8 8x16x32 DPAS
@@ -565,85 +553,6 @@ if(STRATA_SYCL_PARITY)
   endif()
 endif()
 
-# -----------------------------------------------------------------------------
-# DeepSeek-V4.1-Flash SYCL Engine Path (strata-dsv41)
-# -----------------------------------------------------------------------------
-# Not maintained since 2026-10-30 (see README.md); off by default.
-option(STRATA_BUILD_DSV41 "Build the DeepSeek-V4.1 SYCL engine path (strata-dsv41), not maintained" OFF)
-if(STRATA_BUILD_DSV41)
-  # (the engine's device code, in the library so the synthetic tests below run the same kernels)
-  add_library(strata_dsv41_kernels STATIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_kernels.dp.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_gguf.dp.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_iq.dp.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_tq.dp.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/vendor/exl3.dp.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/vendor/sampler.dp.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/vendor/moe_win.dp.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/vendor/exl3_cpu.cpp)
-
-  target_include_directories(strata_dsv41_kernels PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41
-    ${STRATA_ROOT}/include
-    ${STRATA_ROOT}/third_party/ggml)
-  target_link_libraries(strata_dsv41_kernels PUBLIC strata_core)
-
-  add_executable(strata-dsv41
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_main.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_model.dp.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_vision.dp.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_gguf_cpu.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_iq_cpu.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_tq_cpu.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_gg_cpu.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_packinfo.cpp)
-
-  if(NOT STRATA_BUILD_ID AND EXISTS ${STRATA_ROOT}/BUILD_ID)
-    file(STRINGS ${STRATA_ROOT}/BUILD_ID STRATA_BUILD_ID LIMIT_COUNT 1)
-  endif()
-  if(NOT STRATA_BUILD_ID)
-    set(STRATA_BUILD_ID "sycl-b70")
-  endif()
-
-  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_main.cpp PROPERTIES
-    COMPILE_DEFINITIONS "DS4_BUILD_ID=\"${STRATA_BUILD_ID}\"")
-
-  target_include_directories(strata-dsv41 PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41
-    ${STRATA_ROOT}/include
-    ${STRATA_ROOT}/third_party/ggml)
-
-  target_compile_options(strata-dsv41 PUBLIC -qmkl=sequential)
-  target_link_options(strata-dsv41 PUBLIC -qmkl=sequential)
-  target_link_libraries(strata-dsv41 PRIVATE strata_dsv41_kernels strata_core Threads::Threads)
-  # the CPU lane's trellis / ggml-type rows (ds4_tq_cpu.cpp, ds4_gg_cpu.cpp) through strata_kernels_cpu, as the top-level build
-  # does; without it both compile to stubs. ds4_gg_cpu.cpp takes no -mavx512*: the AVX-512 rows live in strata_kernels_cpu and are
-  # taken only where cpu_avx512_ok() says the CPU has them (a Zen 3 host has none)
-  if(STRATA_NATIVE_EXPERTS)
-    target_link_libraries(strata-dsv41 PRIVATE strata_kernels_cpu)
-    target_compile_definitions(strata-dsv41 PRIVATE STRATA_DSV41_TQ_CPU=1)
-  endif()
-  if(STRATA_SYCL_PARITY)   # the CUDA->SYCL shim's semantics on the device (~300 MB of device memory)
-    add_executable(ds4_shim_test ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_shim_test.cpp)
-    target_include_directories(ds4_shim_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41
-                               ${STRATA_ROOT}/include ${STRATA_ROOT}/third_party/ggml)
-    target_link_libraries(ds4_shim_test PRIVATE strata_core Threads::Threads)
-    add_test(NAME ds4_shim_test COMMAND ds4_shim_test)
-    set_tests_properties(ds4_shim_test PROPERTIES TIMEOUT 120)   # (a hung kernel fails the test instead of holding the GPU)
-    # --prune-experts: the plan (ds4_prune.hpp) and the engine's routers with the masked biases (~3 MB of device memory)
-    add_executable(ds4_prune_test ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_prune_test.cpp)
-    target_link_libraries(ds4_prune_test PRIVATE strata_dsv41_kernels strata_core Threads::Threads)
-    add_test(NAME ds4_prune_test COMMAND ds4_prune_test)
-    set_tests_properties(ds4_prune_test PROPERTIES TIMEOUT 120)
-    # the prompt path's GGUF expert sets on XMX (joint_matrix) against the F32 kernel and a host reference; --bench for timings
-    add_executable(ds4_xmx_test ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41/ds4_xmx_test.cpp)
-    target_link_libraries(ds4_xmx_test PRIVATE strata_dsv41_kernels strata_core Threads::Threads)
-    add_test(NAME ds4_xmx_test COMMAND ds4_xmx_test)
-    set_tests_properties(ds4_xmx_test PROPERTIES TIMEOUT 300)
-  endif()
-endif()
 
 # -----------------------------------------------------------------------------
 # Qwen3.8-27B (dense, GGUF architecture qwen35): a model family of the one `strata` binary (docs/Q36.md)
