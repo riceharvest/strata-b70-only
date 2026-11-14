@@ -1841,7 +1841,7 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
                        int kst, int ctxp, int ns_ref, bool u16, float gate_val_scale,
                        const std::vector<float>& K_raw, const std::vector<float>& V_raw,
                        const int8_t* k8b, const float* hks, const uint16_t* hk16,
-                       const int8_t* v8b, const float* hvs, int cells_raw,
+                       const int8_t* v8b, const float* hvs, int cells_raw, int nseg_ref,
                        double& rq_out, double& rx_out, const float* got, double& nrm2_out) {
         (void) gate_val_scale;
         float mx = 0.f;
@@ -1852,57 +1852,87 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
             const float y = qr[d] * inv;
             qc[d] = (int8_t) std::max(-127, std::min(127, (int) (y + (y < 0.f ? -0.5f : 0.5f))));
         }
-        // Single global reference (online softmax is invariant to segment boundaries up to ~1e-6 fp32 rounding).
-        double M = -1e300, l_acc = 0.0;
-        std::vector<double> o_acc(HD, 0.0);
+        // Segmented online softmax matching kernel nseg_ref split and per-32-cell vmx = max(p * vs) V quantization.
+        const int nseg_eff = std::max(1, nseg_ref);
+        const int nblk = (n + 31) / 32;
+        const int per = std::max(1, (nblk + nseg_eff - 1) / nseg_eff);
         const int max_q = u16 ? 65535 : 255;
-        for (int b0 = 0; b0 < n; b0 += 32) {
-            const int b1 = std::min(b0 + 32, n);
-            double s[32];
-            double mb = -1e300, vmx = 0.0;
-            for (int cc = b0; cc < b1; ++cc) {
-                bool valid = true;
-                if (tmask_row != 0xffffffffu && cc >= p0_tree) {
-                    const int u = cc - p0_tree;
-                    valid = (u >= 0 && u < 32) && ((tmask_row >> u) & 1u);
-                }
-                if (!valid) { s[cc - b0] = -1e30; continue; }
-                const int8_t* kk = &k8b[((size_t) kvh * kst + cc) * HD];
-                if (ns_ref == 4) {
-                    float o = 0.f;
-                    for (int g4 = 0; g4 < 4; ++g4) {
-                        int dot = 0;
-                        for (int d = 0; d < 64; ++d) dot += (int) qc[64 * g4 + d] * kk[64 * g4 + d];
-                        o += (float) dot * FB::f32_from_f16(hk16[((size_t) kvh * kst + cc) * 4 + g4]);
+        double M_glob = -1e300, l_glob = 0.0;
+        std::vector<double> o_glob(HD, 0.0);
+        for (int seg = 0; seg < nseg_eff; ++seg) {
+            const int blk_a = seg * per;
+            if (blk_a >= nblk) break;
+            const int blk_b = std::min(blk_a + per, nblk);
+            double M = -1e300, l_acc = 0.0;
+            double o_acc[HD] = {};
+            for (int blk = blk_a; blk < blk_b; ++blk) {
+                const int b0 = blk * 32, b1 = std::min(b0 + 32, n);
+                double s[32];
+                double mb = -1e300;
+                for (int cc = b0; cc < b1; ++cc) {
+                    bool valid = true;
+                    if (tmask_row != 0xffffffffu && cc >= p0_tree) {
+                        const int u = cc - p0_tree;
+                        valid = (u >= 0 && u < 32) && ((tmask_row >> u) & 1u);
                     }
-                    s[cc - b0] = (double) (o * qsc);
-                } else {
-                    int dot = 0;
-                    for (int d = 0; d < HD; ++d) dot += (int) qc[d] * kk[d];
-                    s[cc - b0] = (double) ((float) dot * (qsc * hks[(size_t) kvh * kst + cc]));
+                    if (!valid) { s[cc - b0] = -1e30; continue; }
+                    const int8_t* kk = &k8b[((size_t) kvh * kst + cc) * HD];
+                    if (ns_ref == 4) {
+                        float o = 0.f;
+                        for (int g4 = 0; g4 < 4; ++g4) {
+                            int dot = 0;
+                            for (int d = 0; d < 64; ++d) dot += (int) qc[64 * g4 + d] * kk[64 * g4 + d];
+                            o += (float) dot * FB::f32_from_f16(hk16[((size_t) kvh * kst + cc) * 4 + g4]);
+                        }
+                        s[cc - b0] = (double) (o * qsc);
+                    } else {
+                        int dot = 0;
+                        for (int d = 0; d < HD; ++d) dot += (int) qc[d] * kk[d];
+                        s[cc - b0] = (double) ((float) dot * (qsc * hks[(size_t) kvh * kst + cc]));
+                    }
+                    mb = std::max(mb, s[cc - b0]);
                 }
-                mb = std::max(mb, s[cc - b0]);
-                vmx = std::max(vmx, (double) hvs[(size_t) kvh * ctxp + cc]);
+                if (mb <= -1e29) continue;
+                const double mn = std::max(M, mb);
+                const double alpha = (M > -1e29) ? std::exp(M - mn) : 0.0;
+                for (int d = 0; d < HD; ++d) o_acc[d] *= alpha;
+                double lb = 0.0, vmx = 0.0;
+                double pv[32] = {};
+                for (int cc = b0; cc < b1; ++cc) {
+                    if (s[cc - b0] <= -1e29) continue;
+                    const double p = std::exp(std::max(s[cc - b0] - mn, -87.0));
+                    lb += p;
+                    const double pvs = p * (double) hvs[(size_t) kvh * ctxp + cc];
+                    pv[cc - b0] = pvs;
+                    vmx = std::max(vmx, pvs);
+                }
+                const double i_q = (vmx > 1e-30) ? ((double) max_q / vmx) : 0.0;
+                long long acc[HD] = {};
+                for (int cc = b0; cc < b1; ++cc) {
+                    if (s[cc - b0] <= -1e29) continue;
+                    const long long qw = std::min<long long>((long long) max_q, (long long) (pv[cc - b0] * i_q + 0.5));
+                    for (int d = 0; d < HD; ++d)
+                        acc[d] += qw * (long long) v8b[(((size_t) kvh * (ctxp / 32) + cc / 32) * 256 + d) * 32 + cc % 32];
+                }
+                const double srw = (vmx > 1e-30) ? (vmx / (double) max_q) : 0.0;
+                for (int d = 0; d < HD; ++d) o_acc[d] += (double) acc[d] * srw;
+                l_acc = l_acc * alpha + lb;
+                M = mn;
             }
-            if (mb <= -1e29) continue;
-            const double mn = std::max(M, mb);
-            const double alpha = (M > -1e29) ? std::exp(M - mn) : 0.0;
-            for (int d = 0; d < HD; ++d) o_acc[d] *= alpha;
-            double lb = 0.0;
-            const double i_q = (double) max_q / std::max(vmx, 1e-30);
-            std::vector<long long> acc(HD, 0);
-            for (int cc = b0; cc < b1; ++cc) {
-                if (s[cc - b0] <= -1e29) continue;
-                const double p = std::exp(std::max(s[cc - b0] - mn, -87.0));
-                lb += p;
-                const long long qw = std::min<long long>(max_q, (long long) (p * i_q * (double) hvs[(size_t) kvh * ctxp + cc] + 0.5));
-                for (int d = 0; d < HD; ++d)
-                    acc[d] += qw * (long long) v8b[(((size_t) kvh * (ctxp / 32) + cc / 32) * 256 + d) * 32 + cc % 32];
+            if (l_acc > 0.0) {
+                if (l_glob <= 0.0) {
+                    M_glob = M;
+                    l_glob = l_acc;
+                    for (int d = 0; d < HD; ++d) o_glob[d] = o_acc[d];
+                } else {
+                    const double mn = std::max(M_glob, M);
+                    const double ag = std::exp(M_glob - mn);
+                    const double as = std::exp(M - mn);
+                    for (int d = 0; d < HD; ++d) o_glob[d] = o_glob[d] * ag + o_acc[d] * as;
+                    l_glob = l_glob * ag + l_acc * as;
+                    M_glob = mn;
+                }
             }
-            const double srw = vmx / (double) max_q;
-            for (int d = 0; d < HD; ++d) o_acc[d] += (double) acc[d] * srw;
-            l_acc = l_acc * alpha + lb;
-            M = mn;
         }
         // Plain float64 unquantized attention reference:
         double MX = -1e300, dx = 0.0;
@@ -1928,7 +1958,7 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
         double eq = 0.0, ex = 0.0, n2 = 0.0;
         for (int d = 0; d < HD; ++d) {
             const double o = got[d];
-            const double rq = l_acc > 0.0 ? o_acc[d] / l_acc : 0.0;
+            const double rq = l_glob > 0.0 ? o_glob[d] / l_glob : 0.0;
             const double rx = dx > 0.0 ? nx[d] / dx : 0.0;
             eq += (o - rq) * (o - rq);
             ex += (o - rx) * (o - rx);
@@ -2025,19 +2055,25 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
         const int cells = 4096;
         ParityKv p = build_kv(cells);
         const int T = 1, pos0_val = cells - 1;
-        const int nblk = (cells + xa::kBlk - 1) / xa::kBlk;
-        const int nseg = std::min(std::min(NSEG_MAX, 256 / HKV), std::max(1, nblk / 2));
+        xa::Call2 c_small{};
+        c_small.q = dq; c_small.pos0 = dpos; c_small.t0 = 0; c_small.nt = T; c_small.H = H; c_small.HKV = HKV; c_small.scale = 1.0f / 16.0f;
+        c_small.k8 = p.dk8; c_small.ks = p.dks; c_small.ks16 = p.dk16; c_small.v8t = p.dv8; c_small.vs = p.dvs;
+        c_small.ns = ns; c_small.kstride = p.ctx; c_small.ctxp = p.ctxp; c_small.pos_hint = pos0_val + T;
+        c_small.qb = dqb; c_small.qs = dqs; c_small.pacc = dpa; c_small.pm = dpm; c_small.pl = dpl;
+        c_small.out = dout; c_small.form_override = 0; c_small.u16_override = 1;
+        set_dbg_caps(c_small, p, T);
+        const int nseg = xa::xatt2_plan_nseg(c_small, 0);
         const int nseg_stride = ((nseg + 3) & ~3) <= NSEG_MAX ? ((nseg + 3) & ~3) : nseg;
         const int blk_end = ((cells + xa::kBlk - 1) / xa::kBlk);   // 128
 
-        std::printf("xatt2 small diagnostic (T=1, cells=%d, kstride=%d, ctxp=%d, ns=%d, form=S1, nseg=%d, stride=%d):\n",
+        std::printf("xatt2 small diagnostic (T=1, cells=%d, kstride=%d, ctxp=%d, ns=%d, form=R8, nseg=%d, stride=%d):\n",
                     cells, p.ctx, p.ctxp, ns, nseg, nseg_stride);
         std::printf("  Host bounds check (max touched elem/byte vs allocated elems/bytes):\n");
         std::printf("    TagXa2Q    q: max=%zu / alloc=%zu floats | qb: max=%zu / alloc=%zu dwords | qs: max=%zu / alloc=%zu floats | SLM=4096 / 131072 B\n",
                     (size_t) H * HD - 1, rows_m * HD,
                     (((size_t) (HKV - 1) * 8u + 7u) * xa::kMaxBatchGroups2 + 0u) * 128u + 127u, p.ctx ? xa::qb2_dwords(HKV) : 0,
                     ((size_t) (HKV - 1) * xa::kMaxBatchGroups2 + 0u) * 16u + 15u, xa::qs2_floats(HKV));
-        std::printf("    TagXa2S1   pos0: max=0 / alloc=%d int32 | qb: max=%zu / alloc=%zu dw | qs: max=%zu / alloc=%zu fl | SLM=0 / 131072 B\n",
+        std::printf("    TagXa2R8   pos0: max=0 / alloc=%d int32 | qb: max=%zu / alloc=%zu dw | qs: max=%zu / alloc=%zu fl | SLM=0 / 131072 B\n",
                     TM,
                     (((size_t) (HKV - 1) * 8u + 7u) * xa::kMaxBatchGroups2 + 0u) * 128u + 127u, xa::qb2_dwords(HKV),
                     ((size_t) (HKV - 1) * xa::kMaxBatchGroups2 + 0u) * 16u + 7u, xa::qs2_floats(HKV));
@@ -2066,14 +2102,7 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
             q.memcpy(dpos, &pos0_val, 4);
             q.memset(d_dbg_flag, 0, 4);
             q.wait();
-            xa::Call2 c{};
-            c.q = dq; c.pos0 = dpos; c.t0 = 0; c.nt = T; c.H = H; c.HKV = HKV; c.scale = 1.0f / 16.0f;
-            c.k8 = p.dk8; c.ks = p.dks; c.ks16 = p.dk16; c.v8t = p.dv8; c.vs = p.dvs;
-            c.ns = ns; c.kstride = p.ctx; c.ctxp = p.ctxp; c.pos_hint = pos0_val + T;
-            c.qb = dqb; c.qs = dqs; c.pacc = dpa; c.pm = dpm; c.pl = dpl;
-            c.out = dout; c.form_override = 0; c.u16_override = 1;
-            set_dbg_caps(c, p, T);
-            taken = xa::attend2(c, &q);
+            taken = xa::attend2(c_small, &q);
             q.wait();
             q.memcpy(host_out.data(), dout, (size_t) T * H * HD * 4);
             q.memcpy(&h_dbg, d_dbg_flag, 4);
@@ -2085,12 +2114,12 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
         for (int row : {0, 5, 7, H - 1}) {
             ref_row(row / (H / HKV), &Q[(size_t) row * HD], pos0_val + 1, 0xffffffffu, 0x3fffffff,
                     p.ctx, p.ctxp, ns, true, 1.f, p.K, p.V, p.k8b, p.hks.data(), p.hk16.data(),
-                    p.v8b, p.hvs.data(), p.cells, eq, ex, &host_out[(size_t) row * HD], n2);
+                    p.v8b, p.hvs.data(), p.cells, nseg, eq, ex, &host_out[(size_t) row * HD], n2);
         }
         const double rq = std::sqrt(eq / n2), rx = std::sqrt(ex / n2);
         const bool ok = exc_msg.empty() && h_dbg == 0 && taken && rq < 3e-4;
         if (!ok) ++bad;
-        std::printf("  small T= 1 form=S1 u16=1 pos0=%d | vs q_f64=%.2e (bound 3.0e-04) vs fp64=%.2e dbg=%u %s%s%s\n",
+        std::printf("  small T= 1 form=R8 u16=1 pos0=%d | vs q_f64=%.2e (bound 3.0e-04) vs fp64=%.2e dbg=%u %s%s%s\n",
                     pos0_val, rq, rx, h_dbg, ok ? "ok" : "FAIL", exc_msg.empty() ? "" : " EXC=", exc_msg.c_str());
         std::fflush(stdout);
         free_kv(p);
@@ -2118,7 +2147,7 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
         auto* dk8 = p.dk8; auto* dv8 = p.dv8; auto* dks = p.dks; auto* dvs = p.dvs; auto* dk16 = p.dk16;
 
         std::printf("xatt2 parity (ns=%d, cells=%d, kstride=%d tail test):\n", ns, cells, ctx);
-        std::printf("  bound contract: NOT bitwise to XATT1 (per-32-cell V-scale quant + online softmax); "
+        std::printf("  bound contract: NOT bitwise to XATT1 (exp2 + per-32-cell p*vs quant + online softmax across nseg segments); "
                     "expected RMS vs float64 quantized ref <= 3.0e-4 (u16), <= 2.5e-2 (u8)\n");
         std::fflush(stdout);
         std::vector<float> host_out(rows_m * HD);
@@ -2128,6 +2157,7 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
             std::fill(host_out.begin(), host_out.end(), 0.0f);
             uint32_t h_dbg = 0;
             bool taken = false;
+            int nseg_planned = 1;
             std::string exc_msg;
             try {
                 q.memcpy(dpos, &pos0_val, 4);
@@ -2149,6 +2179,7 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
                 if (use_tmask) { c.tmask = dtmask; c.tp0 = dtp0; }
                 c.form_override = form; c.u16_override = u16;
                 set_dbg_caps(c, p, T);
+                nseg_planned = xa::xatt2_plan_nseg(c, 0);
                 taken = xa::attend2(c, &q);
                 q.wait();
                 q.memcpy(host_out.data(), dout, (size_t) T * H * HD * 4);
@@ -2164,28 +2195,32 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
                 const int t = row / H, head = row % H, kvh = head / (H / HKV);
                 const int n = pos0_val + t + 1;
                 ref_row(kvh, &Q[(size_t) row * HD], n, htm[t], p0_tree, ctx, ctxp, ns, u16 != 0, 1.f,
-                        K, V, k8b, hks.data(), hk16.data(), v8b, hvs.data(), cells,
+                        K, V, k8b, hks.data(), hk16.data(), v8b, hvs.data(), cells, nseg_planned,
                         eq, ex, &host_out[(size_t) row * HD], n2);
             }
             const double rq = std::sqrt(eq / n2), rx = std::sqrt(ex / n2);
             const double limit = u16 ? 3e-4 : 2.5e-2;
             const bool ok = exc_msg.empty() && h_dbg == 0 && taken && rq < limit;
             if (!ok) ++bad;
-            std::printf("  T=%2d form=%-2s u16=%d tmask=%d pos0=%d | vs q_f64=%.2e (bound %.1e) vs fp64=%.2e dbg=%u %s%s%s\n",
-                        T, xa::xatt2_form_name(form), u16, use_tmask ? 1 : 0, pos0_val, rq, limit, rx, h_dbg,
+            std::printf("  T=%2d form=%-5s u16=%d tmask=%d nseg=%2d pos0=%d | vs q_f64=%.2e (bound %.1e) vs fp64=%.2e dbg=%u %s%s%s\n",
+                        T, xa::xatt2_form_name(form), u16, use_tmask ? 1 : 0, nseg_planned, pos0_val, rq, limit, rx, h_dbg,
                         ok ? "ok" : "FAIL", exc_msg.empty() ? "" : " EXC=", exc_msg.c_str());
             std::fflush(stdout);
         };
         for (int T : tl) {
             if (T < 1 || T > TM || cells < T + 8) continue;
             const int pos0 = cells - T;   // exercises exact final cell = cells - 1!
-            if (T == 1) run_check(T, 0, 1, false, pos0);
+            run_check(T, 0, 1, false, pos0);
             run_check(T, 1, 1, false, pos0);
             run_check(T, 2, 1, false, pos0);
             run_check(T, 3, 1, false, pos0);
-            run_check(T, T == 1 ? 0 : 1, 0, false, pos0);
+            run_check(T, 0, 0, false, pos0);
+            run_check(T, 3, 0, false, pos0);
         }
-        if (cells > 16) run_check(5, 1, 1, true, cells - 8);
+        if (cells > 16) {
+            run_check(5, 0, 1, true, cells - 8);
+            run_check(5, 3, 1, true, cells - 8);
+        }
 
         // Batch mode parity (4 slots with heterogeneous positions & token counts in ONE launch):
         {
@@ -2238,10 +2273,12 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
             bool taken = false;
             std::string exc_msg;
             std::fill(host_out.begin(), host_out.end(), 0.0f);
+            std::vector<int> nseg_grp(ngrp, 1);
             try {
                 q.memcpy(dpos, hrc, (size_t) r0 * 4);
                 q.memset(d_dbg_flag, 0, 4);
                 q.wait();
+                for (int gi = 0; gi < ngrp; ++gi) nseg_grp[gi] = xa::xatt2_plan_nseg(cb, gi);
                 taken = xa::attend2(cb, &q);
                 q.wait();
                 q.memcpy(host_out.data(), dout, (size_t) r0 * H * HD * 4);
@@ -2263,7 +2300,7 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
                         ungated[d] = (float) ((double) host_out[row * HD + d] / std::max(s, 1e-12));
                     }
                     ref_row(head / (H / HKV), &Q[row * HD], hrc[tok] + 1, 0xffffffffu, 0x3fffffff, ctx, ctxp, ns, true, 1.f,
-                            K, V, k8b, hks.data(), hk16.data(), v8b, hvs.data(), cells,
+                            K, V, k8b, hks.data(), hk16.data(), v8b, hvs.data(), cells, nseg_grp[gi],
                             eq, ex, ungated.data(), n2);
                 }
             }
@@ -2343,29 +2380,48 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
                 std::printf("  T=%2d (%2d rows/kvh): %7.1f us/layer (%5.2f ms x16) | %5.1f GB/s (%5.1f%% of 590)\n",
                             T, T * (H / HKV), us, x16_ms, gbps, pct);
             } else {
-                const int forms[] = {0, 1, 2, 3};
-                const int segs_list[] = {8, 16, 32, 64};
-                for (int fm : forms) {
-                    if (fm == 0 && T > 1) continue;
-                    for (int u16 : {1, 0}) {
-                        if (fm >= 2 && u16 == 0) continue;   // test u16=0 on primary S1/D2
-                        for (int nseg : segs_list) {
-                            const double us = time_graph_warm(q, 16, [&](int m) {
-                                const KvBuf& kb = bufs[m % n_bufs];
-                                xa::Call2 c{};
-                                c.q = dq; c.pos0 = dpos; c.t0 = 0; c.nt = T; c.H = H; c.HKV = HKV; c.scale = 1.0f / 16.0f;
-                                c.k8 = kb.k8; c.ks = kb.ks; c.ks16 = kb.ks16; c.v8t = kb.v8t; c.vs = kb.vs;
-                                c.ns = ns; c.kstride = ctx; c.ctxp = ctxp; c.pos_hint = cells;
-                                c.qb = dqb; c.qs = dqs; c.pacc = dpa; c.pm = dpm; c.pl = dpl;
-                                c.out = dout; c.gate = dgate;
-                                c.form_override = fm; c.u16_override = u16; c.nseg_override = nseg;
-                                xa::attend2(c, &q);
-                            }, 0.40, 11);
-                            const double gbps = (logical_bytes / (us * 1e-6)) / 1e9;
-                            std::printf("  T=%2d form=%-2s u16=%d nseg=%2d: %7.1f us/layer | %5.1f GB/s (%5.1f%% of 590)\n",
-                                        T, xa::xatt2_form_name(fm), u16, nseg, us, gbps, 100.0 * gbps / 590.0);
-                        }
+                const int forms_t1[] = {0, 1};
+                const int forms_tn[] = {0, 1, 2, 3};
+                const int* forms = (T == 1) ? forms_t1 : forms_tn;
+                const int nforms = (T == 1) ? 2 : 4;
+                const int segs_list[] = {8, 16, 24, 32, 48, 64, 96};
+                for (int fi = 0; fi < nforms; ++fi) {
+                    const int fm = forms[fi];
+                    for (int nseg : segs_list) {
+                        const double us = time_graph_warm(q, 16, [&](int m) {
+                            const KvBuf& kb = bufs[m % n_bufs];
+                            xa::Call2 c{};
+                            c.q = dq; c.pos0 = dpos; c.t0 = 0; c.nt = T; c.H = H; c.HKV = HKV; c.scale = 1.0f / 16.0f;
+                            c.k8 = kb.k8; c.ks = kb.ks; c.ks16 = kb.ks16; c.v8t = kb.v8t; c.vs = kb.vs;
+                            c.ns = ns; c.kstride = ctx; c.ctxp = ctxp; c.pos_hint = cells;
+                            c.qb = dqb; c.qs = dqs; c.pacc = dpa; c.pm = dpm; c.pl = dpl;
+                            c.out = dout; c.gate = dgate;
+                            c.form_override = fm; c.u16_override = 1; c.nseg_override = nseg;
+                            xa::attend2(c, &q);
+                        }, 0.40, 11);
+                        const double gbps = (logical_bytes / (us * 1e-6)) / 1e9;
+                        std::printf("  T=%2d form=%-5s u16=1 nseg=%2d: %7.1f us/layer | %5.1f GB/s (%5.1f%% of 590)\n",
+                                    T, (T == 1 && fm == 1) ? "R8D8" : xa::xatt2_form_name(fm), nseg, us, gbps, 100.0 * gbps / 590.0);
                     }
+                }
+                for (int fm : {0, 3}) {
+                    xa::Call2 cp{};
+                    cp.nt = T; cp.H = H; cp.HKV = HKV; cp.pos_hint = cells; cp.form_override = fm; cp.u16_override = 0;
+                    const int nseg_def = xa::xatt2_plan_nseg(cp, 0);
+                    const double us = time_graph_warm(q, 16, [&](int m) {
+                        const KvBuf& kb = bufs[m % n_bufs];
+                        xa::Call2 c{};
+                        c.q = dq; c.pos0 = dpos; c.t0 = 0; c.nt = T; c.H = H; c.HKV = HKV; c.scale = 1.0f / 16.0f;
+                        c.k8 = kb.k8; c.ks = kb.ks; c.ks16 = kb.ks16; c.v8t = kb.v8t; c.vs = kb.vs;
+                        c.ns = ns; c.kstride = ctx; c.ctxp = ctxp; c.pos_hint = cells;
+                        c.qb = dqb; c.qs = dqs; c.pacc = dpa; c.pm = dpm; c.pl = dpl;
+                        c.out = dout; c.gate = dgate;
+                        c.form_override = fm; c.u16_override = 0; c.nseg_override = -1;
+                        xa::attend2(c, &q);
+                    }, 0.40, 11);
+                    const double gbps = (logical_bytes / (us * 1e-6)) / 1e9;
+                    std::printf("  T=%2d form=%-5s u16=0 nseg=%2d: %7.1f us/layer | %5.1f GB/s (%5.1f%% of 590)\n",
+                                T, (T == 1 && fm == 3) ? "R8D8" : xa::xatt2_form_name(fm), nseg_def, us, gbps, 100.0 * gbps / 590.0);
                 }
             }
             std::fflush(stdout);

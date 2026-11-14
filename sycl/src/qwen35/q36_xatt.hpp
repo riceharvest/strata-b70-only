@@ -126,7 +126,7 @@ struct Call2 {
     const int32_t* tp0 = nullptr;
 
     // Tuning / sweep overrides (-1 = use env/default):
-    int form_override = -1;              // -1=auto/env, 0=S1, 1=D2, 2=S8(SLM), 3=L8(noSLM)
+    int form_override = -1;              // -1=auto/env, 0=R8 (reg/L1), 1=RS16 (16K SLM / R8_D8), 2=RS8 (8K SLM), 3=RS16K (16K Kb+Vb)
     int nseg_override = 0;               // 0=auto/env, >0=fixed segments per KV head
     int u16_override = -1;               // -1=auto/env (default 1), 0=u8 P, 1=u16 P
     int zero_fence = 0;                  // runtime 0 for anti-hoist fencing
@@ -142,8 +142,10 @@ struct Call2 {
     size_t dbg_out_floats = 0;           // allocated capacity of `out`/`gate` in floats (0 = derive)
 };
 
-/// Returns the form name string ("S1", "D2", "S8", "L8").
+/// Returns the form name string ("R8", "RS16", "RS8", "RS16K").
 const char* xatt2_form_name(int form);
+/// Returns the planned segment count for group `group_idx` (matches attend2's dispatch).
+int xatt2_plan_nseg(const Call2& c, int group_idx = 0);
 /// Single-pass online-softmax attention (+ merge when c.out != nullptr).
 bool attend2(const Call2& c, void* stream);
 
