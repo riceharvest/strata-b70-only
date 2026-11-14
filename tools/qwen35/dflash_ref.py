@@ -23,6 +23,8 @@ Subcommands
                                 replays an engine dump (STRATA_Q36_DFLASH_DUMP) and prints the agreement with the engine
   synth --ckpt D --pack F       the BF16 weights against the pack's on a synthetic context: the quantization's own cost (hidden
                                 relative error, no head needed)
+  ablate --ckpt D --pack F      synth, with a per-layer cosine trace and ONE matrix class at a time put back to BF16 (conv, ctx, o, mlp, q, hproj)
+  taps DUMP LLAMA_LAYERS        D1 check: the dump's captured rows against llama.cpp's l_out-N of the same tokens (nearest layer must be the tapped one)
 
 Dump format (written by the engine, one folder):
   meta.json     {"n_embd", "taps", "mask_token", "block", "window", "head_subset", "n_steps", ...}
@@ -172,8 +174,8 @@ class Drafter:
         self.have[pos] = True
 
     # ---- one block
-    def block(self, P, embed_anchor, embed_mask, valid_lo=0):
-        """-> final-normed rows [8][H]."""
+    def block(self, P, embed_anchor, embed_mask, valid_lo=0, trace=None):
+        """-> final-normed rows [8][H].  trace: a list that gets the residual stream after every layer."""
         w, eps = self.w, self.eps
         x = np.concatenate([embed_anchor[None], np.repeat(embed_mask[None], BLOCK - 1, axis=0)]).astype(np.float32)
         pos = np.arange(P, P + BLOCK)
@@ -215,6 +217,8 @@ class Drafter:
             m = self.mm(m, p + "down")
             m = conv_block(m, dyn[:, 1], w.get(p + "mbase").reshape(2, 2, H)[1])
             x = r + m
+            if trace is not None:
+                trace.append(x.copy())
         return rms(x, w.vec("norm"), eps)
 
     def select(self, hrows, cand, unary, anchor):
@@ -250,15 +254,110 @@ class Head:
     def logits_cand(self, h, ids):
         return self.rows_of(ids) @ h
 
-    def top1_full(self, h, chunk=8192):
-        best, bi = -np.inf, -1
-        for a in range(0, self.rows, chunk):
-            r = self.dq(self.raw[a:a + chunk], self.t.tensor_type).reshape(-1, int(self.t.shape[0])).astype(np.float32)
-            l = r @ h
-            j = int(np.argmax(l))
-            if l[j] > best:
-                best, bi = float(l[j]), a + j
+    def load_matrix(self, ids=None, chunk=8192):
+        """the head rows (of `ids`, or all) dequantized once, kept as fp16 [n][n_embd]."""
+        sel = np.arange(self.rows) if ids is None else np.asarray(ids)
+        out = np.empty((len(sel), int(self.t.shape[0])), np.float16)
+        for a0 in range(0, len(sel), chunk):
+            out[a0:a0 + chunk] = self.rows_of(sel[a0:a0 + chunk]).astype(np.float16)
+        self.mat, self.ids = out, sel
+        return out
+
+    def top1_rows(self, h, chunk=16384):
+        """h [r][n_embd] -> the token id with the highest logit of each row, over the loaded matrix (all rows or the subset)."""
+        best = np.full(len(h), -np.inf, np.float32)
+        bi = np.zeros(len(h), np.int64)
+        for a0 in range(0, len(self.mat), chunk):
+            lg = self.mat[a0:a0 + chunk].astype(np.float32) @ h.T             # [chunk][r]
+            j = lg.argmax(axis=0)
+            v = lg[j, np.arange(len(h))]
+            up = v > best
+            best[up], bi[up] = v[up], self.ids[a0 + j[up]]
         return bi
+
+
+
+class Mix:
+    """Weights taken from `a` (the pack) except the classes in `bf` (taken from `b`, the BF16 checkpoint): the ablation."""
+
+    CLASSES = {"conv": ("akp", "mkp"), "ctx": ("fc", "kv_all", "k", "v"), "o": ("o",), "mlp": ("gate", "up", "down"), "q": ("q",), "hproj": ("hproj",)}
+
+    def __init__(self, a, b, bf):
+        self.a, self.b, self.layers = a, b, a.layers
+        self.names = {n for c in bf for n in self.CLASSES[c]}
+
+    def _src(self, name):
+        kind = name.split(".", 1)[1] if name[0] == "l" and name[1].isdigit() else name
+        return self.b if kind in self.names else self.a
+
+    def get(self, name):
+        return self._src(name).get(name)
+
+    def vec(self, name):
+        return self.get(name).reshape(-1)
+
+    def codebook_rows(self, name, ids):
+        return self._src(name).codebook_rows(name, ids)
+
+
+def cos_rows(a, b):
+    return (a * b).sum(1) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1) + 1e-30)
+
+
+def cmd_ablate(a):
+    """BF16 against the pack on a synthetic context, then the pack with ONE class of matrices put back to BF16: which class carries the loss."""
+    rng = np.random.default_rng(3)
+    n = a.rows
+    taps = DP.bf16_to_f32(DP.f32_to_bf16(rng.standard_normal((n, 5 * H)).astype(np.float32) * a.scale))
+    emb = (rng.standard_normal((2, H)) * 0.02).astype(np.float32)
+    wb, wp = Weights(ckpt=a.ckpt), Weights(pack=a.pack)
+
+    def run(w):
+        d = Drafter(w, act16=False, max_pos=n + 16)
+        d.add_context(taps, np.arange(n))
+        tr = []
+        out = d.block(n, emb[0], emb[1], trace=tr)
+        return tr, out
+
+    t0 = time.time()
+    tb, ob = run(wb)
+    print("bf16 baseline %.0fs" % (time.time() - t0), flush=True)
+    print("%-26s %-40s final: rel err, min cos" % ("variant", "per-layer min cosine L0..L4"))
+    for tag, bf in [("pack (all int4)", [])] + [("pack, %s in bf16" % c, [c]) for c in Mix.CLASSES] + [("pack, ctx+conv in bf16", ["ctx", "conv"])]:
+        tp, op = run(Mix(wp, wb, bf))
+        per = " ".join("%.4f" % cos_rows(x, y).min() for x, y in zip(tp, tb))
+        print("%-26s %-40s %.4f  %.4f" % (tag, per, np.linalg.norm(op - ob) / np.linalg.norm(ob), cos_rows(op, ob).min()), flush=True)
+    return 0
+
+
+def cmd_taps(a):
+    """D1 check against llama.cpp: the engine's captured rows (ctx.bin of a dump) against llama.cpp's l_out-N of the same tokens
+    (q36_llama_dump --dump-layers F: f32 [pos][layer][n_embd]).  Each tap's rows are compared with layers L-1, L, L+1: the right layer must be
+    the nearest for every tap (an off-by-one in the capture point shows here)."""
+    pos, taps = read_ctx(os.path.join(a.dump, "ctx.bin"))
+    last = {int(p): i for i, p in enumerate(pos)}
+    ll = np.memmap(a.llama, dtype=np.float32, mode="r").reshape(-1, a.n_layer, H)
+    keep = [p for p in sorted(last) if p < len(ll)][: a.max_rows]
+    if not keep:
+        print("no common positions")
+        return 1
+    ok = True
+    for k, L in enumerate((5, 19, 33, 47, 61)):
+        errs = {}
+        for dl in (-1, 0, 1):
+            e = []
+            for p in keep:
+                x = taps[last[p]][k * H:(k + 1) * H]
+                y = np.asarray(ll[p, L + dl])
+                e.append(np.linalg.norm(x - y) / (np.linalg.norm(y) + 1e-30))
+            errs[dl] = float(np.median(e))
+        best = min(errs, key=errs.get)
+        good = best == 0 and errs[0] < 0.15
+        ok &= good
+        print("tap %d (layer %2d): median ||ctx - l_out||/||l_out||  L-1 %.4f  L %.4f  L+1 %.4f  -> nearest %s %s" %
+              (k, L, errs[-1], errs[0], errs[1], {-1: "L-1", 0: "L", 1: "L+1"}[best], "ok" if good else "WRONG"))
+    print("RESULT", "PASS" if ok else "FAIL", "(%d positions)" % len(keep))
+    return 0 if ok else 1
 
 
 # ---------------------------------------------------------------------------------------------------- dump replay
@@ -282,8 +381,14 @@ def cmd_replay(a):
     w = Weights(ckpt=a.ckpt, pack=a.pack)
     max_pos = int(max(cpos.max(), max(s["P"] for s in steps))) + 16
     d = Drafter(w, mask_token=meta.get("mask_token", 248070), act16=a.act16, max_pos=max_pos)
-    head = Head(a.gguf) if a.gguf else None
-    done, agree1, pathok, n1, hdiff, hcos, ldiff = 0, 0, 0, 0, [], [], []
+    head = None
+    if a.gguf:
+        head = Head(a.gguf)
+        sub = os.path.join(a.dump, "subset.bin")
+        ids = np.fromfile(sub, dtype=np.int32) if meta.get("head_subset") and os.path.exists(sub) else None
+        print("loading the head: %s" % ("the engine's draft head, %d ids" % len(ids) if ids is not None else "all %d rows" % head.rows), flush=True)
+        head.load_matrix(ids)
+    done, pathok, n1, agree1, hdiff, hcos, missing = 0, 0, 0, 0, [], [], 0
     per_pos = np.zeros(7)
     for s in steps:
         t0 = time.time()
@@ -293,36 +398,40 @@ def cmd_replay(a):
                 b0 = min(upto, a0 + 256)
                 d.add_context(ctaps[a0:b0], cpos[a0:b0].astype(np.int64))
             done = upto
+        lo = max(s.get("valid_lo", 0), s["P"] - 2047, 0)
+        miss = sum(1 for j in range(lo, s["P"]) if not d.have[j])
+        if miss:
+            missing += 1
+            print("  WARNING step %d: %d context positions in [%d, %d) are not in ctx.bin (raise STRATA_Q36_DFLASH_DUMP_ROWS)" % (s["step"], miss, lo, s["P"]))
         b = blocks[s["step"]]
         out = d.block(s["P"], b[0], b[1], s.get("valid_lo", 0))
         cand = np.array(s["cand"]); un = np.array(s["unary"], np.float32)
         eng = b[2:]
-        dd = np.abs(out - eng)
-        hdiff.append(float(dd.max()))
-        hcos.append(float(((out * eng).sum(1) / (np.linalg.norm(out, axis=1) * np.linalg.norm(eng, axis=1) + 1e-30)).min()))
+        hdiff.append(float(np.abs(out - eng).max()))
+        hcos.append(float(cos_rows(out, eng).min()))
         path = d.select(out[1:], cand, un, s["anchor"])
         pathok += int(path == s["path"])
-        for i in range(7):
-            e1 = int(cand[i][int(np.argmax(un[i]))])
-            if head is not None:
-                lg = head.logits_cand(out[1 + i], cand[i])
-                r1 = int(cand[i][int(np.argmax(lg))])
-                ldiff.append(float(np.abs(lg - un[i]).max()))
-            else:
-                r1 = e1   # no head: only the hidden rows and the path are compared
-            agree1 += int(e1 == r1)
-            per_pos[i] += int(e1 == r1)
-            n1 += 1
+        e1 = [int(cand[i][int(np.argmax(un[i]))]) for i in range(7)]
+        if head is not None:
+            r1 = head.top1_rows(out[1:])              # the reference's own best token over the same rows the engine's head has
+            for i in range(7):
+                agree1 += int(e1[i] == int(r1[i]))
+                per_pos[i] += int(e1[i] == int(r1[i]))
+                n1 += 1
         print("step %3d P %6d: hidden max|d| %.4f min cos %.5f path %s (%.1fs)" % (s["step"], s["P"], hdiff[-1], hcos[-1], "same" if path == s["path"] else "DIFF", time.time() - t0), flush=True)
     n = len(steps)
     print("steps %d: hidden max abs diff worst %.4f, min cosine %.5f, selector path identical in %d (%.1f%%)" % (n, max(hdiff), min(hcos), pathok, 100.0 * pathok / max(n, 1)))
-    if head is not None:
-        print("top-1 over the engine's candidates agrees %d / %d = %.2f%% (per position %s), candidate logit max abs diff %.3f" %
-              (agree1, n1, 100.0 * agree1 / max(n1, 1), " ".join("%.0f%%" % (100 * x / max(n, 1)) for x in per_pos), max(ldiff)))
-    else:
-        print("no --gguf: the top-1 check was skipped (hidden rows and path only)")
-    ok = (min(hcos) > 0.99 and pathok >= 0.99 * n) if head is None else (agree1 >= 0.99 * n1)
-    print("RESULT", "PASS" if ok else "FAIL")
+    if missing:
+        print("WARNING: %d steps had missing context rows: their numbers are not comparable" % missing)
+    cos_ok = min(hcos) > 0.99
+    if head is None:
+        print("no --gguf: the top-1 check was NOT run (hidden rows and path only). RESULT INCOMPLETE (hidden %s)" % ("ok" if cos_ok else "FAIL"))
+        return 0 if cos_ok else 1
+    top1 = 100.0 * agree1 / max(n1, 1)
+    print("top-1 of the engine's candidate list (cand[argmax unary]) against the reference's best token over the %s: %d / %d = %.2f%% (per position %s)" %
+          ("same head rows" , agree1, n1, top1, " ".join("%.0f%%" % (100 * x / max(n, 1)) for x in per_pos)))
+    ok = cos_ok and top1 >= 99.0
+    print("RESULT", "PASS" if ok else "FAIL", "(hidden min cosine %.5f, top-1 %.2f%%)" % (min(hcos), top1))
     return 0 if ok else 1
 
 
@@ -412,6 +521,16 @@ def main():
     r.add_argument("--gguf", help="the target's GGUF (output.weight): logits of the candidates")
     r.add_argument("--act16", action="store_true")
     r.add_argument("--steps", type=int, default=0)
+    ab = sub.add_parser("ablate")
+    ab.add_argument("--ckpt", required=True)
+    ab.add_argument("--pack", required=True)
+    ab.add_argument("--rows", type=int, default=300)
+    ab.add_argument("--scale", type=float, default=1.0)
+    tp = sub.add_parser("taps")
+    tp.add_argument("dump")
+    tp.add_argument("llama", help="q36_llama_dump --dump-layers file: f32 [pos][layer][n_embd]")
+    tp.add_argument("--n-layer", type=int, default=64)
+    tp.add_argument("--max-rows", type=int, default=400)
     s = sub.add_parser("synth")
     s.add_argument("--ckpt", required=True)
     s.add_argument("--pack", required=True)
@@ -420,7 +539,7 @@ def main():
     a = ap.parse_args()
     if a.cmd == "replay" and not (a.ckpt or a.pack):
         ap.error("replay needs --ckpt or --pack")
-    return {"selftest": cmd_selftest, "replay": cmd_replay, "synth": cmd_synth}[a.cmd](a)
+    return {"selftest": cmd_selftest, "replay": cmd_replay, "synth": cmd_synth, "ablate": cmd_ablate, "taps": cmd_taps}[a.cmd](a)
 
 
 if __name__ == "__main__":
