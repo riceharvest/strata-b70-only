@@ -1550,6 +1550,8 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
+        if sampling.get("ignore_eos") is True:       # vLLM's / llama.cpp's flag: an end-of-turn token does not end the reply
+            keys += " ignore_eos=1"
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
@@ -5124,6 +5126,7 @@ class Service:
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
         sampling = resolve_sampling(self.model_arch, thinking, self.sampling_defaults, self.shared, sampling)
+        ignore_eos = isinstance(sampling, dict) and sampling.get("ignore_eos") is True
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
@@ -5353,6 +5356,10 @@ class Service:
                                 if trace is not None and trace["first_token_s"] is None:
                                     with self.status_lock:
                                         trace["first_token_s"] = round(time.perf_counter() - trace["_clock"], 3)
+                                if t in self.stop_ids and ignore_eos:    # (the engine went on: the token counts, its text is not sent)
+                                    raw_ids.append(t)
+                                    seg.append(t)
+                                    continue
                                 if t in self.stop_ids:
                                     if force and parser.state == "reasoning" and parser.buf == THINK_END:
                                         opens = True    # #537: the held </think> was the end: the call opens there

@@ -9605,6 +9605,8 @@ struct Slot {
     std::vector<int32_t> drafts;  // --batch-mtp: the MTP block's chained proposals for the tokens after `x`
     int depth = 2;                // ... how many the next window takes (follows what was accepted)
     long long offered = 0, accepted = 0;
+    bool ignore_eos = false;   // LANE SOLO: the request's ignore_eos=1: an end-of-answer token is a token like another
+    bool eos(int t) const { return !ignore_eos && is_eos(t); }
     strata::qwen35::SpecPlan plan;   // STRATA_Q36_BATCH_SAMPLE: plan.ok = a request that needs the host's draw drafts through the window's top-M rows
     /// Whether the slot takes drafts in a --batch-mtp window: it decodes greedily on the device, or its rows' candidates serve it.
     bool drafts_ok() const { return !smp.needs_logits() || plan.ok; }
@@ -9818,7 +9820,7 @@ struct Serve {
             if (cand) {
                 pk = cpicks;
                 a = strata::qwen35::batch_slot_step(sl.smp, sl.plan, sl.hist, sl.drafts, E.rows_cand(r0), sl.rng, cpicks, sl.stop,
-                                                    sl.produced, sl.max_new, ss.pos, E.ctx, [](int t) { return is_eos(t); });
+                                                    sl.produced, sl.max_new, ss.pos, E.ctx, [&sl](int t) { return sl.eos(t); });
                 y0 = cpicks[0];
             } else {
                 if (sl.smp.needs_logits()) {   // (a request the candidates cannot serve: one row, the whole row to the host)
@@ -9827,7 +9829,7 @@ struct Serve {
                 }
                 // draft a + 1 stands when the pick before it is that draft (ss.pos: the position of the slot's next token: the
                 // window did not move it)
-                for (int y = y0; a < D && y == sl.drafts[(size_t) a] && !is_eos(y) && !sl.stop && sl.produced + a + 2 <= sl.max_new &&
+                for (int y = y0; a < D && y == sl.drafts[(size_t) a] && !sl.eos(y) && !sl.stop && sl.produced + a + 2 <= sl.max_new &&
                                  ss.pos + a + 3 <= E.ctx; y = E.rows_pick[r0 + a])
                     ++a;
             }
@@ -9845,7 +9847,7 @@ struct Serve {
                 std::printf("BT %d %d\n", b, y);
                 ++sl.produced;
                 sl.hist.push_back(y);
-                const char* fin = is_eos(y) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+                const char* fin = sl.eos(y) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
                                   : ss.pos + j + 2 > E.ctx ? "length" : nullptr;
                 if (fin) {
                     if (btime && bt_n > 0)
@@ -9969,7 +9971,7 @@ struct Serve {
             std::printf("BT %d %d\n", b, y);
             ++sl.produced;
             sl.hist.push_back(y);
-            const char* fin = is_eos(y) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+            const char* fin = sl.eos(y) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
                               : ss.pos + 1 > E.ctx ? "length" : nullptr;
             if (fin) {
                 std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms_since(sl.t0));
@@ -10039,6 +10041,7 @@ struct Serve {
         }
         const long long max_new = std::strtoll(p, &p, 10);
         Sampling smp;
+        bool ignore_eos = false;   // LANE SOLO: ignore_eos=1 (the server sends it for a request that asked: a benchmark's fixed length)
         std::vector<uint64_t> img_keys;
         for (;;) {
             while (*p == ' ') ++p;
@@ -10058,6 +10061,7 @@ struct Serve {
             else if (key == "penalty_freq") smp.freq = std::strtof(v, nullptr);
             else if (key == "penalty_present") smp.present = std::strtof(v, nullptr);
             else if (key == "seed") smp.seed = std::strtoull(v, nullptr, 10);
+            else if (key == "ignore_eos") ignore_eos = std::atoi(v) != 0;
             else if (key == "img_keys") {
                 const char* q = v;
                 img_keys.clear();
@@ -10302,7 +10306,7 @@ struct Serve {
             std::printf("T %d\n", nx);
             ++produced;
             hist.push_back(nx);
-            const char* fin = is_eos(nx) ? "stop" : stop.load() ? "cancel" : max_new <= 1 ? "length"
+            const char* fin = (!ignore_eos && is_eos(nx)) ? "stop" : stop.load() ? "cancel" : max_new <= 1 ? "length"
                               : E.pos + 1 > E.ctx ? "length" : nullptr;
             const bool cont = fin == nullptr;
             std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
@@ -10322,6 +10326,7 @@ struct Serve {
                 sl.produced = 1;
                 sl.max_new = max_new;
                 sl.smp = smp;
+                sl.ignore_eos = ignore_eos;
                 sl.rng = rng;
                 sl.hist = hist;
                 sl.t0 = Clock::now();
@@ -10354,7 +10359,7 @@ struct Serve {
                 ++produced;
                 hist.push_back(t);
                 client_live.push_back(t);
-                if (is_eos(t)) { finish = "stop"; return false; }
+                if (!ignore_eos && is_eos(t)) { finish = "stop"; return false; }
                 if (produced >= max_new) return false;
                 if (stop.load()) { finish = "cancel"; return false; }
                 return true;

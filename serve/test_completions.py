@@ -5,7 +5,7 @@ from pathlib import Path
 import unittest
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, MockEngine, Service, serve
+from serve.server import ByteTokenizer, MockEngine, Service, StrataEngine, serve
 
 TEMPLATE = ChatTemplate(Path(__file__).with_name("chat_template.jinja"))
 
@@ -146,6 +146,25 @@ class Completions(unittest.TestCase):
             self.assertIn("error", json.loads(raw))
         self.ok({"prompt": "a", "max_tokens": 500})          # as the chat path: shortened to the room (fit_max_tokens)
         self.assertEqual(self.engine.last_max_new, 64 - 8 - 1)
+
+    def test_ignore_eos_runs_past_the_end_token_on_both_endpoints(self):
+        self.start("a<|im_end|>b")
+        out = self.ok({"prompt": "p", "max_tokens": 32})
+        self.assertEqual((out["choices"][0]["text"], out["choices"][0]["finish_reason"]), ("a", "stop"))
+        out = self.ok({"prompt": "p", "max_tokens": 32, "ignore_eos": True})
+        self.assertEqual((out["choices"][0]["text"], out["choices"][0]["finish_reason"]), ("ab", "length"))
+        self.assertEqual(out["usage"]["completion_tokens"], 4)          # a, <|im_end|>, b, the script's own end
+        chat = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 32, "reasoning_effort": "none"}
+        status, raw = self.post(chat, "/v1/chat/completions")
+        self.assertEqual(json.loads(raw)["choices"][0]["message"]["content"], "a")
+        status, raw = self.post({**chat, "ignore_eos": True}, "/v1/chat/completions")
+        body = json.loads(raw)
+        self.assertEqual((body["choices"][0]["message"]["content"], body["choices"][0]["finish_reason"]), ("ab", "length"))
+
+    def test_ignore_eos_is_a_key_for_the_engine_only_when_true(self):
+        self.assertEqual(StrataEngine.sampling_keys({"ignore_eos": True}), " ignore_eos=1")
+        for v in (False, None, "yes", 1):
+            self.assertEqual(StrataEngine.sampling_keys({"ignore_eos": v}), "")
 
     def test_chat_completions_is_untouched(self):
         self.start("ok")
