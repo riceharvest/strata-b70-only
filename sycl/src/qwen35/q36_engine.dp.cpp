@@ -4060,7 +4060,7 @@ struct Engine {
                 xb16 = reinterpret_cast<uint16_t*>(dalloc(nw));
                 if (w4x_mode) {
                     std::fprintf(stderr, "strata-q36: W4X (u4 x s8, gs=%d) active for B70W4 matrices at %d..%d columns (STRATA_Q36_W4X=%d)\n",
-                                 w4x_gs, w4h_min_t, kGemmT, w4x_mode);
+                                 w4x_gs, w4h_min_t, w4_max_t(), w4x_mode);
                 } else {
                     std::fprintf(stderr, "strata-q36: W4A16 active for B70W4 matrices at %d..%d columns (STRATA_Q36_W4H_T=%d)\n",
                                  w4h_min_t, kGemmT, w4h_min_t);
@@ -4401,7 +4401,8 @@ struct Engine {
         q8_src = nullptr;
         return (const char*) q8 + (size_t) row0 * K::native_q8_1_bytes(n, 1);
     }
-    bool a16(const Mat& w, int T) const { return w4a16 && w.type == kW4Type && T >= w4h_min_t && T <= kGemmT; }
+    int w4_max_t() const { return w4x_mode ? 32 : kGemmT; }
+    bool a16(const Mat& w, int T) const { return w4a16 && w.type == kW4Type && T >= w4h_min_t && T <= w4_max_t(); }
     void pack16(const float* x, int n, int T, uint16_t* d) {
         if (w4x_mode) strata::q36xr::w4x_quantize(x, n, d, n, T, w4x_gs, st);
         else strata::q36xr::w4h_pack(x, n, d, n, T, st);
@@ -4454,14 +4455,14 @@ struct Engine {
     }
     bool use_w4_i8(const Mat& w, int T) const {
         const int mode = pp_w4_mode();
-        if (mode <= 0 || mode == 2 || w.type != kW4Type || T <= kGemmT || !pp_dxT) return false;
+        if (mode <= 0 || mode == 2 || w.type != kW4Type || T <= w4_max_t() || !pp_dxT) return false;
         if (!strata::q36pp::handles_w4_i8(w.n_in, w.n_out, T)) return false;
         if (mode >= 3) return true;
         return ((int64_t)(w.n_out / 256) * ((T + 127) / 128)) >= 16;
     }
     bool use_w4_f16(const Mat& w, int T) const {
         const int mode = pp_w4_mode();
-        if (mode == 0 || w.type != kW4Type || T <= kGemmT) return false;
+        if (mode == 0 || w.type != kW4Type || T <= w4_max_t()) return false;
         if (!strata::q36pp::handles_w4_f16(w.n_in, w.n_out, T)) return false;
         if (mode == 2) return true;
         if ((int64_t) w.n_in * w.n_out > w4_f16_elems) return true;
@@ -4517,18 +4518,19 @@ struct Engine {
     }
 
     void mm(const Mat& w, const float* xin, float* out, int T) {
-        if (T > kGemmT && w.type == kW4Type && !use_w4_i8(w, T) && !use_w4_f16(w, T) &&
-            (int64_t) w.n_in * w.n_out > w4_f16_elems) {
-            q8_src = nullptr;
-            for (int c0 = 0; c0 < T; c0 += kGemmT) {
-                mm(w, xin + (size_t) c0 * w.n_in, out + (size_t) c0 * w.n_out, std::min(kGemmT, T - c0));
-            }
-            return;
-        }
         if (a16(w, T)) {
             q8_src = nullptr;
             pack16(xin, w.n_in, T, xb16);
             mmh(w, xb16, out, T);
+            return;
+        }
+        const int w4_step = w4_max_t();
+        if (T > w4_step && w.type == kW4Type && !use_w4_i8(w, T) && !use_w4_f16(w, T) &&
+            (int64_t) w.n_in * w.n_out > w4_f16_elems) {
+            q8_src = nullptr;
+            for (int c0 = 0; c0 < T; c0 += w4_step) {
+                mm(w, xin + (size_t) c0 * w.n_in, out + (size_t) c0 * w.n_out, std::min(w4_step, T - c0));
+            }
             return;
         }
         const void* qh = q8_hit(xin, w.n_in, T);
@@ -4665,10 +4667,17 @@ struct Engine {
                 if (strata::q36pp::gemm_w4_f16(w.d, x16, out, w.n_in, w.n_out, T, st)) return;
             }
             if (w.type == kW4Type) {
+                if (a16(w, T)) {
+                    q8_src = nullptr;
+                    pack16(pp_cur_src, w.n_in, T, xb16);
+                    mmh(w, xb16, out, T);
+                    return;
+                }
+                const int w4_step = w4_max_t();
                 if ((int64_t) w.n_in * w.n_out > w4_f16_elems) {
                     q8_src = nullptr;
-                    for (int c0 = 0; c0 < T; c0 += kGemmT) {
-                        mm(w, pp_cur_src + (size_t) c0 * w.n_in, out + (size_t) c0 * w.n_out, std::min(kGemmT, T - c0));
+                    for (int c0 = 0; c0 < T; c0 += w4_step) {
+                        mm(w, pp_cur_src + (size_t) c0 * w.n_in, out + (size_t) c0 * w.n_out, std::min(w4_step, T - c0));
                     }
                     return;
                 }
@@ -5407,15 +5416,14 @@ work-group size if needed.
     /// input) are one launch, as k_moe_out_small does for the MoE layers.
     void dense_ffn(const Layer& L, int T, const float* wn, float* hout, bool next_w4_i8 = false) {
         const int N = (int) m->g.n_embd, FF = (int) m->g.n_ff;
-        if (T <= kGemmT) {
-            if (a16(L.ffn_gate, T) && a16(L.ffn_up, T) && a16(L.ffn_down, T)) {   // W4A16: h and silu(gate) * up as FP16 images
-                pack16(h, N, T, xa16);
-                mmh(L.ffn_gate, xa16, sg, T);
-                mmh(L.ffn_up, xa16, su, T);
-                if (w4x_mode) strata::q36xr::w4x_swiglu_quantize(sg, su, xb16, FF, T, w4x_gs, st);
-                else strata::q36xr::w4h_swiglu_pack(sg, su, xb16, FF, T, st);
-                mmh(L.ffn_down, xb16, sy, T);
-            } else {
+        if (a16(L.ffn_gate, T) && a16(L.ffn_up, T) && a16(L.ffn_down, T)) {   // W4A16 / W4X: h and silu(gate) * up
+            pack16(h, N, T, xa16);
+            mmh(L.ffn_gate, xa16, sg, T);
+            mmh(L.ffn_up, xa16, su, T);
+            if (w4x_mode) strata::q36xr::w4x_swiglu_quantize(sg, su, xb16, FF, T, w4x_gs, st);
+            else strata::q36xr::w4h_swiglu_pack(sg, su, xb16, FF, T, st);
+            mmh(L.ffn_down, xb16, sy, T);
+        } else if (T <= kGemmT) {
             if (!xq_post) quant(h, N, T, xq);
             mmq(L.ffn_gate, xq, sg, T);
             mmq(L.ffn_up, xq, su, T);
@@ -5423,7 +5431,6 @@ work-group size if needed.
             if (T <= 8) K::native_swiglu_quantize_q8_1(sg, su, q8, FF, T, st);
             else K::native_swiglu_quantize_q8_1(sg, su, q8, FF * T, 1, st);   // (9+ columns: as one vector, the same blocks)
             mmq(L.ffn_down, q8, sy, T);
-            }
         } else {
             prep(h, N, T, q8);
             apply(L.ffn_gate, nullptr, sg, T);
