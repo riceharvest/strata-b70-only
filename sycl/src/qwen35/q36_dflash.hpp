@@ -173,6 +173,13 @@ public:
     /// The first context position the last prepare() left valid (for the dump).
     int64_t valid_lo() const { return sl_.empty() ? 0 : sl_[0].vlo; }
     int64_t ctx_hi() const { return sl_.empty() ? 0 : sl_[0].hi; }
+    /// Rows the next prepare() at position P (single stream, slot 0) has to run through eager context flushes (each one waits) besides the last <= kRows ones that go in the pass: the
+    /// captured rows its context has not consumed yet - the prompt's rows at a request's first block, or the rows of the steps that ran on another arm (the arbiter's MTP steps).  0 when
+    /// the captured run does not end at P (prepare() then restarts the context empty).
+    int64_t pending_rows(int64_t P) const {
+        if (sl_.empty() || !sl_[0].have || sl_[0].cap_hi != P) return 0;
+        return std::max<int64_t>(0, std::min<int64_t>(P - sl_[0].hi, kWindow - 1) - kRows);
+    }
 
     // ---- STRATA_Q36_DFLASH_DUMP=<dir>: what tools/qwen35/dflash_ref.py replay reads (format: its docstring)
     void enable_dump(const std::string& dir, int max_steps, int max_rows);

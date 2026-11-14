@@ -1,16 +1,21 @@
 // q36_darb.hpp - the throughput arbiter of the DFlash serve loop (STRATA_Q36_DFLASH_ARB=1, default off).  Host only, no SYCL.
 //
-// Two arms: 0 = a drafter step (draft + verify, a tree too), 1 = a lookup / MTP step.  Every step is a sample (tokens = accepted drafts + 1,
-// ms = host clock around the step; the step already waits once for its picks, so no sync is added).  An arm's rate is EWMA(tokens) / EWMA(ms).
-// The request runs on the arm with the higher rate; the other arm is probed with one step in `period` steps (doubled after a probe that does not
-// flip the choice, up to `max_period`; reset when it does), so a request where MTP is faster ends on MTP for almost every step and pays the probes.
-//   * a sample of a step that recorded a graph (once, ~60 ms) is invalid: not counted, and a probe whose step was invalid is repeated (3 times at most);
-//   * a flip needs the other rate above the chosen one by `margin` and `dwell` steps since the last flip;
-//   * the chosen arm's samples weigh max(1/16, 1/(k + 2)) (k = steps since it became chosen: the stale value of a probe is replaced fast), a probe's weigh 0.4.
-// The first look at the other arm is `init` (6) steps in a row; the choice flips only on an arm with 3+ samples; a probe that finds the other arm 15% or more slower doubles the period.
-// Read once from the environment: STRATA_Q36_DFLASH_ARB (0/1), _ARB_PERIOD (16), _ARB_MAX_PERIOD (256), _ARB_MARGIN (0.05), _ARB_INIT (6), _ARB_DWELL (8).
+// Two arms: 0 = a drafter step (draft + verify, a tree too), 1 = a lookup / MTP step.  Every step is a sample: tokens = accepted drafts + 1 (1 .. 8, a noisy
+// reading: ~55% relative standard deviation on the measured 26K histogram) and ms = the host clock around the step (the step already waits once for its picks:
+// no sync is added; it barely varies).  An arm's rate is mean(tokens) / mean(ms) over a discounted window (weight 0.995 per step, half-life ~140 steps), with the
+// standard error of the mean tokens (weighted Welford).
+//   * The request runs on the chosen arm; the other arm is probed.  While the comparison is INCONCLUSIVE (|rate difference| < z = 1 standard error) the arms
+//     alternate (every 2nd step is a probe, bounded by a budget of 35% of the steps + 6), because one step is a poor reading.  Once the other arm is confidently
+//     slower (-z standard errors, z = 1) the probe period starts at `period` (16 steps) and doubles after every probe that confirms it, up to `max_period` (256): a
+//     request where one arm is clearly faster ends on it for almost every step and pays the probes.  The choice flips when the other arm is faster by z
+//     standard errors AND by `margin`.  Arms that are equal stay inconclusive and alternate, which costs nothing; arms 5% apart cost at most half of that.
+//   * The first look at the other arm is `init` (6) steps in a row.
+//   * A step that is not a clean sample (it recorded a graph once, ~60 ms; the drafter flushed context rows it had not seen: the caller says) is `valid = false`:
+//     counted as a step, not as a sample; a probe whose step was not clean is repeated (3 times at most).
+// Read once from the environment: STRATA_Q36_DFLASH_ARB (0/1), _ARB_PERIOD (16), _ARB_MAX_PERIOD (256), _ARB_MARGIN (0.05), _ARB_INIT (6), _ARB_Z (1.0).
 #pragma once
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 
@@ -18,8 +23,8 @@ namespace strata::q36da {
 
 struct ArbCfg {
     bool on = false;
-    int period = 16, max_period = 256, init = 6, dwell = 8;
-    double margin = 0.05;
+    int period = 16, max_period = 256, init = 6;
+    double margin = 0.05, z = 1.0;
     static ArbCfg from_env() {
         auto num = [](const char* k, double d) { const char* v = std::getenv(k); return v != nullptr && v[0] != '\0' ? std::atof(v) : d; };
         ArbCfg c;
@@ -27,8 +32,8 @@ struct ArbCfg {
         c.period = std::max(2, (int) num("STRATA_Q36_DFLASH_ARB_PERIOD", 16));
         c.max_period = std::max(c.period, (int) num("STRATA_Q36_DFLASH_ARB_MAX_PERIOD", 256));
         c.init = std::max(1, (int) num("STRATA_Q36_DFLASH_ARB_INIT", 6));
-        c.dwell = std::max(1, (int) num("STRATA_Q36_DFLASH_ARB_DWELL", 8));
         c.margin = std::max(0.0, num("STRATA_Q36_DFLASH_ARB_MARGIN", 0.05));
+        c.z = std::max(0.0, num("STRATA_Q36_DFLASH_ARB_Z", 1.0));
         return c;
     }
 };
@@ -50,40 +55,38 @@ public:
     /// The arm of the next step.
     int pick() const { return probing_ ? 1 - cur_ : cur_; }
 
-    /// A step on `arm` is done: `toks` tokens in `ms` milliseconds; `valid` false = not a sample (it recorded a graph).
+    /// A step on `arm` is done: `toks` tokens in `ms` milliseconds; `valid` false = not a clean sample.
     void note(int arm, int toks, double ms, bool valid) {
         ++total_[arm];
+        ++g_;
         if (!c_.on) return;
-        const bool other = arm != cur_;   // a step of the arm that is not the chosen one is a probe (also when the drafter declined and the step took the other path)
+        const bool other = arm != cur_;
         if (!valid) {
             ++invalid_;
             if (probing_ && other && ++probe_bad_ >= 3) end_probe(false);   // (give up: a probe that never gets a clean step must not hold the request)
             return;
         }
-        Est& e = est_[arm];
+        est_[arm].add(toks, ms, g_);
+        if (other && !probing_) return;   // (an unplanned step of the other arm, e.g. the drafter declined: a sample, nothing else)
         if (!other) {
-            const double a = std::max(1.0 / 16.0, 1.0 / (double) (k_ + 2));
-            ++k_;
-            e.add(toks, ms, a);
-            ++since_flip_;
             ++since_probe_;
-            // the chosen arm's rate can fall under the other arm's old value (checked with the dwell and the margin)
-            maybe_flip();
-            if (!probing_ && since_probe_ >= (est_[1 - cur_].n < kMinN ? c_.init : period_)) {
-                probing_ = true;
-                probe_bad_ = 0;
-                probe_got_ = 0;
+            if (!probing_) {
+                const bool first = est_[1 - cur_].n(g_) < kMinN;
+                if (since_probe_ >= (first ? c_.init : next_gap()) && (first || budget_ok())) {
+                    probing_ = true;
+                    probe_bad_ = 0;
+                    probe_got_ = 0;
+                }
             }
             return;
         }
-        e.add(toks, ms, std::max(0.15, 1.0 / (double) (e.n + 1)));   // (a running mean for the first probes, then ~6 probes' memory)
         ++probes_;
-        if (++probe_got_ >= probe_len()) end_probe(true);
+        if (++probe_got_ >= (est_[1 - cur_].n(g_) < kMinN ? c_.init : 1)) end_probe(true);
     }
 
     double rate(int arm) const { return est_[arm].rate(); }
-    double ms_step(int arm) const { return est_[arm].n > 0 ? est_[arm].ms : 0.0; }
-    int samples(int arm) const { return est_[arm].n; }
+    double ms_step(int arm) const { return est_[arm].ms(); }
+    int samples(int arm) const { return est_[arm].count; }
     long long steps(int arm) const { return total_[arm]; }
     long long probes() const { return probes_; }
     long long flips() const { return flips_; }
@@ -91,39 +94,60 @@ public:
     int period() const { return period_; }
 
 private:
+    static constexpr int kMinN = 3;           // samples an arm needs before its rate counts
+    static constexpr double kDecay = 0.995;   // per step: half-life ~140 steps
+
     struct Est {
-        double tok = 0, ms = 0;
-        int n = 0;
-        void add(int t, double m, double a) {
-            if (n == 0) { tok = (double) t; ms = m; }
-            else { tok += a * ((double) t - tok); ms += a * (m - ms); }
-            ++n;
+        double w = 0, mt = 0, m2 = 0, mm = 0;   // weights, weighted mean tokens, weighted sum of squares, weighted mean ms
+        long long last = 0;
+        int count = 0;
+        void decay(long long g) {
+            if (g > last) { const double f = std::pow(kDecay, (double) (g - last)); w *= f; m2 *= f; last = g; }
         }
-        double rate() const { return n > 0 && ms > 0 ? tok / ms : 0.0; }
+        void add(int t, double ms, long long g) {
+            decay(g);
+            ++count;
+            const double nw = w + 1.0, d = (double) t - mt;
+            mt += d / nw;
+            m2 += d * ((double) t - mt);
+            mm += (ms - mm) / nw;
+            w = nw;
+        }
+        double n(long long g) const { return w * std::pow(kDecay, (double) std::max<long long>(0, g - last)); }
+        double rate() const { return count > 0 && mm > 0 ? mt / mm : 0.0; }
+        double ms() const { return count > 0 ? mm : 0.0; }
+        /// standard error of the rate: sd(tokens) / sqrt(n) / mean ms (a floor on the variance for a few samples)
+        double se(long long g) const {
+            const double nn = std::max(1.0, n(g));
+            const double var = w > 1.0 ? m2 / (w - 1.0) : 4.0;
+            return std::sqrt(std::max(var, 0.04)) / std::sqrt(nn) / std::max(mm, 1e-9);
+        }
     };
 
-    static constexpr int kMinN = 3;   // samples an arm needs before its rate can flip the choice
-    /// Steps of a probe: the first look at the other arm takes `init` steps in a row (one step of an arm is a poor reading), later ones one.
-    int probe_len() const { return est_[1 - cur_].n < kMinN ? c_.init : 1; }
+    double diff() const { return est_[1 - cur_].rate() - est_[cur_].rate(); }
+    double se_diff() const {
+        const double a = est_[1 - cur_].se(g_), b = est_[cur_].se(g_);
+        return std::sqrt(a * a + b * b);
+    }
+    bool budget_ok() const { return (double) probes_ <= 0.35 * (double) g_ + 6.0; }
+    /// steps of the chosen arm between two probes: 1 while the comparison is inconclusive, the (doubling) period once the other arm is confidently slower
+    int next_gap() const {
+        const double z = se_diff() > 0 ? diff() / se_diff() : 0.0;
+        return std::fabs(z) < c_.z ? 1 : period_;
+    }
     void end_probe(bool got) {
         probing_ = false;
         since_probe_ = 0;
-        if (!got) return;
-        const int before = cur_;
-        // the probe's verdict: flip when the other arm is clearly faster (the dwell does not apply to a probe); back off only when it is clearly slower
-        // (a close or noisy reading keeps the period: one step of an arm is 1 .. 8 tokens)
-        if (est_[1 - cur_].n >= kMinN && est_[1 - cur_].rate() > est_[cur_].rate() * (1.0 + c_.margin)) flip();
-        if (cur_ == before && est_[1 - cur_].n >= kMinN && est_[1 - cur_].rate() < est_[cur_].rate() * 0.85) period_ = std::min(period_ * 2, c_.max_period);
-    }
-    void maybe_flip() {
-        if (since_flip_ < c_.dwell || est_[1 - cur_].n < kMinN) return;
-        if (est_[1 - cur_].rate() > est_[cur_].rate() * (1.0 + c_.margin)) flip();
+        if (!got || est_[1 - cur_].n(g_) < kMinN) return;
+        const double d = diff(), s = se_diff();
+        const double z = s > 0 ? d / s : 0.0;
+        if (z > c_.z && d > est_[cur_].rate() * c_.margin) { flip(); return; }
+        if (z < -c_.z) period_ = std::min(period_ * 2, c_.max_period);   // confidently slower: probe less
+        else period_ = c_.period;                                         // (inconclusive: next_gap() is 1 for now)
     }
     void flip() {
         cur_ = 1 - cur_;
         ++flips_;
-        k_ = 0;
-        since_flip_ = 0;
         since_probe_ = 0;
         period_ = c_.period;
         probing_ = false;
@@ -132,9 +156,9 @@ private:
     ArbCfg c_;
     Est est_[2];
     int cur_ = kDf, period_;
-    int k_ = 0, since_flip_ = 0, since_probe_ = 0, probe_bad_ = 0, probe_got_ = 0;
+    int since_probe_ = 0, probe_bad_ = 0, probe_got_ = 0;
     bool probing_ = false;
-    long long total_[2] = {0, 0}, probes_ = 0, flips_ = 0, invalid_ = 0;
+    long long total_[2] = {0, 0}, probes_ = 0, flips_ = 0, invalid_ = 0, g_ = 0;
 };
 
 }   // namespace strata::q36da

@@ -10605,6 +10605,8 @@ struct Serve {
                 const bool df_fb = df_avail && (arb_on ? dfr.arb.pick() == strata::q36da::Arb::kMtp : dfr.off > 0);   // this step is one of the fallback's (or the arbiter's MTP arm)
                 const auto arb_t0 = Clock::now();
                 const size_t arb_g0 = E.row_graphs.size() + E.df_graphs.size();
+                // a drafter step that has to catch its context up first (the prompt's rows, the rows of the steps on the other arm) pays eager flushes: not a clean sample of the steady-state step
+                const bool arb_catch = arb_on && !df_fb && E.df->pending_rows(E.pos) > 0;
                 if (df_avail && !df_fb) {
                     const int Dd = std::min({max_drafts, strata::q36df::kDrafts, E.lookup_depth()});
                     bool lk = false;
@@ -10680,7 +10682,7 @@ struct Serve {
                     look.observe(drafts, a, picks[a]);
                 }
                 if (arb_on)   // the step's host time (draft + verify; it has waited for its picks): a sample of the arm that RAN (a declined drafter step ran the MTP arm); a step that recorded a graph is not one
-                    dfr.arb.note(df_step ? strata::q36da::Arb::kDf : strata::q36da::Arb::kMtp, a + 1, ms_since(arb_t0), E.row_graphs.size() + E.df_graphs.size() == arb_g0);
+                    dfr.arb.note(df_step ? strata::q36da::Arb::kDf : strata::q36da::Arb::kMtp, a + 1, ms_since(arb_t0), E.row_graphs.size() + E.df_graphs.size() == arb_g0 && !(df_step && arb_catch));
                 offered += D;
                 accepted += a;
                 if (df_fb) {   // DFLASH BLOCK: a step of the fallback is done

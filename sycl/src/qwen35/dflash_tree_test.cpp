@@ -250,7 +250,7 @@ static double geo_p(double mean) {   // E[t] = (1 - p^8) / (1 - p) for t clamped
 }
 struct SimArm { double mean_tok, ms; };
 struct SimOut { long long steps[2]; double tokens, ms; strata::q36da::Arb* arb; };
-static SimOut simulate(const strata::q36da::ArbCfg& cfg, SimArm a0, SimArm a1, int n, std::mt19937_64& rng, int switch_at = -1, SimArm b0 = {0, 0}, SimArm b1 = {0, 0}, double graph_ms = 0) {
+static SimOut simulate(const strata::q36da::ArbCfg& cfg, SimArm a0, SimArm a1, int n, std::mt19937_64& rng, int switch_at = -1, SimArm b0 = {0, 0}, SimArm b1 = {0, 0}, double graph_ms = 0, double flush_ms = 0) {
     static strata::q36da::Arb* keep = nullptr;
     delete keep;
     keep = new strata::q36da::Arb(cfg);
@@ -258,6 +258,7 @@ static SimOut simulate(const strata::q36da::ArbCfg& cfg, SimArm a0, SimArm a1, i
     SimArm arms[2] = {a0, a1};
     std::uniform_real_distribution<double> u(0.0, 1.0);
     bool seen[2] = {false, false};
+    bool mtp_since_df = false;
     for (int i = 0; i < n; ++i) {
         if (i == switch_at) { arms[0] = b0; arms[1] = b1; }
         const int arm = keep->pick();
@@ -268,6 +269,8 @@ static SimOut simulate(const strata::q36da::ArbCfg& cfg, SimArm a0, SimArm a1, i
         double ms = arms[arm].ms * (0.97 + 0.06 * u(rng));
         bool valid = true;
         if (!seen[arm]) { seen[arm] = true; ms += graph_ms; valid = graph_ms == 0; }   // the first step of an arm records a graph
+        if (arm == 0 && mtp_since_df && flush_ms > 0) { ms += flush_ms; valid = false; }   // the drafter's first step after MTP steps flushes the rows it missed (the engine says so: not a clean sample)
+        mtp_since_df = arm == 1 ? true : false;
         keep->note(arm, t, ms, valid);
         ++o.steps[arm];
         o.tokens += t;
@@ -314,6 +317,7 @@ static void test_arbiter() {
         std::printf("  arbiter %-13s: %.3f of the better arm (staying on the drafter: %.3f), %.1f%% of the steps on the worse arm\n", k.name, frac / 100, fixed / 100,
                     100.0 * (double) other / 70000.0);
         check(frac / 100 >= k.need, (std::string("arbiter ") + k.name + ": mean throughput near the better arm").c_str(), std::to_string(frac / 100));
+        if (std::string(k.name).find("30%") != std::string::npos) check((double) other / 70000.0 <= 0.10, (std::string("arbiter ") + k.name + ": at most 10% of the steps on the worse arm").c_str(), std::to_string((double) other / 70000.0));
         if (k.best == 1) check(frac / 100 > fixed / 100 + 0.05, (std::string("arbiter ") + k.name + ": beats staying on the drafter").c_str());
     }
     // 4. the regime changes at step 300 (the drafter's acceptance falls: code -> prose): the arbiter follows
@@ -328,6 +332,18 @@ static void test_arbiter() {
         check(o.arb->invalid() == 2, "graph steps are invalid samples", std::to_string(o.arb->invalid()));
         check(o.arb->chosen() == 0, "graph steps do not flip a better drafter");
         check(std::fabs(o.arb->ms_step(1) - 36.0) < 4.0, "the MTP estimate is the real step time, not the graph's", std::to_string(o.arb->ms_step(1)));
+    }
+    // 5b. the drafter's catch-up flush after MTP steps (20 ms on the first drafter step after a probe or a stretch of MTP steps) is not a sample: a better drafter stays chosen
+    {
+        double frac = 0;
+        int on_df = 0;
+        for (int rep = 0; rep < 100; ++rep) {
+            const SimOut o = simulate(c, {6.0, 38.0}, {4.5, 36.0}, 700, rng, -1, {0, 0}, {0, 0}, 0, 20.0);
+            frac += (o.tokens / o.ms) / (6.0 / 38.0);
+            on_df += o.arb->chosen() == 0;
+        }
+        std::printf("  arbiter drafter +30%% with a 20 ms catch-up flush after MTP steps: %.3f of the better arm, ends on the drafter in %d of 100\n", frac / 100, on_df);
+        check(frac / 100 > 0.93 && on_df >= 90, "arbiter: the drafter's catch-up flush does not push a better drafter off");
     }
     // 6. a probe that never gets a clean step is given up after 3 tries, the request goes on on its arm
     {
