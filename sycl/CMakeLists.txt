@@ -341,10 +341,6 @@ add_test(NAME spec_admission_exact_top_only COMMAND ${CMAKE_COMMAND} -E env STRA
 add_executable(draft_policy_test ${STRATA_ROOT}/src/spec/draft_policy_test.cpp ${STRATA_ROOT}/src/spec/draft_policy.cpp)
 target_include_directories(draft_policy_test PRIVATE ${STRATA_ROOT}/include)
 add_test(NAME draft_policy_test COMMAND draft_policy_test)
-# Host-only test of the DFlash drafter's verify tree (q36_dtree.hpp): best-first growth, DFS layout, the 2 GDN checkpoint slots simulated.
-add_executable(dflash_tree_test ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/dflash_tree_test.cpp)
-target_include_directories(dflash_tree_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
-add_test(NAME dflash_tree_test COMMAND dflash_tree_test)
 
 # The kernel parity programs, tests and benches run on the card. Each one compiles its own device code, which is most of a
 # full build's time: they are built on request (-DSTRATA_SYCL_PARITY=ON, or build.sh with a target name after configuring with it).
@@ -685,6 +681,10 @@ if(STRATA_BUILD_Q36)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_dflash.dp.cpp   # the DFlash 2 block drafter (STRATA_Q36_DFLASH; off: never called)
     ${STRATA_ROOT}/src/qwen35/q36_requant.cpp)
   target_compile_definitions(strata PRIVATE STRATA_Q36_PORT=1)
+  # Host-only test of the DFlash drafter's verify tree (q36_dtree.hpp): best-first growth, DFS layout, the 2 GDN checkpoint slots simulated.
+  add_executable(dflash_tree_test ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/dflash_tree_test.cpp)
+  target_include_directories(dflash_tree_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
+  add_test(NAME dflash_tree_test COMMAND dflash_tree_test)
   # B70W4 (the int4 pack's kernels, q36_w4.dp.cpp) as a library of its own: a change there recompiles its kernels alone (the
   # executable's AOT link compiles about 1,500), and they take their own register-file size (STRATA_Q36_W4_GRF=128 at
   # configure time: without -doubleGRF).

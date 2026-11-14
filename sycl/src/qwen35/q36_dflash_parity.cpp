@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <map>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -630,6 +631,217 @@ void test_compact_stage(Dflash& d) {
     sycl::free(dpos, *g_q);
 }
 
+// ---- STRATA_Q36_DFLASH_W4X: the int8 route against the fp16 one
+constexpr int kKvAllRows_() { return kLayers * 2 * kKvHeads * kHd; }
+struct W4Shape { const char* name; int n_in, n_out; std::vector<const void*> w; };
+std::vector<W4Shape> block_shapes(Dflash& d) {
+    std::vector<W4Shape> sh = {{"ckp  5120 -> 1280", kN, kKpOut, {}}, {"q    5120 -> 4096", kN, kHeads * kHd, {}}, {"kv   5120 -> 2048", kN, 2048, {}}, {"o    4096 -> 5120", kHeads * kHd, kN, {}},
+                               {"gate/up 5120 -> 17408", kN, kFF, {}}, {"down 17408 -> 5120", kFF, kN, {}}, {"hproj 5120 -> 256", kN, kRank, {}}, {"fc   25600 -> 5120", kTaps * kN, kN, {}},
+                               {"kv_all 5120 -> 10240", kN, kKvAllRows_(), {}}};
+    for (int l = 0; l < kLayers; ++l) {
+        const std::string p = "l" + std::to_string(l) + ".";
+        sh[0].w.push_back(d.tensor(p + "akp")); sh[0].w.push_back(d.tensor(p + "mkp"));
+        sh[1].w.push_back(d.tensor(p + "q"));
+        sh[2].w.push_back(static_cast<const uint8_t*>(d.tensor("kv_all")) + (size_t) l * (2048 / 16) * (kN / 256) * 2176);
+        sh[3].w.push_back(d.tensor(p + "o"));
+        sh[4].w.push_back(d.tensor(p + "gate")); sh[4].w.push_back(d.tensor(p + "up"));
+        sh[5].w.push_back(d.tensor(p + "down"));
+    }
+    sh[6].w.push_back(d.tensor("hproj"));
+    sh[7].w.push_back(d.tensor("fc"));
+    sh[8].w.push_back(d.tensor("kv_all"));
+    return sh;
+}
+
+// mmvq_w4x on int8 activations against mmvq_w4h on fp16 operands, same weights, same random activations: the relative L2 distance of the outputs is the int8 quantization's
+// cost (one scale a group of 128 inputs, rounding to +-127: ~0.5% of a group's largest value a term)
+void test_w4x_products(Dflash& d) {
+    auto shapes = block_shapes(d);
+    double worst = 0;
+    bool ok = true, declined = false;
+    std::string where;
+    for (auto& sh : shapes) {
+        for (int nc : {16, 24, 32}) {
+            auto x = rvec((size_t) nc * sh.n_in, 1.f);
+            float* dxf = up(x);
+            uint16_t* dx16 = dev<uint16_t>(strata::q36xr::w4h_act_halfs(sh.n_in, nc));
+            strata::q36xr::w4h_pack(dxf, sh.n_in, dx16, sh.n_in, nc, g_q);
+            void* act = dev<uint8_t>(strata::q36xr::w4x_act_bytes(sh.n_in, nc, 128));
+            strata::q36xr::w4x_quantize(dxf, sh.n_in, act, sh.n_in, nc, 128, g_q);
+            float* yh = dev<float>((size_t) nc * sh.n_out);
+            float* yx = dev<float>((size_t) nc * sh.n_out);
+            const bool a = strata::q36xr::mmvq_w4h(sh.w[0], dx16, yh, sh.n_in, sh.n_out, nc, g_q);
+            const bool b = strata::q36xr::mmvq_w4x(sh.w[0], act, yx, sh.n_in, sh.n_out, nc, 128, g_q);
+            g_q->wait();
+            declined = declined || !a || !b;
+            if (a && b) {
+                auto h = down(yh, (size_t) nc * sh.n_out), xx = down(yx, (size_t) nc * sh.n_out);
+                double num = 0, den = 0;
+                size_t nonfin = 0;
+                for (size_t i = 0; i < h.size(); ++i) {
+                    if (!std::isfinite(xx[i])) { ++nonfin; continue; }
+                    num += ((double) xx[i] - h[i]) * ((double) xx[i] - h[i]);
+                    den += (double) h[i] * h[i];
+                }
+                const double rel = std::sqrt(num / std::max(den, 1e-30));
+                if (nonfin || rel > 0.02) { ok = false; where += fmt(" [%.0f cols, rel %.4f]", nc, rel) + sh.name; }
+                worst = std::max(worst, rel);
+            }
+            for (void* p : {(void*) dxf, (void*) dx16, act, (void*) yh, (void*) yx}) sycl::free(p, *g_q);
+        }
+    }
+    check("W4X products == W4H products within int8 quantization (16/24/32 columns)", ok && !declined, fmt("worst relative L2 distance %.4f (bound 0.02)", worst) + where);
+}
+
+// the pass: a batch pass of 2 blocks with the int8 route against the fp16 one: the final-normed rows must stay close (cosine), and the int8 route must repeat bitwise
+void test_w4x_pass(Dflash& d) {
+    const int NS = 2, Ts[NS] = {100, 70};
+    const int32_t anchors[NS] = {4242, 17};
+    std::vector<float*> dxs;
+    int32_t* dpos = up(std::vector<int32_t>{0});
+    for (int s = 0; s < NS; ++s) {
+        auto x = rvec((size_t) Ts[s] * kN, 2.f);
+        float* dx = up(x);
+        dxs.push_back(dx);
+        for (int k = 0; k < kTaps; ++k) d.capture(*g_q, k, dx, Ts[s], dpos, s);
+    }
+    g_q->wait();
+    auto go = [&](std::vector<float>& h) {
+        for (int s = 0; s < NS; ++s) { d.invalidate(s); d.note_forward(0, Ts[s], s); }
+        Dflash::Req rq[NS] = {{0, Ts[0], anchors[0]}, {1, Ts[1], anchors[1]}};
+        int cols[NS] = {0, 0};
+        d.prepare_batch(*g_q, rq, NS, cols);
+        d.run_batch(*g_q, NS, cols[0] + cols[1]);
+        g_q->wait();
+        d.debug_h(*g_q, 8 * NS, h);
+    };
+    std::vector<float> h0, h1, h2;
+    d.set_w4x(*g_q, false);
+    go(h0);
+    const bool on = d.set_w4x(*g_q, true, 16);
+    go(h1);
+    go(h2);
+    d.set_w4x(*g_q, false);
+    double mincos = 1, maxrel = 0;
+    size_t nonfin = 0;
+    for (int r = 0; on && r < 8 * NS; ++r) {
+        double dot = 0, a2 = 0, b2 = 0, df = 0;
+        for (int i = 0; i < kN; ++i) {
+            const double a = h0[(size_t) r * kN + i], b = h1[(size_t) r * kN + i];
+            if (!std::isfinite(b)) ++nonfin;
+            dot += a * b; a2 += a * a; b2 += b * b; df += (a - b) * (a - b);
+        }
+        mincos = std::min(mincos, dot / std::sqrt(a2 * b2 + 1e-30));
+        maxrel = std::max(maxrel, std::sqrt(df / std::max(a2, 1e-30)));
+    }
+    const bool same = on && std::memcmp(h1.data(), h2.data(), h1.size() * 4) == 0;
+    std::printf("  W4X pass: final-normed rows vs the fp16 route: min cosine %.5f, max relative L2 %.4f, %.0f non-finite\n", mincos, maxrel, (double) nonfin);
+    check("W4X batch pass: rows close to the fp16 route (cosine > 0.9: a sanity floor, the card's acceptance is the test)", on && nonfin == 0 && mincos > 0.9, fmt("min cosine %.4f", mincos));
+    check("W4X batch pass repeats bitwise", same);
+    for (auto* p : dxs) sycl::free(p, *g_q);
+    sycl::free(dpos, *g_q);
+}
+
+template <class F> double median_us(F&& fn, int per = 40) {
+    const auto t0 = std::chrono::steady_clock::now();
+    while (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < 0.2) { for (int i = 0; i < per; ++i) fn((size_t) i); g_q->wait(); }
+    std::vector<double> us;
+    for (int rep = 0; rep < 9; ++rep) {
+        const auto a = std::chrono::steady_clock::now();
+        for (int i = 0; i < per; ++i) fn((size_t) i);
+        g_q->wait();
+        us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - a).count() / per);
+    }
+    std::sort(us.begin(), us.end());
+    return us[us.size() / 2];
+}
+
+// the product table at 8 / 16 / 24 / 32 columns: mmvq_w4h, mmvq_w4x alone, quantize + mmvq_w4x (a rotation of distinct matrices: more than the 24 MiB LLC where the pack has them)
+void bench_w4x_products(Dflash& d) {
+    auto shapes = block_shapes(d);
+    std::printf("\nproducts at 8 / 16 / 24 / 32 columns: us (GB/s of the weights) of mmvq_w4h | mmvq_w4x | quantize + mmvq_w4x   (floor = bytes / 590 GB/s)\n%-26s %8s %8s", "shape", "MB", "floor");
+    for (int nc : {8, 16, 24, 32}) std::printf(" | %2d cols: %-26s", nc, "w4h | w4x | q+w4x");
+    std::printf("\n");
+    for (auto& sh : shapes) {
+        const double bytes = (double) strata::q36xr::w4_bytes(sh.n_in, sh.n_out);
+        std::printf("%-26s %8.1f %6.1fus", sh.name, bytes / 1e6, bytes / 590e3);
+        for (int nc : {8, 16, 24, 32}) {
+            auto x = rvec((size_t) nc * sh.n_in, 1.f);
+            float* dxf = up(x);
+            uint16_t* dx16 = dev<uint16_t>(strata::q36xr::w4h_act_halfs(sh.n_in, nc));
+            strata::q36xr::w4h_pack(dxf, sh.n_in, dx16, sh.n_in, nc, g_q);
+            void* act = dev<uint8_t>(strata::q36xr::w4x_act_bytes(sh.n_in, nc, 128));
+            strata::q36xr::w4x_quantize(dxf, sh.n_in, act, sh.n_in, nc, 128, g_q);
+            float* y = dev<float>((size_t) nc * sh.n_out);
+            g_q->wait();
+            const double uh = median_us([&](size_t k) { strata::q36xr::mmvq_w4h(sh.w[k % sh.w.size()], dx16, y, sh.n_in, sh.n_out, nc, g_q); });
+            const double ux = median_us([&](size_t k) { strata::q36xr::mmvq_w4x(sh.w[k % sh.w.size()], act, y, sh.n_in, sh.n_out, nc, 128, g_q); });
+            const double uq = median_us([&](size_t k) {
+                strata::q36xr::w4x_quantize(dxf, sh.n_in, act, sh.n_in, nc, 128, g_q);
+                strata::q36xr::mmvq_w4x(sh.w[k % sh.w.size()], act, y, sh.n_in, sh.n_out, nc, 128, g_q);
+            });
+            char c[96];
+            std::snprintf(c, sizeof c, "%.1f(%.0f) | %.1f(%.0f) | %.1f", uh, bytes / uh / 1e3, ux, bytes / ux / 1e3, uq);
+            std::printf(" | %-36s", c);
+            for (void* p : {(void*) dxf, (void*) dx16, act, (void*) y}) sycl::free(p, *g_q);
+        }
+        std::printf("\n");
+    }
+}
+
+// the time of each stage of a block pass, from the host-submitted pass on a profiling queue: a barrier after every stage, the stage's time = the gap between consecutive barrier
+// completions (the kernel(s) + the gap before it; the barrier itself costs a little: read it as an upper bound, and the sum against the pass without barriers)
+void profile_block(Dflash& d, int nb, const char* label) {
+    std::printf("\nblock pass stages, %s (%d block%s, %d columns): median over 20 passes of the stage's time a pass (us), calls a pass, share\n", label, nb, nb > 1 ? "s" : "", 8 * nb);
+    try {
+        sycl::queue pq(g_q->get_context(), g_q->get_device(), {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()});
+        sycl::queue* saved = g_q;
+        g_q = &pq;   // (the hooks of this test submit to g_q: one queue, in order)
+        struct Rec { const char* name; sycl::event ev; };
+        std::vector<Rec> recs;
+        d.set_stage_hook([&](const char* n) { recs.push_back({n, pq.ext_oneapi_submit_barrier()}); });
+        std::map<std::string, std::vector<double>> per;
+        std::map<std::string, int> calls;
+        std::vector<double> totals;
+        std::vector<std::string> order;
+        for (int rep = 0; rep < 24; ++rep) {
+            recs.clear();
+            sycl::event e0 = pq.ext_oneapi_submit_barrier();
+            d.block_batch(pq, nb);
+            pq.wait();
+            if (rep < 4) continue;
+            double prev = (double) e0.get_profiling_info<sycl::info::event_profiling::command_end>();
+            const double first = prev;
+            std::map<std::string, double> sum;
+            std::map<std::string, int> cnt;
+            for (auto& r : recs) {
+                const double t = (double) r.ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+                sum[r.name] += (t - prev) / 1e3;
+                ++cnt[r.name];
+                prev = t;
+                if (rep == 4 && std::find(order.begin(), order.end(), r.name) == order.end()) order.push_back(r.name);
+            }
+            totals.push_back((prev - first) / 1e3);
+            for (auto& kv : sum) { per[kv.first].push_back(kv.second); calls[kv.first] = cnt[kv.first]; }
+        }
+        d.set_stage_hook(nullptr);
+        g_q = saved;
+        std::sort(totals.begin(), totals.end());
+        const double tot = totals[totals.size() / 2];
+        double acc = 0;
+        for (const auto& nm : order) {
+            auto& v = per[nm];
+            std::sort(v.begin(), v.end());
+            const double med = v[v.size() / 2];
+            acc += med;
+            std::printf("  %-18s %9.1f us  x%-3d  %5.1f%%   (%.1f us a call)\n", nm.c_str(), med, calls[nm], 100.0 * med / tot, med / calls[nm]);
+        }
+        std::printf("  %-18s %9.1f us  (the stages add up to %.1f us)\n", "pass", tot, acc);
+    } catch (const std::exception& e) {
+        std::printf("  (profiling queue unavailable: %s)\n", e.what());
+    }
+}
+
 int whole(bool bench) {
     Bench* b = new Bench;
     std::string err;
@@ -684,7 +896,15 @@ int whole(bool bench) {
     test_tree_gather(b->d, tok, pr, dbg);
     b->d.enable_tree(*g_q, false);
     test_compact_stage(b->d);
+    test_w4x_products(b->d);
+    test_w4x_pass(b->d);
     if (!bench) { batch_vs_singles(b->d); return 0; }
+    // the bench passes start from the state of the whole-pass check again (the tests above reused slot 0's staging and the meta)
+    for (int k = 0; k < kTaps; ++k) b->d.capture(*g_q, k, dx, T, dpos);
+    b->d.invalidate();
+    b->d.note_forward(0, T);
+    b->d.prepare(*g_q, T, 4242);
+    g_q->wait();
     // bytes a pass reads: the block's weights (every layer's q, o, gate, up, down, 2 kernel projections, its kv slice) + hproj; the context update's fc + kv_all
     auto w4 = [](int n_in, int n_out) { return (double) strata::q36xr::w4_bytes(n_in, n_out); };
     const double blk = kLayers * (w4(kN, 4096) + w4(4096, kN) + 2 * w4(kN, kFF) + w4(kFF, kN) + 2 * w4(kN, kKpOut) + w4(kN, 2048)) + w4(kN, kRank);
@@ -707,6 +927,7 @@ int whole(bool bench) {
     time_it("context update, 8 rows (fc + kv_all)", ctx, [&] { b->d.ctx_update(*g_q, 8, false); });
     time_it("both (run(8))", blk + ctx, [&] { b->d.run(*g_q, 8); });
     std::printf("(the three lines above: ~85 / 5 / ~90 kernels submitted from the host one by one)\n");
+    profile_block(b->d, 1, "8 rows, 100 context rows");
     // the same passes recorded once and replayed as the engine does (graph_run): the host's submission gone, the kernel boundaries at graph cost
     {
         auto graph_it = [&](const char* name, double bytes, auto&& body) {
@@ -732,6 +953,7 @@ int whole(bool bench) {
         b->d.run(*g_q, n3);
         g_q->wait();
         graph_it("GRAPH block pass, 2,047 context rows", blk, [&] { b->d.block(*g_q); });
+        profile_block(b->d, 1, "8 rows, 2,047 context rows");
         std::printf("(the difference between the last line and 'GRAPH block pass (8 rows)' is the attention at a full window: floor of its K/V reads 42 MB = %.3f ms)\n", 42e6 / 590e6);
         sycl::free(dx3, *g_q);
     }
@@ -791,6 +1013,7 @@ int whole(bool bench) {
         std::printf("(cell: us / GB/s.  The pass uses the best C of each class through STRATA_Q36_DFLASH_W4C=ckp,q,kv,o,gate_up,down,hproj and STRATA_Q36_DFLASH_W4T; unset = the engine's)\n");
     }
     batch_vs_singles(b->d);
+    bench_w4x_products(b->d);
     // the batch pass: the block's weights read once for 8 nb columns (graph replay; the head's hook here is the synthetic one)
     for (int nb = 1; nb <= kMaxBlocks; ++nb) {
         char nm[64];
@@ -802,6 +1025,23 @@ int whole(bool bench) {
         auto* gx = new sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>(graph->finalize());
         delete graph;
         time_it(nm, blk, [&] { g_q->ext_oneapi_graph(*gx); });
+    }
+    profile_block(b->d, 4, "w4h products");
+    // the same with the int8 route (STRATA_Q36_DFLASH_W4X): graph replay of the batch passes, then the stage profile
+    if (b->d.set_w4x(*g_q, true, 16)) {
+        for (int nb = 2; nb <= kMaxBlocks; ++nb) {
+            char nm[64];
+            std::snprintf(nm, sizeof nm, "GRAPH block pass, %d blocks, W4X", nb);
+            dpct::experimental::command_graph_ptr graph = nullptr;
+            dpct::experimental::begin_recording(g_q);
+            b->d.block_batch(*g_q, nb);
+            dpct::experimental::end_recording(g_q, &graph);
+            auto* gx = new sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>(graph->finalize());
+            delete graph;
+            time_it(nm, blk, [&] { g_q->ext_oneapi_graph(*gx); });
+        }
+        profile_block(b->d, 4, "W4X products");
+        b->d.set_w4x(*g_q, false);
     }
     return 0;
 }

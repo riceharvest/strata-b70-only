@@ -981,45 +981,69 @@ void Dflash::block_batch(sycl::queue& q, int nb) {
     float* const hcf = x ? hcf_ : nullptr;
     float* const attf = x ? attf_ : nullptr;
     hooks_.embed(meta_ + kMetaTok, R, x_);
+    if (stage_hook_) stage_hook_("embed");
     if (debug_) q.memcpy(dbg_embed_, x_, 2 * kN * sizeof(float));
     k::rms_pack(q, x_, in_ln_[0], eps_, h_, h16_, R);
+    if (stage_hook_) stage_hook_("rms_pack");
     for (int l = 0; l < kLayers; ++l) {
         prod(q, akp_[l], h16_, dyn_a_, kN, kKpOut, R, kCkp, x ? h_ : nullptr);
+        if (stage_hook_) stage_hook_("ckp (akp, mkp)");
         k::conv_pack(q, h_, dyn_a_, 0, abase_[l], h16b_, R, hcf);
+        if (stage_hook_) stage_hook_("conv_pack");
         prod(q, wq_[l], h16b_, qy_, kN, kHeads * kHd, R, kCq, hcf);
+        if (stage_hook_) stage_hook_("q");
         prod(q, static_cast<const uint8_t*>(kv_) + (size_t) l * (kKvRows / 16) * (kN / 256) * 2176, h16b_, kvy_, kN, kKvRows, R, kCkv, hcf, false);   // (same input as q: quantized once)
+        if (stage_hook_) stage_hook_("kv");
         k::qk_prep(q, qy_, kvy_, qn_[l], kn_[l], meta_, eps_, qb_, kb_, vb_, R);
+        if (stage_hook_) stage_hook_("qk_prep");
         k::attn_part(q, qb_, kb_, vb_, kring_, vring_, l, meta_, part_acc_, part_m_, part_l_, nb);
+        if (stage_hook_) stage_hook_("attn_part");
         k::attn_merge(q, part_acc_, part_m_, part_l_, att16_, nb, attf);
+        if (stage_hook_) stage_hook_("attn_merge");
         prod(q, wo_[l], att16_, oy_, kHeads * kHd, kN, R, kCo, attf);
+        if (stage_hook_) stage_hook_("o");
         k::finish_rms(q, oy_, dyn_a_, abase_[l], x_, post_ln_[l], eps_, h_, h16_, R);
+        if (stage_hook_) stage_hook_("finish_rms");
         prod(q, mkp_[l], h16_, dyn_m_, kN, kKpOut, R, kCkp, x ? h_ : nullptr);
+        if (stage_hook_) stage_hook_("ckp (akp, mkp)");
         k::conv_pack(q, h_, dyn_m_, 0, mbase_[l], h16b_, R, hcf);
+        if (stage_hook_) stage_hook_("conv_pack");
         prod(q, wg_[l], h16b_, gy_, kN, kFF, R, kCgu, hcf);
+        if (stage_hook_) stage_hook_("gate");
         prod(q, wu_[l], h16b_, uy_, kN, kFF, R, kCgu, hcf, false);   // (same input as gate)
+        if (stage_hook_) stage_hook_("up");
         if (x) {
             strata::q36xr::w4x_swiglu_quantize(gy_, uy_, w4x_act_, kFF, R, 128, &q);
+            if (stage_hook_) stage_hook_("swiglu");
             if (!xmm(q, wd_[l], dny_, kFF, kN, R)) {   // (declined: the fp16 form)
                 strata::q36xr::w4h_swiglu_pack(gy_, uy_, sw16_, kFF, R, &q);
                 prod(q, wd_[l], sw16_, dny_, kFF, kN, R, kCdn);
             }
         } else {
             strata::q36xr::w4h_swiglu_pack(gy_, uy_, sw16_, kFF, R, &q);
+            if (stage_hook_) stage_hook_("swiglu");
             prod(q, wd_[l], sw16_, dny_, kFF, kN, R, kCdn);
         }
+        if (stage_hook_) stage_hook_("down");
         k::finish_rms(q, dny_, dyn_m_, mbase_[l], x_, l + 1 < kLayers ? in_ln_[l + 1] : norm_, eps_, h_, h16_, R);
+        if (stage_hook_) stage_hook_("finish_rms");
     }
     // h_ = the final-normed block rows
     prod(q, hproj_, h16_, hp_y_, kN, kRank, R, kCh, x ? h_ : nullptr);
+    if (stage_hook_) stage_hook_("hproj");
     int nd = 0;
     const int32_t* idmap = nullptr;
     const int hr = nb * kDrafts;   // the head's rows: rows 1 .. 7 of every block
     const float* hin = h_ + kN;
     if (nb > 1) { k::gather_hn(q, h_, hn_, nb); hin = hn_; }
     hooks_.head(hin, hr, logits_, nd, idmap);
+    if (stage_hook_) stage_hook_("head (hook)");
     k::top1(q, logits_, nd, hr, (nd + kTopChunk - 1) / kTopChunk, top_part_);
+    if (stage_hook_) stage_hook_("top1");
     k::top2(q, top_part_, (nd + kTopChunk - 1) / kTopChunk, hr, idmap, cand_, unary_);
+    if (stage_hook_) stage_hook_("top2");
     k::selector_walk(q, hp_y_, cand_, unary_, pred_cb_, succ_cb_, meta_, out_tok_, out_prob_, nb);
+    if (stage_hook_) stage_hook_("selector_walk");
     if (tree_ && tgath_ != nullptr && nb == 1) k::gather_tree(q, out_tok_, cand_, unary_, hp_y_, pred_cb_, succ_cb_, meta_, tgath_);
 }
 
@@ -1119,6 +1143,15 @@ void Dflash::dump_rows(sycl::queue& q, int64_t c0, int n) {
     }
     std::fflush(f_ctx_);
     dump_records_ += n;
+}
+
+void Dflash::dump_ids(const std::vector<int32_t>& ids) {
+    if (!dump_) return;
+    if (FILE* f = std::fopen((dump_dir_ + "/ids.txt").c_str(), "wb")) {
+        for (size_t i = 0; i < ids.size(); ++i) std::fprintf(f, "%s%d", i ? " " : "", (int) ids[i]);
+        std::fprintf(f, "\n");
+        std::fclose(f);
+    }
 }
 
 void Dflash::dump_step(sycl::queue& q, int64_t P, int32_t anchor) {

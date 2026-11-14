@@ -3648,6 +3648,7 @@ struct Engine {
     // ---- DFLASH TREE (STRATA_Q36_DFLASH_TREE=1, default off): the window verifies a TREE of the drafter's candidates (q36_dtree.hpp) instead of its one chain.
     bool df_tree = false;
     int df_tree_rows = 16;               // STRATA_Q36_DFLASH_TREE_NODES draft nodes + the root (default 15 + 1)
+    bool df_tree_force = false;          // STRATA_Q36_DFLASH_TREE_FORCE=1: a chain-only tree also goes through the tree verify (the invariant check: same drafts / text as the linear arm)
     float df_tree_minlp = -3.912023f;    // STRATA_Q36_DFLASH_TREE_MINP (default 0.02): a pending node below this cumulative probability is not added
     strata::q36dt::Gather* df_tg_h = nullptr;   // pinned host image of the last draft's scores (dflash_draft fills it when the tree is on)
     /// DFlash drafts are usable for a step now (single session, graphs, no pictures).
@@ -10626,7 +10627,7 @@ struct Serve {
                         tp.min_lp = E.df_tree_minlp;
                         const auto tnodes = strata::q36dt::build(*E.df_tg_h, tp);
                         const strata::q36dt::Layout tl = strata::q36dt::layout(tnodes);
-                        if (tl.ok && tl.T > D + 1) {
+                        if (tl.ok && (tl.T > D + 1 || (E.df_tree_force && tl.T >= 3))) {
                             int tree_off = D;
                             a = E.spec_step_dtree(nx, fix, max_drafts, tl, tree_off, drafts, picks, &stop, plan.ok ? &sel : nullptr);
                             taken = true;
@@ -10723,6 +10724,7 @@ struct Serve {
                      (long long) fresh, prompt_ms, prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, produced,
                      decode_ms, decode_ms > 0 ? 1000.0 * (double) produced / decode_ms : 0.0, accepted, offered, look_ok, looked, finish);
         if (df_steps > 0) {   // DFLASH BLOCK: the acceptance length = tokens a verify step (the accepted drafts and the window's own)
+            if (E.df != nullptr) E.df->dump_ids(ss.live);   // (STRATA_Q36_DFLASH_DUMP: the ids by position, for the tap check against llama.cpp)
             std::fprintf(stderr, "strata serve: dflash: %lld verify steps, %lld drafts accepted, mean %.3f tokens a step\n", df_steps, df_acc,
                          (double) (df_acc + df_steps) / (double) df_steps);
             std::fprintf(stderr, "strata serve: dflash: drafts offered a step %.2f; accepted per step: 0:%lld 1:%lld 2:%lld 3:%lld 4:%lld 5:%lld 6:%lld 7:%lld; context rows at the first block %d of %d; "
@@ -11044,6 +11046,7 @@ int strata::qwen35::run(int argc, char** argv) {
             E.df_keep_mtp = (mt == nullptr || mt[0] == '\0' ? 3.0 : std::atof(mt)) > 0.0;
         }
         if (const char* te = std::getenv("STRATA_Q36_DFLASH_TREE"); te != nullptr && std::atoi(te) != 0 && E.df_cap && !E.df_batch) {   // DFLASH TREE (single stream only)
+            E.df_tree_force = std::getenv("STRATA_Q36_DFLASH_TREE_FORCE") != nullptr && std::atoi(std::getenv("STRATA_Q36_DFLASH_TREE_FORCE")) != 0;
             if (const char* tn = std::getenv("STRATA_Q36_DFLASH_TREE_NODES"); tn != nullptr && tn[0] != '\0') E.df_tree_rows = std::max(3, std::min(16, std::atoi(tn) + 1));
             if (const char* tp = std::getenv("STRATA_Q36_DFLASH_TREE_MINP"); tp != nullptr && tp[0] != '\0') E.df_tree_minlp = std::atof(tp) > 0.0 ? (float) std::log(std::atof(tp)) : -1.0e9f;
             if (dflash.enable_tree(*E.st, true)) {

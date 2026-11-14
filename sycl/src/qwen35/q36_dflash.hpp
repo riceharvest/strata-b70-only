@@ -162,6 +162,8 @@ public:
     // on activations quantized to int8 (a scale a group of 128 inputs) instead of mmvq_w4h on fp16 operands.  The 8-column pass keeps mmvq_w4h.  NOT bitwise to the w4h forms.
     bool set_w4x(sycl::queue& q, bool on, int min_cols = 16);
     bool w4x_on() const { return w4x_; }
+    /// Bench: called with a stage's name after each stage of block_batch is enqueued (null: nothing).  Read when the pass is enqueued / recorded.
+    void set_stage_hook(std::function<void(const char*)> h) { stage_hook_ = std::move(h); }
     /// Debug: the final-normed rows h [rows][kN] of the last block pass (waits).
     bool debug_h(sycl::queue& q, int rows, std::vector<float>& out);
     /// Debug: the last block's intermediates and candidates (waits).
@@ -175,6 +177,7 @@ public:
     // ---- STRATA_Q36_DFLASH_DUMP=<dir>: what tools/qwen35/dflash_ref.py replay reads (format: its docstring)
     void enable_dump(const std::string& dir, int max_steps, int max_rows);
     void dump_subset(const int32_t* ids, int n);                       ///< the draft head's token ids (subset.bin)
+    void dump_ids(const std::vector<int32_t>& ids);                    ///< the request's token ids by position (ids.txt, space separated): what llama.cpp must be fed for `dflash_ref.py taps` to reach the generated rows too
     void dump_step(sycl::queue& q, int64_t P, int32_t anchor);         ///< after a draft: the step's block, candidates and path (waits)
 
     // ---- products on named tensors (parity / bench)
@@ -234,6 +237,7 @@ private:
     uint64_t* top_part_ = nullptr;
     float* hn_ = nullptr;                      // the head's input rows [kMaxBlocks x 7][kN]
     int n_slots_ = 1;
+    std::function<void(const char*)> stage_hook_;
     bool w4x_ = false;
     int w4x_min_ = 16;
     uint8_t* w4x_act_ = nullptr;               // the int8 activations of the product in flight (w4x_act_bytes(25600, 32, 128))
