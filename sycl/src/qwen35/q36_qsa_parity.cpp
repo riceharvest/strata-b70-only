@@ -339,6 +339,7 @@ void test_score(const Weights16& w) {
     // the 16 rows' scores and ids are the same whatever the rows of a launch (1, 2, 4, 8): select_rows launches 8 at a time; a 3-row call is a 4-row kernel
     const auto sel16 = down(sc.sel, (size_t) 16 * kTopBlocks);
     bool same = true;
+    std::string first_call_diff;
     for (int nr : {1, 3, 5}) {
         for (int r0 : {0, 6, 13}) {
             if (r0 + nr > 16) continue;
@@ -353,8 +354,24 @@ void test_score(const Weights16& w) {
             const auto id1 = down(s1.sel, (size_t) nr * kTopBlocks);
             for (int r = 0; r < nr; ++r) {
                 const int c = (P + r0 + r + 1) / 4;
-                same = same && std::memcmp(&sc1[(size_t) r * nbc], &score[(size_t) (r0 + r) * nbc], (size_t) c * 4) == 0;
-                same = same && std::memcmp(&id1[(size_t) r * kTopBlocks], &sel16[(size_t) (r0 + r) * kTopBlocks], kTopBlocks * 4) == 0;
+                if (std::memcmp(&sc1[(size_t) r * nbc], &score[(size_t) (r0 + r) * nbc], (size_t) c * 4) != 0) {
+                    same = false;
+                    if (first_call_diff.empty()) {
+                        int fb = 0;
+                        while (fb < c && std::memcmp(&sc1[(size_t) r * nbc + fb], &score[(size_t) (r0 + r) * nbc + fb], 4) == 0) ++fb;
+                        first_call_diff = fmt("call nr %.0f from row %.0f, its row %.0f: SCORES differ", nr, r0, r) +
+                                          fmt(" at block %.0f: got %.9g, 16-row call %.9g", fb, sc1[(size_t) r * nbc + fb], score[(size_t) (r0 + r) * nbc + fb]);
+                    }
+                }
+                if (std::memcmp(&id1[(size_t) r * kTopBlocks], &sel16[(size_t) (r0 + r) * kTopBlocks], kTopBlocks * 4) != 0) {
+                    same = false;
+                    if (first_call_diff.empty()) {
+                        int fi = 0;
+                        while (fi < kTopBlocks && id1[(size_t) r * kTopBlocks + fi] == sel16[(size_t) (r0 + r) * kTopBlocks + fi]) ++fi;
+                        first_call_diff = fmt("call nr %.0f from row %.0f, its row %.0f: IDS differ (scores equal)", nr, r0, r) +
+                                          fmt(" at slot %.0f: got %.0f, 16-row call %.0f", fi, id1[(size_t) r * kTopBlocks + fi], sel16[(size_t) (r0 + r) * kTopBlocks + fi]);
+                    }
+                }
             }
             free_scratch(s1, g_q);
         }
@@ -373,8 +390,173 @@ void test_score(const Weights16& w) {
         }
     }
     check("score+select: 16 rows' ids = the host's top 512 of the card's scores", sdiff.empty(), sdiff);
-    check("score+select: rows bitwise the same in calls of 1, 3, 5", same);
+    check("score+select: rows bitwise the same in calls of 1, 3, 5", same, first_call_diff);
     free_scratch(sc, g_q); free_state(ls, g_q);
+}
+
+// ---- the OLD select kernels (parity only, no part of the engine): the same 21 cases through each, scores copied in (the scoring kernel is out of
+// the loop), one info line per variant.  Read: 916106b3 ok + 05573cfe FAIL -> the sub-group aggregation; both FAIL and the new kernel ok -> the
+// library scan / generic-space atomics / shuffles; all three FAIL alike -> shared code (harness, row_vis_blocks, the 1,024-wide work-group).
+struct TagOldA; struct TagOldB;
+inline uint32_t skey_d(float v) { return sycl::bit_cast<uint32_t>(v) & 0x7FFFFFFFu; }
+template <class Tag>
+void old_select(sycl::queue& q, const float* score, int c_in, int32_t* sel, int32_t* nsel) {
+    q.parallel_for<Tag>(sycl::nd_range<1>((size_t) 1024, 1024), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+        auto grp = it.get_group();
+        auto& hist = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[256]>(grp);
+        auto& sh = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[2]>(grp);
+        const int t = (int) it.get_group(0);
+        const int tid = (int) it.get_local_id(0);
+        const int c = c_in;
+        const float* sc = score;
+        int32_t* out = sel + (size_t) t * kTopBlocks;
+        if (c <= kTopBlocks) {
+            for (int i = tid; i < c; i += 1024) out[i] = i;
+            if (tid == 0) nsel[t] = c;
+            return;
+        }
+        uint32_t prefix = 0;
+        int rem = kTopBlocks;
+        for (int pass = 0; pass < 4; ++pass) {
+            const int shift = 24 - 8 * pass;
+            if (tid < 256) hist[tid] = 0;
+            sycl::group_barrier(grp);
+            for (int i = tid; i < c; i += 1024) {
+                const uint32_t u = skey_d(sc[i]);
+                if (pass == 0 || (u >> (shift + 8)) == prefix) {
+                    sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::generic_space>
+                        a(hist[(u >> shift) & 255u]);
+                    a.fetch_add(1);
+                }
+            }
+            sycl::group_barrier(grp);
+            if (tid == 0) {
+                int cum = 0, bin = 255;
+                for (; bin > 0; --bin) {
+                    if (cum + hist[bin] >= rem) break;
+                    cum += hist[bin];
+                }
+                sh[0] = bin; sh[1] = cum;
+            }
+            sycl::group_barrier(grp);
+            prefix = (prefix << 8) | (uint32_t) sh[0];
+            rem -= sh[1];
+            sycl::group_barrier(grp);
+        }
+        // prefix is now the 512th best score's bits; rem of the scores equal to it are taken, the lowest block indices first
+        const int S = (c + 1023) / 1024;
+        const int lo = tid * S, hi = sycl::min(c, lo + S);
+        int gt = 0, eq = 0;
+        for (int i = lo; i < hi; ++i) {
+            const uint32_t u = skey_d(sc[i]);
+            gt += u > prefix;
+            eq += u == prefix;
+        }
+        const int eq_before = sycl::exclusive_scan_over_group(grp, eq, sycl::plus<int>());
+        const int take_eq = sycl::min(sycl::max(rem - eq_before, 0), eq);
+        const int off = sycl::exclusive_scan_over_group(grp, gt + take_eq, sycl::plus<int>());
+        int o = off, seen = 0;
+        for (int i = lo; i < hi; ++i) {
+            const uint32_t u = skey_d(sc[i]);
+            if (u > prefix) {
+                out[o++] = i;
+            } else if (u == prefix) {
+                if (seen < take_eq) out[o++] = i;
+                ++seen;
+            }
+        }
+        if (tid == 0) nsel[t] = kTopBlocks;
+    });
+}
+
+template <class Tag>
+void old_select_agg(sycl::queue& q, const float* score, int c_in, int32_t* sel, int32_t* nsel) {
+    q.parallel_for<Tag>(sycl::nd_range<1>((size_t) 1024, 1024), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+        auto grp = it.get_group();
+        auto& hist = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[256]>(grp);
+        auto& sh = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[2]>(grp);
+        auto sg = it.get_sub_group();
+        const int lane = (int) sg.get_local_id()[0];
+        const int t = (int) it.get_group(0);
+        const int tid = (int) it.get_local_id(0);
+        const int c = c_in;
+        const float* sc = score;
+        int32_t* out = sel + (size_t) t * kTopBlocks;
+        if (c <= kTopBlocks) {
+            for (int i = tid; i < c; i += 1024) out[i] = i;
+            if (tid == 0) nsel[t] = c;
+            return;
+        }
+        uint32_t prefix = 0;
+        int rem = kTopBlocks;
+        for (int pass = 0; pass < 4; ++pass) {
+            const int shift = 24 - 8 * pass;
+            if (tid < 256) hist[tid] = 0;
+            sycl::group_barrier(grp);
+            // The first two digits are low in entropy (the scores of a row share their exponent: nearly all of the 64K elements fall in a
+            // few bins), so there a sub-group first counts the lanes of equal bin and the lowest of them adds the count once; passes 2 and 3
+            // see only the elements that match the prefix.  (Every lane takes the same trips: the shuffles are convergent.)
+            for (int base = 0; base < c; base += 1024) {
+                const int i = base + tid;
+                int bin = -1;
+                if (i < c) {
+                    const uint32_t u = skey_d(sc[i]);
+                    if (pass == 0 || (u >> (shift + 8)) == prefix) bin = (int) ((u >> shift) & 255u);
+                }
+                if (pass < 2) {
+                    int cnt = 0, first = 16;
+#pragma unroll
+                    for (int k = 0; k < 16; ++k) {
+                        const int ob = sycl::select_from_group(sg, bin, sycl::id<1>(k));
+                        if (ob == bin) { ++cnt; if (first == 16) first = k; }
+                    }
+                    if (bin >= 0 && first == lane) {
+                        sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::generic_space> a(hist[bin]);
+                        a.fetch_add(cnt);
+                    }
+                } else if (bin >= 0) {
+                    sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::generic_space> a(hist[bin]);
+                    a.fetch_add(1);
+                }
+            }
+            sycl::group_barrier(grp);
+            if (tid == 0) {
+                int cum = 0, bin = 255;
+                for (; bin > 0; --bin) {
+                    if (cum + hist[bin] >= rem) break;
+                    cum += hist[bin];
+                }
+                sh[0] = bin; sh[1] = cum;
+            }
+            sycl::group_barrier(grp);
+            prefix = (prefix << 8) | (uint32_t) sh[0];
+            rem -= sh[1];
+            sycl::group_barrier(grp);
+        }
+        // prefix is now the 512th best score's bits; rem of the scores equal to it are taken, the lowest block indices first
+        const int S = (c + 1023) / 1024;
+        const int lo = tid * S, hi = sycl::min(c, lo + S);
+        int gt = 0, eq = 0;
+        for (int i = lo; i < hi; ++i) {
+            const uint32_t u = skey_d(sc[i]);
+            gt += u > prefix;
+            eq += u == prefix;
+        }
+        const int eq_before = sycl::exclusive_scan_over_group(grp, eq, sycl::plus<int>());
+        const int take_eq = sycl::min(sycl::max(rem - eq_before, 0), eq);
+        const int off = sycl::exclusive_scan_over_group(grp, gt + take_eq, sycl::plus<int>());
+        int o = off, seen = 0;
+        for (int i = lo; i < hi; ++i) {
+            const uint32_t u = skey_d(sc[i]);
+            if (u > prefix) {
+                out[o++] = i;
+            } else if (u == prefix) {
+                if (seen < take_eq) out[o++] = i;
+                ++seen;
+            }
+        }
+        if (tid == 0) nsel[t] = kTopBlocks;
+    });
 }
 
 // ---- select: exact, on scores that are given ---------------------------------------------------------------------------------------
@@ -393,6 +575,9 @@ void test_select() {
     for (int t = 0; t < 16; ++t) for (int hh = 0; hh < kHeads; ++hh) qi[((size_t) t * kHeads + hh) * kD] = 1.0f;
     g_q->memcpy(sc.qidx, qi.data(), qi.size() * 4).wait();
     int total = 0, bad = 0;
+    float* dsc = dev<float>(nbc);
+    int var_bad[2] = {0, 0};
+    std::string var_first[2];
     for (int c : {100, 512, 513, 700, 5000, 65535, 65536}) {
         for (int mode = 0; mode < 3; ++mode) {   // 0: distinct random values, 1: only 16 distinct values (heavy ties), 2: ties plus negative values and -0.0
             std::vector<float> v(nbc);
@@ -423,8 +608,24 @@ void test_select() {
             const std::string diff = select_diff(sel, ns, hs, s, down(sc.score, (size_t) c), down(sc.dbg, 16), c);
             ++total;
             if (!diff.empty()) { ++bad; check(fmt("select: c %.0f blocks, mode %.0f", c, mode), false, diff); }
+            {   // the old kernels on the same scores (information only)
+                g_q->memcpy(dsc, s.data(), (size_t) c * 4).wait();
+                const std::vector<int> zero16(16, 0);
+                for (int var = 0; var < 2; ++var) {
+                    g_q->memset(sc.sel, 0xFF, (size_t) kTopBlocks * 4).wait();
+                    if (var == 0) old_select<TagOldA>(*g_q, dsc, c, sc.sel, sc.nsel);
+                    else old_select_agg<TagOldB>(*g_q, dsc, c, sc.sel, sc.nsel);
+                    g_q->wait();
+                    const std::string d2 = select_diff(down(sc.sel, kTopBlocks), down(sc.nsel, 1)[0], hs, s, s, zero16, c);
+                    if (!d2.empty()) { ++var_bad[var]; if (var_first[var].empty()) var_first[var] = fmt("c %.0f mode %.0f: ", c, mode) + d2; }
+                }
+            }
         }
     }
+    for (int var = 0; var < 2; ++var)
+        std::printf("info   old select %-44s on the same scores: %d of %d cases differ%s%s\n",
+                    var == 0 ? "916106b3 (generic atomics, library scan)" : "05573cfe (+ sub-group aggregation)", var_bad[var], total,
+                    var_first[var].empty() ? "" : "; first: ", var_first[var].c_str());
     check("select: " + std::to_string(total) + " cases (c 100..65536, distinct / tied / -0.0) exact", bad == 0);
     // a tree window: c = root / 4
     {
