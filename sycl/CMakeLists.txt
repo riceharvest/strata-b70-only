@@ -686,7 +686,8 @@ if(STRATA_BUILD_Q36)
   add_library(q36_w4 SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4.dp.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xatt.dp.cpp
               ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4h.dp.cpp
               ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_pp_i8.dp.cpp
-              ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_gdn_wy.dp.cpp)
+              ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_gdn_wy.dp.cpp
+              ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_fmha_i8.dp.cpp)
   target_include_directories(q36_w4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35 ${CMAKE_CURRENT_SOURCE_DIR}/include)
   set_target_properties(q36_w4 PROPERTIES CXX_EXTENSIONS ON)
   if(STRATA_SYCL_AOT)

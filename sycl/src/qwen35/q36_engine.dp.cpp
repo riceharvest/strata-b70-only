@@ -37,6 +37,7 @@
 #include "q36_xatt.hpp"
 #include "q36_pp_i8.hpp"
 #include "q36_gdn_wy.hpp"
+#include "q36_fmha_i8.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -3534,6 +3535,8 @@ struct Engine {
     // M4b: a prompt chunk's attention on the flash XMX kernel (q36_prefill.dp.hpp; STRATA_Q36_PATTN=gemm: the GEMM path),
     // its GDN recurrence on the register-resident kernel (STRATA_Q36_GDN_XE=0: k_gdn_seq_cols).  Set in init().
     bool pattn_flash = false;
+    bool pattn_i8 = false;
+    bool pattn_i8_u16 = false;
     bool gdn_xe = false;
     bool gdn_wy = false;
     void* gdn_wy_ws = nullptr;
@@ -3861,25 +3864,6 @@ struct Engine {
                                      "STRATA_Q36_PATTN=gemm, a context a multiple of 64): use STRATA_Q36_KV=f16\n");
                 std::exit(1);
             }
-#ifdef STRATA_Q36_TLA
-            if (pattn_flash && kv_q8 && !(pa && std::string(pa) == "lp2")) {
-                int seg = q36pf::kTlaSeg;
-                if (const char* sv = std::getenv("STRATA_Q36_TLA_SEG")) seg = std::atoi(sv) / q36pf::kFaBC * q36pf::kFaBC;
-                seg = (int) std::min<int64_t>(seg, ctx);
-                pattn_tla = q36pf::tla_shape_ok((int) g.n_head, (int) g.n_head_kv, (int) g.head_dim, seg, (int) T);
-                if (pattn_tla) {
-                    const size_t HKV_ = (size_t) g.n_head_kv, H_ = (size_t) g.n_head, HD_ = (size_t) g.head_dim;
-                    tla.vt = 0;   // (set once kv_vt is decided, below)
-                    tla.seg = seg; tla.T = (int) T; tla.H = (int) H_; tla.HKV = (int) HKV_;
-                    tla.k16 = dalloc_t<sycl::half>((size_t) seg * HKV_ * HD_);
-                    tla.v16 = dalloc_t<sycl::half>((size_t) seg * HKV_ * HD_);
-                    tla.o16 = dalloc_t<sycl::half>(T * H_ * HD_);
-                    tla.of = dalloc(T * H_ * HD_);
-                    for (float*& l : tla.lse) l = dalloc(H_ * T);
-                    tla.cu = dalloc_t<int32_t>(8);
-                }
-            }
-#endif
             const char* gx = std::getenv("STRATA_Q36_GDN_XE");
             gdn_xe = !(gx && gx[0] == '0') &&
                      q36pf::gdn_xe_ok(*st, (int) g.ssm_state_size, (int) g.ssm_k_heads, (int) g.ssm_v_heads,
@@ -3903,20 +3887,6 @@ struct Engine {
                     }
                 }
             }
-            bool tla_on = false;
-#ifdef STRATA_Q36_TLA
-            tla_on = pattn_tla;
-            if (tla_on)
-                std::fprintf(stderr, "strata-q36: prompt attention vllm-xpu-kernels chunk_prefill (sycl-tla, int8 K / V to FP16 "
-                                     "in %d-cell segments, LSE-merged; %.0f MiB of buffers)\n",
-                             tla.seg, q36pf::tla_bytes(tla.seg, tla.T, tla.H, tla.HKV) / 1048576.0);
-#endif
-            std::fprintf(stderr, "strata-q36: prompt attention %s, prompt GDN recurrence %s\n",
-                         tla_on ? "chunk_prefill"
-                         : pattn_flash ? (kv_q8 ? "flash (XMX, 64-cell blocks, int8 K / V dequantized in local memory)"
-                                              : "flash (XMX, 64-cell blocks)")
-                                     : "GEMM (scores in memory)",
-                         gdn_wy ? "chunkwise C=64 WY XMX" : (gdn_xe ? "register-resident" : "column kernel"));
         }
         // the GEMM path's scores (the flash path has none: 0.38 GB less; kAttScoreFloats then says 16 M so that
         // place_experts finds nothing to shrink, and attn_core allocates them if the GEMM path ever runs)
@@ -4117,9 +4087,48 @@ struct Engine {
                                  ls * 16 / xa::kG, btag, (double) (total_mir + scratch) / 1073741824.0);
                 }
             }
+        {
+            const char* pa = std::getenv("STRATA_Q36_PATTN");
+            const bool want_i8 = pattn_flash && kv_q8 && kv_vt &&
+                                 (!pa || std::string(pa) == "i8" || std::string(pa) == "i8_u16") &&
+                                 strata::q36fmha::supports((int) T, (int) g.n_head, (int) g.n_head_kv, (int) g.head_dim, vt_ctxp);
+            if (want_i8) {
+                pattn_i8 = true;
+                pattn_i8_u16 = (pa && std::string(pa) == "i8_u16");
+            }
+            bool tla_on = false;
 #ifdef STRATA_Q36_TLA
-            tla.vt = kv_vt ? vt_ctxp : 0;   // (the prompt path's dequantize follows the layout that was decided)
+            if (!pattn_i8 && pattn_flash && kv_q8 && !(pa && std::string(pa) == "lp2")) {
+                int seg = q36pf::kTlaSeg;
+                if (const char* sv = std::getenv("STRATA_Q36_TLA_SEG")) seg = std::atoi(sv) / q36pf::kFaBC * q36pf::kFaBC;
+                seg = (int) std::min<int64_t>(seg, ctx);
+                pattn_tla = q36pf::tla_shape_ok((int) g.n_head, (int) g.n_head_kv, (int) g.head_dim, seg, (int) T);
+                if (pattn_tla) {
+                    const size_t HKV_ = (size_t) g.n_head_kv, H_ = (size_t) g.n_head, HD_ = (size_t) g.head_dim;
+                    tla.vt = kv_vt ? vt_ctxp : 0;
+                    tla.seg = seg; tla.T = (int) T; tla.H = (int) H_; tla.HKV = (int) HKV_;
+                    tla.k16 = dalloc_t<sycl::half>((size_t) seg * HKV_ * HD_);
+                    tla.v16 = dalloc_t<sycl::half>((size_t) seg * HKV_ * HD_);
+                    tla.o16 = dalloc_t<sycl::half>(T * H_ * HD_);
+                    tla.of = dalloc(T * H_ * HD_);
+                    for (float*& l : tla.lse) l = dalloc(H_ * T);
+                    tla.cu = dalloc_t<int32_t>(8);
+                    tla_on = true;
+                    std::fprintf(stderr, "strata-q36: prompt attention vllm-xpu-kernels chunk_prefill (sycl-tla, int8 K / V to FP16 "
+                                         "in %d-cell segments, LSE-merged; %.0f MiB of buffers)\n",
+                                 tla.seg, q36pf::tla_bytes(tla.seg, tla.T, tla.H, tla.HKV) / 1048576.0);
+                }
+            }
 #endif
+            std::fprintf(stderr, "strata-q36: prompt attention %s, prompt GDN recurrence %s\n",
+                         pattn_i8 ? (pattn_i8_u16 ? "int8 XMX T1H6 (u16 P, 0 MiB scratch)"
+                                                  : "int8 XMX T1H6 (kBC=64 u8 P, 0 MiB scratch)")
+                         : tla_on ? "chunk_prefill"
+                         : pattn_flash ? (kv_q8 ? "flash (XMX, 64-cell blocks, int8 K / V dequantized in local memory)"
+                                              : "flash (XMX, 64-cell blocks)")
+                                     : "GEMM (scores in memory)",
+                         gdn_wy ? "chunkwise C=64 WY XMX" : (gdn_xe ? "register-resident" : "column kernel"));
+        }
         }
         for (const Layer& L : m->layers) {   // the verify windows' GDN inputs (one set, whichever session runs)
             if (L.attn) {
@@ -5524,11 +5533,13 @@ work-group size if needed.
                 if constexpr (std::is_same_v<KV, sycl::half>)
                     q36pf::flash_prompt_attn(*st, q16, kcl, vcl, att, T, (int) p0, H, HKV, ctx);
                 else if constexpr (std::is_same_v<KV, int8_t>) {
+                    if (pattn_i8 && kv_vt && strata::q36fmha::supports(T, H, HKV, HD, vt_ctxp))
+                        strata::q36fmha::forward(*st, vt_ctxp, q16, kcl, vcl, att, T, (int) p0, H, HKV, ctx, pattn_i8_u16);
 #ifdef STRATA_Q36_TLA
-                    if (pattn_tla)
+                    else if (pattn_tla)
                         q36pf::tla_prompt_attn_q8(*st, tla, q16, kcl, vcl, att, T, (int) p0, H, HKV, ctx);
-                    else
 #endif
+                    else
                         q36pf::flash_prompt_attn_q8(*st, kv_vt ? vt_ctxp : 0, q16, kcl, vcl, att, T, (int) p0, H, HKV, ctx);
                 }
             } else
