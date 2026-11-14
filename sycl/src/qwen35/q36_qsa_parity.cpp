@@ -217,6 +217,80 @@ void test_index(const Weights16& w, const LayerWeights& lw) {
     free_scratch(sc, g_q); free_state(ls, g_q);
 }
 
+// ---- select diagnostics: what differs, in words ---------------------------------------------------------------------------------------
+uint32_t skey_h(float v) { uint32_t b; std::memcpy(&b, &v, 4); return b & 0x7FFFFFFFu; }
+// The host's own selection of the first c scores s: ids ascending, the threshold key, how many are above it and how many equal to it.
+struct HostSel { std::vector<int> ids; uint32_t thr = 0; int gt = 0, eq = 0; };
+HostSel host_select(const std::vector<float>& s, int c) {
+    HostSel h;
+    std::vector<int> idx(c);
+    for (int b = 0; b < c; ++b) idx[b] = b;
+    if (c <= kTopBlocks) { h.ids = idx; return h; }
+    std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return skey_h(s[a]) > skey_h(s[b]); });
+    h.thr = skey_h(s[idx[kTopBlocks - 1]]);
+    for (int b = 0; b < c; ++b) { const uint32_t k = skey_h(s[b]); h.gt += k > h.thr; h.eq += k == h.thr; }
+    idx.resize(kTopBlocks);
+    std::sort(idx.begin(), idx.end());
+    h.ids = idx;
+    return h;
+}
+// Compares a row's ids / count with the host's; the text names the first difference (empty when equal).  got_scores: the scores the card
+// wrote (first c), dbg: the kernel's 16 ints of the row.
+std::string select_diff(const std::vector<int>& got, int ns, const HostSel& h, const std::vector<float>& s, const std::vector<float>& got_scores,
+                        const std::vector<int>& dbg, int c) {
+    std::string out;
+    char b[300];
+    const int want = (int) h.ids.size();
+    // 1. the scores the card wrote against the host's (the select's input)
+    int sbad = 0, sfirst = -1;
+    for (int i = 0; i < c && i < (int) got_scores.size(); ++i)
+        if (std::memcmp(&got_scores[i], &s[i], 4) != 0) { if (!sbad) sfirst = i; ++sbad; }
+    if (sbad) { std::snprintf(b, sizeof b, "[scores differ at %d blocks, first b=%d got %.9g want %.9g] ", sbad, sfirst, got_scores[sfirst], s[sfirst]); out += b; }
+    // 2. the ids
+    std::vector<char> in_got(c > 0 ? c : 1, 0);
+    int oob = 0, dup = 0, unsorted = 0;
+    for (int i = 0; i < want && i < (int) got.size(); ++i) {
+        const int x = got[i];
+        if (x < 0 || x >= c) { ++oob; continue; }
+        if (in_got[x]) ++dup;
+        in_got[x] = 1;
+        if (i && got[i] <= got[i - 1]) ++unsorted;
+    }
+    std::vector<char> in_want(c > 0 ? c : 1, 0);
+    for (int x : h.ids) in_want[x] = 1;
+    int missing = 0, extra = 0, fm = -1, fe = -1;
+    for (int x = 0; x < c; ++x) {
+        if (in_want[x] && !in_got[x]) { if (!missing) fm = x; ++missing; }
+        if (!in_want[x] && in_got[x]) { if (!extra) fe = x; ++extra; }
+    }
+    if (ns != want) { std::snprintf(b, sizeof b, "[count got %d want %d] ", ns, want); out += b; }
+    if (oob || dup || unsorted || missing || extra) {
+        std::snprintf(b, sizeof b, "[ids: %d out of range / unwritten, %d duplicates, %d not ascending, %d missing, %d extra] ", oob, dup, unsorted, missing, extra);
+        out += b;
+        if (fm >= 0) { std::snprintf(b, sizeof b, "[first missing b=%d key %08x] ", fm, skey_h(s[fm])); out += b; }
+        if (fe >= 0) { std::snprintf(b, sizeof b, "[first extra b=%d key %08x] ", fe, skey_h(s[fe])); out += b; }
+        std::snprintf(b, sizeof b, "[got[0..3] %d %d %d %d, want[0..3] %d %d %d %d] ", got[0], got[1], got[2], got[3], h.ids[0], h.ids[1], h.ids[2], h.ids[3]);
+        out += b;
+    }
+    if (!out.empty() && c > kTopBlocks) {
+        // 3. the kernel's decisions against the host's
+        std::snprintf(b, sizeof b, "[thr key host %08x gt %d eq %d | card %08x rem %d gt %d eq %d (host rem %d)] ", h.thr, h.gt, h.eq,
+                      (unsigned) dbg[0], dbg[1], dbg[2], dbg[3], kTopBlocks - h.gt);
+        out += b;
+        std::snprintf(b, sizeof b, "[card candidates per pass %d %d %d %d, bins %02x %02x %02x %02x, c %d]", dbg[4], dbg[5], dbg[6], dbg[7],
+                      dbg[9], dbg[10], dbg[11], dbg[12], dbg[8]);
+        out += b;
+        // the scores around the threshold (host order)
+        std::vector<uint32_t> ks;
+        for (int i = 0; i < c; ++i) ks.push_back(skey_h(s[i]));
+        std::sort(ks.begin(), ks.end(), std::greater<uint32_t>());
+        std::snprintf(b, sizeof b, " [keys of the 509th..515th best: %08x %08x %08x %08x %08x %08x %08x]", ks[508], ks[509], ks[510], ks[511],
+                      ks[512 < c ? 512 : c - 1], ks[513 < c ? 513 : c - 1], ks[514 < c ? 514 : c - 1]);
+        out += b;
+    }
+    return out;
+}
+
 // ---- score ---------------------------------------------------------------------------------------------------------------------------
 void test_score(const Weights16& w) {
     (void) w;
@@ -301,80 +375,6 @@ void test_score(const Weights16& w) {
     check("score+select: 16 rows' ids = the host's top 512 of the card's scores", sdiff.empty(), sdiff);
     check("score+select: rows bitwise the same in calls of 1, 3, 5", same);
     free_scratch(sc, g_q); free_state(ls, g_q);
-}
-
-// ---- select diagnostics: what differs, in words ---------------------------------------------------------------------------------------
-uint32_t skey_h(float v) { uint32_t b; std::memcpy(&b, &v, 4); return b & 0x7FFFFFFFu; }
-// The host's own selection of the first c scores s: ids ascending, the threshold key, how many are above it and how many equal to it.
-struct HostSel { std::vector<int> ids; uint32_t thr = 0; int gt = 0, eq = 0; };
-HostSel host_select(const std::vector<float>& s, int c) {
-    HostSel h;
-    std::vector<int> idx(c);
-    for (int b = 0; b < c; ++b) idx[b] = b;
-    if (c <= kTopBlocks) { h.ids = idx; return h; }
-    std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return skey_h(s[a]) > skey_h(s[b]); });
-    h.thr = skey_h(s[idx[kTopBlocks - 1]]);
-    for (int b = 0; b < c; ++b) { const uint32_t k = skey_h(s[b]); h.gt += k > h.thr; h.eq += k == h.thr; }
-    idx.resize(kTopBlocks);
-    std::sort(idx.begin(), idx.end());
-    h.ids = idx;
-    return h;
-}
-// Compares a row's ids / count with the host's; the text names the first difference (empty when equal).  got_scores: the scores the card
-// wrote (first c), dbg: the kernel's 16 ints of the row.
-std::string select_diff(const std::vector<int>& got, int ns, const HostSel& h, const std::vector<float>& s, const std::vector<float>& got_scores,
-                        const std::vector<int>& dbg, int c) {
-    std::string out;
-    char b[300];
-    const int want = (int) h.ids.size();
-    // 1. the scores the card wrote against the host's (the select's input)
-    int sbad = 0, sfirst = -1;
-    for (int i = 0; i < c && i < (int) got_scores.size(); ++i)
-        if (std::memcmp(&got_scores[i], &s[i], 4) != 0) { if (!sbad) sfirst = i; ++sbad; }
-    if (sbad) { std::snprintf(b, sizeof b, "[scores differ at %d blocks, first b=%d got %.9g want %.9g] ", sbad, sfirst, got_scores[sfirst], s[sfirst]); out += b; }
-    // 2. the ids
-    std::vector<char> in_got(c > 0 ? c : 1, 0);
-    int oob = 0, dup = 0, unsorted = 0;
-    for (int i = 0; i < want && i < (int) got.size(); ++i) {
-        const int x = got[i];
-        if (x < 0 || x >= c) { ++oob; continue; }
-        if (in_got[x]) ++dup;
-        in_got[x] = 1;
-        if (i && got[i] <= got[i - 1]) ++unsorted;
-    }
-    std::vector<char> in_want(c > 0 ? c : 1, 0);
-    for (int x : h.ids) in_want[x] = 1;
-    int missing = 0, extra = 0, fm = -1, fe = -1;
-    for (int x = 0; x < c; ++x) {
-        if (in_want[x] && !in_got[x]) { if (!missing) fm = x; ++missing; }
-        if (!in_want[x] && in_got[x]) { if (!extra) fe = x; ++extra; }
-    }
-    if (ns != want) { std::snprintf(b, sizeof b, "[count got %d want %d] ", ns, want); out += b; }
-    if (oob || dup || unsorted || missing || extra) {
-        std::snprintf(b, sizeof b, "[ids: %d out of range / unwritten, %d duplicates, %d not ascending, %d missing, %d extra] ", oob, dup, unsorted, missing, extra);
-        out += b;
-        if (fm >= 0) { std::snprintf(b, sizeof b, "[first missing b=%d key %08x] ", fm, skey_h(s[fm])); out += b; }
-        if (fe >= 0) { std::snprintf(b, sizeof b, "[first extra b=%d key %08x] ", fe, skey_h(s[fe])); out += b; }
-        std::snprintf(b, sizeof b, "[got[0..3] %d %d %d %d, want[0..3] %d %d %d %d] ", got[0], got[1], got[2], got[3], h.ids[0], h.ids[1], h.ids[2], h.ids[3]);
-        out += b;
-    }
-    if (!out.empty() && c > kTopBlocks) {
-        // 3. the kernel's decisions against the host's
-        std::snprintf(b, sizeof b, "[thr key host %08x gt %d eq %d | card %08x rem %d gt %d eq %d (host rem %d)] ", h.thr, h.gt, h.eq,
-                      (unsigned) dbg[0], dbg[1], dbg[2], dbg[3], kTopBlocks - h.gt);
-        out += b;
-        std::snprintf(b, sizeof b, "[card candidates per pass %d %d %d %d, bins %02x %02x %02x %02x, c %d]", dbg[4], dbg[5], dbg[6], dbg[7],
-                      dbg[9], dbg[10], dbg[11], dbg[12], dbg[8]);
-        out += b;
-        // the scores around the threshold (host order)
-        std::vector<uint32_t> ks;
-        for (int i = 0; i < c; ++i) ks.push_back(skey_h(s[i]));
-        std::sort(ks.begin(), ks.end(), std::greater<uint32_t>());
-        std::snprintf(b, sizeof b, " [keys of the 509th..515th best: %08x %08x %08x %08x %08x %08x %08x]", ks[508], ks[509], ks[510], ks[511],
-                      ks[512 < c ? 512 : c - 1], ks[513 < c ? 513 : c - 1], ks[514 < c ? 514 : c - 1]);
-        out += b;
-    }
-    return out;
 }
 
 // ---- select: exact, on scores that are given ---------------------------------------------------------------------------------------
