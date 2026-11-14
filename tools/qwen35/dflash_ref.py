@@ -337,7 +337,12 @@ def cmd_taps(a):
     pos, taps = read_ctx(os.path.join(a.dump, "ctx.bin"))
     last = {int(p): i for i, p in enumerate(pos)}
     ll = np.memmap(a.llama, dtype=np.float32, mode="r").reshape(-1, a.n_layer, H)
-    keep = [p for p in sorted(last) if p < len(ll)][: a.max_rows]
+    if getattr(a, "positions", None):   # only these positions (the engine's moved.txt: rows a tree step moved in the staging ring, "position source_row" a line)
+        want = sorted({int(l.split()[0]) for l in open(a.positions) if l.strip()})
+        keep = [p for p in want if p in last and p < len(ll)]
+        print("positions asked for %d, found in both the dump and the llama.cpp file: %d" % (len(want), len(keep)))
+    else:
+        keep = [p for p in sorted(last) if p < len(ll)][: a.max_rows]
     if not keep:
         print("no common positions")
         return 1
@@ -353,6 +358,10 @@ def cmd_taps(a):
             errs[dl] = float(np.median(e))
         best = min(errs, key=errs.get)
         good = best == 0 and errs[0] < 0.15
+        if getattr(a, "positions", None):   # a row put at the wrong position is far from its own l_out: count them
+            far = sum(1 for p in keep if np.linalg.norm(taps[last[p]][k * H:(k + 1) * H] - np.asarray(ll[p, L])) / (np.linalg.norm(np.asarray(ll[p, L])) + 1e-30) > 0.5)
+            good = good and far == 0
+            print("  tap %d: %d of %d moved rows are further than 0.5 from their own l_out" % (k, far, len(keep)))
         ok &= good
         print("tap %d (layer %2d): median ||ctx - l_out||/||l_out||  L-1 %.4f  L %.4f  L+1 %.4f  -> nearest %s %s" %
               (k, L, errs[-1], errs[0], errs[1], {-1: "L-1", 0: "L", 1: "L+1"}[best], "ok" if good else "WRONG"))
@@ -531,6 +540,7 @@ def main():
     tp.add_argument("llama", help="q36_llama_dump --dump-layers file: f32 [pos][layer][n_embd]")
     tp.add_argument("--n-layer", type=int, default=64)
     tp.add_argument("--max-rows", type=int, default=400)
+    tp.add_argument("--positions", help="a file of positions (first number of each line), e.g. the dump's moved.txt: compare exactly those rows (default: the first --max-rows positions, i.e. the prompt)")
     s = sub.add_parser("synth")
     s.add_argument("--ckpt", required=True)
     s.add_argument("--pack", required=True)

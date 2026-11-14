@@ -790,13 +790,17 @@ void bench_w4x_products(Dflash& d) {
 }
 
 // the time of each stage of a block pass, from the host-submitted pass on a profiling queue: a barrier after every stage, the stage's time = the gap between consecutive barrier
-// completions (the kernel(s) + the gap before it; the barrier itself costs a little: read it as an upper bound, and the sum against the pass without barriers)
-void profile_block(Dflash& d, int nb, const char* label) {
+// completions (the kernel(s) + the gap before it).  Two things could make this a measurement of the HOST: the pass is ~180 submissions (a kernel and a barrier a stage), and small kernels
+// run a few us.  So the GPU gets a head start (a ~0.7 GB memset queued first: ~2 ms) and the sum of the stages is printed against `ref_ms`, the same pass replayed as a graph: a sum
+// more than 10% above it is flagged host-bound (the table then over-counts the small stages).  Barrier timestamps that do not rise are flagged too.
+void profile_block(Dflash& d, int nb, const char* label, double ref_ms) {
     std::printf("\nblock pass stages, %s (%d block%s, %d columns): median over 20 passes of the stage's time a pass (us), calls a pass, share\n", label, nb, nb > 1 ? "s" : "", 8 * nb);
     try {
         sycl::queue pq(g_q->get_context(), g_q->get_device(), {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()});
         sycl::queue* saved = g_q;
         g_q = &pq;   // (the hooks of this test submit to g_q: one queue, in order)
+        const size_t head_bytes = (size_t) 768 << 20;
+        char* head = sycl::malloc_device<char>(head_bytes, pq);
         struct Rec { const char* name; sycl::event ev; };
         std::vector<Rec> recs;
         d.set_stage_hook([&](const char* n) { recs.push_back({n, pq.ext_oneapi_submit_barrier()}); });
@@ -804,8 +808,10 @@ void profile_block(Dflash& d, int nb, const char* label) {
         std::map<std::string, int> calls;
         std::vector<double> totals;
         std::vector<std::string> order;
+        long long bad_ts = 0, n_ts = 0;
         for (int rep = 0; rep < 24; ++rep) {
             recs.clear();
+            if (head != nullptr) pq.memset(head, rep & 0xFF, head_bytes);   // (the GPU's head start: the host runs ahead while this executes)
             sycl::event e0 = pq.ext_oneapi_submit_barrier();
             d.block_batch(pq, nb);
             pq.wait();
@@ -816,6 +822,8 @@ void profile_block(Dflash& d, int nb, const char* label) {
             std::map<std::string, int> cnt;
             for (auto& r : recs) {
                 const double t = (double) r.ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+                ++n_ts;
+                if (t <= prev || t <= 0.0) ++bad_ts;
                 sum[r.name] += (t - prev) / 1e3;
                 ++cnt[r.name];
                 prev = t;
@@ -826,6 +834,7 @@ void profile_block(Dflash& d, int nb, const char* label) {
         }
         d.set_stage_hook(nullptr);
         g_q = saved;
+        if (head != nullptr) sycl::free(head, pq);
         std::sort(totals.begin(), totals.end());
         const double tot = totals[totals.size() / 2];
         double acc = 0;
@@ -836,7 +845,9 @@ void profile_block(Dflash& d, int nb, const char* label) {
             acc += med;
             std::printf("  %-18s %9.1f us  x%-3d  %5.1f%%   (%.1f us a call)\n", nm.c_str(), med, calls[nm], 100.0 * med / tot, med / calls[nm]);
         }
-        std::printf("  %-18s %9.1f us  (the stages add up to %.1f us)\n", "pass", tot, acc);
+        std::printf("  %-18s %9.1f us  (the stages add up to %.1f us); the same pass as a graph: %.1f us\n", "pass", tot, acc, ref_ms * 1e3);
+        if (bad_ts > 0) std::printf("  WARNING: %lld of %lld barrier timestamps did not rise: this table is not usable\n", bad_ts, n_ts);
+        else if (ref_ms > 0 && tot > 1.1 * ref_ms * 1e3) std::printf("  WARNING: the stages add up to %.0f%% of the graph's time: the host-submitted pass is host-bound, the small stages are over-counted\n", 100.0 * tot / (ref_ms * 1e3));
     } catch (const std::exception& e) {
         std::printf("  (profiling queue unavailable: %s)\n", e.what());
     }
@@ -922,12 +933,12 @@ int whole(bool bench) {
         std::sort(ms.begin(), ms.end());
         const double med = ms[ms.size() / 2];
         std::printf("%-34s %8.3f ms (min %.3f)  %7.1f GB/s of %.0f MB   floor at 590 GB/s: %.3f ms\n", name, med, ms[0], bytes / med / 1e6, bytes / 1e6, bytes / 590e6);
+        return med;
     };
     time_it("block pass (8 rows), no head", blk, [&] { b->d.block(*g_q); });
     time_it("context update, 8 rows (fc + kv_all)", ctx, [&] { b->d.ctx_update(*g_q, 8, false); });
     time_it("both (run(8))", blk + ctx, [&] { b->d.run(*g_q, 8); });
     std::printf("(the three lines above: ~85 / 5 / ~90 kernels submitted from the host one by one)\n");
-    profile_block(b->d, 1, "8 rows, 100 context rows");
     // the same passes recorded once and replayed as the engine does (graph_run): the host's submission gone, the kernel boundaries at graph cost
     {
         auto graph_it = [&](const char* name, double bytes, auto&& body) {
@@ -937,9 +948,10 @@ int whole(bool bench) {
             dpct::experimental::end_recording(g_q, &graph);
             auto* gx = new sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>(graph->finalize());
             delete graph;
-            time_it(name, bytes, [&] { g_q->ext_oneapi_graph(*gx); });
+            return time_it(name, bytes, [&] { g_q->ext_oneapi_graph(*gx); });
         };
-        graph_it("GRAPH block pass (8 rows), no head", blk, [&] { b->d.block(*g_q); });
+        const double g8 = graph_it("GRAPH block pass (8 rows), no head", blk, [&] { b->d.block(*g_q); });
+        profile_block(b->d, 1, "8 rows, 100 context rows", g8);
         graph_it("GRAPH context update, 8 rows", ctx, [&] { b->d.ctx_update(*g_q, 8, false); });
         graph_it("GRAPH run(8) = what a draft costs", blk + ctx, [&] { b->d.run(*g_q, 8); });
         // the attention at a full window: 3,000 captured rows, the drafter's ring holds the last 2,047 (the pass above had 100)
@@ -952,8 +964,8 @@ int whole(bool bench) {
         const int n3 = b->d.prepare(*g_q, T3, 4242);
         b->d.run(*g_q, n3);
         g_q->wait();
-        graph_it("GRAPH block pass, 2,047 context rows", blk, [&] { b->d.block(*g_q); });
-        profile_block(b->d, 1, "8 rows, 2,047 context rows");
+        const double g2047 = graph_it("GRAPH block pass, 2,047 context rows", blk, [&] { b->d.block(*g_q); });
+        profile_block(b->d, 1, "8 rows, 2,047 context rows", g2047);
         std::printf("(the difference between the last line and 'GRAPH block pass (8 rows)' is the attention at a full window: floor of its K/V reads 42 MB = %.3f ms)\n", 42e6 / 590e6);
         sycl::free(dx3, *g_q);
     }
@@ -1015,6 +1027,7 @@ int whole(bool bench) {
     batch_vs_singles(b->d);
     bench_w4x_products(b->d);
     // the batch pass: the block's weights read once for 8 nb columns (graph replay; the head's hook here is the synthetic one)
+    double t4 = 0;
     for (int nb = 1; nb <= kMaxBlocks; ++nb) {
         char nm[64];
         std::snprintf(nm, sizeof nm, "GRAPH block pass, %d blocks (%d columns)", nb, 8 * nb);
@@ -1024,10 +1037,11 @@ int whole(bool bench) {
         dpct::experimental::end_recording(g_q, &graph);
         auto* gx = new sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>(graph->finalize());
         delete graph;
-        time_it(nm, blk, [&] { g_q->ext_oneapi_graph(*gx); });
+        t4 = time_it(nm, blk, [&] { g_q->ext_oneapi_graph(*gx); });
     }
-    profile_block(b->d, 4, "w4h products");
+    profile_block(b->d, 4, "w4h products", t4);
     // the same with the int8 route (STRATA_Q36_DFLASH_W4X): graph replay of the batch passes, then the stage profile
+    double t4x = 0;
     if (b->d.set_w4x(*g_q, true, 16)) {
         for (int nb = 2; nb <= kMaxBlocks; ++nb) {
             char nm[64];
@@ -1038,9 +1052,9 @@ int whole(bool bench) {
             dpct::experimental::end_recording(g_q, &graph);
             auto* gx = new sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>(graph->finalize());
             delete graph;
-            time_it(nm, blk, [&] { g_q->ext_oneapi_graph(*gx); });
+            t4x = time_it(nm, blk, [&] { g_q->ext_oneapi_graph(*gx); });
         }
-        profile_block(b->d, 4, "W4X products");
+        profile_block(b->d, 4, "W4X products", t4x);
         b->d.set_w4x(*g_q, false);
     }
     return 0;

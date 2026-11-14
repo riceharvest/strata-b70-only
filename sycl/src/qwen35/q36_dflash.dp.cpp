@@ -967,7 +967,9 @@ bool Dflash::prepare_batch(sycl::queue& q, const Req* reqs, int nb, int* cols) {
 // ---- passes
 void Dflash::ctx_update(sycl::queue& q, int n, bool /*eager*/) {
     if (n <= 0) return;
-    const bool x = xw(n);   // W4X: the int8 route for a flush of 16 .. 32 columns (the fp16 operands are written too: a declined product falls back)
+    // W4X: the int8 route for a flush of 16 .. 32 columns, BATCH servers only (n_slots_ > 1): a single stream keeps the fp16 flush, so its K/V ring and its 8-column pass are what they were
+    // (the fp16 operands are written too: a declined product falls back)
+    const bool x = xw(n) && n_slots_ > 1;
     k::ctx_prep(q, stag_, meta_, n, ctx_x16_, ctx_scale_, x ? ctxf_ : nullptr);
     prod(q, fc_, ctx_x16_, ctx_y_, kTaps * kN, kN, n, -1, x ? ctxf_ : nullptr);
     k::ctx_norm(q, ctx_y_, ctx_scale_, hidden_norm_, eps_, n, ctx_h16_, x ? ctxhf_ : nullptr);
@@ -1061,6 +1063,9 @@ void Dflash::compact_stage(sycl::queue& q, int64_t p0, const int32_t* path, int 
     uint16_t* base = stag_ + (size_t) slot * kStagElems;
     for (int k = 1; k < n_keep; ++k) {
         if (path[k] == k) continue;
+        if (dump_) {   // STRATA_Q36_DFLASH_DUMP: the positions whose staging row came from another window row ("position source_row"), for `dflash_ref.py taps --positions`
+            if (FILE* f = std::fopen((dump_dir_ + "/moved.txt").c_str(), "ab")) { std::fprintf(f, "%lld %d\n", (long long) (p0 + k), (int) path[k]); std::fclose(f); }
+        }
         q.memcpy(base + (size_t) ((p0 + k) % kRing) * (kTaps * kN), base + (size_t) ((p0 + path[k]) % kRing) * (kTaps * kN), (size_t) kTaps * kN * sizeof(uint16_t));
     }
 }

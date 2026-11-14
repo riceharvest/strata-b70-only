@@ -10498,7 +10498,8 @@ struct Serve {
         long long produced = 0, offered = 0, accepted = 0;
         int depth_cap = q36_draft_base_at(E.pos, E.mtp_d);   // (the next step's drafts: q36_next_cap)
         std::vector<int32_t> given;                // a lookup's drafts
-        long long looked = 0, look_ok = 0, df_steps = 0, df_acc = 0, dt_steps = 0, dt_rows = 0, dt_nodes_acc = 0;
+        long long looked = 0, look_ok = 0, df_steps = 0, df_acc = 0, dt_steps = 0, dt_rows = 0, dt_nodes_acc = 0, dt_chain = 0, dt_off = 0;
+        const size_t graphs0 = E.row_graphs.size(), dgraphs0 = E.df_graphs.size();   // (graphs recorded during this request: ~60 ms each at first use)
         DfRule dfr;   // DFLASH BLOCK
         Lookup& look = looks[s];
         const char* finish = "length";
@@ -10619,6 +10620,7 @@ struct Serve {
                 if (df_step) {
                     D = (int) given.size();
                     bool taken = false;
+                    if (E.df_tree && !E.dtree_ok(max_drafts, plan.ok)) ++dt_off;   // (the switch is on but this step cannot verify a tree: tree_ok() false, a sampled request without the candidate kernels, ...)
                     if (E.dtree_ok(max_drafts, plan.ok)) {   // DFLASH TREE: the drafter's candidates as a tree (the chain is its spine); a chain alone goes the linear way
                         strata::q36dt::Params tp;
                         tp.max_rows = E.dtree_rows();
@@ -10634,7 +10636,7 @@ struct Serve {
                             ++dt_steps;
                             dt_rows += tl.T;
                             dt_nodes_acc += a;
-                        }
+                        } else ++dt_chain;   // (the tree was only the chain, or no layout: the linear way below)
                     }
                     if (!taken) {
                         E.df_skip_mtp = true;
@@ -10730,9 +10732,11 @@ struct Serve {
             std::fprintf(stderr, "strata serve: dflash: drafts offered a step %.2f; accepted per step: 0:%lld 1:%lld 2:%lld 3:%lld 4:%lld 5:%lld 6:%lld 7:%lld; context rows at the first block %d of %d; "
                                  "fallbacks %lld (%lld steps on the lookup / MTP path)\n", (double) dfr.offered / (double) df_steps, dfr.hist[0], dfr.hist[1], dfr.hist[2], dfr.hist[3],
                          dfr.hist[4], dfr.hist[5], dfr.hist[6], dfr.hist[7], dfr.first_rows, dfr.first_need, dfr.switches, dfr.fb_steps);
-            if (dt_steps > 0)   // DFLASH TREE
-                std::fprintf(stderr, "strata serve: dflash tree: %lld of %lld steps verified a tree, mean %.2f rows a window, %.2f drafts accepted a tree step\n", dt_steps, df_steps,
-                             (double) dt_rows / (double) dt_steps, (double) dt_nodes_acc / (double) dt_steps);
+            if (E.df_tree)   // DFLASH TREE (always printed with the switch on: an arm whose tree never ran must not look like an arm whose tree did not help)
+                std::fprintf(stderr, "strata serve: dflash tree: %lld of %lld steps verified a tree (mean %.2f rows a window, %.2f drafts accepted a tree step), %lld went the linear way (the tree was only "
+                                     "the chain), %lld could not take a tree (tree_ok / candidate kernels); graphs recorded during this request: %zu verify / fallback, %zu drafter\n", dt_steps, df_steps,
+                             dt_steps ? (double) dt_rows / (double) dt_steps : 0.0, dt_steps ? (double) dt_nodes_acc / (double) dt_steps : 0.0, dt_chain, dt_off, E.row_graphs.size() - graphs0,
+                             E.df_graphs.size() - dgraphs0);
         }
     }
 
