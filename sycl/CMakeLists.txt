@@ -690,6 +690,7 @@ if(STRATA_BUILD_Q36)
   # configure time: without -doubleGRF).
   add_library(q36_w4 SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4.dp.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xatt.dp.cpp
               ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4h.dp.cpp
+              ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4x.dp.cpp
               ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_gdn_wy.dp.cpp
               ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_fmha_i8.dp.cpp
               ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_pp_i8.dp.cpp)
@@ -726,6 +727,7 @@ if(STRATA_BUILD_Q36)
   # the attention kernels: a row's result must not depend on the window's size (a kernel per row count), so no fast-math
   set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xatt.dp.cpp PROPERTIES COMPILE_OPTIONS -fp-model=precise)
   set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4h.dp.cpp PROPERTIES COMPILE_OPTIONS -fp-model=precise)
+  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4x.dp.cpp PROPERTIES COMPILE_OPTIONS -fp-model=precise)
   target_link_libraries(strata PRIVATE q36_w4 q36_pp)
   set_target_properties(strata PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
   target_include_directories(strata PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35 ${STRATA_ROOT}/third_party/ggml)

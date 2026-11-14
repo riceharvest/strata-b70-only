@@ -39,4 +39,18 @@ bool mmvq_w4h_8(const void* weights, const uint16_t* x16, float* y, int n_in, in
 void w4h_pack(const float* x, int ldx, uint16_t* x16, int n_in, int ncols, void* stream);
 void w4h_swiglu_pack(const float* g, const float* u, uint16_t* x16, int n, int ncols, void* stream);
 void w4_dequant_f16(const void* weights, uint16_t* out, int n_in, int n_out, void* stream);
+
+/// W4X native u4 x s8 decode/verify path (q36_w4x.dp.cpp, gs = 128 or 32).
+std::size_t w4x_act_bytes(int n_in, int ncols, int gs);
+void w4x_quantize(const float* x, int ldx, void* act, int n_in, int ncols, int gs, void* stream);
+void w4x_rms_apply_quantize(const float* x_res, int ldx, const float* norm_w, const float* inv_rms,
+                            void* act, float* h_out, int ld_out, int n_in, int ncols, int gs, void* stream);
+void w4x_swiglu_quantize(const float* g, const float* u, void* act, int n_in, int ncols, int gs, void* stream);
+bool mmvq_w4x(const void* weights, const void* act, float* y, int n_in, int n_out, int ncols, int gs,
+              void* stream, int ksplit_override = 0);
+
+/// Optional merged gate+up interleaved B70W4 pack: one launch produces gs = 128 activations for ffn_down.
+std::size_t w4x_gu_merged_bytes(int n_in, int n_ff);
+bool mmvq_w4x_gu_swiglu(const void* gu_weights, const void* act_in, void* act_down,
+                        int n_in, int n_ff, int ncols, int gs, void* stream);
 }   // namespace strata::q36xr

@@ -86,7 +86,7 @@ void capture_rows(sycl::queue& q, uint16_t* stag, int k, const float* x, int T, 
 // ---------------------------------------------------------------------------------------------------------------- context rows
 // staging rows of the n context rows -> fc's x16 operand, with a per-row power-of-two scale that keeps the fp16 range (the fc is
 // linear and the next op is a norm: hidden_norm runs with eps / s^2, which is exact).
-void ctx_prep(sycl::queue& q, const uint16_t* stag, const int32_t* meta, int n, uint16_t* x16, float* scale) {
+void ctx_prep(sycl::queue& q, const uint16_t* stag, const int32_t* meta, int n, uint16_t* x16, float* scale, float* xf) {
     const int ncp = round8(n);
     q.submit([&](sycl::handler& h) {
         h.parallel_for<Tag<2>>(sycl::nd_range<1>((size_t) n * 256, 256), [=](sycl::nd_item<1> it) {
@@ -98,14 +98,17 @@ void ctx_prep(sycl::queue& q, const uint16_t* stag, const int32_t* meta, int n, 
             float s = 1.f;
             if (am > 8192.f) s = sycl::exp2(sycl::ceil(sycl::log2(am / 8192.f)));
             const float inv = 1.f / s;
-            for (int i = t; i < kTaps * kN; i += 256) x16[x16_at(j, i, ncp)] = h2u(sycl::half(bf2f(row[i]) * inv));
+            for (int i = t; i < kTaps * kN; i += 256) {
+                x16[x16_at(j, i, ncp)] = h2u(sycl::half(bf2f(row[i]) * inv));
+                if (xf != nullptr) xf[(size_t) j * (kTaps * kN) + i] = bf2f(row[i]) * inv;   // (STRATA_Q36_DFLASH_W4X: the same scaled values, as floats)
+            }
             if (t == 0) scale[j] = s;
         });
     });
 }
 
 // y = fc output [n][kN] -> hidden_norm -> x16 [n_in = kN]
-void ctx_norm(sycl::queue& q, const float* y, const float* scale, const float* w, float eps, int n, uint16_t* x16) {
+void ctx_norm(sycl::queue& q, const float* y, const float* scale, const float* w, float eps, int n, uint16_t* x16, float* hf) {
     const int ncp = round8(n);
     q.parallel_for<Tag<3>>(sycl::nd_range<1>((size_t) n * 256, 256), [=](sycl::nd_item<1> it) {
         const int j = (int) it.get_group(0), t = (int) it.get_local_id(0);
@@ -119,6 +122,7 @@ void ctx_norm(sycl::queue& q, const float* y, const float* scale, const float* w
         for (int k = 0; k < kN / 256; ++k) {
             const int i = t + k * 256;
             x16[x16_at(j, i, ncp)] = h2u(sycl::half(v[k] * r * w[i]));
+            if (hf != nullptr) hf[(size_t) j * kN + i] = v[k] * r * w[i];
         }
     });
 }
@@ -172,7 +176,7 @@ void rms_pack(sycl::queue& q, const float* x, const float* w, float eps, float* 
 
 // the two-tap grouped conv of side `side` (0: before the block's products, 1: after): y[r] = (b0 + d0[r]) x[r] + (r >= 1)(b1 + d1[r]) x[r-1]
 // with dyn [row][1280] (side x tap x group) and base [2 side][2 tap][kN]; the result packed (8 columns, n_in = kN)
-void conv_pack(sycl::queue& q, const float* x, const float* dyn, int side, const float* base, uint16_t* x16, int rows) {
+void conv_pack(sycl::queue& q, const float* x, const float* dyn, int side, const float* base, uint16_t* x16, int rows, float* yf) {
     q.parallel_for<Tag<6>>(sycl::nd_range<1>((size_t) rows * kN, 256), [=](sycl::nd_item<1> it) {
         const size_t id = it.get_global_id(0);
         const int row = (int) (id / kN), ch = (int) (id % kN), grp = ch >> 4;
@@ -180,6 +184,7 @@ void conv_pack(sycl::queue& q, const float* x, const float* dyn, int side, const
         float y = (base[(side * 2 + 0) * kN + ch] + dr[grp]) * x[(size_t) row * kN + ch];
         if ((row & 7) >= 1) y += (base[(side * 2 + 1) * kN + ch] + dr[320 + grp]) * x[(size_t) (row - 1) * kN + ch];   // (a block's first row has no tap behind it)
         x16[x16_at(row, ch, rows)] = h2u(sycl::half(y));
+        if (yf != nullptr) yf[(size_t) row * kN + ch] = y;   // (STRATA_Q36_DFLASH_W4X: the float image, quantized to int8 by the next product)
     });
 }
 
@@ -341,7 +346,7 @@ void attn_part(sycl::queue& q, const float* qb, const float* kb, const float* vb
 }
 
 // combine the chunks' partials; the result packed as o_proj's operand (n_in 4096, 8 columns)
-void attn_merge(sycl::queue& q, const float* part_acc, const float* part_m, const float* part_l, uint16_t* x16, int nb) {
+void attn_merge(sycl::queue& q, const float* part_acc, const float* part_m, const float* part_l, uint16_t* x16, int nb, float* yf) {
     q.parallel_for<Tag<10>>(sycl::nd_range<1>((size_t) nb * kRows * kHeads * kHd, kHd), [=](sycl::nd_item<1> it) {
         const int g = (int) it.get_group(0), d = (int) it.get_local_id(0);
         const int row = g / kHeads, head = g % kHeads;   // row: 0 .. 8 nb - 1
@@ -362,6 +367,7 @@ void attn_merge(sycl::queue& q, const float* part_acc, const float* part_m, cons
         }
         const float o = L > 0.f ? a / L : 0.f;
         x16[x16_at(row, head * kHd + d, nb * kRows)] = h2u(sycl::half(o));
+        if (yf != nullptr) yf[(size_t) row * (kHeads * kHd) + head * kHd + d] = o;
     });
 }
 
@@ -674,6 +680,12 @@ bool Dflash::alloc(sycl::queue& q, std::string& err) {
         }
     }
     if (const char* e = std::getenv("STRATA_Q36_DFLASH_W4T"); e != nullptr && std::atoi(e) >= 16) w4t_ = std::atoi(e);
+    if (const char* e = std::getenv("STRATA_Q36_DFLASH_W4X"); e != nullptr && std::atoi(e) != 0) {   // read once: the int8 route for 16 .. 32 columns
+        const char* mc = std::getenv("STRATA_Q36_DFLASH_W4X_MIN");
+        if (set_w4x(q, true, mc != nullptr && mc[0] != '\0' ? std::atoi(mc) : 16))
+            std::fprintf(stderr, "strata-q36: dflash: W4X on: products of %d .. 32 columns run mmvq_w4x on int8 activations (the 8-column pass is unchanged)\n", w4x_min_);
+        else std::fprintf(stderr, "strata-q36: dflash: W4X off (no device memory for its buffers)\n");
+    }
     return true;
 }
 
@@ -760,7 +772,45 @@ void Dflash::set_hooks(sycl::queue& q, const Hooks& h) {
     vram_ += hrows * h.max_nd * 4;
 }
 
-bool Dflash::prod(sycl::queue& q, const void* wt, const uint16_t* x16, float* y, int n_in, int n_out, int ncols, int cls) {
+bool Dflash::xmm(sycl::queue& q, const void* wt, float* y, int n_in, int n_out, int ncols) {
+    if (!strata::q36xr::mmvq_w4x(wt, w4x_act_, y, n_in, n_out, ncols, 128, &q)) {
+        static int shown = 0;
+        if (shown++ < 3) std::fprintf(stderr, "strata-q36: dflash: mmvq_w4x declined %d x %d (%d columns)\n", n_in, n_out, ncols);
+        return false;
+    }
+    return true;
+}
+
+bool Dflash::set_w4x(sycl::queue& q, bool on, int min_cols) {
+    if (!on) { w4x_ = false; return true; }
+    if (w4x_act_ == nullptr) {
+        const size_t act = (strata::q36xr::w4x_act_bytes(kTaps * kN, 32, 128) + 4095) / 4096 * 4096;
+        w4x_act_ = static_cast<uint8_t*>(sycl::aligned_alloc_device(4096, act, q));
+        hcf_ = static_cast<float*>(sycl::aligned_alloc_device(4096, (size_t) kMaxBlocks * kRows * kN * 4, q));
+        attf_ = static_cast<float*>(sycl::aligned_alloc_device(4096, (size_t) kMaxBlocks * kRows * kHeads * kHd * 4, q));
+        ctxf_ = static_cast<float*>(sycl::aligned_alloc_device(4096, (size_t) kEagerCols * kTaps * kN * 4, q));
+        ctxhf_ = static_cast<float*>(sycl::aligned_alloc_device(4096, (size_t) kEagerCols * kN * 4, q));
+        vram_ += act + (size_t) kMaxBlocks * kRows * (kN + kHeads * kHd) * 4 + (size_t) kEagerCols * (kTaps + 1) * kN * 4;
+    }
+    if (!w4x_act_ || !hcf_ || !attf_ || !ctxf_ || !ctxhf_) return false;
+    w4x_ = true;
+    w4x_min_ = std::max(9, min_cols);   // (8 columns and fewer keep the w4h forms: the single pass, bitwise to what ran before)
+    return true;
+}
+
+bool Dflash::debug_h(sycl::queue& q, int rows, std::vector<float>& out) {
+    if (h_ == nullptr || rows < 1 || rows > kMaxBlocks * kRows) return false;
+    out.resize((size_t) rows * kN);
+    q.wait();
+    q.memcpy(out.data(), h_, out.size() * 4).wait();
+    return true;
+}
+
+bool Dflash::prod(sycl::queue& q, const void* wt, const uint16_t* x16, float* y, int n_in, int n_out, int ncols, int cls, const float* xf, bool requant) {
+    if (xf != nullptr && xw(ncols)) {
+        if (requant) strata::q36xr::w4x_quantize(xf, n_in, w4x_act_, n_in, ncols, 128, &q);
+        if (xmm(q, wt, y, n_in, n_out, ncols)) return true;   // (declined: the fp16 operands are there too, below)
+    }
     if (cls >= 0 && cls < kCNum && w4c_[cls] > 0 && ncols == kRows && strata::q36xr::mmvq_w4h_8(wt, x16, y, n_in, n_out, &q, w4c_[cls], w4t_)) return true;
     if (!strata::q36xr::mmvq_w4h(wt, x16, y, n_in, n_out, ncols, &q)) {
         static int shown = 0;
@@ -917,38 +967,50 @@ bool Dflash::prepare_batch(sycl::queue& q, const Req* reqs, int nb, int* cols) {
 // ---- passes
 void Dflash::ctx_update(sycl::queue& q, int n, bool /*eager*/) {
     if (n <= 0) return;
-    k::ctx_prep(q, stag_, meta_, n, ctx_x16_, ctx_scale_);
-    prod(q, fc_, ctx_x16_, ctx_y_, kTaps * kN, kN, n);
-    k::ctx_norm(q, ctx_y_, ctx_scale_, hidden_norm_, eps_, n, ctx_h16_);
-    prod(q, kv_, ctx_h16_, kv_y_, kN, kKvAllRows, n);
+    const bool x = xw(n);   // W4X: the int8 route for a flush of 16 .. 32 columns (the fp16 operands are written too: a declined product falls back)
+    k::ctx_prep(q, stag_, meta_, n, ctx_x16_, ctx_scale_, x ? ctxf_ : nullptr);
+    prod(q, fc_, ctx_x16_, ctx_y_, kTaps * kN, kN, n, -1, x ? ctxf_ : nullptr);
+    k::ctx_norm(q, ctx_y_, ctx_scale_, hidden_norm_, eps_, n, ctx_h16_, x ? ctxhf_ : nullptr);
+    prod(q, kv_, ctx_h16_, kv_y_, kN, kKvAllRows, n, -1, x ? ctxhf_ : nullptr);
     k::ctx_store(q, kv_y_, meta_, n, kn_, kring_, vring_, eps_);
 }
 
 void Dflash::block_batch(sycl::queue& q, int nb) {
     const int R = nb * kRows;   // columns of every product of the pass: the weights are read once for all the blocks
+    const bool x = xw(R);       // STRATA_Q36_DFLASH_W4X: 16 .. 32 columns take mmvq_w4x on int8 activations (the floats below are their source; fp16 operands are written too)
+    float* const hcf = x ? hcf_ : nullptr;
+    float* const attf = x ? attf_ : nullptr;
     hooks_.embed(meta_ + kMetaTok, R, x_);
     if (debug_) q.memcpy(dbg_embed_, x_, 2 * kN * sizeof(float));
     k::rms_pack(q, x_, in_ln_[0], eps_, h_, h16_, R);
     for (int l = 0; l < kLayers; ++l) {
-        prod(q, akp_[l], h16_, dyn_a_, kN, kKpOut, R, kCkp);
-        k::conv_pack(q, h_, dyn_a_, 0, abase_[l], h16b_, R);
-        prod(q, wq_[l], h16b_, qy_, kN, kHeads * kHd, R, kCq);
-        prod(q, static_cast<const uint8_t*>(kv_) + (size_t) l * (kKvRows / 16) * (kN / 256) * 2176, h16b_, kvy_, kN, kKvRows, R, kCkv);
+        prod(q, akp_[l], h16_, dyn_a_, kN, kKpOut, R, kCkp, x ? h_ : nullptr);
+        k::conv_pack(q, h_, dyn_a_, 0, abase_[l], h16b_, R, hcf);
+        prod(q, wq_[l], h16b_, qy_, kN, kHeads * kHd, R, kCq, hcf);
+        prod(q, static_cast<const uint8_t*>(kv_) + (size_t) l * (kKvRows / 16) * (kN / 256) * 2176, h16b_, kvy_, kN, kKvRows, R, kCkv, hcf, false);   // (same input as q: quantized once)
         k::qk_prep(q, qy_, kvy_, qn_[l], kn_[l], meta_, eps_, qb_, kb_, vb_, R);
         k::attn_part(q, qb_, kb_, vb_, kring_, vring_, l, meta_, part_acc_, part_m_, part_l_, nb);
-        k::attn_merge(q, part_acc_, part_m_, part_l_, att16_, nb);
-        prod(q, wo_[l], att16_, oy_, kHeads * kHd, kN, R, kCo);
+        k::attn_merge(q, part_acc_, part_m_, part_l_, att16_, nb, attf);
+        prod(q, wo_[l], att16_, oy_, kHeads * kHd, kN, R, kCo, attf);
         k::finish_rms(q, oy_, dyn_a_, abase_[l], x_, post_ln_[l], eps_, h_, h16_, R);
-        prod(q, mkp_[l], h16_, dyn_m_, kN, kKpOut, R, kCkp);
-        k::conv_pack(q, h_, dyn_m_, 0, mbase_[l], h16b_, R);
-        prod(q, wg_[l], h16b_, gy_, kN, kFF, R, kCgu);
-        prod(q, wu_[l], h16b_, uy_, kN, kFF, R, kCgu);
-        strata::q36xr::w4h_swiglu_pack(gy_, uy_, sw16_, kFF, R, &q);
-        prod(q, wd_[l], sw16_, dny_, kFF, kN, R, kCdn);
+        prod(q, mkp_[l], h16_, dyn_m_, kN, kKpOut, R, kCkp, x ? h_ : nullptr);
+        k::conv_pack(q, h_, dyn_m_, 0, mbase_[l], h16b_, R, hcf);
+        prod(q, wg_[l], h16b_, gy_, kN, kFF, R, kCgu, hcf);
+        prod(q, wu_[l], h16b_, uy_, kN, kFF, R, kCgu, hcf, false);   // (same input as gate)
+        if (x) {
+            strata::q36xr::w4x_swiglu_quantize(gy_, uy_, w4x_act_, kFF, R, 128, &q);
+            if (!xmm(q, wd_[l], dny_, kFF, kN, R)) {   // (declined: the fp16 form)
+                strata::q36xr::w4h_swiglu_pack(gy_, uy_, sw16_, kFF, R, &q);
+                prod(q, wd_[l], sw16_, dny_, kFF, kN, R, kCdn);
+            }
+        } else {
+            strata::q36xr::w4h_swiglu_pack(gy_, uy_, sw16_, kFF, R, &q);
+            prod(q, wd_[l], sw16_, dny_, kFF, kN, R, kCdn);
+        }
         k::finish_rms(q, dny_, dyn_m_, mbase_[l], x_, l + 1 < kLayers ? in_ln_[l + 1] : norm_, eps_, h_, h16_, R);
     }
     // h_ = the final-normed block rows
-    prod(q, hproj_, h16_, hp_y_, kN, kRank, R, kCh);
+    prod(q, hproj_, h16_, hp_y_, kN, kRank, R, kCh, x ? h_ : nullptr);
     int nd = 0;
     const int32_t* idmap = nullptr;
     const int hr = nb * kDrafts;   // the head's rows: rows 1 .. 7 of every block

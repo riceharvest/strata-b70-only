@@ -57,18 +57,18 @@ namespace k {
 void capture(sycl::queue& q, uint16_t* stag, int tap, const float* x, int T, const int32_t* pos0);
 /// Batch rows (rows_mode): row r is cell rcell[r] of slot rslot[r]; stag = slot 0's staging.
 void capture_rows(sycl::queue& q, uint16_t* stag, int tap, const float* x, int T, const int32_t* rcell, const int32_t* rslot);
-void ctx_prep(sycl::queue& q, const uint16_t* stag, const int32_t* meta, int n, uint16_t* x16, float* scale);
-void ctx_norm(sycl::queue& q, const float* y, const float* scale, const float* w, float eps, int n, uint16_t* x16);
+void ctx_prep(sycl::queue& q, const uint16_t* stag, const int32_t* meta, int n, uint16_t* x16, float* scale, float* xf = nullptr);
+void ctx_norm(sycl::queue& q, const float* y, const float* scale, const float* w, float eps, int n, uint16_t* x16, float* hf = nullptr);
 void ctx_store(sycl::queue& q, const float* kv, const int32_t* meta, int n, const float* const* kn, sycl::half* kring, sycl::half* vring, float eps);
 // the block kernels take `rows` = 8 x the blocks of the pass (8 .. 32); a block is its own 8 rows (the conv taps and the attention stop at its edge)
 void rms_pack(sycl::queue& q, const float* x, const float* w, float eps, float* h, uint16_t* x16, int rows = kRows);
-void conv_pack(sycl::queue& q, const float* x, const float* dyn, int side, const float* base, uint16_t* x16, int rows = kRows);
+void conv_pack(sycl::queue& q, const float* x, const float* dyn, int side, const float* base, uint16_t* x16, int rows = kRows, float* yf = nullptr);
 void finish_rms(sycl::queue& q, const float* o, const float* dyn, const float* base, float* x, const float* w, float eps, float* h, uint16_t* x16, int rows = kRows);
 void qk_prep(sycl::queue& q, const float* qy, const float* kvy, const float* qn, const float* kn, const int32_t* meta, float eps, float* qb, float* kb, float* vb, int rows = kRows);
 /// part buffers: [block][chunk][head][row] (m, l) and [..][128] (acc)
 void attn_part(sycl::queue& q, const float* qb, const float* kb, const float* vb, const sycl::half* kring, const sycl::half* vring, int layer,
                const int32_t* meta, float* part_acc, float* part_m, float* part_l, int nb = 1);
-void attn_merge(sycl::queue& q, const float* part_acc, const float* part_m, const float* part_l, uint16_t* x16, int nb = 1);
+void attn_merge(sycl::queue& q, const float* part_acc, const float* part_m, const float* part_l, uint16_t* x16, int nb = 1, float* yf = nullptr);
 /// rows 1 .. 7 of each block of h [nb x 8][kN] -> hn [nb x 7][kN]
 void gather_hn(sycl::queue& q, const float* h, float* hn, int nb);
 void top1(sycl::queue& q, const float* logits, int nd, int rows, int nch, uint64_t* part);
@@ -158,6 +158,12 @@ public:
     /// After a tree verify of `n_keep` rows whose row r (the window's DFS order) was captured at position p0 + r: the kept rows path[k] (DFS rows, path[0] = 0) move to
     /// position p0 + k of the slot's staging ring (in order, on q).  Rows the capture wrote for rejected nodes are left (never read: the host mirror ends at p0 + n_keep).
     void compact_stage(sycl::queue& q, int64_t p0, const int32_t* path, int n_keep, int slot = 0);
+    // ---- STRATA_Q36_DFLASH_W4X (default off): the products of 16 .. 32 columns (batch passes, big context flushes) run q36xr::mmvq_w4x (u4 x s8 DPAS, q36_w4x.dp.cpp from b70-w4x)
+    // on activations quantized to int8 (a scale a group of 128 inputs) instead of mmvq_w4h on fp16 operands.  The 8-column pass keeps mmvq_w4h.  NOT bitwise to the w4h forms.
+    bool set_w4x(sycl::queue& q, bool on, int min_cols = 16);
+    bool w4x_on() const { return w4x_; }
+    /// Debug: the final-normed rows h [rows][kN] of the last block pass (waits).
+    bool debug_h(sycl::queue& q, int rows, std::vector<float>& out);
     /// Debug: the last block's intermediates and candidates (waits).
     bool debug_last(sycl::queue& q, Debug& d);
     /// Debug: staging rows of positions [p0, p0 + n) as bf16 [n][5 x kN] (waits); false when a position is not in the ring.
@@ -185,7 +191,10 @@ private:
     void stage_meta(sycl::queue& q, int64_t P, int32_t anchor, int64_t c0, int nrows, int slot);   // fills + copies the meta (one block)
     void flush_eager(sycl::queue& q, int64_t c0, int nrows, int slot);
     int plan_flush(sycl::queue& q, int slot, int64_t P, int64_t* at);   // flushes all but the last <= 8 pending rows of a slot; returns those rows, `at` their first position
-    bool prod(sycl::queue& q, const void* w, const uint16_t* x16, float* y, int n_in, int n_out, int ncols, int cls = -1);
+    // `xf`: the same activations as floats [ncols][n_in] (null: none); with W4X on and ncols in range they are quantized (requant) and the product is mmvq_w4x
+    bool prod(sycl::queue& q, const void* w, const uint16_t* x16, float* y, int n_in, int n_out, int ncols, int cls = -1, const float* xf = nullptr, bool requant = true);
+    bool xw(int ncols) const { return w4x_ && ncols >= w4x_min_ && ncols <= 32; }   // this pass's products take the int8 route
+    bool xmm(sycl::queue& q, const void* w, float* y, int n_in, int n_out, int ncols);   // mmvq_w4x on the quantized activations already in w4x_act_
     int w4c_[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // STRATA_Q36_DFLASH_W4C: threads a tile of the block's products by class (0: the engine's mmvq_w4h)
     int w4t_ = 1024;                          // STRATA_Q36_DFLASH_W4T: threads in all of those
     const void* w(const std::string& name) const;
@@ -225,6 +234,10 @@ private:
     uint64_t* top_part_ = nullptr;
     float* hn_ = nullptr;                      // the head's input rows [kMaxBlocks x 7][kN]
     int n_slots_ = 1;
+    bool w4x_ = false;
+    int w4x_min_ = 16;
+    uint8_t* w4x_act_ = nullptr;               // the int8 activations of the product in flight (w4x_act_bytes(25600, 32, 128))
+    float *hcf_ = nullptr, *attf_ = nullptr, *ctxf_ = nullptr, *ctxhf_ = nullptr;   // float images of conv_pack / attn_merge / ctx_prep / ctx_norm outputs (W4X)
     bool tree_ = false;
     q36dt::Gather* tgath_ = nullptr;           // device image for the tree builder (STRATA_Q36_DFLASH_TREE)
     int32_t *cand_ = nullptr, *out_tok_ = nullptr;
