@@ -13,7 +13,46 @@ strata doctor --live
 strata launch --status
 ```
 
+## This fork: one B70, Linux
+
+These are the failures an owner of one Intel Arc Pro B70 on Linux hits with this fork. The rest of this page is
+upstream's and is kept as it was.
+
+**Answers are 3-5% slower than the published numbers.**
+Rebuild with the pinned image (`strata-sycl-dev:latest`). The build used a newer device compiler than the pinned
+one. The tell is the size of the built `strata`: 162,115,384 bytes with IGC 2.41.5 (pinned) and 161,967,928 bytes with
+IGC 2.42.6. The Dockerfile downloads the five pinned .debs and `build.sh` prints the compiler and warns when it is not
+the pinned one. A binary built with 2.41.5 runs at full speed on the 26.40 runtime.
+
+**`duplicate split shard number` from setup or at start.**
+Put the model folder in `STRATA_SYCL_MOUNTS`, or keep the model under the same parent folder as the repository. One shard
+of the model is an absolute symlink that points outside the folder the container mounts.
+
+**A kernel benchmark dies with `DEVICE_LOST` or "xe exec queue reset".**
+Update the fork. It was seen at the first big row of `q36_mmvq_dense_parity --bench`: the benchmark used a fixed 640 MiB
+weight pool, and the 27B head row is 715 MB in Q4_K and 874 MB in Q5_K, so it read past the pool. PR #35 fixed it. The
+engine was never at risk. Do not rerun a failing kernel benchmark before its fix.
+
+**Out of free RAM, or the model is using the file tier.**
+Use a smaller model or a shorter context, not a flag. This machine has no swap. `--ple-io ram` only keeps the n-gram
+table in RAM with 85 GB or more of real RAM; setup used to read a made-up 1,024 GB, fixed in PR #28. The measured floor is
+7 GiB free at UD-IQ2_XS with 250K context.
+
+**`strata generate --mtp --spec 4` ends with a segfault (exit 139) after the reply was printed.**
+Update the fork. The draft layer's destructor freed device memory while the runtime was already shutting down. It is
+fixed by giving the buffers back before `main` returns (issue #3, upstream PR #5161). The check is
+`sycl/tools/test_mtp_teardown.sh`.
+
+**Pictures do not work.**
+The served recipe sets `--vision no`. Run setup again with `--vision cpu` (setup adds `--vision no` only when you
+pass no `--vision` at all; the CPU reader is the one this fork ships), or add a `"vision"` section with `exe` (`engine-sycl/strata-vision`) and `mmproj` to
+`strata-<model>.json`. `STRATA_VISION_DIR` does not turn pictures on: it only names the folder for the reader's
+temporary files. See [B70.md](B70.md).
+
 ## The desktop app and the Terminal
+
+This section is upstream's. It does not apply to this fork: there is no desktop app, no `START-HERE.bat` and no installer
+download here. Build and run from the source checkout ([Quickstart](QUICKSTART.md)).
 
 **I cannot find `START-HERE.bat` or `SETUP.bat`.**
 Open the installed Strata app, or run `strata launch`. Those wrappers are in the source repository and are not the
