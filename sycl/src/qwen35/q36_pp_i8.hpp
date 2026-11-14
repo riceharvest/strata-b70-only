@@ -30,4 +30,28 @@ void* pack_ab16(const float* alpha, const float* beta, int HV, int N, void* stre
 void gdn_ab_pp(const void* ab16, const float* h, const float* dt, const float* ssm_a,
                float* al_out, float* be_out, int n_in, int HV, int T, void* stream);
 
+// PP2 (card-up B70W4 prompt GEMM + fused FFN gate/up+SwiGLU+x128 + coalesced RMS/x128): gated by STRATA_Q36_PP2.
+bool pp2_enabled() noexcept;
+bool pp2_fuse_enabled() noexcept;
+size_t dxT_pp2_floats(int n_in, int T) noexcept;
+void quantize_x128_pp2(const float* x, void* xq8, float* dxT, int K, int M, void* stream);
+void swiglu_x128_pp2(const float* g, const float* u, void* xq8, float* dxT, int K, int M, void* stream);
+bool gemm_w4_i8_pp2(const void* weights, const void* xq8, const float* dxT, float* y,
+                    int n_in, int n_out, int T, void* stream);
+bool rms_pp2(float* x, const float* y, const float* w, float* h, void* xq8, float* dxT,
+             int n, int T, float eps, void* stream);
+bool gemm_w4_i8_gu_swiglu_pp2(const void* w_gate, const void* w_up,
+                              const void* xq8_in, const float* dxT_in,
+                              void* xq8_out, float* dxT_out,
+                              int n_in, int n_out, int T, void* stream);
+
+// PP3 (fatgemm-paced 256-GRF ping-pong W4I8 GEMM + fused FFN gate/up+SwiGLU+x128): gated by STRATA_Q36_PP3.
+bool pp3_enabled() noexcept;
+bool gemm_w4_i8_pp3(const void* weights, const void* xq8, const float* dxT, float* y,
+                    int n_in, int n_out, int T, void* stream);
+bool gemm_w4_i8_gu_swiglu_pp3(const void* w_gate, const void* w_up,
+                              const void* xq8_in, const float* dxT_in,
+                              void* xq8_out, float* dxT_out,
+                              int n_in, int n_out, int T, void* stream);
+
 }  // namespace strata::q36pp

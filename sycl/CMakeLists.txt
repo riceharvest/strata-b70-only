@@ -612,8 +612,9 @@ if(STRATA_BUILD_Q36)
       set(_q36_w4_grf "")
     endif()
     set_property(TARGET q36_w4 PROPERTY COMPILE_OPTIONS -fsycl -fsycl-targets=spir64_gen -O3 -Wno-unused-command-line-argument
-                 -fno-sycl-instrument-device-code)
+                 -fno-sycl-instrument-device-code -fsycl-device-code-split=per_kernel)
     set_property(TARGET q36_w4 PROPERTY LINK_OPTIONS -fsycl -fsycl-targets=spir64_gen -Wno-unused-command-line-argument
+                 -fsycl-device-code-split=per_kernel
                  -fsycl-max-parallel-link-jobs=${STRATA_SYCL_LINK_JOBS}
                  "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${STRATA_SYCL_AOT} -options \\\"-cl-fp32-correctly-rounded-divide-sqrt${_q36_w4_grf}\\\"\"")
   else()
@@ -626,8 +627,9 @@ if(STRATA_BUILD_Q36)
   set_target_properties(q36_pp PROPERTIES CXX_EXTENSIONS ON)
   if(STRATA_SYCL_AOT)
     set_property(TARGET q36_pp PROPERTY COMPILE_OPTIONS -fsycl -fsycl-targets=spir64_gen -O3 -Wno-unused-command-line-argument
-                 -fno-sycl-instrument-device-code)
+                 -fno-sycl-instrument-device-code -fsycl-device-code-split=per_kernel)
     set_property(TARGET q36_pp PROPERTY LINK_OPTIONS -fsycl -fsycl-targets=spir64_gen -Wno-unused-command-line-argument
+                 -fsycl-device-code-split=per_kernel
                  -fsycl-max-parallel-link-jobs=${STRATA_SYCL_LINK_JOBS}
                  "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${STRATA_SYCL_AOT} -options \\\"-cl-fp32-correctly-rounded-divide-sqrt\\\"\"")
   else()
@@ -697,6 +699,20 @@ if(STRATA_BUILD_Q36)
   endif()
   # the 27B's decode forms against a float64 reference and against native_mmvq on the card (PARITY=ON; docs/Q36.md)
   if(STRATA_SYCL_PARITY)
+    add_library(q36_pp3_bench SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_pp3_bench.dp.cpp)
+    target_include_directories(q36_pp3_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35 ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    set_target_properties(q36_pp3_bench PROPERTIES CXX_EXTENSIONS ON)
+    if(STRATA_SYCL_AOT)
+      set_property(TARGET q36_pp3_bench PROPERTY COMPILE_OPTIONS -fsycl -fsycl-targets=spir64_gen -O3
+                   -Wno-unused-command-line-argument -fno-sycl-instrument-device-code -fsycl-device-code-split=per_kernel)
+      set_property(TARGET q36_pp3_bench PROPERTY LINK_OPTIONS -fsycl -fsycl-targets=spir64_gen
+                   -Wno-unused-command-line-argument -fsycl-device-code-split=per_kernel
+                   -fsycl-max-parallel-link-jobs=${STRATA_SYCL_LINK_JOBS}
+                   "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${STRATA_SYCL_AOT} -options \\\"-doubleGRF\\\"\"")
+    else()
+      set_property(TARGET q36_pp3_bench PROPERTY COMPILE_OPTIONS -fsycl -O3 -Wno-unused-command-line-argument -fno-sycl-instrument-device-code)
+      set_property(TARGET q36_pp3_bench PROPERTY LINK_OPTIONS -fsycl)
+    endif()
     add_executable(q36_mmvq_dense_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense_parity.cpp
                    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense.dp.cpp
                    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xr_dense.dp.cpp
@@ -705,7 +721,7 @@ if(STRATA_BUILD_Q36)
                    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_qsa.dp.cpp
                    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_qsa_parity.cpp)   # --qsa
     target_include_directories(q36_mmvq_dense_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
-    target_link_libraries(q36_mmvq_dense_parity PRIVATE strata_kernels strata_prefill q36_w4 q36_pp)
+    target_link_libraries(q36_mmvq_dense_parity PRIVATE strata_kernels strata_prefill q36_w4 q36_pp q36_pp3_bench)
     set_target_properties(q36_mmvq_dense_parity PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
     add_test(NAME q36_mmvq_dense_parity COMMAND q36_mmvq_dense_parity --selftest)
     add_test(NAME q36_dflash_parity COMMAND q36_mmvq_dense_parity --dflash)
