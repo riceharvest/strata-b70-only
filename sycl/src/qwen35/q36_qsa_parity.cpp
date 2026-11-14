@@ -260,7 +260,8 @@ void test_score(const Weights16& w) {
             g_q->memcpy(s1.qidx, qi.data(), qi.size() * 4).wait();
             select_rows(ls, s1, w1, g_q);
             g_q->wait();
-            const auto sc1 = down(s1.score, (size_t) nr * nbc), id1 = down(s1.sel, (size_t) nr * kTopBlocks);
+            const auto sc1 = down(s1.score, (size_t) nr * nbc);
+            const auto id1 = down(s1.sel, (size_t) nr * kTopBlocks);
             for (int r = 0; r < nr; ++r) {
                 const int c = (P + r0 + r + 1) / 4;
                 same = same && std::memcmp(&sc1[(size_t) r * nbc], &score[(size_t) (r0 + r) * nbc], (size_t) c * 4) == 0;
