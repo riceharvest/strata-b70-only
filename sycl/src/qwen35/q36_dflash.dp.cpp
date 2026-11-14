@@ -463,12 +463,13 @@ void k_fill_random(sycl::queue& q, uint8_t* p, uint64_t bytes, uint64_t seed) {
         for (int b = 0; b < 4; ++b) if (o + b < bytes) p[o + b] = (uint8_t) (h >> (8 * b));
     }).wait();
 }
-// a random w4 matrix: the nibbles random, the group meta sane (fp16 scale ~ 2^-8, zero 1 .. 16)
+// a random w4 matrix: the nibbles random, the group meta sane (fp16 scale 2^-13 .. 2^-12, zero 1 .. 16).  The scale matters for the whole-pass check
+// only: at 2^-8 the random pass overflows the fp16 operands in layer 0 (CPU simulation, REPORT section 8) and every row turns NaN.
 void k_fix_w4_meta(sycl::queue& q, uint8_t* p, uint64_t records) {
     q.parallel_for<Tag<15>>(sycl::range<1>(records * 32), [=](sycl::id<1> id) {
         uint32_t* rec = reinterpret_cast<uint32_t*>(p + (id[0] / 32) * 2176) + 512;
         const uint32_t h = hash32(0xABCDEFULL + id[0]);
-        rec[id[0] % 32] = (0x1C00u + (h & 0x3FFu)) | ((1u + ((h >> 10) & 15u)) << 16);
+        rec[id[0] % 32] = (0x0800u + (h & 0x3FFu)) | ((1u + ((h >> 10) & 15u)) << 16);
     }).wait();
 }
 void k_fix_f32(sycl::queue& q, float* p, uint64_t n, float base, float amp, uint64_t seed) {

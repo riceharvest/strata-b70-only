@@ -46,8 +46,27 @@ float rnd() {   // ~N(0, 1) (sum of 4 uniforms, scaled)
 std::vector<float> rvec(size_t n, float scale = 1.f) { std::vector<float> v(n); for (auto& x : v) x = rnd() * scale; return v; }
 uint16_t f2bf(float f) { uint32_t u; std::memcpy(&u, &f, 4); u += 0x7FFFu + ((u >> 16) & 1u); return (uint16_t) (u >> 16); }
 float bf2f(uint16_t b) { uint32_t u = (uint32_t) b << 16; float f; std::memcpy(&f, &u, 4); return f; }
-uint16_t h2u(float f) { sycl::half h(f); uint16_t u; std::memcpy(&u, &h, 2); return u; }
-float u2h(uint16_t u) { sycl::half h; std::memcpy(&h, &u, 2); return (float) h; }
+// float -> IEEE half, round to nearest even, every range.  NOT sycl::half(float) on the host: the DPC++ host conversion (half_type.hpp,
+// detail::float2Half) rounds the normal range correctly but TRUNCATES results below 2^-13 (its subnormal branch shifts the bits out), while the
+// device rounds to nearest even.  Against that reference a correct kernel "differs" in the one element in ~10^4 whose half is subnormal.
+uint16_t h2u(float f) {
+    uint32_t b; std::memcpy(&b, &f, 4);
+    const uint16_t sign = (uint16_t) ((b >> 16) & 0x8000u);
+    if (std::isnan(f)) return (uint16_t) (sign | 0x7E00u);
+    if (std::isinf(f)) return (uint16_t) (sign | 0x7C00u);
+    const double a = std::fabs((double) f);
+    if (a < 6.103515625e-05) return (uint16_t) (sign | (uint16_t) std::nearbyint(std::ldexp(a, 24)));   // subnormal (1024 = the smallest normal, by carry)
+    int e = std::ilogb(a);
+    double q = std::nearbyint(std::ldexp(a, 10 - e));                                                      // [1024, 2048]
+    if (q >= 2048.0) { q = 1024.0; ++e; }
+    if (e > 15) return (uint16_t) (sign | 0x7C00u);
+    return (uint16_t) (sign | (uint16_t) (((e + 15) << 10) + ((int) q - 1024)));
+}
+float u2h(uint16_t u) {
+    const int e = (u >> 10) & 31, m = u & 1023;
+    const double v = e == 0 ? std::ldexp((double) m, -24) : e == 31 ? (m ? NAN : INFINITY) : std::ldexp(1024.0 + m, e - 25);
+    return (float) ((u & 0x8000) ? -v : v);
+}
 size_t x16_at(int col, int i, int ncp) { return ((size_t) (i >> 4) * ncp + col) * 16 + (i & 15); }
 
 sycl::queue* g_q = nullptr;
@@ -72,6 +91,21 @@ void rope_table(int64_t pos, float* out) {
 }
 
 // ---- the checks
+// The device's float -> half is IEEE round-to-nearest-even in every range (ties and subnormals included): the premise of the bitwise checks below.
+void test_half_convert() {
+    std::vector<float> v = {1.f + 0x1p-11f, 1.f + 3 * 0x1p-11f, 0x1p-25f, 3 * 0x1p-25f, 1.5f * 0x1p-24f, 2.5f * 0x1p-24f, 0x1p-14f - 0x1p-25f, 65519.f, 65520.f, -0x1.ffcp-15f, 3.3e-6f, 1e-8f};
+    for (int i = 0; i < 4096; ++i) v.push_back(rnd() * 1e-4f);   // the subnormal and near-subnormal range
+    for (int i = 0; i < 4096; ++i) v.push_back(rnd() * 3.f);
+    float* dv = up(v);
+    uint16_t* dh = dev<uint16_t>(v.size());
+    g_q->parallel_for(sycl::range<1>(v.size()), [=](sycl::id<1> i) { sycl::half h(dv[i[0]]); dh[i[0]] = sycl::bit_cast<uint16_t>(h); }).wait();
+    auto h = down(dh, v.size());
+    size_t bad = 0;
+    for (size_t i = 0; i < v.size(); ++i) bad += h[i] != h2u(v[i]);
+    check("float -> half on the device: IEEE RNE (ties, subnormals)", bad == 0, fmt("%.0f of %.0f differ from the exact RNE", (double) bad, (double) v.size()));
+    sycl::free(dv, *g_q); sycl::free(dh, *g_q);
+}
+
 void test_capture() {
     const int64_t p0 = 5000;
     for (int T : {70, 2100}) {
@@ -493,6 +527,14 @@ int whole(bool bench) {
     auto pr = down(b->d.out_probs(), kDrafts);
     bool ok = n == kRows;
     for (int l = 0; l < kDrafts; ++l) ok = ok && tok[l] >= 0 && tok[l] < b->nd && pr[l] > 0.f && pr[l] <= 1.f;
+    Debug dbg;
+    b->d.debug_last(*g_q, dbg);
+    size_t nonfinite = 0;
+    double hmax = 0;
+    for (float v : dbg.hn) { if (!std::isfinite(v)) ++nonfinite; else hmax = std::max(hmax, (double) std::fabs(v)); }
+    std::printf("  whole pass stats: final-normed rows: %.0f non-finite of %.0f, max |h| %.3g; unary[0][0] %.4g, prob[0] %.4g, first picks %d %d %d\n", (double) nonfinite,
+                (double) dbg.hn.size(), hmax, (double) dbg.unary[0], (double) pr[0], (int) tok[0], (int) tok[1], (int) tok[2]);
+    check("whole pass: block rows finite (random pack with a sane scale)", nonfinite == 0, fmt("%.0f non-finite", (double) nonfinite));
     check("whole pass on a random pack: 7 tokens in range", ok, fmt("n = %.0f context rows, first token %.0f", (double) n, (double) tok[0]));
     if (!bench) return 0;
     // bytes a pass reads: the block's weights (every layer's q, o, gate, up, down, 2 kernel projections, its kv slice) + hproj; the context update's fc + kv_all
@@ -527,6 +569,7 @@ int parity_main(int argc, char** argv) {
     for (int i = 0; i < argc; ++i) if (std::string(argv[i]) == "--bench") bench = true;
     g_q = &dpct::get_in_order_queue();
     strata::q36xr::init(g_q);
+    test_half_convert();
     test_capture();
     test_ctx();
     test_block_rows();
