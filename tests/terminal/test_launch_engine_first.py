@@ -110,7 +110,7 @@ class EngineBeforeModel(unittest.TestCase):
         self.assertIsNone(err)
         self.assertTrue(r.engine_problem.startswith("no graphics card that Strata can use was found"))
         text = r.events[-1].text
-        self.assertIn("Strata needs an NVIDIA or AMD graphics card", text)
+        self.assertIn("Strata needs an Intel Arc graphics card (the SYCL engine)", text)
         self.assertNotIn("--feed", text)
         self.assertNotIn("<address>", text)
         self.assertNotIn("--feed", no_engine_final(r.engine_problem))
@@ -124,7 +124,7 @@ class EngineBeforeModel(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(r.engine_problem, WRONG_FAMILY)
         text = r.events[-1].text
-        self.assertIn(WRONG_FAMILY, text)
+        self.assertIn(WRONG_FAMILY.rstrip("."), text)
 
     def test_installed_wrong_family_package_uses_its_plain_notice(self):
         report = {"usable": False, "engine": None, "notice": WRONG_FAMILY}
@@ -180,7 +180,7 @@ class EngineBeforeModel(unittest.TestCase):
         self.assertEqual(result.engine_problem, WRONG_FAMILY)
         self.assertEqual(result.final_text, no_engine_final(WRONG_FAMILY))
         self.assertIn("The model is ready, but Strata can't start it yet", result.final_text)
-        self.assertIn(WRONG_FAMILY, result.final_text)
+        self.assertIn(WRONG_FAMILY.rstrip("."), result.final_text)
         self.assertIn(NO_ENGINE_STEP, result.final_text)
 
     def test_the_setup_child_is_told_to_go_on_without_an_engine(self):

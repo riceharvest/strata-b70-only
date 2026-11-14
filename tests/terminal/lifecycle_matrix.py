@@ -576,7 +576,7 @@ def runtime_case(rig: Rig, name: str, what: str, *, vram: bool = False) -> Resul
             kill_hard(owner)
             graceful = None
         elif what == "server-killed":
-            server = next(i for i in idents if "serve.server" in " ".join(i.cmd))
+            server = next(i for i in idents if "serve.server" in " ".join(i.cmd) or "server_intel.py" in " ".join(i.cmd))
             kill_hard(server.pid)
             graceful = None
             note = "server killed, owner left alive"

@@ -1,7 +1,7 @@
 """sycl/setup_intel.py: the prompt chunk size setup recommends for an Intel card (--prefill).
 
 A Battlemage card (xe driver, not an A-series) with 24 GB or more and a context over 32K (the prompt borrows cache slots) gets
-8192; everything else keeps 4096; a chunk size the user put in the config is kept."""
+16384; everything else keeps 4096; a chunk size the user put in the config is kept."""
 import importlib.util
 import sys
 from pathlib import Path
@@ -24,9 +24,9 @@ def prefill_of(ctx, card, extra=()):
 
 
 def test_helper_values():
-    assert si.recommended_prefill(32.0, 131072, "xe", "e223")[0] == 8192
+    assert si.recommended_prefill(32.0, 131072, "xe", "e223")[0] == 16384
     assert si.recommended_prefill(32.0, 131072, "xe", "e223")[1]          # a plain line says why
-    assert si.recommended_prefill(24.0, 65536, "xe", "e221")[0] == 8192
+    assert si.recommended_prefill(24.0, 65536, "xe", "e221")[0] == 16384
     assert si.recommended_prefill(32.0, 32768, "xe", "e223") == (4096, "")   # own prompt buffers: a bigger chunk costs cache slots
     assert si.recommended_prefill(16.0, 131072, "xe", "e212")[0] == 4096     # under 24 GB
     assert si.recommended_prefill(16.0, 131072, "xe", "56a0")[0] == 4096     # Alchemist
@@ -34,7 +34,7 @@ def test_helper_values():
 
 
 def test_config_battlemage_long_context():
-    assert prefill_of(131072, B70) == "8192"
+    assert prefill_of(131072, B70) == "16384"
 
 
 def test_config_battlemage_32k_keeps_4096():

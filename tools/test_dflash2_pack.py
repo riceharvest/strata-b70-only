@@ -129,6 +129,8 @@ class PackWithoutTorch(unittest.TestCase):
             import safetensors  # noqa: F401
         except ImportError:
             self.skipTest("torch or safetensors is not installed here (the point of the change)")
+        if not hasattr(torch, "__version__") or not hasattr(safetensors, "__version__"):
+            self.skipTest("torch or safetensors is not installed here (namespace leftover)")
         old_src = subprocess.run(["git", "show", "f1b6a2144:tools/dflash2_pack.py"], cwd=HERE, capture_output=True, text=True)
         if old_src.returncode != 0:
             self.skipTest("the earlier version is not in this clone")

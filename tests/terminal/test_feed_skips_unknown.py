@@ -13,7 +13,7 @@ from strata_control import feed as feedmod
 
 
 def engine(**kw):
-    e = {"version": "0.1.53", "platform": "linux-x86_64", "backend": "cuda", "variant": "cuda13", "archs": ["sm_86"], "min_driver": {},
+    e = {"version": "0.1.53", "platform": "linux-x86_64", "backend": "sycl", "variant": "xe2", "archs": ["xe"], "min_driver": {},
          "min_runtime": None, "build_id": "b", "format": "tar.gz", "url": "e.tar.gz", "size": 10, "sha256": "a" * 64,
          "manifest_sha256": "b" * 64, "installed_bytes": 20, "notes": ""}
     e.update(kw)

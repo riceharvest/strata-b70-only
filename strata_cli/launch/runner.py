@@ -2377,7 +2377,7 @@ def explain_engine_exit(result: dict, config: Path | None, marks: dict | None = 
     if not text.endswith((".", "!")):
         text += "."
     step = next((words for pattern, words in KNOWN_CAUSES if pattern.search(" ".join([cause, str(why or "")]))), "Run it again; if it repeats, report the log.")
-    return text, step + (f" The engine's log: {log}" if log else " The engine's log has the reason (strata logs, or the log named in the run config).")
+    return text, step + _log_sentence(log)
 
 
 def _log_sentence(log: str | None) -> str:

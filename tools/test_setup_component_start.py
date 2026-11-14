@@ -24,9 +24,8 @@ class ComponentStart(unittest.TestCase):
         self.config = self.root / "strata-iq3_s.json"
         self.gguf = self.root / "model.gguf"
         self.gguf.write_bytes(b"GGUF")
-        self.cards = [{"index": i, "name": f"RTX {i}", "arch": "89", "vram_gb": 24.0} for i in range(2)]
 
-    def run_start(self, exe="component:strata-engine", backend="cuda", gpu=0, win=False, keep=None):
+    def run_start(self, exe="component:strata-engine", backend="sycl", gpu=0, win=False, keep=None):
         cfg = {"exe": exe, "backend": backend, "args": ["--native", str(self.gguf)],
                "gpu": gpu, "gpus_asked": True, "model_name": "test", "port": 8080}
         self.config.write_text(json.dumps(cfg), encoding="utf-8")
@@ -35,16 +34,10 @@ class ComponentStart(unittest.TestCase):
             st.enter_context(contextlib.redirect_stdout(self.output))
             st.enter_context(mock.patch.object(setup, "WIN", win))
             st.enter_context(mock.patch.dict(os.environ, {"STRATA_EXECV": ""}))
-            st.enter_context(mock.patch.object(setup, "gpus", return_value=self.cards))
             st.enter_context(mock.patch.object(setup, "amd_gpus", return_value=[
-                {"index": i, "name": f"Radeon {i}", "arch": "gfx1201", "vram_gb": 24.0} for i in range(2)]))
-            st.enter_context(mock.patch.object(setup, "check_gpus"))
+                {"index": i, "name": f"Intel Arc Pro B70 {i}", "arch": "xe", "vram_gb": 32.0} for i in range(2)]))
             st.enter_context(mock.patch.object(setup, "split_budget", return_value=False))
             st.enter_context(mock.patch.object(setup, "split_mmap", return_value=False))
-            st.enter_context(mock.patch.object(setup, "recommend_remote_expert_opt"))
-            st.enter_context(mock.patch.object(setup, "old_gpus_opt_in", return_value=[]))
-            for name in ("engine_runs_on", "engine_archs_hip", "hip_runtime_beside_exe"):
-                st.enter_context(mock.patch.object(setup, name, side_effect=AssertionError("legacy engine lookup: " + name)))
             self.server = st.enter_context(mock.patch.object(setup.subprocess, "call", return_value=0))
             return setup.start(self.config, None, gpu=gpu, open_browser=False, yes=True, keep=keep)
 
@@ -64,14 +57,6 @@ class ComponentStart(unittest.TestCase):
     def test_component_can_save_several_gpus_without_looking_for_a_source_build(self):
         self.assertEqual(self.run_start(gpu=[0, 1]), 0)
         self.assertEqual(json.loads(self.config.read_text())["gpu"], [0, 1])
-
-    def test_windows_hip_component_does_not_repair_the_legacy_engine_folder(self):
-        self.assertEqual(self.run_start(backend="hip", win=True), 0)
-        self.server.assert_called_once()
-
-    def test_hip_component_does_not_read_source_build_architectures(self):
-        self.assertEqual(self.run_start(backend="hip", gpu=[0, 1]), 0)
-        self.server.assert_called_once()
 
     def test_missing_model_file_is_still_reported(self):
         self.gguf.unlink()

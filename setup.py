@@ -1575,6 +1575,21 @@ def recommend_remote_expert_opt(cfg: dict, off: bool = False) -> None:
            "--no-remote-expert-opt leaves it out)")
 
 
+CMAKE_MIN = (3, 24)                    # CMakeLists.txt: cmake_minimum_required(VERSION 3.24)
+
+
+def _tool_version(path, name):
+    """(ok, version tuple) of `path --version`: ok False when it does not run (a pip launcher whose Python is gone)."""
+    try:
+        done = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False, ()
+    if done.returncode != 0:
+        return False, ()
+    found = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", done.stdout or "")
+    return True, tuple(int(x) for x in found.groups() if x) if found else ()
+
+
 def find_tool(name):
     """The tool the build uses (cmake, ninja): the one pip installed next to THIS Python first (the virtualenv's own, #3822), then PATH,
     then ~/.local/bin.  One that does not run (a pip launcher whose Python is gone) is skipped, and so is a cmake older than the
@@ -3114,6 +3129,17 @@ def setup_images(a, gpu: dict, hip: bool, models_dir: Path) -> dict | None:
                           policy=a.image_gpu_policy or "auto")
     ok(f"image generation: {quant} on {backend}, GPU policy {cfg['gpu_policy']}")
     return cfg
+
+
+def tool_usable(name):
+    """find_tool found one that runs and (cmake) is new enough: an older system cmake counts as missing, so pip puts the right one in the venv."""
+    found = find_tool(name)
+    if found is None:
+        return False
+    if name == "cmake":
+        runs, version = _tool_version(found, name)
+        return runs and (not version or version[:2] >= CMAKE_MIN)
+    return True
 
 
 def ensure_build_tools():

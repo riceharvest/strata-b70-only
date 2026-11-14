@@ -77,6 +77,9 @@ FALLBACK_MODELS = {
     "Q8_0": {"about": "8-bit, the reference quality (every expert Q8_0); for a 192 GB PC",
              "download_gb": 188.2, "ram_gb": 136, "arena_gb": 128.3, "families": ("unsloth",), "budget": True,
              "vision": True},
+    "UD-IQ1_S": {"about": "Unsloth's smallest dynamic file, the one this fork serves on a B70 (setup takes one tensor from "
+                          "UD-IQ1_M so it can be packed)",
+                 "download_gb": 66.4, "ram_gb": 40, "arena_gb": 33.3, "families": ("unsloth",), "vision": True},
     "Gyro-S": {"about": "the smallest option, for PCs with little memory (27.6 GB of VRAM + RAM together); lower quality "
                         "than the 2-3-bit sizes, and the 2-bit Q2_0 decodes faster",
                "engine": (0, 1, 45, 1),

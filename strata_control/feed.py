@@ -178,6 +178,12 @@ def _time(value, what: str) -> dt.datetime:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
 
 
+def _skipping(skipped: list | None, what: str, reason: str) -> None:
+    if skipped is None:                                  # a caller that wants the strict reading
+        raise FeedError(f"the update feed lists {what}, {reason}")
+    skipped.append(f"The update feed lists {what}, {reason}: skipped (a newer Strata may use it).")
+
+
 #: The other makes' engine families a release feed lists beside the SYCL package. Their entries are left out, not an error,
 #: so such a feed still serves the package this PC can use; any other unknown backend is still a malformed entry.
 FOREIGN_BACKENDS = ("cuda", "hip", "metal", "vulkan")
@@ -188,7 +194,7 @@ def _foreign(item) -> bool:
     return isinstance(item, dict) and item.get("backend") in FOREIGN_BACKENDS
 
 
-def _engine_package(item: dict) -> EnginePackage:
+def _engine_package(item: dict, skipped: list | None = None) -> EnginePackage | None:
     if not isinstance(item, dict):
         raise FeedError("an engine entry in the feed is not an object")
     where = f"engine entry {item.get('version')!r}"
@@ -301,7 +307,8 @@ def parse(payload: bytes, *, source: str, key_id: str) -> Feed:
     if raw_engine is not None:
         if not isinstance(raw_engine, dict) or not isinstance(raw_engine.get("packages"), list):
             raise FeedError("the feed's engine member lists no packages")
-        engine = [_engine_package(item) for item in raw_engine["packages"] if not _foreign(item)]
+        engine = [e for e in (_engine_package(item, skipped) for item in raw_engine["packages"] if not _foreign(item))
+                  if e is not None]
         seen = set()
         for pkg in engine:
             ident = (pkg.version, pkg.platform, pkg.backend, pkg.variant)
@@ -313,7 +320,8 @@ def parse(payload: bytes, *, source: str, key_id: str) -> Feed:
     if raw_dsv41 is not None:
         if not isinstance(raw_dsv41, dict) or not isinstance(raw_dsv41.get("packages"), list):
             raise FeedError("the feed's dsv41 member lists no packages")
-        dsv41 = [_engine_package(item) for item in raw_dsv41["packages"] if not _foreign(item)]
+        dsv41 = [e for e in (_engine_package(item, skipped) for item in raw_dsv41["packages"] if not _foreign(item))
+                 if e is not None]
         seen = set()
         for pkg in dsv41:
             ident = (pkg.version, pkg.platform, pkg.backend, pkg.variant)

@@ -445,7 +445,7 @@ class IQ4XS(Base):
         self.assertAlmostEqual(setup.MODELS[X]["download_gb"], 93682584224 / 1e9, places=1)
         self.assertEqual(setup.MODELS[X]["families"], ("unsloth",))
         self.assertEqual([m for m in setup.MODELS if "unsloth" in setup.MODELS[m].get("families", ())],
-                         [X, M, "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0"])
+                         [X, M, "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0", "UD-IQ1_S"])
         self.assertIsNone(setup.gguf_unsupported(names[0]))                    # #444: a file setup runs now
         self.assertEqual(setup.gguf_choice(names[0]), ("unsloth", X))
         self.assertEqual(setup.budget_model({"args": ["--native", "/m/" + names[0]]}), X)
@@ -697,7 +697,8 @@ class Resident(Base):
         self.assertEqual([m for m in names if setup.size_tag("unsloth", m)], ["UD-IQ4_XS", "UD-Q4_K_XL"])
         self.assertEqual(setup.recommended_size("unsloth", names, 63.7), "UD-Q4_K_XL")
         self.assertEqual(setup.recommended_size("unsloth", names, 191.0), "UD-Q4_K_XL")
-        self.assertEqual(setup.recommended_size("unsloth", names, 40.0), "UD-IQ4_XS")   # nothing fits: the 4-bit i-quant
+        self.assertEqual(setup.recommended_size("unsloth", names, 40.0), "UD-IQ1_S")    # 40 GB: UD-IQ1_S fits
+        self.assertEqual(setup.recommended_size("unsloth", names, 30.0), "UD-IQ4_XS")   # nothing fits: the 4-bit i-quant
 
 
 

@@ -610,7 +610,7 @@ class Helpers(unittest.TestCase):
         and UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 follow by size."""
         s = M.Strata(HERE.parent)
         for models in (s.tables()[0], M.FALLBACK_MODELS):
-            self.assertEqual(s.sizes_of(models, "unsloth"), ["UD-IQ4_XS", "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0"])
+            self.assertEqual(s.sizes_of(models, "unsloth"), ["UD-IQ4_XS", "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0", "UD-IQ1_S"])
             self.assertFalse(models["UD-IQ4_XS"].get("experimental"))
             self.assertFalse(models["UD-Q4_K_XL"].get("experimental"))
         self.assertEqual(s.sizes_of(M.FALLBACK_MODELS, "qwen"), ["Q2_0", "IQ2_XS", "IQ3_XXS", "IQ3_S"])
