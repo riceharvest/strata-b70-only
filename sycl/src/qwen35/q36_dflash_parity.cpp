@@ -488,21 +488,83 @@ void test_topk_select() {
 }
 
 // ---- the whole pass on a random pack
+struct Bench;
+void batch_vs_singles(Dflash& d);
 struct Bench {
     Dflash d;
     float* emb = nullptr;
     int nd = 65536;
 };
 
+// A batch pass of 3 slots (different positions, anchors and context lengths) against the 3 single passes: the weights are read once for 24 columns and every
+// kernel keeps its block to itself, so each block's 7 picks and probabilities must be BITWISE the single pass's (the products' columns are independent, the
+// reductions run in the same order).  Batch first (the context columns of the 3 slots share one product), then the singles on the same staging rows.
+void batch_vs_singles(Dflash& d) {
+    const int NS = 3, Ts[NS] = {100, 70, 2300};
+    const int32_t anchors[NS] = {4242, 17, 99999};
+    std::vector<float*> dxs;
+    int32_t* dpos = up(std::vector<int32_t>{0});
+    for (int s = 0; s < NS; ++s) {
+        auto x = rvec((size_t) Ts[s] * kN, 2.f);
+        float* dx = up(x);
+        dxs.push_back(dx);
+        for (int k = 0; k < kTaps; ++k) d.capture(*g_q, k, dx, Ts[s], dpos, s);
+    }
+    g_q->wait();
+    auto go_batch = [&](int nb, int32_t* tok, float* prob) {
+        for (int s = 0; s < nb; ++s) { d.invalidate(s); d.note_forward(0, Ts[s], s); }
+        Dflash::Req rq[NS];
+        for (int s = 0; s < nb; ++s) rq[s] = {s, (int64_t) Ts[s], anchors[s]};
+        int cols[NS] = {0, 0, 0};
+        const bool ok = d.prepare_batch(*g_q, rq, nb, cols);
+        int tot = 0;
+        for (int s = 0; s < nb; ++s) tot += cols[s];
+        d.run_batch(*g_q, nb, tot);
+        g_q->wait();
+        auto t = down(d.out_tokens(), (size_t) nb * kDrafts);
+        auto p = down(d.out_probs(), (size_t) nb * kDrafts);
+        std::copy(t.begin(), t.end(), tok);
+        std::copy(p.begin(), p.end(), prob);
+        return ok && tot == 8 * nb;
+    };
+    int32_t tb[NS * kDrafts], ts[NS * kDrafts];
+    float pb[NS * kDrafts], ps[NS * kDrafts];
+    const bool ok_b = go_batch(NS, tb, pb);
+    // the singles: the same slots, one at a time, from scratch
+    for (int s = 0; s < NS; ++s) {
+        d.invalidate(s);
+        d.note_forward(0, Ts[s], s);
+        const int n = d.prepare(*g_q, Ts[s], anchors[s], s);
+        d.run(*g_q, n);
+        g_q->wait();
+        auto t = down(d.out_tokens(), kDrafts);
+        auto p = down(d.out_probs(), kDrafts);
+        for (int l = 0; l < kDrafts; ++l) { ts[s * kDrafts + l] = t[l]; ps[s * kDrafts + l] = p[l]; }
+    }
+    size_t bad = 0, badp = 0;
+    for (int i = 0; i < NS * kDrafts; ++i) { bad += tb[i] != ts[i]; badp += std::memcmp(&pb[i], &ps[i], 4) != 0; }
+    bool distinct = false;
+    for (int l = 0; l < kDrafts; ++l) distinct = distinct || tb[l] != tb[kDrafts + l];
+    check("batch pass of 3 slots == 3 single passes (bitwise)", ok_b && bad == 0 && badp == 0 && distinct,
+          fmt("%.0f picks and %.0f probabilities differ", (double) bad, (double) badp) + (distinct ? "" : " (the blocks gave the same picks: the test is blind)"));
+    for (auto* p : dxs) sycl::free(p, *g_q);
+    sycl::free(dpos, *g_q);
+}
+
 int whole(bool bench) {
     Bench* b = new Bench;
     std::string err;
-    if (!b->d.load_synthetic(*g_q, 99, err)) { std::printf("load_synthetic: %s\n", err.c_str()); return 1; }
-    b->emb = dev<float>((size_t) kRows * kN);
-    g_q->parallel_for(sycl::range<1>((size_t) kRows * kN), [e = b->emb](sycl::id<1> i) { e[i] = ((float) ((i[0] * 2654435761u) & 0xFFFF) / 32768.f - 1.f) * 0.5f; }).wait();
+    if (!b->d.load_synthetic(*g_q, 99, err, 3)) { std::printf("load_synthetic: %s\n", err.c_str()); return 1; }
     Hooks hk;
     hk.max_nd = b->nd;
-    hk.embed = [&](const int32_t*, int n, float* out) { g_q->memcpy(out, b->emb, (size_t) n * kN * 4); };
+    // an embedding that is a function of (the row's token, its row in the block): a block of a batch pass gets what it gets alone
+    hk.embed = [&](const int32_t* tok, int n, float* out) {
+        g_q->parallel_for(sycl::range<1>((size_t) n * kN), [=](sycl::id<1> id) {
+            const size_t r = id[0] / kN, i = id[0] % kN;
+            const uint32_t h = (uint32_t) ((uint64_t) ((uint32_t) tok[r] * 8u + (uint32_t) (r & 7)) * 2654435761u + i * 40503u) * 2246822519u;
+            out[id[0]] = ((float) ((h >> 8) & 0xFFFF) / 32768.f - 1.f) * 0.5f;
+        });
+    };
     hk.head = [&](const float* hn, int n, float* lg, int& nd, const int32_t*& idmap) {
         const int ndv = b->nd;
         g_q->parallel_for(sycl::range<1>((size_t) n * ndv), [=](sycl::id<1> i) {   // a deterministic function of the row's first element, so the picks move with it
@@ -536,7 +598,7 @@ int whole(bool bench) {
                 (double) dbg.hn.size(), hmax, (double) dbg.unary[0], (double) pr[0], (int) tok[0], (int) tok[1], (int) tok[2]);
     check("whole pass: block rows finite (random pack with a sane scale)", nonfinite == 0, fmt("%.0f non-finite", (double) nonfinite));
     check("whole pass on a random pack: 7 tokens in range", ok, fmt("n = %.0f context rows, first token %.0f", (double) n, (double) tok[0]));
-    if (!bench) return 0;
+    if (!bench) { batch_vs_singles(b->d); return 0; }
     // bytes a pass reads: the block's weights (every layer's q, o, gate, up, down, 2 kernel projections, its kv slice) + hproj; the context update's fc + kv_all
     auto w4 = [](int n_in, int n_out) { return (double) strata::q36xr::w4_bytes(n_in, n_out); };
     const double blk = kLayers * (w4(kN, 4096) + w4(4096, kN) + 2 * w4(kN, kFF) + w4(kFF, kN) + 2 * w4(kN, kKpOut) + w4(kN, 2048)) + w4(kN, kRank);
@@ -558,7 +620,103 @@ int whole(bool bench) {
     time_it("block pass (8 rows), no head", blk, [&] { b->d.block(*g_q); });
     time_it("context update, 8 rows (fc + kv_all)", ctx, [&] { b->d.ctx_update(*g_q, 8, false); });
     time_it("both (run(8))", blk + ctx, [&] { b->d.run(*g_q, 8); });
-    std::printf("(host-submitted kernels, not a graph: add ~0.59 us a kernel boundary less in the engine's replayed graph; the engine's draft head %s is not in these numbers)\n", "(Q6_K 1.04 GB / the 64K draft vocabulary)");
+    std::printf("(the three lines above: ~85 / 5 / ~90 kernels submitted from the host one by one)\n");
+    // the same passes recorded once and replayed as the engine does (graph_run): the host's submission gone, the kernel boundaries at graph cost
+    {
+        auto graph_it = [&](const char* name, double bytes, auto&& body) {
+            dpct::experimental::command_graph_ptr graph = nullptr;
+            dpct::experimental::begin_recording(g_q);
+            body();
+            dpct::experimental::end_recording(g_q, &graph);
+            auto* gx = new sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>(graph->finalize());
+            delete graph;
+            time_it(name, bytes, [&] { g_q->ext_oneapi_graph(*gx); });
+        };
+        graph_it("GRAPH block pass (8 rows), no head", blk, [&] { b->d.block(*g_q); });
+        graph_it("GRAPH context update, 8 rows", ctx, [&] { b->d.ctx_update(*g_q, 8, false); });
+        graph_it("GRAPH run(8) = what a draft costs", blk + ctx, [&] { b->d.run(*g_q, 8); });
+        // the attention at a full window: 3,000 captured rows, the drafter's ring holds the last 2,047 (the pass above had 100)
+        const int T3 = 3000;
+        auto x3 = rvec((size_t) T3 * kN, 2.f);
+        float* dx3 = up(x3);
+        b->d.invalidate();
+        for (int k = 0; k < kTaps; ++k) b->d.capture(*g_q, k, dx3, T3, dpos);
+        b->d.note_forward(0, T3);
+        const int n3 = b->d.prepare(*g_q, T3, 4242);
+        b->d.run(*g_q, n3);
+        g_q->wait();
+        graph_it("GRAPH block pass, 2,047 context rows", blk, [&] { b->d.block(*g_q); });
+        std::printf("(the difference between the last line and 'GRAPH block pass (8 rows)' is the attention at a full window: floor of its K/V reads 42 MB = %.3f ms)\n", 42e6 / 590e6);
+        sycl::free(dx3, *g_q);
+    }
+    // each product shape of the block at 8 columns on random incompressible weights (a rotation of distinct matrices, more than the 24 MiB LLC where the pack has them):
+    // the engine's mmvq_w4h, then STRATA_Q36_DFLASH_W4C's decompositions (threads a tile 1 / 2 / 4 / 8 / 16 at 1024 and 2048 threads in all).  Back-to-back launches.
+    {
+        struct Shape { const char* name; int n_in, n_out; std::vector<const void*> w; };
+        std::vector<Shape> shapes = {{"ckp  akp/mkp 5120 -> 1280", kN, kKpOut, {}}, {"q    5120 -> 4096", kN, kHeads * kHd, {}}, {"kv   5120 -> 2048 (a layer's slice)", kN, 2048, {}},
+                                     {"o    4096 -> 5120", kHeads * kHd, kN, {}}, {"gate/up 5120 -> 17408", kN, kFF, {}}, {"down 17408 -> 5120", kFF, kN, {}}, {"hproj 5120 -> 256", kN, kRank, {}}};
+        for (int l = 0; l < kLayers; ++l) {
+            const std::string p = "l" + std::to_string(l) + ".";
+            shapes[0].w.push_back(b->d.tensor(p + "akp")); shapes[0].w.push_back(b->d.tensor(p + "mkp"));
+            shapes[1].w.push_back(b->d.tensor(p + "q"));
+            shapes[2].w.push_back(static_cast<const uint8_t*>(b->d.tensor("kv_all")) + (size_t) l * (2048 / 16) * (kN / 256) * 2176);
+            shapes[3].w.push_back(b->d.tensor(p + "o"));
+            shapes[4].w.push_back(b->d.tensor(p + "gate")); shapes[4].w.push_back(b->d.tensor(p + "up"));
+            shapes[5].w.push_back(b->d.tensor(p + "down"));
+        }
+        shapes[6].w.push_back(b->d.tensor("hproj"));
+        std::printf("\nproducts at 8 columns (us per product; GB/s of its weights; floor at 590 GB/s)\n%-40s %9s %8s", "shape", "MB", "floor");
+        const int cfgs[][2] = {{0, 0}, {1, 1024}, {2, 1024}, {4, 1024}, {8, 1024}, {16, 1024}, {4, 2048}, {8, 2048}, {16, 2048}};
+        for (auto& c : cfgs) { char h[32]; if (c[0] == 0) std::snprintf(h, sizeof h, "engine"); else std::snprintf(h, sizeof h, "C%d/%d", c[0], c[1]); std::printf(" %14s", h); }
+        std::printf("\n");
+        for (auto& sh : shapes) {
+            const double bytes = (double) strata::q36xr::w4_bytes(sh.n_in, sh.n_out);
+            std::vector<uint16_t> xh((size_t) strata::q36xr::w4h_act_halfs(sh.n_in, 8));
+            for (auto& v : xh) v = h2u(rnd());
+            uint16_t* dx = up(xh);
+            float* dy = dev<float>((size_t) sh.n_out * 8);
+            std::printf("%-40s %9.1f %7.1fus", sh.name, bytes / 1e6, bytes / 590e3);
+            for (auto& c : cfgs) {
+                auto run1 = [&](size_t k) {
+                    const void* w = sh.w[k % sh.w.size()];
+                    if (c[0] == 0) return strata::q36xr::mmvq_w4h(w, dx, dy, sh.n_in, sh.n_out, 8, g_q);
+                    return strata::q36xr::mmvq_w4h_8(w, dx, dy, sh.n_in, sh.n_out, g_q, c[0], c[1]);
+                };
+                if (!run1(0)) { std::printf(" %14s", "declined"); continue; }
+                g_q->wait();
+                const int per = 40;
+                const auto t0 = std::chrono::steady_clock::now();
+                while (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < 0.2) { for (int i = 0; i < per; ++i) run1((size_t) i); g_q->wait(); }
+                std::vector<double> us;
+                for (int rep = 0; rep < 9; ++rep) {
+                    const auto a = std::chrono::steady_clock::now();
+                    for (int i = 0; i < per; ++i) run1((size_t) i);
+                    g_q->wait();
+                    us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - a).count() / per);
+                }
+                std::sort(us.begin(), us.end());
+                char cell[48];
+                std::snprintf(cell, sizeof cell, "%.1f/%.0f", us[us.size() / 2], bytes / us[us.size() / 2] / 1e3);
+                std::printf(" %14s", cell);
+            }
+            std::printf("\n");
+            sycl::free(dx, *g_q); sycl::free(dy, *g_q);
+        }
+        std::printf("(cell: us / GB/s.  The pass uses the best C of each class through STRATA_Q36_DFLASH_W4C=ckp,q,kv,o,gate_up,down,hproj and STRATA_Q36_DFLASH_W4T; unset = the engine's)\n");
+    }
+    batch_vs_singles(b->d);
+    // the batch pass: the block's weights read once for 8 nb columns (graph replay; the head's hook here is the synthetic one)
+    for (int nb = 1; nb <= kMaxBlocks; ++nb) {
+        char nm[64];
+        std::snprintf(nm, sizeof nm, "GRAPH block pass, %d blocks (%d columns)", nb, 8 * nb);
+        dpct::experimental::command_graph_ptr graph = nullptr;
+        dpct::experimental::begin_recording(g_q);
+        b->d.block_batch(*g_q, nb);
+        dpct::experimental::end_recording(g_q, &graph);
+        auto* gx = new sycl::ext::oneapi::experimental::command_graph<sycl::ext::oneapi::experimental::graph_state::executable>(graph->finalize());
+        delete graph;
+        time_it(nm, blk, [&] { g_q->ext_oneapi_graph(*gx); });
+    }
     return 0;
 }
 

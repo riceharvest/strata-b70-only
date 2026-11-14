@@ -35,30 +35,45 @@ constexpr int kEagerCols = 32;  ///< rows one eager context flush takes (one wei
 constexpr int kKpOut = 1280;    ///< kernel_projection outputs: side x tap x group = 2 x 2 x 320
 constexpr int kChunks = 17;     ///< attention chunks: 16 x 128 context keys + the 8 block keys
 constexpr int kMaxNd = 248320;  ///< the most logits a head row can have
+constexpr int kMaxBlocks = 4;   ///< blocks one batch pass drafts for (4 x 8 rows = 32 columns, the most one weight pass takes)
+constexpr size_t kStagElems = (size_t) kRing * kTaps * kN;                 ///< one slot's staging ring (bf16 elements)
+constexpr size_t kRingElems = (size_t) kLayers * kKvHeads * kRing * kHd;   ///< one slot's K (or V) ring (fp16 elements)
+/// The block's product classes (STRATA_Q36_DFLASH_W4C=ckp,q,kv,o,gate_up,down,hproj: the threads a tile of each, 0 = the engine's own form).
+enum ProdClass { kCkp = 0, kCq, kCkv, kCo, kCgu, kCdn, kCh, kCNum };
 
-/// The device meta's layout (int32 / float words), staged by prepare().
+/// The device meta's layout (int32 / float words), staged by prepare().  Per block b (up to kMaxBlocks: the batch passes draft for several slots at once): [kMetaP + b]
+/// the block's first position, [kMetaAnchor + b] its anchor token, [kMetaVlo + b] the first valid context position, [kMetaBSlot + b] the slot whose rings it reads.
+/// Context column j (up to 32 of a pass): [kMetaCtxPos + j] its position, [kMetaCtxSlot + j] its ring cell, [kMetaCtxId + j] its slot; its RoPE (cos[64], sin[64]) at
+/// kMetaRopeCtx + 128 j.  Block row r (8 a block): [kMetaTok + r] its token, its RoPE at kMetaRopeBlk + 128 r.
 namespace k_consts {
-constexpr int kMetaP = 0, kMetaAnchor = 1, kMetaVlo = 2, kMetaN = 3, kMetaCtxPos = 16, kMetaCtxSlot = 48, kMetaTok = 80, kMetaRopeCtx = 96,
-              kMetaRopeBlk = 4192, kMetaWords = 5216;
+constexpr int kMetaP = 0, kMetaAnchor = 4, kMetaVlo = 8, kMetaBSlot = 12, kMetaN = 16, kMetaCtxPos = 32, kMetaCtxSlot = 64, kMetaCtxId = 96, kMetaTok = 128,
+              kMetaRopeCtx = 192, kMetaRopeBlk = 4288, kMetaWords = 8384;
 }
 
 /// The kernels, public for the parity program (q36_mmvq_dense_parity --dflash).  Layouts: q36_dflash.dp.cpp's header.
 namespace k {
 void capture(sycl::queue& q, uint16_t* stag, int tap, const float* x, int T, const int32_t* pos0);
+/// Batch rows (rows_mode): row r is cell rcell[r] of slot rslot[r]; stag = slot 0's staging.
+void capture_rows(sycl::queue& q, uint16_t* stag, int tap, const float* x, int T, const int32_t* rcell, const int32_t* rslot);
 void ctx_prep(sycl::queue& q, const uint16_t* stag, const int32_t* meta, int n, uint16_t* x16, float* scale);
 void ctx_norm(sycl::queue& q, const float* y, const float* scale, const float* w, float eps, int n, uint16_t* x16);
 void ctx_store(sycl::queue& q, const float* kv, const int32_t* meta, int n, const float* const* kn, sycl::half* kring, sycl::half* vring, float eps);
-void rms_pack(sycl::queue& q, const float* x, const float* w, float eps, float* h, uint16_t* x16);
-void conv_pack(sycl::queue& q, const float* x, const float* dyn, int side, const float* base, uint16_t* x16);
-void finish_rms(sycl::queue& q, const float* o, const float* dyn, const float* base, float* x, const float* w, float eps, float* h, uint16_t* x16);
-void qk_prep(sycl::queue& q, const float* qy, const float* kvy, const float* qn, const float* kn, const int32_t* meta, float eps, float* qb, float* kb, float* vb);
+// the block kernels take `rows` = 8 x the blocks of the pass (8 .. 32); a block is its own 8 rows (the conv taps and the attention stop at its edge)
+void rms_pack(sycl::queue& q, const float* x, const float* w, float eps, float* h, uint16_t* x16, int rows = kRows);
+void conv_pack(sycl::queue& q, const float* x, const float* dyn, int side, const float* base, uint16_t* x16, int rows = kRows);
+void finish_rms(sycl::queue& q, const float* o, const float* dyn, const float* base, float* x, const float* w, float eps, float* h, uint16_t* x16, int rows = kRows);
+void qk_prep(sycl::queue& q, const float* qy, const float* kvy, const float* qn, const float* kn, const int32_t* meta, float eps, float* qb, float* kb, float* vb, int rows = kRows);
+/// part buffers: [block][chunk][head][row] (m, l) and [..][128] (acc)
 void attn_part(sycl::queue& q, const float* qb, const float* kb, const float* vb, const sycl::half* kring, const sycl::half* vring, int layer,
-               const int32_t* meta, float* part_acc, float* part_m, float* part_l);
-void attn_merge(sycl::queue& q, const float* part_acc, const float* part_m, const float* part_l, uint16_t* x16);
+               const int32_t* meta, float* part_acc, float* part_m, float* part_l, int nb = 1);
+void attn_merge(sycl::queue& q, const float* part_acc, const float* part_m, const float* part_l, uint16_t* x16, int nb = 1);
+/// rows 1 .. 7 of each block of h [nb x 8][kN] -> hn [nb x 7][kN]
+void gather_hn(sycl::queue& q, const float* h, float* hn, int nb);
 void top1(sycl::queue& q, const float* logits, int nd, int rows, int nch, uint64_t* part);
 void top2(sycl::queue& q, const uint64_t* part, int nch, int rows, const int32_t* idmap, int32_t* cand, float* unary);
+/// hp [nb x 8][256], cand / unary [nb x 7][16]; block b walks from meta anchor b and writes out_tok / out_prob [b][7]
 void selector_walk(sycl::queue& q, const float* hp, const int32_t* cand, const float* unary, const uint16_t* pred, const uint16_t* succ, const int32_t* meta,
-                   int32_t* out_tok, float* out_prob);
+                   int32_t* out_tok, float* out_prob, int nb = 1);
 }   // namespace k
 
 /// The target's pieces the drafter borrows (the engine fills them).
@@ -90,9 +105,9 @@ public:
 
     /// Reads the pack (tools/qwen35/dflash_pack.py) to the device and allocates the rings and buffers (~1.4 GB).  `stage_rows`: the
     /// most rows one forward() call captures (the engine's chunk; larger calls keep their last kRing rows).
-    bool load(sycl::queue& q, const std::string& pack_path, std::string& err);
+    bool load(sycl::queue& q, const std::string& pack_path, std::string& err, int n_slots = 1);
     /// A random pack's worth of weights (parity / bench: no file; ~1.2 GB of random incompressible records).
-    bool load_synthetic(sycl::queue& q, uint64_t seed, std::string& err);
+    bool load_synthetic(sycl::queue& q, uint64_t seed, std::string& err, int n_slots = 1);
     bool loaded() const { return blob_ != nullptr; }
     void set_hooks(sycl::queue& q, const Hooks& h);   ///< allocates the logits scratch
     void enable_debug(bool on) { debug_ = on; }
@@ -102,29 +117,40 @@ public:
     // ---- target side (the engine calls these)
     /// Inside forward(): rows 0 .. T-1 of the residual stream x [T][kN] (fp32) after target layer tap_layer(tap) take positions
     /// *pos0 + r of the staging ring (bf16).  Recorded in the verify graph; pos0 is the device position the graph reads.
-    void capture(sycl::queue& q, int tap, const float* x, int T, const int32_t* pos0_dev);
+    void capture(sycl::queue& q, int tap, const float* x, int T, const int32_t* pos0_dev, int slot = 0);
+    /// The same for batch rows (rows_mode): row r is cell rcell_dev[r] of slot rslot_dev[r] (the engine's device tables).
+    void capture_rows(sycl::queue& q, int tap, const float* x, int T, const int32_t* rcell_dev, const int32_t* rslot_dev);
     static int tap_layer(int k) { return 5 + 14 * k; }   ///< 5 19 33 47 61 (0-based layer whose output is tapped)
     /// Host bookkeeping, after the rows [p0, p0 + n) of the history were forwarded and COMMITTED (after the accept decision).
-    void note_forward(int64_t p0, int64_t n);
-    /// The history is another one (a session switch, a restore): the context is dropped.
-    void invalidate();
+    void note_forward(int64_t p0, int64_t n, int slot = 0);
+    /// The history is another one (a restore, a copied session, a reset): the slot's context is dropped.
+    void invalidate(int slot = 0);
 
     // ---- draft
     /// Plans the draft whose block starts at position P (every row below P is committed; `anchor` is the token at P): flushes
     /// all but the last <= 8 pending context rows eagerly, stages the meta of the rest.  Returns n, the context rows run() takes
     /// (0 .. 8); the engine keys its graph on it.  Async on q except for the eager flushes' small waits.
-    int prepare(sycl::queue& q, int64_t P, int32_t anchor);
+    int prepare(sycl::queue& q, int64_t P, int32_t anchor, int slot = 0);
+    /// One batch pass for several slots (STRATA_Q36_DFLASH_BATCH): the block of request b starts at position P (anchor token) of its slot.  Flushes each slot's
+    /// older pending rows eagerly and stages the meta of every block; `cols` gets each block's context rows for the pass (0 .. 8, 32 in all at most).  false: more
+    /// than kMaxBlocks requests, or a slot that does not exist.
+    struct Req { int slot; int64_t P; int32_t anchor; };
+    bool prepare_batch(sycl::queue& q, const Req* reqs, int nb, int* cols);
+    /// The pass of nb blocks after prepare_batch: the context update (eager, `cols` columns in all) and the blocks.  Out: out_tokens() [nb][7].
+    void run_batch(sycl::queue& q, int nb, int cols_total);
+    /// The block pass alone for nb blocks (recordable: the engine keys a graph on nb).
+    void block_batch(sycl::queue& q, int nb);
     /// Enqueues the context update (n rows) and the block.  Reads only device memory; recordable.
     void run(sycl::queue& q, int n);
-    const int32_t* out_tokens() const { return out_tok_; }   ///< device [7]
+    const int32_t* out_tokens() const { return out_tok_; }   ///< device [nb][7]
     const float* out_probs() const { return out_prob_; }     ///< device [7]
     /// Debug: the last block's intermediates and candidates (waits).
     bool debug_last(sycl::queue& q, Debug& d);
     /// Debug: staging rows of positions [p0, p0 + n) as bf16 [n][5 x kN] (waits); false when a position is not in the ring.
     bool debug_stage_rows(sycl::queue& q, int64_t p0, int n, std::vector<uint16_t>& out);
     /// The first context position the last prepare() left valid (for the dump).
-    int64_t valid_lo() const { return ctx_vlo_; }
-    int64_t ctx_hi() const { return ctx_hi_; }
+    int64_t valid_lo() const { return sl_.empty() ? 0 : sl_[0].vlo; }
+    int64_t ctx_hi() const { return sl_.empty() ? 0 : sl_[0].hi; }
 
     // ---- STRATA_Q36_DFLASH_DUMP=<dir>: what tools/qwen35/dflash_ref.py replay reads (format: its docstring)
     void enable_dump(const std::string& dir, int max_steps, int max_rows);
@@ -136,15 +162,18 @@ public:
 
     // ---- the parts, public for the parity program (q36_mmvq_dense_parity --dflash)
     void ctx_update(sycl::queue& q, int n, bool eager);
-    void block(sycl::queue& q);
+    void block(sycl::queue& q) { block_batch(q, 1); }
 
 private:
     struct Ent { uint64_t off = 0, bytes = 0; int n_in = 0, n_out = 0; int kind = 0; };
     bool parse_index(const std::string& js, std::string& err);
     bool alloc(sycl::queue& q, std::string& err);
-    void stage_meta(sycl::queue& q, int64_t P, int32_t anchor, int64_t c0, int nrows);   // fills + copies the meta
-    void flush_eager(sycl::queue& q, int64_t c0, int nrows);
-    bool prod(sycl::queue& q, const void* w, const uint16_t* x16, float* y, int n_in, int n_out, int ncols);
+    void stage_meta(sycl::queue& q, int64_t P, int32_t anchor, int64_t c0, int nrows, int slot);   // fills + copies the meta (one block)
+    void flush_eager(sycl::queue& q, int64_t c0, int nrows, int slot);
+    int plan_flush(sycl::queue& q, int slot, int64_t P, int64_t* at);   // flushes all but the last <= 8 pending rows of a slot; returns those rows, `at` their first position
+    bool prod(sycl::queue& q, const void* w, const uint16_t* x16, float* y, int n_in, int n_out, int ncols, int cls = -1);
+    int w4c_[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // STRATA_Q36_DFLASH_W4C: threads a tile of the block's products by class (0: the engine's mmvq_w4h)
+    int w4t_ = 1024;                          // STRATA_Q36_DFLASH_W4T: threads in all of those
     const void* w(const std::string& name) const;
 
     // pack
@@ -164,8 +193,8 @@ private:
     const uint16_t *pred_cb_ = nullptr, *succ_cb_ = nullptr;
 
     // device state
-    uint16_t* stag_ = nullptr;                 // [kRing][kTaps * kN] bf16
-    sycl::half *kring_ = nullptr, *vring_ = nullptr;   // [layer][kv head][kRing][128]
+    uint16_t* stag_ = nullptr;                 // [slot][kRing][kTaps * kN] bf16
+    sycl::half *kring_ = nullptr, *vring_ = nullptr;   // [slot][layer][kv head][kRing][128]
     int32_t* meta_ = nullptr;                  // device meta (see q36_dflash.dp.cpp), host twin below
     int32_t* hmeta_ = nullptr;
     uint16_t* ctx_x16_ = nullptr;              // fc input   [25600 / 16][32][16]
@@ -180,6 +209,8 @@ private:
     float *oy_ = nullptr, *gy_ = nullptr, *uy_ = nullptr, *dny_ = nullptr, *hp_y_ = nullptr;
     float* logits_ = nullptr;
     uint64_t* top_part_ = nullptr;
+    float* hn_ = nullptr;                      // the head's input rows [kMaxBlocks x 7][kN]
+    int n_slots_ = 1;
     int32_t *cand_ = nullptr, *out_tok_ = nullptr;
     float *unary_ = nullptr, *out_prob_ = nullptr, *dbg_embed_ = nullptr;
     int nch_ = 0;
@@ -193,10 +224,13 @@ private:
     void dump_rows(sycl::queue& q, int64_t c0, int n);
     void dump_meta();
 
-    // host mirror: the captured run and the flushed run (positions)
-    int64_t cap_lo_ = 0, cap_hi_ = 0;          // staging holds rows [cap_lo_, cap_hi_) of the current history (cap_lo_ = cap_hi_: none)
-    int64_t ctx_vlo_ = 0, ctx_hi_ = 0;         // the drafter's K/V ring holds rows [ctx_vlo_, ctx_hi_)
-    bool have_cap_ = false;
+    // host mirror of each slot: the captured run and the flushed run (positions)
+    struct Ctx {
+        int64_t cap_lo = 0, cap_hi = 0;        // staging holds rows [cap_lo, cap_hi) of the current history (cap_lo = cap_hi: none)
+        int64_t vlo = 0, hi = 0;               // the drafter's K/V ring holds rows [vlo, hi)
+        bool have = false;
+    };
+    std::vector<Ctx> sl_;
 };
 
 }   // namespace strata::q36df

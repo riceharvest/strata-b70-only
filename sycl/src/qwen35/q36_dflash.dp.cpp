@@ -1,8 +1,8 @@
 // q36_dflash.dp.cpp - the DFlash 2 block drafter for the dense Qwen3.8-27B (q36_dflash.hpp; spec: tools/qwen35/dflash_ref.py).
 //
-// Device meta (int32 words / float words), staged by prepare(): [0] P  [1] anchor token  [2] first valid context position  [3] rows
-// [16..47] context positions  [48..79] context ring slots  [80..87] block tokens  [96..4191] RoPE (cos[64], sin[64]) of 32 context
-// rows  [4192..5215] RoPE of the 8 block rows.  Every kernel reads its variable inputs from here, so a recorded graph replays.
+// Device meta (int32 words / float words), staged by prepare(): the layout is q36_dflash.hpp's k_consts (per block: P, anchor, first valid context
+// position, slot; per context column: position, ring cell, slot, RoPE; per block row: token, RoPE).  Every kernel reads its variable inputs from
+// here, so a recorded graph replays.  Slot s's rings: staging at stag + s * kStagElems, K / V at kring / vring + s * kRingElems.
 //
 // Layouts: x16 = the q36xr W4A16 operand: element (col, i) of an [ncols][n_in] matrix at ((i / 16) * ncp + col) * 16 + i % 16, ncp =
 // columns rounded up to 8.  A product's y is [col][n_out].  K/V rings: [layer][kv head][kRing][128] fp16.
@@ -69,6 +69,19 @@ void capture(sycl::queue& q, uint16_t* stag, int k, const float* x, int T, const
     });
 }
 
+void capture_rows(sycl::queue& q, uint16_t* stag, int k, const float* x, int T, const int32_t* rcell, const int32_t* rslot) {
+    const size_t items = (size_t) T * (kN / 4);
+    q.parallel_for<Tag<18>>(sycl::range<1>(items), [=](sycl::id<1> id) {
+        const int r = (int) (id[0] / (kN / 4)), c4 = (int) (id[0] % (kN / 4));
+        const int slot = (int) (rcell[r] % kRing);
+        const sycl::float4 v = *reinterpret_cast<const sycl::float4*>(x + (size_t) r * kN + c4 * 4);
+        uint16_t* d = stag + (size_t) rslot[r] * kStagElems + ((size_t) slot * kTaps + k) * kN + c4 * 4;
+        const uint32_t lo = (uint32_t) f2bf(v.x()) | ((uint32_t) f2bf(v.y()) << 16);
+        const uint32_t hi = (uint32_t) f2bf(v.z()) | ((uint32_t) f2bf(v.w()) << 16);
+        *reinterpret_cast<sycl::uint2*>(d) = sycl::uint2(lo, hi);
+    });
+}
+
 // ---------------------------------------------------------------------------------------------------------------- context rows
 // staging rows of the n context rows -> fc's x16 operand, with a per-row power-of-two scale that keeps the fp16 range (the fc is
 // linear and the next op is a norm: hidden_norm runs with eps / s^2, which is exact).
@@ -77,7 +90,7 @@ void ctx_prep(sycl::queue& q, const uint16_t* stag, const int32_t* meta, int n, 
     q.submit([&](sycl::handler& h) {
         h.parallel_for<Tag<2>>(sycl::nd_range<1>((size_t) n * 256, 256), [=](sycl::nd_item<1> it) {
             const int j = (int) it.get_group(0), t = (int) it.get_local_id(0);
-            const uint16_t* row = stag + (size_t) meta[kMetaCtxSlot + j] * (kTaps * kN);
+            const uint16_t* row = stag + (size_t) meta[kMetaCtxId + j] * kStagElems + (size_t) meta[kMetaCtxSlot + j] * (kTaps * kN);
             float am = 0.f;
             for (int i = t; i < kTaps * kN; i += 256) am = sycl::fmax(am, sycl::fabs(bf2f(row[i])));
             am = sycl::reduce_over_group(it.get_group(), am, sycl::maximum<float>());
@@ -129,7 +142,7 @@ void ctx_store(sycl::queue& q, const float* kv, const int32_t* meta, int n, cons
             const int i = d & 63;
             const float c = rope[i], s = rope[64 + i];
             const float o = d < 64 ? xn * c - sh[d + 64] * s : xn * c + sh[d - 64] * s;
-            const size_t at = (((size_t) l * kKvHeads + kvh) * kRing + slot) * kHd + d;
+            const size_t at = (size_t) meta[kMetaCtxId + j] * kRingElems + (((size_t) l * kKvHeads + kvh) * kRing + slot) * kHd + d;
             kring[at] = sycl::half(o);
             vring[at] = sycl::half(src[kKvRows / 2 + kvh * kHd + d]);
         });
@@ -138,8 +151,8 @@ void ctx_store(sycl::queue& q, const float* kv, const int32_t* meta, int n, cons
 
 // ---------------------------------------------------------------------------------------------------------------- block rows
 // h = rms(x) * w, also packed (8 columns)
-void rms_pack(sycl::queue& q, const float* x, const float* w, float eps, float* h, uint16_t* x16) {
-    q.parallel_for<Tag<5>>(sycl::nd_range<1>((size_t) kRows * 256, 256), [=](sycl::nd_item<1> it) {
+void rms_pack(sycl::queue& q, const float* x, const float* w, float eps, float* h, uint16_t* x16, int rows) {
+    q.parallel_for<Tag<5>>(sycl::nd_range<1>((size_t) rows * 256, 256), [=](sycl::nd_item<1> it) {
         const int row = (int) it.get_group(0), t = (int) it.get_local_id(0);
         float v[kN / 256], ss = 0.f;
 #pragma unroll
@@ -151,27 +164,27 @@ void rms_pack(sycl::queue& q, const float* x, const float* w, float eps, float* 
             const int i = t + k * 256;
             const float o = v[k] * r * w[i];
             h[(size_t) row * kN + i] = o;
-            x16[x16_at(row, i, kRows)] = h2u(sycl::half(o));
+            x16[x16_at(row, i, rows)] = h2u(sycl::half(o));
         }
     });
 }
 
 // the two-tap grouped conv of side `side` (0: before the block's products, 1: after): y[r] = (b0 + d0[r]) x[r] + (r >= 1)(b1 + d1[r]) x[r-1]
 // with dyn [row][1280] (side x tap x group) and base [2 side][2 tap][kN]; the result packed (8 columns, n_in = kN)
-void conv_pack(sycl::queue& q, const float* x, const float* dyn, int side, const float* base, uint16_t* x16) {
-    q.parallel_for<Tag<6>>(sycl::nd_range<1>((size_t) kRows * kN, 256), [=](sycl::nd_item<1> it) {
+void conv_pack(sycl::queue& q, const float* x, const float* dyn, int side, const float* base, uint16_t* x16, int rows) {
+    q.parallel_for<Tag<6>>(sycl::nd_range<1>((size_t) rows * kN, 256), [=](sycl::nd_item<1> it) {
         const size_t id = it.get_global_id(0);
         const int row = (int) (id / kN), ch = (int) (id % kN), grp = ch >> 4;
         const float* dr = dyn + (size_t) row * kKpOut + side * 640;
         float y = (base[(side * 2 + 0) * kN + ch] + dr[grp]) * x[(size_t) row * kN + ch];
-        if (row >= 1) y += (base[(side * 2 + 1) * kN + ch] + dr[320 + grp]) * x[(size_t) (row - 1) * kN + ch];
-        x16[x16_at(row, ch, kRows)] = h2u(sycl::half(y));
+        if ((row & 7) >= 1) y += (base[(side * 2 + 1) * kN + ch] + dr[320 + grp]) * x[(size_t) (row - 1) * kN + ch];   // (a block's first row has no tap behind it)
+        x16[x16_at(row, ch, rows)] = h2u(sycl::half(y));
     });
 }
 
 // the finish conv of side 1 on a product's output, + residual, then the next norm: x += conv(o); h = rms(x) * w; h packed
-void finish_rms(sycl::queue& q, const float* o, const float* dyn, const float* base, float* x, const float* w, float eps, float* h, uint16_t* x16) {
-    q.parallel_for<Tag<7>>(sycl::nd_range<1>((size_t) kRows * 256, 256), [=](sycl::nd_item<1> it) {
+void finish_rms(sycl::queue& q, const float* o, const float* dyn, const float* base, float* x, const float* w, float eps, float* h, uint16_t* x16, int rows) {
+    q.parallel_for<Tag<7>>(sycl::nd_range<1>((size_t) rows * 256, 256), [=](sycl::nd_item<1> it) {
         const int row = (int) it.get_group(0), t = (int) it.get_local_id(0);
         const float* dr = dyn + (size_t) row * kKpOut + 640;
         float v[kN / 256], ss = 0.f;
@@ -179,7 +192,7 @@ void finish_rms(sycl::queue& q, const float* o, const float* dyn, const float* b
         for (int k = 0; k < kN / 256; ++k) {
             const int ch = t + k * 256, grp = ch >> 4;
             float y = (base[2 * kN + ch] + dr[grp]) * o[(size_t) row * kN + ch];
-            if (row >= 1) y += (base[3 * kN + ch] + dr[320 + grp]) * o[(size_t) (row - 1) * kN + ch];
+            if ((row & 7) >= 1) y += (base[3 * kN + ch] + dr[320 + grp]) * o[(size_t) (row - 1) * kN + ch];
             const float xr = x[(size_t) row * kN + ch] + y;
             x[(size_t) row * kN + ch] = xr;
             v[k] = xr;
@@ -192,16 +205,16 @@ void finish_rms(sycl::queue& q, const float* o, const float* dyn, const float* b
             const int i = t + k * 256;
             const float hv = v[k] * r * w[i];
             h[(size_t) row * kN + i] = hv;
-            x16[x16_at(row, i, kRows)] = h2u(sycl::half(hv));
+            x16[x16_at(row, i, rows)] = h2u(sycl::half(hv));
         }
     });
 }
 
 // q [8][4096], kv [8][2048] -> per head RMS norm + RoPE (the block's positions): qb [8][32][128], kb [8][8][128]; vb [8][8][128] = V as is
-void qk_prep(sycl::queue& q, const float* qy, const float* kvy, const float* qn, const float* kn, const int32_t* meta, float eps, float* qb, float* kb, float* vb) {
+void qk_prep(sycl::queue& q, const float* qy, const float* kvy, const float* qn, const float* kn, const int32_t* meta, float eps, float* qb, float* kb, float* vb, int rows) {
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sh(sycl::range<1>(kHd), h);
-        h.parallel_for<Tag<8>>(sycl::nd_range<1>((size_t) kRows * 48 * kHd, kHd), [=](sycl::nd_item<1> it) {
+        h.parallel_for<Tag<8>>(sycl::nd_range<1>((size_t) rows * 48 * kHd, kHd), [=](sycl::nd_item<1> it) {
             const int g = (int) it.get_group(0), d = (int) it.get_local_id(0);
             const int row = g / 48, hs = g % 48;
             if (hs >= 40) {
@@ -228,21 +241,25 @@ void qk_prep(sycl::queue& q, const float* qy, const float* kvy, const float* qn,
 // attention of the 8 block rows (non causal).  A work-group: one kv head, 2 of its 4 query heads x 8 rows = 16 queries, 128 keys.
 // chunks 0 .. 15: context keys (positions lo + 128 c + t, lo = max(vlo, P - 2047)); chunk 16: the block's 8 keys.  Row i sees context
 // position j when j >= P + i - 2047 (and j >= vlo) and every block key.  Writes the chunk's (m, l, acc) partials.
-void attn_part(sycl::queue& q, const float* qb, const float* kb, const float* vb, const sycl::half* kring, const sycl::half* vring, int layer,
-                 const int32_t* meta, float* part_acc, float* part_m, float* part_l) {
+void attn_part(sycl::queue& q, const float* qb, const float* kb, const float* vb, const sycl::half* kring0, const sycl::half* vring0, int layer,
+                 const int32_t* meta, float* part_acc, float* part_m, float* part_l, int nb) {
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> qs(sycl::range<1>(16 * kHd), h);
         sycl::local_accessor<float, 1> ps(sycl::range<1>(16 * kChunk), h);
-        h.parallel_for<Tag<9>>(sycl::nd_range<1>((size_t) kKvHeads * 2 * kChunks * kChunk, kChunk), [=](sycl::nd_item<1> it) {
-            const int g = (int) it.get_group(0), t = (int) it.get_local_id(0);
+        h.parallel_for<Tag<9>>(sycl::nd_range<1>((size_t) nb * kKvHeads * 2 * kChunks * kChunk, kChunk), [=](sycl::nd_item<1> it) {
+            const int g0 = (int) it.get_group(0), t = (int) it.get_local_id(0);
+            const int blk_i = g0 / (kKvHeads * 2 * kChunks), g = g0 % (kKvHeads * 2 * kChunks);   // the block of this group
             const int kvh = g / (2 * kChunks), rem = g % (2 * kChunks), qsp = rem / kChunks, c = rem % kChunks;
-            const int P = meta[kMetaP], vlo = meta[kMetaVlo];
+            const int P = meta[kMetaP + blk_i], vlo = meta[kMetaVlo + blk_i];
+            const sycl::half* kring = kring0 + (size_t) meta[kMetaBSlot + blk_i] * kRingElems;
+            const sycl::half* vring = vring0 + (size_t) meta[kMetaBSlot + blk_i] * kRingElems;
+            const size_t rb = (size_t) blk_i * kRows;   // the block's first row in qb / kb / vb
             const int lo = vlo > P - (kWindow - 1) ? vlo : P - (kWindow - 1);
             const int nctx = P - lo > 0 ? P - lo : 0;
             for (int i = t; i < 16 * kHd; i += kChunk) {
                 const int qq = i / kHd, d = i % kHd;
                 const int head = kvh * 4 + qsp * 2 + qq / 8, row = qq % 8;
-                qs[i] = qb[((size_t) row * kHeads + head) * kHd + d];
+                qs[i] = qb[((rb + row) * kHeads + head) * kHd + d];
             }
             sycl::group_barrier(it.get_group());
             // this thread's key
@@ -259,7 +276,7 @@ void attn_part(sycl::queue& q, const float* qb, const float* kb, const float* vb
             } else {
                 valid = t < kRows;
                 pos = P + t;
-                if (valid) kf = kb + ((size_t) t * kKvHeads + kvh) * kHd;
+                if (valid) kf = kb + ((rb + t) * kKvHeads + kvh) * kHd;
             }
             float s[16];
 #pragma unroll
@@ -295,7 +312,7 @@ void attn_part(sycl::queue& q, const float* qb, const float* kb, const float* vb
                 ps[qq * kChunk + t] = p;
                 if (t == 0) {
                     const int head = kvh * 4 + qsp * 2 + qq / 8;
-                    const size_t pi = ((size_t) c * kHeads + head) * kRows + row;
+                    const size_t pi = (((size_t) blk_i * kChunks + c) * kHeads + head) * kRows + row;
                     part_m[pi] = m;
                     part_l[pi] = l;
                 }
@@ -309,30 +326,32 @@ void attn_part(sycl::queue& q, const float* qb, const float* kb, const float* vb
             for (int k = 0; k < nk; ++k) {
                 float v;
                 if (!blk) v = (float) vring[(((size_t) layer * kKvHeads + kvh) * kRing + (size_t) ((lo + c * kChunk + k) % kRing)) * kHd + t];
-                else v = vb[((size_t) k * kKvHeads + kvh) * kHd + t];
+                else v = vb[((rb + k) * kKvHeads + kvh) * kHd + t];
 #pragma unroll
                 for (int qq = 0; qq < 16; ++qq) acc[qq] += ps[qq * kChunk + k] * v;
             }
 #pragma unroll
             for (int qq = 0; qq < 16; ++qq) {
                 const int head = kvh * 4 + qsp * 2 + qq / 8, row = qq % 8;
-                part_acc[(((size_t) c * kHeads + head) * kRows + row) * kHd + t] = acc[qq];
+                part_acc[((((size_t) blk_i * kChunks + c) * kHeads + head) * kRows + row) * kHd + t] = acc[qq];
             }
         });
     });
 }
 
 // combine the chunks' partials; the result packed as o_proj's operand (n_in 4096, 8 columns)
-void attn_merge(sycl::queue& q, const float* part_acc, const float* part_m, const float* part_l, uint16_t* x16) {
-    q.parallel_for<Tag<10>>(sycl::nd_range<1>((size_t) kRows * kHeads * kHd, kHd), [=](sycl::nd_item<1> it) {
+void attn_merge(sycl::queue& q, const float* part_acc, const float* part_m, const float* part_l, uint16_t* x16, int nb) {
+    q.parallel_for<Tag<10>>(sycl::nd_range<1>((size_t) nb * kRows * kHeads * kHd, kHd), [=](sycl::nd_item<1> it) {
         const int g = (int) it.get_group(0), d = (int) it.get_local_id(0);
-        const int row = g / kHeads, head = g % kHeads;
+        const int row = g / kHeads, head = g % kHeads;   // row: 0 .. 8 nb - 1
+        const size_t bi = (size_t) (row / kRows) * kChunks;   // the block's first chunk
+        const int ri = row % kRows;
         float M = -INFINITY;
-        for (int c = 0; c < kChunks; ++c) M = sycl::fmax(M, part_m[((size_t) c * kHeads + head) * kRows + row]);
+        for (int c = 0; c < kChunks; ++c) M = sycl::fmax(M, part_m[((bi + c) * kHeads + head) * kRows + ri]);
         float L = 0.f, a = 0.f;
         if (M > -INFINITY) {
             for (int c = 0; c < kChunks; ++c) {
-                const size_t pi = ((size_t) c * kHeads + head) * kRows + row;
+                const size_t pi = ((bi + c) * kHeads + head) * kRows + ri;
                 const float mc = part_m[pi];
                 if (mc == -INFINITY) continue;
                 const float e = sycl::exp(mc - M);
@@ -341,7 +360,16 @@ void attn_merge(sycl::queue& q, const float* part_acc, const float* part_m, cons
             }
         }
         const float o = L > 0.f ? a / L : 0.f;
-        x16[x16_at(row, head * kHd + d, kRows)] = h2u(sycl::half(o));
+        x16[x16_at(row, head * kHd + d, nb * kRows)] = h2u(sycl::half(o));
+    });
+}
+
+// rows 1 .. 7 of each block -> the head's input rows
+void gather_hn(sycl::queue& q, const float* h, float* hn, int nb) {
+    q.parallel_for<Tag<19>>(sycl::range<1>((size_t) nb * kDrafts * (kN / 4)), [=](sycl::id<1> id) {
+        const size_t r = id[0] / (kN / 4), c4 = id[0] % (kN / 4);
+        const size_t src = (r / kDrafts) * kRows + 1 + r % kDrafts;
+        *reinterpret_cast<sycl::float4*>(hn + r * kN + c4 * 4) = *reinterpret_cast<const sycl::float4*>(h + src * kN + c4 * 4);
     });
 }
 
@@ -409,14 +437,19 @@ void top2(sycl::queue& q, const uint64_t* part, int nch, int rows, const int32_t
 
 // the selector's walk: step l (row l + 1): s[c] = unary[l][c] + sum_r pred[prev][r] hp[l + 1][r] succ[cand[l][c]][r]; pick the best c
 // (ties: the lowest); prev = its token.  hp [8][256] (column = block row).  Writes the 7 picks and their softmax probabilities.
-void selector_walk(sycl::queue& q, const float* hp, const int32_t* cand, const float* unary, const uint16_t* pred, const uint16_t* succ, const int32_t* meta,
-              int32_t* out_tok, float* out_prob) {
+void selector_walk(sycl::queue& q, const float* hp0, const int32_t* cand0, const float* unary0, const uint16_t* pred, const uint16_t* succ, const int32_t* meta,
+              int32_t* out_tok0, float* out_prob0, int nb) {
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> w(sycl::range<1>(kRank), h), part(sycl::range<1>(256), h), sc(sycl::range<1>(kTopK), h);
         sycl::local_accessor<int32_t, 1> st(sycl::range<1>(2), h);
-        h.parallel_for<Tag<13>>(sycl::nd_range<1>(256, 256), [=](sycl::nd_item<1> it) {
-            const int t = (int) it.get_local_id(0);
-            if (t == 0) st[0] = meta[kMetaAnchor];
+        h.parallel_for<Tag<13>>(sycl::nd_range<1>((size_t) nb * 256, 256), [=](sycl::nd_item<1> it) {
+            const int t = (int) it.get_local_id(0), bk = (int) it.get_group(0);   // a work-group a block
+            const float* hp = hp0 + (size_t) bk * kRows * kRank;
+            const int32_t* cand = cand0 + bk * kDrafts * kTopK;
+            const float* unary = unary0 + bk * kDrafts * kTopK;
+            int32_t* out_tok = out_tok0 + bk * kDrafts;
+            float* out_prob = out_prob0 + bk * kDrafts;
+            if (t == 0) st[0] = meta[kMetaAnchor + bk];
             sycl::group_barrier(it.get_group());
             for (int l = 0; l < kDrafts; ++l) {
                 const int prev = st[0];
@@ -536,6 +569,7 @@ bool Dflash::parse_index(const std::string& js, std::string& err) {
 }
 
 bool Dflash::alloc(sycl::queue& q, std::string& err) {
+    sl_.assign((size_t) n_slots_, Ctx{});
     auto need = [&](const char* n) -> const void* {
         const void* p = w(n);
         if (!p) err = std::string("the pack lacks ") + n;
@@ -576,9 +610,9 @@ bool Dflash::alloc(sycl::queue& q, std::string& err) {
         abase_[l] = static_cast<const float*>(w(p + "abase")); mbase_[l] = static_cast<const float*>(w(p + "mbase"));
     }
     auto dev = [&](size_t bytes) { vram_ += bytes; return sycl::aligned_alloc_device(4096, (bytes + 4095) / 4096 * 4096, q); };
-    stag_ = static_cast<uint16_t*>(dev((size_t) kRing * kTaps * kN * 2));
-    kring_ = static_cast<sycl::half*>(dev((size_t) kLayers * kKvHeads * kRing * kHd * 2));
-    vring_ = static_cast<sycl::half*>(dev((size_t) kLayers * kKvHeads * kRing * kHd * 2));
+    stag_ = static_cast<uint16_t*>(dev(kStagElems * 2 * (size_t) n_slots_));
+    kring_ = static_cast<sycl::half*>(dev(kRingElems * 2 * (size_t) n_slots_));
+    vring_ = static_cast<sycl::half*>(dev(kRingElems * 2 * (size_t) n_slots_));
     meta_ = static_cast<int32_t*>(dev(kMetaWords * 4));
     hmeta_ = sycl::malloc_host<int32_t>(kMetaWords, q);
     ctx_x16_ = static_cast<uint16_t*>(dev((size_t) kTaps * kN * kEagerCols * 2));
@@ -586,28 +620,42 @@ bool Dflash::alloc(sycl::queue& q, std::string& err) {
     ctx_scale_ = static_cast<float*>(dev(kEagerCols * 4));
     ctx_h16_ = static_cast<uint16_t*>(dev((size_t) kN * kEagerCols * 2));
     kv_y_ = static_cast<float*>(dev((size_t) kEagerCols * kKvAllRows * 4));
-    x_ = static_cast<float*>(dev(kRows * kN * 4)); h_ = static_cast<float*>(dev(kRows * kN * 4));
-    h16_ = static_cast<uint16_t*>(dev(kRows * kN * 2)); h16b_ = static_cast<uint16_t*>(dev(kRows * kN * 2));
-    att16_ = static_cast<uint16_t*>(dev(kRows * kHeads * kHd * 2));
-    sw16_ = static_cast<uint16_t*>(dev((size_t) kRows * kFF * 2));
-    dyn_a_ = static_cast<float*>(dev(kRows * kKpOut * 4)); dyn_m_ = static_cast<float*>(dev(kRows * kKpOut * 4));
-    qy_ = static_cast<float*>(dev(kRows * kHeads * kHd * 4)); kvy_ = static_cast<float*>(dev(kRows * kKvRows * 4));
-    qb_ = static_cast<float*>(dev(kRows * kHeads * kHd * 4)); kb_ = static_cast<float*>(dev(kRows * kKvHeads * kHd * 4));
-    vb_ = static_cast<float*>(dev(kRows * kKvHeads * kHd * 4));
-    part_acc_ = static_cast<float*>(dev((size_t) kChunks * kHeads * kRows * kHd * 4));
-    part_m_ = static_cast<float*>(dev((size_t) kChunks * kHeads * kRows * 4)); part_l_ = static_cast<float*>(dev((size_t) kChunks * kHeads * kRows * 4));
-    oy_ = static_cast<float*>(dev(kRows * kN * 4));
-    gy_ = static_cast<float*>(dev((size_t) kRows * kFF * 4)); uy_ = static_cast<float*>(dev((size_t) kRows * kFF * 4));
-    dny_ = static_cast<float*>(dev(kRows * kN * 4)); hp_y_ = static_cast<float*>(dev(kRows * kRank * 4));
-    cand_ = static_cast<int32_t*>(dev(kDrafts * kTopK * 4)); unary_ = static_cast<float*>(dev(kDrafts * kTopK * 4));
-    out_tok_ = static_cast<int32_t*>(dev(kDrafts * 4)); out_prob_ = static_cast<float*>(dev(kDrafts * 4));
+    constexpr size_t MR = (size_t) kRows * kMaxBlocks;   // the rows of the largest pass (32 columns)
+    x_ = static_cast<float*>(dev(MR * kN * 4)); h_ = static_cast<float*>(dev(MR * kN * 4));
+    h16_ = static_cast<uint16_t*>(dev(MR * kN * 2)); h16b_ = static_cast<uint16_t*>(dev(MR * kN * 2));
+    att16_ = static_cast<uint16_t*>(dev(MR * kHeads * kHd * 2));
+    sw16_ = static_cast<uint16_t*>(dev(MR * kFF * 2));
+    dyn_a_ = static_cast<float*>(dev(MR * kKpOut * 4)); dyn_m_ = static_cast<float*>(dev(MR * kKpOut * 4));
+    qy_ = static_cast<float*>(dev(MR * kHeads * kHd * 4)); kvy_ = static_cast<float*>(dev(MR * kKvRows * 4));
+    qb_ = static_cast<float*>(dev(MR * kHeads * kHd * 4)); kb_ = static_cast<float*>(dev(MR * kKvHeads * kHd * 4));
+    vb_ = static_cast<float*>(dev(MR * kKvHeads * kHd * 4));
+    part_acc_ = static_cast<float*>(dev((size_t) kMaxBlocks * kChunks * kHeads * kRows * kHd * 4));
+    part_m_ = static_cast<float*>(dev((size_t) kMaxBlocks * kChunks * kHeads * kRows * 4)); part_l_ = static_cast<float*>(dev((size_t) kMaxBlocks * kChunks * kHeads * kRows * 4));
+    oy_ = static_cast<float*>(dev(MR * kN * 4));
+    gy_ = static_cast<float*>(dev(MR * kFF * 4)); uy_ = static_cast<float*>(dev(MR * kFF * 4));
+    dny_ = static_cast<float*>(dev(MR * kN * 4)); hp_y_ = static_cast<float*>(dev(MR * kRank * 4));
+    hn_ = static_cast<float*>(dev((size_t) kMaxBlocks * kDrafts * kN * 4));
+    cand_ = static_cast<int32_t*>(dev(kMaxBlocks * kDrafts * kTopK * 4)); unary_ = static_cast<float*>(dev(kMaxBlocks * kDrafts * kTopK * 4));
+    out_tok_ = static_cast<int32_t*>(dev(kMaxBlocks * kDrafts * 4)); out_prob_ = static_cast<float*>(dev(kMaxBlocks * kDrafts * 4));
     dbg_embed_ = static_cast<float*>(dev(2 * kN * 4));
     if (!stag_ || !kring_ || !vring_ || !meta_ || !hmeta_ || !ctx_x16_ || !kv_y_ || !part_acc_ || !gy_ || !dbg_embed_) { err = "out of device memory for the drafter's buffers"; return false; }
     q.memset(meta_, 0, kMetaWords * 4).wait();
+    if (const char* e = std::getenv("STRATA_Q36_DFLASH_W4C"); e != nullptr && e[0] != '\0') {   // read once: "ckp,q,kv,o,gate_up,down,hproj"
+        const char* c = e;
+        for (int i = 0; i < kCNum && *c; ++i) {
+            const int v = std::atoi(c);
+            w4c_[i] = (v == 1 || v == 2 || v == 4 || v == 8 || v == 16) ? v : 0;
+            const char* nx = std::strchr(c, ',');
+            if (!nx) break;
+            c = nx + 1;
+        }
+    }
+    if (const char* e = std::getenv("STRATA_Q36_DFLASH_W4T"); e != nullptr && std::atoi(e) >= 16) w4t_ = std::atoi(e);
     return true;
 }
 
-bool Dflash::load(sycl::queue& q, const std::string& path, std::string& err) {
+bool Dflash::load(sycl::queue& q, const std::string& path, std::string& err, int n_slots) {
+    n_slots_ = std::max(1, n_slots);
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) { err = "cannot open " + path; return false; }
     char magic[8];
@@ -642,7 +690,8 @@ bool Dflash::load(sycl::queue& q, const std::string& path, std::string& err) {
     return alloc(q, err);
 }
 
-bool Dflash::load_synthetic(sycl::queue& q, uint64_t seed, std::string& err) {
+bool Dflash::load_synthetic(sycl::queue& q, uint64_t seed, std::string& err, int n_slots) {
+    n_slots_ = std::max(1, n_slots);
     uint64_t off = 0;
     auto add = [&](const std::string& name, int kind, int n_in, int n_out) {
         Ent e;
@@ -682,12 +731,14 @@ bool Dflash::load_synthetic(sycl::queue& q, uint64_t seed, std::string& err) {
 void Dflash::set_hooks(sycl::queue& q, const Hooks& h) {
     hooks_ = h;
     nch_ = (h.max_nd + kTopChunk - 1) / kTopChunk;
-    logits_ = static_cast<float*>(sycl::aligned_alloc_device(4096, ((size_t) kDrafts * h.max_nd * 4 + 4095) / 4096 * 4096, q));
-    top_part_ = static_cast<uint64_t*>(sycl::aligned_alloc_device(4096, ((size_t) kDrafts * nch_ * kTopK * 8 + 4095) / 4096 * 4096, q));
-    vram_ += (size_t) kDrafts * h.max_nd * 4;
+    const size_t hrows = (size_t) kDrafts * (n_slots_ > 1 ? kMaxBlocks : 1);   // the head's rows: 7 a block
+    logits_ = static_cast<float*>(sycl::aligned_alloc_device(4096, (hrows * h.max_nd * 4 + 4095) / 4096 * 4096, q));
+    top_part_ = static_cast<uint64_t*>(sycl::aligned_alloc_device(4096, (hrows * nch_ * kTopK * 8 + 4095) / 4096 * 4096, q));
+    vram_ += hrows * h.max_nd * 4;
 }
 
-bool Dflash::prod(sycl::queue& q, const void* wt, const uint16_t* x16, float* y, int n_in, int n_out, int ncols) {
+bool Dflash::prod(sycl::queue& q, const void* wt, const uint16_t* x16, float* y, int n_in, int n_out, int ncols, int cls) {
+    if (cls >= 0 && cls < kCNum && w4c_[cls] > 0 && ncols == kRows && strata::q36xr::mmvq_w4h_8(wt, x16, y, n_in, n_out, &q, w4c_[cls], w4t_)) return true;
     if (!strata::q36xr::mmvq_w4h(wt, x16, y, n_in, n_out, ncols, &q)) {
         static int shown = 0;
         if (shown++ < 3) std::fprintf(stderr, "strata-q36: dflash: mmvq_w4h declined %d x %d (%d columns)\n", n_in, n_out, ncols);
@@ -697,89 +748,147 @@ bool Dflash::prod(sycl::queue& q, const void* wt, const uint16_t* x16, float* y,
 }
 
 // ---- target side
-void Dflash::capture(sycl::queue& q, int tap, const float* x, int T, const int32_t* pos0_dev) {
-    if (stag_) k::capture(q, stag_, tap, x, T, pos0_dev);
+void Dflash::capture(sycl::queue& q, int tap, const float* x, int T, const int32_t* pos0_dev, int slot) {
+    if (stag_) k::capture(q, stag_ + (size_t) slot * kStagElems, tap, x, T, pos0_dev);
+}
+void Dflash::capture_rows(sycl::queue& q, int tap, const float* x, int T, const int32_t* rcell_dev, const int32_t* rslot_dev) {
+    if (stag_) k::capture_rows(q, stag_, tap, x, T, rcell_dev, rslot_dev);
 }
 
-void Dflash::invalidate() { have_cap_ = false; cap_lo_ = cap_hi_ = ctx_vlo_ = ctx_hi_ = 0; }
+void Dflash::invalidate(int slot) {
+    if (slot < 0 || slot >= (int) sl_.size()) return;
+    sl_[(size_t) slot] = Ctx{};
+}
 
-void Dflash::note_forward(int64_t p0, int64_t n) {
-    if (n <= 0) return;
-    if (!have_cap_) {
-        have_cap_ = true;
-        cap_lo_ = p0; cap_hi_ = p0 + n; ctx_vlo_ = ctx_hi_ = p0;
-    } else if (p0 == cap_hi_) {
-        cap_hi_ += n;
-    } else if (p0 < cap_hi_ && p0 >= cap_lo_) {   // a rewind inside the captured run: what is below p0 stays
-        cap_hi_ = p0 + n;
-        ctx_hi_ = std::min(ctx_hi_, p0);
-        ctx_vlo_ = std::min(ctx_vlo_, ctx_hi_);
-    } else {                                       // below the run or past it: nothing known about the rows in between
-        cap_lo_ = p0; cap_hi_ = p0 + n; ctx_vlo_ = ctx_hi_ = p0;
+void Dflash::note_forward(int64_t p0, int64_t n, int slot) {
+    if (n <= 0 || slot < 0 || slot >= (int) sl_.size()) return;
+    Ctx& c = sl_[(size_t) slot];
+    if (!c.have) {
+        c.have = true;
+        c.cap_lo = p0; c.cap_hi = p0 + n; c.vlo = c.hi = p0;
+    } else if (p0 == c.cap_hi) {
+        c.cap_hi += n;
+    } else if (p0 < c.cap_hi && p0 >= c.cap_lo) {   // a rewind inside the captured run: what is below p0 stays
+        c.cap_hi = p0 + n;
+        c.hi = std::min(c.hi, p0);
+        c.vlo = std::min(c.vlo, c.hi);
+    } else {                                         // below the run or past it: nothing known about the rows in between
+        c.cap_lo = p0; c.cap_hi = p0 + n; c.vlo = c.hi = p0;
     }
 }
 
 // ---- meta
-void Dflash::stage_meta(sycl::queue& q, int64_t P, int32_t anchor, int64_t c0, int nrows) {
+// One block's part of the meta (block `b` of the pass, rows 8 b .. 8 b + 7) and the context columns [col0, col0 + nrows) of positions c0 ...  of `slot`.
+// Host words in hmeta_; stage_meta (one block, a fresh meta) and the batch version both end in one copy to the device.
+static void table_rope(int64_t pos, float* out) {
+    const double theta = 1.0e7;
+    for (int i = 0; i < 64; ++i) {
+        const double ang = (double) pos * std::pow(theta, -2.0 * i / kHd);
+        out[i] = (float) std::cos(ang);
+        out[64 + i] = (float) std::sin(ang);
+    }
+}
+
+void Dflash::stage_meta(sycl::queue& q, int64_t P, int32_t anchor, int64_t c0, int nrows, int slot) {
     int32_t* m = hmeta_;
-    std::memset(m, 0, sizeof(int32_t) * 96);
+    std::memset(m, 0, sizeof(int32_t) * kMetaCtxPos * 2);   // (the per-block words and the first context words; the tables are rewritten below)
     m[kMetaP] = (int32_t) P;
     m[kMetaAnchor] = anchor;
-    m[kMetaVlo] = (int32_t) std::max<int64_t>(ctx_vlo_, 0);
+    m[kMetaVlo] = (int32_t) std::max<int64_t>(sl_[(size_t) slot].vlo, 0);
+    m[kMetaBSlot] = slot;
     m[kMetaN] = nrows;
     float* rc = reinterpret_cast<float*>(m + kMetaRopeCtx);
     float* rb = reinterpret_cast<float*>(m + kMetaRopeBlk);
-    const double theta = 1.0e7;
-    auto table = [&](int64_t pos, float* out) {
-        for (int i = 0; i < 64; ++i) {
-            const double ang = (double) pos * std::pow(theta, -2.0 * i / kHd);
-            out[i] = (float) std::cos(ang);
-            out[64 + i] = (float) std::sin(ang);
-        }
-    };
     for (int j = 0; j < nrows; ++j) {
         const int64_t pos = c0 + j;
         m[kMetaCtxPos + j] = (int32_t) pos;
         m[kMetaCtxSlot + j] = (int32_t) (pos % kRing);
-        table(pos, rc + (size_t) j * 128);
+        m[kMetaCtxId + j] = slot;
+        table_rope(pos, rc + (size_t) j * 128);
     }
     for (int r = 0; r < kRows; ++r) {
         m[kMetaTok + r] = r == 0 ? anchor : mask_token_;
-        table(P + r, rb + (size_t) r * 128);
+        table_rope(P + r, rb + (size_t) r * 128);
     }
     q.memcpy(meta_, hmeta_, sizeof(int32_t) * kMetaWords);
 }
 
-void Dflash::flush_eager(sycl::queue& q, int64_t c0, int nrows) {
-    stage_meta(q, c0 + nrows, 0, c0, nrows);   // (P and the block rows' tables are not read by the context update)
+void Dflash::flush_eager(sycl::queue& q, int64_t c0, int nrows, int slot) {
+    stage_meta(q, c0 + nrows, 0, c0, nrows, slot);   // (P and the block rows' tables are not read by the context update)
     ctx_update(q, nrows, true);
     q.wait();                                  // the host's meta may be rewritten
 }
 
-int Dflash::prepare(sycl::queue& q, int64_t P, int32_t anchor) {
-    if (!have_cap_ || cap_hi_ != P) {   // the captured run does not end at P (a path that never called note_forward, a session switch)
-        have_cap_ = true;
-        cap_lo_ = cap_hi_ = P;
-        ctx_vlo_ = ctx_hi_ = P;
+// All but the last <= 8 pending rows of the slot's context go through eager passes of up to 32 rows; returns the rows left (0 .. 8), starting at *at.
+int Dflash::plan_flush(sycl::queue& q, int slot, int64_t P, int64_t* at_out) {
+    Ctx& c = sl_[(size_t) slot];
+    if (!c.have || c.cap_hi != P) {   // the captured run does not end at P (a path that never called note_forward, a session switch)
+        c.have = true;
+        c.cap_lo = c.cap_hi = P;
+        c.vlo = c.hi = P;
     }
-    const int64_t lo_need = std::max<int64_t>({cap_lo_, P - (kWindow - 1), 0});
-    int64_t s = ctx_hi_;
-    if (s < lo_need) { s = lo_need; ctx_vlo_ = s; }          // the ring's run does not reach the rows we still can get: restart it
+    const int64_t lo_need = std::max<int64_t>({c.cap_lo, P - (kWindow - 1), 0});
+    int64_t s = c.hi;
+    if (s < lo_need) { s = lo_need; c.vlo = s; }          // the ring's run does not reach the rows we still can get: restart it
     if (s > P) s = P;
     int64_t total = P - s;
     const int ng = (int) std::min<int64_t>(total, kRows);
     int64_t at = s;
     while (total - ng > 0) {
         const int k = (int) std::min<int64_t>(total - ng, kEagerCols);
-        dump_rows(q, at, k);
-        flush_eager(q, at, k);
+        if (slot == 0) dump_rows(q, at, k);
+        flush_eager(q, at, k, slot);
         at += k;
         total -= k;
     }
-    dump_rows(q, at, ng);
-    stage_meta(q, P, anchor, at, ng);
-    ctx_hi_ = P;
+    *at_out = at;
+    c.hi = P;
     return ng;
+}
+
+int Dflash::prepare(sycl::queue& q, int64_t P, int32_t anchor, int slot) {
+    int64_t at = 0;
+    const int ng = plan_flush(q, slot, P, &at);
+    if (slot == 0) dump_rows(q, at, ng);
+    stage_meta(q, P, anchor, at, ng, slot);
+    return ng;
+}
+
+bool Dflash::prepare_batch(sycl::queue& q, const Req* reqs, int nb, int* cols) {
+    if (nb < 1 || nb > kMaxBlocks) return false;
+    for (int b = 0; b < nb; ++b) if (reqs[b].slot < 0 || reqs[b].slot >= n_slots_) return false;
+    int64_t at[kMaxBlocks];
+    int total = 0;
+    for (int b = 0; b < nb; ++b) {
+        cols[b] = plan_flush(q, reqs[b].slot, reqs[b].P, &at[b]);   // (the eager flushes run here, one slot after the other)
+        total += cols[b];
+    }
+    int32_t* m = hmeta_;
+    std::memset(m, 0, sizeof(int32_t) * kMetaCtxPos * 2);
+    float* rc = reinterpret_cast<float*>(m + kMetaRopeCtx);
+    float* rb = reinterpret_cast<float*>(m + kMetaRopeBlk);
+    int col = 0;
+    for (int b = 0; b < nb; ++b) {
+        const Req& r = reqs[b];
+        m[kMetaP + b] = (int32_t) r.P;
+        m[kMetaAnchor + b] = r.anchor;
+        m[kMetaVlo + b] = (int32_t) std::max<int64_t>(sl_[(size_t) r.slot].vlo, 0);
+        m[kMetaBSlot + b] = r.slot;
+        for (int j = 0; j < cols[b]; ++j, ++col) {
+            const int64_t pos = at[b] + j;
+            m[kMetaCtxPos + col] = (int32_t) pos;
+            m[kMetaCtxSlot + col] = (int32_t) (pos % kRing);
+            m[kMetaCtxId + col] = r.slot;
+            table_rope(pos, rc + (size_t) col * 128);
+        }
+        for (int i = 0; i < kRows; ++i) {
+            m[kMetaTok + b * kRows + i] = i == 0 ? r.anchor : mask_token_;
+            table_rope(r.P + i, rb + (size_t) (b * kRows + i) * 128);
+        }
+    }
+    m[kMetaN] = total;
+    q.memcpy(meta_, hmeta_, sizeof(int32_t) * kMetaWords);
+    return true;
 }
 
 // ---- passes
@@ -792,41 +901,50 @@ void Dflash::ctx_update(sycl::queue& q, int n, bool /*eager*/) {
     k::ctx_store(q, kv_y_, meta_, n, kn_, kring_, vring_, eps_);
 }
 
-void Dflash::block(sycl::queue& q) {
-    hooks_.embed(meta_ + kMetaTok, kRows, x_);
+void Dflash::block_batch(sycl::queue& q, int nb) {
+    const int R = nb * kRows;   // columns of every product of the pass: the weights are read once for all the blocks
+    hooks_.embed(meta_ + kMetaTok, R, x_);
     if (debug_) q.memcpy(dbg_embed_, x_, 2 * kN * sizeof(float));
-    k::rms_pack(q, x_, in_ln_[0], eps_, h_, h16_);
+    k::rms_pack(q, x_, in_ln_[0], eps_, h_, h16_, R);
     for (int l = 0; l < kLayers; ++l) {
-        prod(q, akp_[l], h16_, dyn_a_, kN, kKpOut, kRows);
-        k::conv_pack(q, h_, dyn_a_, 0, abase_[l], h16b_);
-        prod(q, wq_[l], h16b_, qy_, kN, kHeads * kHd, kRows);
-        prod(q, static_cast<const uint8_t*>(kv_) + (size_t) l * (kKvRows / 16) * (kN / 256) * 2176, h16b_, kvy_, kN, kKvRows, kRows);
-        k::qk_prep(q, qy_, kvy_, qn_[l], kn_[l], meta_, eps_, qb_, kb_, vb_);
-        k::attn_part(q, qb_, kb_, vb_, kring_, vring_, l, meta_, part_acc_, part_m_, part_l_);
-        k::attn_merge(q, part_acc_, part_m_, part_l_, att16_);
-        prod(q, wo_[l], att16_, oy_, kHeads * kHd, kN, kRows);
-        k::finish_rms(q, oy_, dyn_a_, abase_[l], x_, post_ln_[l], eps_, h_, h16_);
-        prod(q, mkp_[l], h16_, dyn_m_, kN, kKpOut, kRows);
-        k::conv_pack(q, h_, dyn_m_, 0, mbase_[l], h16b_);
-        prod(q, wg_[l], h16b_, gy_, kN, kFF, kRows);
-        prod(q, wu_[l], h16b_, uy_, kN, kFF, kRows);
-        strata::q36xr::w4h_swiglu_pack(gy_, uy_, sw16_, kFF, kRows, &q);
-        prod(q, wd_[l], sw16_, dny_, kFF, kN, kRows);
-        k::finish_rms(q, dny_, dyn_m_, mbase_[l], x_, l + 1 < kLayers ? in_ln_[l + 1] : norm_, eps_, h_, h16_);
+        prod(q, akp_[l], h16_, dyn_a_, kN, kKpOut, R, kCkp);
+        k::conv_pack(q, h_, dyn_a_, 0, abase_[l], h16b_, R);
+        prod(q, wq_[l], h16b_, qy_, kN, kHeads * kHd, R, kCq);
+        prod(q, static_cast<const uint8_t*>(kv_) + (size_t) l * (kKvRows / 16) * (kN / 256) * 2176, h16b_, kvy_, kN, kKvRows, R, kCkv);
+        k::qk_prep(q, qy_, kvy_, qn_[l], kn_[l], meta_, eps_, qb_, kb_, vb_, R);
+        k::attn_part(q, qb_, kb_, vb_, kring_, vring_, l, meta_, part_acc_, part_m_, part_l_, nb);
+        k::attn_merge(q, part_acc_, part_m_, part_l_, att16_, nb);
+        prod(q, wo_[l], att16_, oy_, kHeads * kHd, kN, R, kCo);
+        k::finish_rms(q, oy_, dyn_a_, abase_[l], x_, post_ln_[l], eps_, h_, h16_, R);
+        prod(q, mkp_[l], h16_, dyn_m_, kN, kKpOut, R, kCkp);
+        k::conv_pack(q, h_, dyn_m_, 0, mbase_[l], h16b_, R);
+        prod(q, wg_[l], h16b_, gy_, kN, kFF, R, kCgu);
+        prod(q, wu_[l], h16b_, uy_, kN, kFF, R, kCgu);
+        strata::q36xr::w4h_swiglu_pack(gy_, uy_, sw16_, kFF, R, &q);
+        prod(q, wd_[l], sw16_, dny_, kFF, kN, R, kCdn);
+        k::finish_rms(q, dny_, dyn_m_, mbase_[l], x_, l + 1 < kLayers ? in_ln_[l + 1] : norm_, eps_, h_, h16_, R);
     }
     // h_ = the final-normed block rows
-    prod(q, hproj_, h16_, hp_y_, kN, kRank, kRows);
+    prod(q, hproj_, h16_, hp_y_, kN, kRank, R, kCh);
     int nd = 0;
     const int32_t* idmap = nullptr;
-    hooks_.head(h_ + kN, kDrafts, logits_, nd, idmap);
-    k::top1(q, logits_, nd, kDrafts, (nd + kTopChunk - 1) / kTopChunk, top_part_);
-    k::top2(q, top_part_, (nd + kTopChunk - 1) / kTopChunk, kDrafts, idmap, cand_, unary_);
-    k::selector_walk(q, hp_y_, cand_, unary_, pred_cb_, succ_cb_, meta_, out_tok_, out_prob_);
+    const int hr = nb * kDrafts;   // the head's rows: rows 1 .. 7 of every block
+    const float* hin = h_ + kN;
+    if (nb > 1) { k::gather_hn(q, h_, hn_, nb); hin = hn_; }
+    hooks_.head(hin, hr, logits_, nd, idmap);
+    k::top1(q, logits_, nd, hr, (nd + kTopChunk - 1) / kTopChunk, top_part_);
+    k::top2(q, top_part_, (nd + kTopChunk - 1) / kTopChunk, hr, idmap, cand_, unary_);
+    k::selector_walk(q, hp_y_, cand_, unary_, pred_cb_, succ_cb_, meta_, out_tok_, out_prob_, nb);
 }
 
 void Dflash::run(sycl::queue& q, int n) {
     ctx_update(q, n, false);
-    block(q);
+    block_batch(q, 1);
+}
+
+void Dflash::run_batch(sycl::queue& q, int nb, int cols_total) {
+    ctx_update(q, cols_total, false);
+    block_batch(q, nb);
 }
 
 bool Dflash::debug_last(sycl::queue& q, Debug& d) {
@@ -843,7 +961,7 @@ bool Dflash::debug_last(sycl::queue& q, Debug& d) {
 }
 
 bool Dflash::debug_stage_rows(sycl::queue& q, int64_t p0, int n, std::vector<uint16_t>& out) {
-    if (!have_cap_ || p0 < cap_lo_ || p0 + n > cap_hi_) return false;
+    if (sl_.empty() || !sl_[0].have || p0 < sl_[0].cap_lo || p0 + n > sl_[0].cap_hi) return false;
     out.resize((size_t) n * kTaps * kN);
     q.wait();
     for (int j = 0; j < n; ++j)
@@ -904,7 +1022,7 @@ void Dflash::dump_step(sycl::queue& q, int64_t P, int32_t anchor) {
     Debug d;
     debug_last(q, d);
     std::fprintf(f_steps_, "{\"step\": %d, \"P\": %lld, \"anchor\": %d, \"ctx_records\": %lld, \"valid_lo\": %lld, \"cand\": [", dump_steps_, (long long) P, anchor,
-                 (long long) dump_records_, (long long) ctx_vlo_);
+                 (long long) dump_records_, (long long) valid_lo());
     for (int l = 0; l < kDrafts; ++l) {
         std::fprintf(f_steps_, "%s[", l ? ", " : "");
         for (int c = 0; c < kTopK; ++c) std::fprintf(f_steps_, "%s%d", c ? ", " : "", d.cand[l * kTopK + c]);

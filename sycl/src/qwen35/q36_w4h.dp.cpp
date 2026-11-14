@@ -193,6 +193,29 @@ bool mmvq_w4h(const void* weights, const uint16_t* x16, float* y, int n_in, int 
 }
 
 
+// The 8-column product with a chosen decomposition (the DFlash drafter's, STRATA_Q36_DFLASH_W4C; the engine's own products keep mmvq_w4h and its
+// STRATA_Q36_W4H_C): `chunks` threads read one tile's records (1, 2, 4, 8, 16), `threads` threads in all.  The tile count of a small product
+// (80 tiles of a kernel projection, 16 of the selector's) leaves most of the 1,024 threads idle at 4 a tile, and 320 tiles over 256 groups (o_proj,
+// down_proj) run in two rounds for a quarter of them; the bench q36_mmvq_dense_parity --dflash --bench prints the table.  The sums are the same
+// products in another split order of the same 128-input groups: the result differs from mmvq_w4h's only by float32 summation order.
+bool mmvq_w4h_8(const void* weights, const uint16_t* x16, float* y, int n_in, int n_out, void* stream, int chunks, int threads) {
+    if (n_in <= 0 || n_in % 256 != 0 || n_out <= 0 || n_out % 16 != 0 || threads < 16) return false;
+    if (!weights || !x16 || !y || (reinterpret_cast<uintptr_t>(weights) & 63u) != 0 || (reinterpret_cast<uintptr_t>(x16) & 3u) != 0) return false;
+    sycl::queue& q = *strata::q_of(stream);
+    const auto* W = static_cast<const uint32_t*>(weights);
+    const auto* X = reinterpret_cast<const uint32_t*>(x16);
+    const int bpr = n_in / 256;
+    switch (chunks) {
+        case 1: launch_w4h<8, 1>(q, W, X, y, bpr, n_out, threads); break;
+        case 2: launch_w4h<8, 2>(q, W, X, y, bpr, n_out, threads); break;
+        case 4: launch_w4h<8, 4>(q, W, X, y, bpr, n_out, threads); break;
+        case 8: launch_w4h<8, 8>(q, W, X, y, bpr, n_out, threads); break;
+        case 16: launch_w4h<8, 16>(q, W, X, y, bpr, n_out, threads); break;
+        default: return false;
+    }
+    return true;
+}
+
 // x [ncols][n_in] (rows of ldx floats) -> x16.  A work-item: 16 inputs of one column.
 void w4h_pack(const float* x, int ldx, uint16_t* x16, int n_in, int ncols, void* stream) {
     sycl::queue& q = *strata::q_of(stream);
