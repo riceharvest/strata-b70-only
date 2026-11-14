@@ -23,6 +23,8 @@
 namespace strata::q36pp {
 namespace {
 using namespace sycl::ext::intel::esimd;
+namespace es = sycl::ext::intel::esimd;
+namespace esx = sycl::ext::intel::experimental::esimd;
 namespace xmx = sycl::ext::intel::esimd::xmx;
 
 constexpr int T_Q8_0  = 8;
@@ -36,6 +38,10 @@ constexpr int T_W4    = 1004;
 
 constexpr auto kAl16 = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::alignment<16>};
 constexpr auto kPfL1 = sycl::ext::oneapi::experimental::properties{cache_hint_L1<cache_hint::cached>, cache_hint_L2<cache_hint::cached>};
+constexpr auto kStreamW = sycl::ext::oneapi::experimental::properties{
+    sycl::ext::oneapi::experimental::alignment<16>,
+    es::cache_hint_L1<es::cache_hint::streaming>,
+    es::cache_hint_L2<es::cache_hint::cached>};
 
 constexpr uint32_t blk_bytes_256(int f) {
     return f == T_Q3_K  ? 110u :
@@ -951,8 +957,9 @@ void launch_w4f16(sycl::queue& q, const uint32_t* W, const uint32_t* X16, float*
                 }
             }
         };
+        auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
         const sycl::nd_range<1> nd((size_t)total_wg * NTHREADS, (size_t)NTHREADS);
-        h.parallel_for<TagW4F16<WGT_N, WGT_M, MT, SCALE_BW>>(nd, run_kernel);
+        h.parallel_for<TagW4F16<WGT_N, WGT_M, MT, SCALE_BW>>(nd, props, run_kernel);
     });
 }
 
@@ -1002,6 +1009,136 @@ bool gemm_w4_f16(const void* weights, const void* x_f16, float* y, int n_in, int
         w4f16::launch_w4f16<4, 2, 4, false>(q, W, X, y, n_in, n_out, T);
     }
     return true;
+}
+
+namespace gdn_ab {
+
+template <int N16> class TagGdnAbPp;
+
+template <int N16>
+SYCL_ESIMD_FUNCTION inline void load_h_k32(const float* h, int n_in, int T, int m0, int tid, int k32,
+                                           simd<uint32_t, 32>& b0, simd<uint32_t, 32>& b1) {
+    const int row0 = m0 + tid * 4;
+    const int koff = k32 * 32;
+#pragma unroll
+    for (int rr = 0; rr < 4; ++rr) {
+        simd<uint32_t, 16> vu = 0u;
+        if (row0 + rr < T) {
+            simd<float, 32> vf = block_load<float, 32>(h + (size_t)(row0 + rr) * n_in + koff, kAl16);
+            simd<sycl::half, 32> vh = convert<sycl::half>(vf);
+            vu = vh.template bit_cast_view<uint32_t>();
+        }
+        b0.template select<8, 1>(8 * rr) = vu.template select<8, 1>(0);
+        b1.template select<8, 1>(8 * rr) = vu.template select<8, 1>(8);
+    }
+}
+
+template <int N16>
+void launch_gdn_ab(sycl::queue& q, const uint32_t* ab16, const float* h, const float* dt, const float* ssm_a,
+                   float* al_out, float* be_out, int n_in, int T) {
+    constexpr int HV = N16 * 16;
+    constexpr int M_WG = 32;
+    constexpr int WG = 8;
+    const int n_wg = (T + M_WG - 1) / M_WG;
+    const int k32_cnt = n_in / 32;
+    const int k16_cnt = n_in / 16;
+    auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
+    q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<TagGdnAbPp<N16>>(
+            sycl::nd_range<2>(sycl::range<2>((size_t)n_wg, (size_t)WG), sycl::range<2>(1, (size_t)WG)),
+            props, [=](sycl::nd_item<2> it) SYCL_ESIMD_KERNEL {
+                slm_init<4096u>();
+                const int tid    = (int)it.get_local_id(1);
+                const int m0     = (int)it.get_group(0) * M_WG;
+                const int m_th   = tid >> 1;
+                const int branch = tid & 1;
+                const uint32_t* Wb = ab16 + (size_t)branch * N16 * k16_cnt * 128u;
+
+                {
+                    simd<uint32_t, 32> b0, b1;
+                    load_h_k32<N16>(h, n_in, T, m0, tid, 0, b0, b1);
+                    slm_block_store<uint32_t, 32>((0u * 4u + (uint32_t)m_th) * 256u + (uint32_t)branch * 128u, b0, kAl16);
+                    slm_block_store<uint32_t, 32>((1u * 4u + (uint32_t)m_th) * 256u + (uint32_t)branch * 128u, b1, kAl16);
+                }
+
+                simd<float, 128> c[N16];
+#pragma unroll
+                for (int t = 0; t < N16; ++t) c[t] = 0.0f;
+
+                for (int k32 = 0; k32 < k32_cnt; ++k32) {
+                    barrier();
+                    const uint32_t cur_slm = (k32 & 1) ? 2048u : 0u;
+                    simd<uint32_t, 32> nb0, nb1;
+                    if (k32 + 1 < k32_cnt) load_h_k32<N16>(h, n_in, T, m0, tid, k32 + 1, nb0, nb1);
+
+#pragma unroll
+                    for (int k16 = 0; k16 < 2; ++k16) {
+                        simd<uint32_t, 64> ahu = slm_block_load<uint32_t, 64>(
+                            cur_slm + ((uint32_t)k16 * 4u + (uint32_t)m_th) * 256u, kAl16);
+                        simd<sycl::half, 128> ah = ahu.template bit_cast_view<sycl::half>();
+#pragma unroll
+                        for (int t = 0; t < N16; ++t) {
+                            simd<uint32_t, 128> bwu = block_load<uint32_t, 128>(
+                                Wb + ((size_t)t * k16_cnt + (size_t)(2 * k32 + k16)) * 128u, kAl16);
+                            simd<sycl::half, 256> bw = bwu.template bit_cast_view<sycl::half>();
+                            c[t] = xmx::dpas<8, 8, float, float, sycl::half, sycl::half>(c[t], bw, ah);
+                        }
+                    }
+
+                    if (k32 + 1 < k32_cnt) {
+                        const uint32_t nxt_slm = (k32 & 1) ? 0u : 2048u;
+                        slm_block_store<uint32_t, 32>(nxt_slm + (0u * 4u + (uint32_t)m_th) * 256u + (uint32_t)branch * 128u, nb0, kAl16);
+                        slm_block_store<uint32_t, 32>(nxt_slm + (1u * 4u + (uint32_t)m_th) * 256u + (uint32_t)branch * 128u, nb1, kAl16);
+                    }
+                }
+
+                simd<float, 16> dtv[N16], sav[N16];
+                if (branch == 0) {
+#pragma unroll
+                    for (int t = 0; t < N16; ++t) {
+                        dtv[t] = block_load<float, 16>(dt + t * 16, kAl16);
+                        sav[t] = block_load<float, 16>(ssm_a + t * 16, kAl16);
+                    }
+                }
+                const int row_base = m0 + m_th * 8;
+#pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    const int row = row_base + r;
+                    if (row < T) {
+                        if (branch == 0) {
+#pragma unroll
+                            for (int t = 0; t < N16; ++t) {
+                                simd<float, 16> v = c[t].template select<16, 1>(16 * r) + dtv[t];
+                                simd<float, 16> u = es::exp(v);
+                                simd<float, 16> sp = es::log(1.0f + u);
+                                sp.merge(u - 0.5f * u * u, u < 1e-4f);
+                                sp.merge(v, v > 20.0f);
+                                block_store<float, 16>(al_out + (size_t)row * HV + t * 16, sp * sav[t], kAl16);
+                            }
+                        } else {
+#pragma unroll
+                            for (int t = 0; t < N16; ++t) {
+                                simd<float, 16> v = c[t].template select<16, 1>(16 * r);
+                                simd<float, 16> sg = 1.0f / (1.0f + es::exp(-v));
+                                block_store<float, 16>(be_out + (size_t)row * HV + t * 16, sg, kAl16);
+                            }
+                        }
+                    }
+                }
+            });
+    });
+}
+
+}  // namespace gdn_ab
+
+void gdn_ab_pp(const void* ab16, const float* h, const float* dt, const float* ssm_a,
+               float* al_out, float* be_out, int n_in, int HV, int T, void* stream) {
+    sycl::queue& q = *strata::q_of(stream);
+    const auto* w = static_cast<const uint32_t*>(ab16);
+    if (HV == 48)      gdn_ab::launch_gdn_ab<3>(q, w, h, dt, ssm_a, al_out, be_out, n_in, T);
+    else if (HV == 16) gdn_ab::launch_gdn_ab<1>(q, w, h, dt, ssm_a, al_out, be_out, n_in, T);
+    else if (HV == 32) gdn_ab::launch_gdn_ab<2>(q, w, h, dt, ssm_a, al_out, be_out, n_in, T);
+    else if (HV == 64) gdn_ab::launch_gdn_ab<4>(q, w, h, dt, ssm_a, al_out, be_out, n_in, T);
 }
 
 }  // namespace strata::q36pp

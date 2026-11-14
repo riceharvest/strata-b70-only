@@ -973,6 +973,19 @@ __dpct_inline__ void k_swiglu16(const float *g, const float *u, sycl::half *h, i
         h[i] = sycl::vec<float, 1>(v).convert<sycl::half, sycl::rounding_mode::automatic>()[0];
     }
 }
+
+__dpct_inline__ void k_swiglu16_v4(const float *g, const float *u, sycl::half *h, int64_t n4) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t i = (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
+    if (i < n4) {
+        const sycl::vec<float, 4> gv = reinterpret_cast<const sycl::vec<float, 4> *>(g)[i];
+        const sycl::vec<float, 4> uv = reinterpret_cast<const sycl::vec<float, 4> *>(u)[i];
+        const sycl::vec<float, 4> vv(silu(gv.x()) * uv.x(), silu(gv.y()) * uv.y(),
+                                     silu(gv.z()) * uv.z(), silu(gv.w()) * uv.w());
+        reinterpret_cast<sycl::vec<sycl::half, 4> *>(h)[i] =
+            vv.convert<sycl::half, sycl::rounding_mode::automatic>();
+    }
+}
 /// y[t][o] = W[o] . x[t] for f32 W [n_out][n_in], n_in a multiple of 128: one warp per row, float4 loads, 8 rows per
 /// block (grid (ceil(n_out / 8), T)).
 __dpct_inline__ void k_gemv_f32(const float *W, const float *x, float *y,
@@ -2358,6 +2371,18 @@ __dpct_inline__ void k_to_f16(const float *x, sycl::half *y, int64_t n) {
             .convert<sycl::half, sycl::rounding_mode::automatic>()[0];
 }
 
+__dpct_inline__ void k_to_f16_v4(const float *x, sycl::half *y, int64_t n4) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int64_t i =
+        (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
+        item_ct1.get_local_id(2);
+    if (i < n4) {
+        const sycl::vec<float, 4> xv = reinterpret_cast<const sycl::vec<float, 4> *>(x)[i];
+        reinterpret_cast<sycl::vec<sycl::half, 4> *>(y)[i] =
+            xv.convert<sycl::half, sycl::rounding_mode::automatic>();
+    }
+}
+
 /// The GDN conv for T tokens in ONE launch (the prompt): one block per 128-channel head, thread = channel, the
 /// 3-entry history carried in registers across the tokens and written back at the end; SiLU, then the L2 norm of the
 /// q/k heads (block < qk_heads) per token - fused_gdn_conv_l2's arithmetic, token after token.  History [channel][3].
@@ -3583,6 +3608,12 @@ struct Engine {
     GSet& gs() { return gsets[(size_t) cur]; }
     strata::prefill::Gemm gemm;
     uint16_t* w4_f16 = nullptr;   // --w4: the FP16 image of the pack's matrix a prompt chunk multiplies by
+    float* pp_dxT = nullptr;      // Phase 5c: per-(128-K) group scale [K/128, M_pad] for INT8 W4 DPAS
+    std::vector<void*> ab16_layers; // Phase 5c: packed FP16 VNNI weights of (L.alpha, L.beta) per GDN layer
+    static bool gdn_ab16_on() {   // STRATA_Q36_AB16=0: fall back to dual f32mm + k_gdn_gb
+        static const bool on = [] { const char* e = std::getenv("STRATA_Q36_AB16"); return !(e && e[0] == '0'); }();
+        return on;
+    }
     dpct::blas::descriptor_ptr blas = nullptr;
     float* att_s = nullptr;            // the prompt attention's scores / probabilities, kAttScoreFloats floats
     static constexpr int kSplitK = 16;
@@ -3844,11 +3875,16 @@ struct Engine {
                                                     m->dense ? g.n_ff : 0});
         // (+ 64 bytes: the XMX forms load a q8_1 block as 16 dwords, 28 bytes past the last block's end)
         CK(DPCT_CHECK_ERROR(q8 = (void *)sycl::malloc_device(
-                                K::native_q8_1_bytes(max_in, 1) * T + 64, q_ct1)));
+                                std::max(K::native_q8_1_bytes(max_in, 1) * T + 64,
+                                         (size_t)max_in * ((T + 127) & ~127) + 64),
+                                q_ct1)));
         CK(DPCT_CHECK_ERROR(xq = (void *)sycl::malloc_device(
                                 K::native_q8_1_bytes((int)N, 1) * T + 64, q_ct1)));
         if (m->dense && q36_xr_on()) strata::q36xr::init(&q_ct1);   // its table, before any graph is recorded
         x16 = dalloc_t<sycl::half>(T * (size_t)max_in);
+        if (m->w4_mats > 0 || m->draft_w4 || (m->has_mtp && q36_draft_w4())) {
+            pp_dxT = dalloc((((size_t)max_in + 127) / 128) * (size_t)((T + 127) & ~127));
+        }
         if (DPCT_CHECK_ERROR(blas = new dpct::blas::descriptor()) != 0 ||
             DPCT_CHECK_ERROR((blas)->set_queue(st)) != 0) {
             std::fprintf(stderr, "strata-q36: cuBLAS handle failed\n");
@@ -4277,6 +4313,18 @@ struct Engine {
             CK(DPCT_CHECK_ERROR(h_map = sycl::malloc_host<int32_t>(T, q_ct1)));
         }
         d_delta = dalloc_t<int32_t>(1);
+        ab16_layers.assign(m->layers.size(), nullptr);
+        if (T > kGemmT && gdn_ab16_on()) {
+            bool any_ab16 = false;
+            for (size_t l = 0; l < m->layers.size(); ++l) {
+                const Layer& L = m->layers[l];
+                if (L.attn) continue;
+                ab16_layers[l] = strata::q36pp::pack_ab16(
+                    L.alpha, L.beta, (int)g.ssm_v_heads, (int)g.n_embd, st);
+                if (ab16_layers[l]) any_ab16 = true;
+            }
+            if (any_ab16) st->wait();
+        }
         cur = 0;
         load_cur();
         CK(DPCT_CHECK_ERROR(
@@ -4368,6 +4416,9 @@ struct Engine {
     int pp_x16_n = 0, pp_x16_T = 0;
     const float* pp_q8_src = nullptr;
     int pp_q8_n = 0, pp_q8_T = 0;
+    const float* pp_x128_src = nullptr;
+    int pp_x128_n = 0, pp_x128_T = 0;
+    bool pp_prefused = false;
     static int pp_i8_mode() {
         static const int v = [] {
             const char* e = std::getenv("STRATA_Q36_PP_I8");
@@ -4382,11 +4433,18 @@ struct Engine {
         }();
         return v;
     }
+    bool use_w4_i8(const Mat& w, int T) const {
+        const int mode = pp_w4_mode();
+        if (mode <= 0 || mode == 2 || w.type != kW4Type || T <= kGemmT || !pp_dxT) return false;
+        if (!strata::q36pp::handles_w4_i8(w.n_in, w.n_out, T)) return false;
+        if (mode >= 3) return true;
+        return ((int64_t)(w.n_out / 256) * ((T + 127) / 128)) >= 16;
+    }
     bool use_w4_f16(const Mat& w, int T) const {
         const int mode = pp_w4_mode();
         if (mode == 0 || w.type != kW4Type || T <= kGemmT) return false;
         if (!strata::q36pp::handles_w4_f16(w.n_in, w.n_out, T)) return false;
-        if (mode >= 2) return true;
+        if (mode == 2) return true;
         if ((int64_t) w.n_in * w.n_out > w4_f16_elems) return true;
         if (w.n_out < 4096) return T >= 192 && T <= 768;
         if (w.n_in >= 16384) return T <= 2048;
@@ -4399,29 +4457,49 @@ struct Engine {
         if (mode >= 2) return true;
         return w.n_out >= 4096 && T <= 384;
     }
-    void invalidate_pp() { pp_x16_src = nullptr; pp_q8_src = nullptr; }
+    void invalidate_pp() { pp_x16_src = nullptr; pp_q8_src = nullptr; pp_x128_src = nullptr; pp_prefused = false; }
     void ensure_pp_x16() {
         if (pp_x16_src == pp_cur_src && pp_x16_n == pp_cur_n && pp_x16_T == pp_cur_T) return;
         auto exp_props = sycl::ext::oneapi::experimental::properties{};
         const float* xin = pp_cur_src;
         const int64_t nt = (int64_t) pp_cur_n * pp_cur_T;
-        ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
-            auto x16_ct1 = x16;
-            cgh.parallel_for<dpct_kernel_name<class k_to_f16_a77384>>(
-                sycl::nd_range<3>(sycl::range(1, 1, grid1(nt)) * sycl::range(1, 1, kThreads),
-                                  sycl::range(1, 1, kThreads)),
-                exp_props, [=](sycl::nd_item<3>) { k_to_f16(xin, x16_ct1, nt); });
-        });
+        if ((nt & 3) == 0 && (((uintptr_t) xin & 15u) == 0u) && (((uintptr_t) x16 & 7u) == 0u)) {
+            const int64_t nt4 = nt >> 2;
+            ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
+                auto x16_ct1 = x16;
+                cgh.parallel_for<dpct_kernel_name<class k_to_f16_v4_a77384>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, grid1(nt4)) * sycl::range(1, 1, kThreads),
+                                      sycl::range(1, 1, kThreads)),
+                    exp_props, [=](sycl::nd_item<3>) { k_to_f16_v4(xin, x16_ct1, nt4); });
+            });
+        } else {
+            ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
+                auto x16_ct1 = x16;
+                cgh.parallel_for<dpct_kernel_name<class k_to_f16_a77384>>(
+                    sycl::nd_range<3>(sycl::range(1, 1, grid1(nt)) * sycl::range(1, 1, kThreads),
+                                      sycl::range(1, 1, kThreads)),
+                    exp_props, [=](sycl::nd_item<3>) { k_to_f16(xin, x16_ct1, nt); });
+            });
+        }
         pp_x16_src = pp_cur_src; pp_x16_n = pp_cur_n; pp_x16_T = pp_cur_T;
     }
     void ensure_pp_q8() {
         if (pp_q8_src == pp_cur_src && pp_q8_n == pp_cur_n && pp_q8_T == pp_cur_T) return;
+        pp_x128_src = nullptr; pp_prefused = false;
         quant(pp_cur_src, pp_cur_n, pp_cur_T, q8);
         pp_q8_src = pp_cur_src; pp_q8_n = pp_cur_n; pp_q8_T = pp_cur_T;
     }
+    void ensure_pp_x128() {
+        if (pp_x128_src == pp_cur_src && pp_x128_n == pp_cur_n && pp_x128_T == pp_cur_T) return;
+        q8_src = nullptr;
+        pp_q8_src = nullptr;
+        strata::q36pp::quantize_x128(pp_cur_src, q8, pp_dxT, pp_cur_n, pp_cur_T, st);
+        pp_x128_src = pp_cur_src; pp_x128_n = pp_cur_n; pp_x128_T = pp_cur_T;
+    }
 
     void mm(const Mat& w, const float* xin, float* out, int T) {
-        if (T > kGemmT && w.type == kW4Type && !use_w4_f16(w, T) && (int64_t) w.n_in * w.n_out > w4_f16_elems) {
+        if (T > kGemmT && w.type == kW4Type && !use_w4_i8(w, T) && !use_w4_f16(w, T) &&
+            (int64_t) w.n_in * w.n_out > w4_f16_elems) {
             q8_src = nullptr;
             for (int c0 = 0; c0 < T; c0 += kGemmT) {
                 mm(w, xin + (size_t) c0 * w.n_in, out + (size_t) c0 * w.n_out, std::min(kGemmT, T - c0));
@@ -4542,14 +4620,27 @@ struct Engine {
     static_assert(kDecT >= kGemmT && kDecT >= kVerify, "the decode GDN kernels take every decode-side row count");
     void prep(const float* xin, int n, int T, void* q) {
         if (T > kGemmT) {
-            invalidate_pp();
-            pp_cur_src = xin;
-            pp_cur_n = n;
-            pp_cur_T = T;
+            if (pp_prefused && pp_x128_src == xin && pp_x128_n == n && pp_x128_T == T) {
+                pp_prefused = false;
+                pp_cur_src = xin;
+                pp_cur_n = n;
+                pp_cur_T = T;
+                pp_x16_src = nullptr;
+                pp_q8_src = nullptr;
+            } else {
+                invalidate_pp();
+                pp_cur_src = xin;
+                pp_cur_n = n;
+                pp_cur_T = T;
+            }
         } else quant(xin, n, T, q);
     }
     void apply(const Mat& w, const void* q, float* out, int T) {
         if (T > kGemmT) {
+            if (use_w4_i8(w, T)) {
+                ensure_pp_x128();
+                if (strata::q36pp::gemm_w4_i8(w.d, q8, pp_dxT, out, w.n_in, w.n_out, T, st)) return;
+            }
             if (use_w4_f16(w, T)) {
                 ensure_pp_x16();
                 if (strata::q36pp::gemm_w4_f16(w.d, x16, out, w.n_in, w.n_out, T, st)) return;
@@ -4762,6 +4853,22 @@ struct Engine {
                 verify_q8("add_rms q8", h, T, " T " + std::to_string(T));
             }
             return;
+        }
+        if (T > kGemmT) {
+            invalidate_pp();
+            q8_src = nullptr;
+            const bool want_x128 = m->dense && use_w4_i8(L.ffn_gate, T) && use_w4_i8(L.ffn_up, T) && pp_dxT != nullptr;
+            if (strata::q36pp::rms_pp(x, y, L.post_norm, h,
+                                      want_x128 ? q8 : nullptr,
+                                      want_x128 ? pp_dxT : nullptr,
+                                      N, T, m->eps, st)) {
+                if (want_x128) {
+                    pp_cur_src = h; pp_cur_n = N; pp_cur_T = T;
+                    pp_x128_src = h; pp_x128_n = N; pp_x128_T = T;
+                    pp_prefused = true;
+                }
+                return;
+            }
         }
         {
             auto exp_props = sycl::ext::oneapi::experimental::properties{};
@@ -5279,7 +5386,7 @@ work-group size if needed.
     /// batch on the native MMVQ (the q8_1 image of h, the SwiGLU with its q8_1 image in one launch), a prompt chunk on the
     /// FP16 GEMMs.  With the fast kernels the residual add, the next norm and that norm's q8_1 image (the next layer's
     /// input) are one launch, as k_moe_out_small does for the MoE layers.
-    void dense_ffn(const Layer& L, int T, const float* wn, float* hout) {
+    void dense_ffn(const Layer& L, int T, const float* wn, float* hout, bool next_w4_i8 = false) {
         const int N = (int) m->g.n_embd, FF = (int) m->g.n_ff;
         if (T <= kGemmT) {
             if (a16(L.ffn_gate, T) && a16(L.ffn_up, T) && a16(L.ffn_down, T)) {   // W4A16: h and silu(gate) * up as FP16 images
@@ -5302,7 +5409,12 @@ work-group size if needed.
             apply(L.ffn_gate, nullptr, sg, T);
             apply(L.ffn_up, nullptr, su, T);
             invalidate_pp();
-            if (use_pp_i8(L.ffn_down, T)) {
+            if (use_w4_i8(L.ffn_down, T) && pp_dxT != nullptr) {
+                q8_src = nullptr;
+                strata::q36pp::swiglu_x128(sg, su, q8, pp_dxT, FF, T, st);
+                pp_cur_src = sg; pp_cur_n = FF; pp_cur_T = T;
+                pp_x128_src = sg; pp_x128_n = FF; pp_x128_T = T;
+            } else if (use_pp_i8(L.ffn_down, T)) {
                 q8_src = nullptr;
                 K::native_swiglu_quantize_q8_1(sg, su, q8, FF * T, 1, st);
                 pp_cur_src = sg; pp_cur_n = FF; pp_cur_T = T;
@@ -5314,9 +5426,17 @@ work-group size if needed.
                 const float *su_ct1 = su;
                 sycl::half *x16_ct2 = x16;
                 const int64_t n_ct3 = (int64_t)T * FF;
-                ((sycl::queue *)(st))->parallel_for<dpct_kernel_name<class k_swiglu16_m3a>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, grid1(n_ct3)) * sycl::range(1, 1, kThreads), sycl::range(1, 1, kThreads)),
-                    [=](sycl::nd_item<3>) { k_swiglu16(sg_ct0, su_ct1, x16_ct2, n_ct3); });
+                if ((n_ct3 & 3) == 0 && (((uintptr_t) sg_ct0 & 15u) == 0u) &&
+                    (((uintptr_t) su_ct1 & 15u) == 0u) && (((uintptr_t) x16_ct2 & 7u) == 0u)) {
+                    const int64_t n4 = n_ct3 >> 2;
+                    ((sycl::queue *)(st))->parallel_for<dpct_kernel_name<class k_swiglu16_v4_m3a>>(
+                        sycl::nd_range<3>(sycl::range(1, 1, grid1(n4)) * sycl::range(1, 1, kThreads), sycl::range(1, 1, kThreads)),
+                        [=](sycl::nd_item<3>) { k_swiglu16_v4(sg_ct0, su_ct1, x16_ct2, n4); });
+                } else {
+                    ((sycl::queue *)(st))->parallel_for<dpct_kernel_name<class k_swiglu16_m3a>>(
+                        sycl::nd_range<3>(sycl::range(1, 1, grid1(n_ct3)) * sycl::range(1, 1, kThreads), sycl::range(1, 1, kThreads)),
+                        [=](sycl::nd_item<3>) { k_swiglu16(sg_ct0, su_ct1, x16_ct2, n_ct3); });
+                }
                 pp_cur_src = sg; pp_cur_n = FF; pp_cur_T = T;
                 pp_x16_src = sg; pp_x16_n = FF; pp_x16_T = T;
             }
@@ -5324,12 +5444,24 @@ work-group size if needed.
         }
         const bool mkq_in = fast_k && T <= kGemmT && wn != nullptr && hout == h && N % 256 == 0;   // the next layer's input
         const bool mkq_out = !mkq_in && fast_k && T <= kGemmT && wn != nullptr && (hout == hmain || hout == hmtp) && N % 256 == 0;
+        const bool pp_next_q = (T > kGemmT) && next_w4_i8 && wn != nullptr && hout == h && pp_dxT != nullptr;
         if (mkq_in || mkq_out) {
             q36k::launch_add_rms_q(x, sy, wn, hout, (q36k::QB *) (mkq_in ? xq : q8), N, T, m->eps, (sycl::queue *) st);   // M2: 1024 threads a row
             if (mkq_out) {
                 q8_src = hout;
                 q8_stride = N;
                 q8_rows = T;
+            }
+        } else if (T > kGemmT && strata::q36pp::rms_pp(x, sy, wn, hout,
+                                                      pp_next_q ? q8 : nullptr,
+                                                      pp_next_q ? pp_dxT : nullptr,
+                                                      N, T, m->eps, st)) {
+            if (pp_next_q) {
+                q8_src = nullptr;
+                invalidate_pp();
+                pp_cur_src = hout; pp_cur_n = N; pp_cur_T = T;
+                pp_x128_src = hout; pp_x128_n = N; pp_x128_T = T;
+                pp_prefused = true;
             }
         } else if (!rms_fast(x, N, sy, x, wn, hout, N, N, T)) {   // (M4: the decode side's last layer / MTP block output norm)
             auto exp_props = sycl::ext::oneapi::experimental::properties{};
@@ -5512,22 +5644,40 @@ work-group size if needed.
             {
                 auto exp_props =
                     sycl::ext::oneapi::experimental::properties{};
+                const int64_t n_q = (int64_t)T * H * HD;
+                if ((n_q & 3) == 0 && (((uintptr_t)q & 15u) == 0u) &&
+                    (((uintptr_t)q16 & 7u) == 0u)) {
+                    const int64_t n4 = n_q >> 2;
+                    ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
+                        const float *q_ct0 = q;
+                        auto q16_ct1 = q16;
+                        cgh.parallel_for<
+                            dpct_kernel_name<class k_to_f16_v4_97106f, KV>>(
+                            sycl::nd_range<3>(
+                                sycl::range(1, 1, grid1(n4)) *
+                                    sycl::range(1, 1, kThreads),
+                                sycl::range(1, 1, kThreads)),
+                            exp_props, [=](sycl::nd_item<3>) {
+                                k_to_f16_v4(q_ct0, q16_ct1, n4);
+                            });
+                    });
+                } else {
+                    ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
+                        const float *q_ct0 = q;
+                        auto q16_ct1 = q16;
+                        auto int64_t_T_H_HD_ct2 = n_q;
 
-                ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
-                    const float *q_ct0 = q;
-                    auto q16_ct1 = q16;
-                    auto int64_t_T_H_HD_ct2 = (int64_t)T * H * HD;
-
-                    cgh.parallel_for<
-                        dpct_kernel_name<class k_to_f16_97106f, KV>>(
-                        sycl::nd_range<3>(
-                            sycl::range(1, 1, grid1((int64_t)T * H * HD)) *
-                                sycl::range(1, 1, kThreads),
-                            sycl::range(1, 1, kThreads)),
-                        exp_props, [=](sycl::nd_item<3> item_ct1) {
-                            k_to_f16(q_ct0, q16_ct1, int64_t_T_H_HD_ct2);
-                        });
-                });
+                        cgh.parallel_for<
+                            dpct_kernel_name<class k_to_f16_97106f, KV>>(
+                            sycl::nd_range<3>(
+                                sycl::range(1, 1, grid1(n_q)) *
+                                    sycl::range(1, 1, kThreads),
+                                sycl::range(1, 1, kThreads)),
+                            exp_props, [=](sycl::nd_item<3> item_ct1) {
+                                k_to_f16(q_ct0, q16_ct1, int64_t_T_H_HD_ct2);
+                            });
+                    });
+                }
             }
             if (flash) {
                 if constexpr (std::is_same_v<KV, sycl::half>)
@@ -5906,7 +6056,7 @@ work-group size if needed.
     /// `verify`: a verify window - the GDN state is read, not written (commit() writes it for the kept rows).
     void layer(const Layer &L, size_t li, int T, int64_t p0,
                const int32_t *dpos, bool graph_mode, bool verify,
-               const float *wn, float *hout) try {
+               const float *wn, float *hout, bool next_w4_i8 = false) try {
         const auto& g = m->g;
         const int N = (int) g.n_embd, Kp = (int) m->top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
         const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, D = (int) g.ssm_state_size;
@@ -5945,6 +6095,8 @@ work-group size if needed.
                                           al_b, be_b, N, HV);
                             });
                 });
+            } else if (T > kGemmT && li < ab16_layers.size() && ab16_layers[li] != nullptr && gdn_ab16_on()) {
+                strata::q36pp::gdn_ab_pp(ab16_layers[li], h, L.dt, L.ssm_a, al_b, be_b, N, HV, T, st);
             } else {
                 f32mm(L.alpha, h, al_b, N, HV, T);
                 f32mm(L.beta, h, be_b, N, HV, T);
@@ -6178,7 +6330,7 @@ work-group size if needed.
         }
         add_rms_post(L, T);
         if (m->dense) {
-            dense_ffn(L, T, wn, hout);
+            dense_ffn(L, T, wn, hout, next_w4_i8);
             return;
         }
         // routed experts (one token: the router and the shared expert's gate in one product, the gate its last row)
@@ -6316,8 +6468,23 @@ work-group size if needed.
         const Layer& L0 = m->layers[0];
         const bool want_q0 = T <= kGemmT && (L0.attn ? (!a16(L0.wq, T) || !a16(L0.wk, T) || !a16(L0.wv, T))
                                                      : (!a16(L0.qkv, T) || !a16(L0.zg, T)));
+        const bool want_pp0 = T > kGemmT && m->dense && pp_dxT != nullptr &&
+                              (L0.attn ? use_w4_i8(L0.wq, T) : use_w4_i8(L0.qkv, T));
+        if (T > kGemmT) {
+            invalidate_pp();
+            q8_src = nullptr;
+        }
         if (rms_fast(x, N, nullptr, nullptr, L0.attn_norm, h, N, N, T, want_q0 ? (q36k::QB*) xq : nullptr)) {   // M4: rows of a decode-side forward
             xq_ready = want_q0;
+        } else if (T > kGemmT && strata::q36pp::rms_pp(x, nullptr, L0.attn_norm, h,
+                                                       want_pp0 ? q8 : nullptr,
+                                                       want_pp0 ? pp_dxT : nullptr,
+                                                       N, T, m->eps, st)) {
+            if (want_pp0) {
+                pp_cur_src = h; pp_cur_n = N; pp_cur_T = T;
+                pp_x128_src = h; pp_x128_n = N; pp_x128_T = T;
+                pp_prefused = true;
+            }
         } else {
             auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
@@ -6339,8 +6506,11 @@ work-group size if needed.
         } // later layers: from k_moe_out
         for (size_t l = 0; l < m->layers.size(); ++l) {
             const bool last = l + 1 == m->layers.size();
+            const bool next_w4_i8 = !last && T > kGemmT && m->dense && pp_dxT != nullptr &&
+                                    (m->layers[l + 1].attn ? use_w4_i8(m->layers[l + 1].wq, T)
+                                                           : use_w4_i8(m->layers[l + 1].qkv, T));
             layer(m->layers[l], l, T, p0, pos0, graph_mode, verify, last ? m->out_norm : m->layers[l + 1].attn_norm,
-                  last ? hmain : h);
+                  last ? hmain : h, next_w4_i8);
         }
         if (heads > 0) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
         else q8_src = nullptr;
