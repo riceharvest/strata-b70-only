@@ -30,7 +30,7 @@ using sycl::half;
 
 inline sycl::queue& Q(void* s) { return *static_cast<sycl::queue*>(s); }
 
-struct TagProj; struct TagPrep; struct TagPool; struct TagRingTree; struct TagScore1; struct TagScore2;
+struct TagProj; struct TagPrep; struct TagPool; struct TagRingTree; struct TagRingUpd; struct TagScore1; struct TagScore2;
 struct TagScore4; struct TagScore8; struct TagSelect; struct TagAttend; struct TagMerge;
 
 inline float h2f(uint16_t u) { return static_cast<float>(sycl::bit_cast<half>(u)); }
@@ -293,9 +293,9 @@ void launch_project(sycl::queue& q, const half* wq, const half* wk, const float*
     });
 }
 
-// ---- prep: per row, 4 query heads (rms * q_norm, rotated -> qidx) and the key (rms * k_pre -> raw, and the ring or traw) ----------
+// ---- prep: per row, 4 query heads (rms * q_norm, rotated -> qidx) and the key (rms * k_pre -> raw, and traw for a tree window) -------
 void launch_prep(sycl::queue& q, const float* proj, const float* qn, const float* kpre, Win win, Rope rp, bool tree, float* qidx, float* raw,
-                 float* ring, float* traw) {
+                 float* traw) {
     const int T = win.T;
     q.parallel_for<TagPrep>(sycl::nd_range<1>((size_t) T * 5 * 128, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
         auto& sm = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[8]>(it.get_group());
@@ -310,11 +310,7 @@ void launch_prep(sycl::queue& q, const float* proj, const float* qn, const float
         const int cell = *win.pos0 + t;
         if (part == 4) {
             raw[(size_t) t * 128 + i] = v;
-            if (tree) {
-                traw[(size_t) t * 128 + i] = v;
-            } else if (T <= kRing || t >= T - 4) {
-                ring[(size_t) (cell % kRing) * 128 + i] = v;
-            }
+            if (tree) traw[(size_t) t * 128 + i] = v;   // (the ring is written after the pooling: launch_ring_update)
             return;
         }
         buf[i] = v;
@@ -351,6 +347,16 @@ void launch_pool(sycl::queue& q, const float* rawwin, const float* ring, const f
         const int dl = delta ? *delta : 0;
         const float v = rope_elem(buf, i, (float) (b * kRatio + dl), rp.base, rp.n_rot);
         pooled[(size_t) b * 128 + i] = half(v);
+    });
+}
+
+// ---- ring update, AFTER the pooling: the pooling reads the ring for the (at most 3) cells before the window, and a window of 29..35 rows
+// (or a long chunk) writes the slot of a cell 32 later over them.  A window of up to kRing rows writes all its rows, a longer one (a prompt
+// chunk, never rolled back) its last 4.
+void launch_ring_update(sycl::queue& q, const float* raw, const int32_t* pos0, int T, float* ring) {
+    q.parallel_for<TagRingUpd>(sycl::nd_range<1>((size_t) T * 128, 128), [=](sycl::nd_item<1> it) {
+        const int t = (int) it.get_group(0), i = (int) it.get_local_id(0);
+        if (T <= kRing || t >= T - 4) ring[(size_t) ((*pos0 + t) % kRing) * 128 + i] = raw[(size_t) t * 128 + i];
     });
 }
 
@@ -693,8 +699,11 @@ void launch_ring_tree(sycl::queue& q, const float* traw, const int32_t* path, co
 void index_rows(const LayerWeights& w, const LayerState& lyr, const Scratch& sc, const float* h, const Win& win, const Rope& rp, bool tree, void* stream) {
     sycl::queue& q = Q(stream);
     launch_project(q, static_cast<const half*>(w.wq), static_cast<const half*>(w.wk), h, win.T, sc.proj);
-    launch_prep(q, sc.proj, w.qn, w.kpre, win, rp, tree, sc.qidx, sc.raw, lyr.ring, lyr.traw);
-    if (!tree) launch_pool(q, sc.raw, lyr.ring, w.knorm, win.pos0, win.delta, win.T, rp, static_cast<half*>(lyr.pooled));
+    launch_prep(q, sc.proj, w.qn, w.kpre, win, rp, tree, sc.qidx, sc.raw, lyr.traw);
+    if (!tree) {
+        launch_pool(q, sc.raw, lyr.ring, w.knorm, win.pos0, win.delta, win.T, rp, static_cast<half*>(lyr.pooled));
+        launch_ring_update(q, sc.raw, win.pos0, win.T, lyr.ring);
+    }
 }
 
 void select_rows(const LayerState& lyr, const Scratch& sc, const Win& win, void* stream) {
