@@ -18487,6 +18487,9 @@ int main(int argc, char **argv) try {
                 if (mt < 2) return -1;
                 return std::max(a0, n - mt);
             };
+            static int64_t lh_serve_req = 0;
+            const int64_t lh_cur_req = lh_serve_req++;
+            sp.arm_layer_hash(lh_cur_req);
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
                 err.clear();
@@ -18571,6 +18574,7 @@ int main(int argc, char **argv) try {
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
             }
+            sp.arm_layer_hash(-1);
             if (!rfd.on && !(!cancelled && refill_defer(err)) && !refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;

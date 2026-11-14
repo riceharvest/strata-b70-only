@@ -4252,6 +4252,57 @@ void copy_f32_wide(float* dst, const float* src, int64_t n, void* stream) {
     if (n % 4) copy_i32((int32_t*) dst + n4 * 4, (const int32_t*) src + n4 * 4, n % 4, stream);
     check("copy_f32_wide");
 }
+namespace {
+__dpct_inline__ uint64_t splitmix64_dev(uint64_t x) {
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+}  // namespace
+void hash_xor64(const void* data, int64_t nbytes, uint64_t seed, uint64_t* dst, void* stream) {
+    if (data == nullptr || dst == nullptr || nbytes <= 0) return;
+    const int64_t n32 = nbytes / 4;
+    const int64_t rem = nbytes & 3;
+    const int64_t blocks = std::max<int64_t>(1, std::min<int64_t>((n32 + 255) / 256, 256));
+    const uint32_t* p32 = static_cast<const uint32_t*>(data);
+    const uint8_t* pb = static_cast<const uint8_t*>(data) + n32 * 4;
+    auto exp_props = sycl::ext::oneapi::experimental::properties{};
+    strata::q_of(stream)
+        ->parallel_for<dpct_kernel_name<class hash_xor64_kernel_i24>>(
+            sycl::nd_range<3>(sycl::range(1, 1, (unsigned) blocks) * sycl::range(1, 1, 256),
+                              sycl::range(1, 1, 256)),
+            exp_props, [=](sycl::nd_item<3> item_ct1) {
+                const int64_t tid = (int64_t) item_ct1.get_group(2) * 256 + item_ct1.get_local_id(2);
+                const int64_t stride = (int64_t) item_ct1.get_group_range(2) * 256;
+                uint64_t acc = 0;
+                for (int64_t i = tid; i < n32; i += stride) {
+                    const uint64_t z = ((uint64_t) p32[i]) ^ (seed + (uint64_t) i * 0x9e3779b97f4a7c15ULL);
+                    acc ^= splitmix64_dev(z);
+                }
+                if (tid == 0 && rem > 0) {
+                    uint32_t tail = 0;
+                    for (int64_t k = 0; k < rem; ++k) tail |= ((uint32_t) pb[k]) << (8 * k);
+                    acc ^= splitmix64_dev(((uint64_t) tail | (1ULL << 32)) ^
+                                          (seed + (uint64_t) n32 * 0x9e3779b97f4a7c15ULL));
+                }
+                const uint32_t lo = sycl::reduce_over_group(
+                    item_ct1.get_group(), (uint32_t) acc, sycl::bit_xor<uint32_t>());
+                const uint32_t hi = sycl::reduce_over_group(
+                    item_ct1.get_group(), (uint32_t) (acc >> 32), sycl::bit_xor<uint32_t>());
+                if (item_ct1.get_local_id(2) == 0) {
+                    uint32_t* d32 = reinterpret_cast<uint32_t*>(dst);
+                    if (lo) {
+                        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                         sycl::access::address_space::global_space>(d32[0]).fetch_xor(lo);
+                    }
+                    if (hi) {
+                        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                         sycl::access::address_space::global_space>(d32[1]).fetch_xor(hi);
+                    }
+                }
+            });
+    check("hash_xor64");
+}
 void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     if (n <= 0) return;
     const int64_t b = (n + 255) / 256;

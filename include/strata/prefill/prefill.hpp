@@ -276,6 +276,9 @@ public:
         return p->lm_mid_;
     }
 
+    /// Diagnostic (STRATA_LAYER_HASH=<path>): arm the next request's first prompt chunk with its request index (< 0 disarms).
+    void arm_layer_hash(int64_t req_id) { lh_pending_req_ = req_id; }
+
 private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages, bool src);
@@ -320,6 +323,7 @@ private:
 
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)
+    int64_t lh_pending_req_ = -1;
     struct Impl;
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;

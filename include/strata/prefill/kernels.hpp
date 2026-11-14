@@ -103,6 +103,8 @@ void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream);
 /// dst[0, n) = src[0, n) in 16-byte loads (both 16-byte aligned; src may be mapped host memory: read over PCIe by
 /// the kernel, not queued on a copy engine).
 void copy_f32_wide(float* dst, const float* src, int64_t n, void* stream);
+/// Diagnostic (STRATA_LAYER_HASH): XOR-reduce SplitMix64(word_i, seed) over [data, data + nbytes) into *dst on stream.
+void hash_xor64(const void* data, int64_t nbytes, uint64_t seed, uint64_t* dst, void* stream);
 /// Gather rows: dst16[i, :] = x16[src[i], :] (n rows of `width` BF16).
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream);
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
