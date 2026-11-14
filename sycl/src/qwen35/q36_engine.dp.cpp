@@ -4041,20 +4041,30 @@ struct Engine {
         {
             const char* e = std::getenv("STRATA_Q36_W4A16");
             const char* et = std::getenv("STRATA_Q36_W4H_T");
+            const char* ex = std::getenv("STRATA_Q36_W4X");
+            w4x_mode = (ex && ex[0] == '2') ? 2 : (ex && ex[0] == '1') ? 1 : 0;
+            w4x_gs = (w4x_mode == 2) ? 32 : 128;
             const bool draft_may_w4 = m->draft_w4 || (m->has_mtp && q36_draft_w4());
             // Auto-hybrid W4 (1..8 cols) + W4A16 (9..16 cols) for batched decode (n_sess > 1) or explicit override;
-            // single-session stays on W4 (FP16 x Q8_1) at <= 9 cols for parity and higher throughput without pack16 overhead.
-            const bool want_w4a16 = e ? (e[0] == '1') : (n_sess > 1 || (et && *et));
+            // STRATA_Q36_W4X=1 (gs=128) or 2 (gs=32) enables the native u4 x s8 decode/verify path for 1..kGemmT cols.
+            const bool want_w4a16 = w4x_mode ? true : (e ? (e[0] == '1') : (n_sess > 1 || (et && *et)));
             w4a16 = (m->w4_mats > 0 || draft_may_w4) && want_w4a16;
             if (w4a16) {
                 if (et && *et) w4h_min_t = std::max(1, std::atoi(et));
-                else if (e && e[0] == '1' && n_sess <= 1) w4h_min_t = 1;
+                else if (w4x_mode || (e && e[0] == '1' && n_sess <= 1)) w4h_min_t = 1;
                 else w4h_min_t = 9;
-                const size_t nh = strata::q36xr::w4h_act_halfs((int) std::max<int64_t>({2 * g.n_embd, g.n_ff}) + 255, 32);
-                xa16 = reinterpret_cast<uint16_t*>(dalloc(nh / 2 + 16));
-                xb16 = reinterpret_cast<uint16_t*>(dalloc(nh / 2 + 16));
-                std::fprintf(stderr, "strata-q36: W4A16 active for B70W4 matrices at %d..%d columns (STRATA_Q36_W4H_T=%d)\n",
-                             w4h_min_t, kGemmT, w4h_min_t);
+                const int max_w4_in = (int) std::max<int64_t>({2 * g.n_embd, g.n_ff}) + 255;
+                const size_t nh = strata::q36xr::w4h_act_halfs(max_w4_in, 32);
+                const size_t nw = std::max(nh / 2 + 16, strata::q36xr::w4x_act_bytes(max_w4_in, 32, 32) / 4 + 16);
+                xa16 = reinterpret_cast<uint16_t*>(dalloc(nw));
+                xb16 = reinterpret_cast<uint16_t*>(dalloc(nw));
+                if (w4x_mode) {
+                    std::fprintf(stderr, "strata-q36: W4X (u4 x s8, gs=%d) active for B70W4 matrices at %d..%d columns (STRATA_Q36_W4X=%d)\n",
+                                 w4x_gs, w4h_min_t, kGemmT, w4x_mode);
+                } else {
+                    std::fprintf(stderr, "strata-q36: W4A16 active for B70W4 matrices at %d..%d columns (STRATA_Q36_W4H_T=%d)\n",
+                                 w4h_min_t, kGemmT, w4h_min_t);
+                }
             }
         }
         {
@@ -4375,6 +4385,8 @@ struct Engine {
     // rows interleaved by 16 inputs - instead of the q8_1 image, at every row count (so a row's result does not depend on
     // its window).  xa16: the image of the layer's input h; xb16: of an inner activation.
     bool w4a16 = false;
+    int w4x_mode = 0;   // 0: off, 1: W4X gs=128, 2: W4X gs=32 (STRATA_Q36_W4X)
+    int w4x_gs = 128;
     int w4h_min_t = 9;
     int64_t w4_f16_elems = 0;
     uint16_t *xa16 = nullptr, *xb16 = nullptr;
@@ -4390,10 +4402,17 @@ struct Engine {
         return (const char*) q8 + (size_t) row0 * K::native_q8_1_bytes(n, 1);
     }
     bool a16(const Mat& w, int T) const { return w4a16 && w.type == kW4Type && T >= w4h_min_t && T <= kGemmT; }
-    void pack16(const float* x, int n, int T, uint16_t* d) { strata::q36xr::w4h_pack(x, n, d, n, T, st); }
+    void pack16(const float* x, int n, int T, uint16_t* d) {
+        if (w4x_mode) strata::q36xr::w4x_quantize(x, n, d, n, T, w4x_gs, st);
+        else strata::q36xr::w4h_pack(x, n, d, n, T, st);
+    }
     void mmh(const Mat& w, const uint16_t* x16v, float* out, int T) {
-        if (!strata::q36xr::mmvq_w4h(w.d, x16v, out, w.n_in, w.n_out, T, st)) {
-            std::fprintf(stderr, "strata-q36: a W4A16 product of %d x %d at %d columns was not taken\n", w.n_in, w.n_out, T);
+        const bool ok = w4x_mode
+            ? strata::q36xr::mmvq_w4x(w.d, x16v, out, w.n_in, w.n_out, T, w4x_gs, st)
+            : strata::q36xr::mmvq_w4h(w.d, x16v, out, w.n_in, w.n_out, T, st);
+        if (!ok) {
+            std::fprintf(stderr, "strata-q36: a %s product of %d x %d at %d columns was not taken\n",
+                         w4x_mode ? "W4X" : "W4A16", w.n_in, w.n_out, T);
             std::exit(1);
         }
     }
@@ -5393,7 +5412,8 @@ work-group size if needed.
                 pack16(h, N, T, xa16);
                 mmh(L.ffn_gate, xa16, sg, T);
                 mmh(L.ffn_up, xa16, su, T);
-                strata::q36xr::w4h_swiglu_pack(sg, su, xb16, FF, T, st);
+                if (w4x_mode) strata::q36xr::w4x_swiglu_quantize(sg, su, xb16, FF, T, w4x_gs, st);
+                else strata::q36xr::w4h_swiglu_pack(sg, su, xb16, FF, T, st);
                 mmh(L.ffn_down, xb16, sy, T);
             } else {
             if (!xq_post) quant(h, N, T, xq);
