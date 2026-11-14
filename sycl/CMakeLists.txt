@@ -587,8 +587,13 @@ if(STRATA_BUILD_Q36)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_engine.dp.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense.dp.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xr_dense.dp.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_dflash.dp.cpp   # the DFlash 2 block drafter (STRATA_Q36_DFLASH; off: never called)
     ${STRATA_ROOT}/src/qwen35/q36_requant.cpp)
   target_compile_definitions(strata PRIVATE STRATA_Q36_PORT=1)
+  # Host-only test of the DFlash drafter's verify tree (q36_dtree.hpp): best-first growth, DFS layout, the 2 GDN checkpoint slots simulated.
+  add_executable(dflash_tree_test ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/dflash_tree_test.cpp)
+  target_include_directories(dflash_tree_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
+  add_test(NAME dflash_tree_test COMMAND dflash_tree_test)
   # B70W4 (the int4 pack's kernels, q36_w4.dp.cpp) as a library of its own: a change there recompiles its kernels alone (the
   # executable's AOT link compiles about 1,500), and they take their own register-file size (STRATA_Q36_W4_GRF=128 at
   # configure time: without -doubleGRF).
@@ -693,10 +698,13 @@ if(STRATA_BUILD_Q36)
   if(STRATA_SYCL_PARITY)
     add_executable(q36_mmvq_dense_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense_parity.cpp
                    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense.dp.cpp
-                   ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xr_dense.dp.cpp)
+                   ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xr_dense.dp.cpp
+                   ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_dflash.dp.cpp
+                   ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_dflash_parity.cpp)
     target_include_directories(q36_mmvq_dense_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
     target_link_libraries(q36_mmvq_dense_parity PRIVATE strata_kernels strata_prefill q36_w4 q36_pp)
     set_target_properties(q36_mmvq_dense_parity PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
     add_test(NAME q36_mmvq_dense_parity COMMAND q36_mmvq_dense_parity --selftest)
+    add_test(NAME q36_dflash_parity COMMAND q36_mmvq_dense_parity --dflash)
   endif()
 endif()

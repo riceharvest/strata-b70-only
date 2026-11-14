@@ -2176,9 +2176,12 @@ int xatt_bench(const char* tl_s, int cells, int ns) {   // ns 4: K as the engine
     return bad ? 1 : 0;
 }
 
+namespace strata::q36df { int parity_main(int argc, char** argv); }   // q36_dflash_parity.cpp: the DFlash 2 drafter's kernels
+
 int main(int argc, char** argv) try {
     setenv("STRATA_MMVQ_KREG", "1", 1);   // the dense forms' latch (strata-q36 sets it for the 27B)
     bool selftest_flag = false;
+    if (argc > 1 && std::string(argv[1]) == "--dflash") return strata::q36df::parity_main(argc - 2, argv + 2);   // [--bench]
     if (argc > 1 && std::string(argv[1]) == "--floor") return floor_bench();
     if (argc > 1 && std::string(argv[1]) == "--xatt") return xatt_bench(argc > 2 ? argv[2] : "1,5,6,16", argc > 3 ? std::atoi(argv[3]) : 25120, argc > 4 ? std::atoi(argv[4]) : 1);
     if (argc > 1 && std::string(argv[1]) == "--w4") return w4_bench(argc > 2 ? argv[2] : "1,4,5,6,8", argc > 3 ? argv[3] : "27");

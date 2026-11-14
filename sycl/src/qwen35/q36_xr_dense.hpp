@@ -33,6 +33,8 @@ bool mmvq_w4(const void* weights, const void* xq, float* y, int n_in, int n_out,
 /// rounded up to 8][16] halfs (w4h_act_halfs of them).  1 .. 32 columns.
 std::size_t w4h_act_halfs(int n_in, int ncols);
 bool mmvq_w4h(const void* weights, const uint16_t* x16, float* y, int n_in, int n_out, int ncols, void* stream);
+/// 8 columns with a chosen decomposition (q36_w4h.dp.cpp: `chunks` in 1, 2, 4, 8, 16 threads a tile, `threads` in all).  Only the DFlash drafter calls it.
+bool mmvq_w4h_8(const void* weights, const uint16_t* x16, float* y, int n_in, int n_out, void* stream, int chunks, int threads);
 /// x [ncols][n_in] floats (rows ldx apart) as x16; the FFN's silu(g) * u as x16.
 void w4h_pack(const float* x, int ldx, uint16_t* x16, int n_in, int ncols, void* stream);
 void w4h_swiglu_pack(const float* g, const float* u, uint16_t* x16, int n, int ncols, void* stream);
