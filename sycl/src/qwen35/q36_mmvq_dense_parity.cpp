@@ -3034,11 +3034,13 @@ int xatt2_bench(bool sweep, const char* tl_s, const char* cl_s, int ns) {
     return bad ? 1 : 0;
 }
 namespace strata::q36df { int parity_main(int argc, char** argv); }   // q36_dflash_parity.cpp: the DFlash 2 drafter's kernels
+namespace strata::q36qsa { int parity_main(int argc, char** argv); }   // q36_qsa_parity.cpp: the QSA kernels (--qsa [--bench [ctx,..]])
 
 int main(int argc, char** argv) try {
     setenv("STRATA_MMVQ_KREG", "1", 1);   // the dense forms' latch (strata-q36 sets it for the 27B)
     bool selftest_flag = false;
     if (argc > 1 && std::string(argv[1]) == "--dflash") return strata::q36df::parity_main(argc - 2, argv + 2);   // [--bench]
+    if (argc > 1 && std::string(argv[1]) == "--qsa") return strata::q36qsa::parity_main(argc - 2, argv + 2);   // [--bench [ctx,ctx,..]]
     if (argc > 1 && std::string(argv[1]) == "--floor") return floor_bench();
     if (argc > 1 && std::string(argv[1]) == "--xatt") return xatt_bench(argc > 2 ? argv[2] : "1,5,6,16", argc > 3 ? std::atoi(argv[3]) : 25120, argc > 4 ? std::atoi(argv[4]) : 1);
     if (argc > 1 && (std::string(argv[1]) == "--xatt2" || std::string(argv[1]) == "--xatt2-sweep")) {
