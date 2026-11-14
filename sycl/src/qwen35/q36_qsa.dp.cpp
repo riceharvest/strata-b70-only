@@ -215,7 +215,7 @@ void copy_state(const LayerState& src, const LayerState& dst, int cells, int ctx
 size_t scratch_bytes(int tmax, int score_rows, int ctx) {
     const size_t nbc = nb_cap_for(ctx);
     return ((size_t) tmax * (kProj + kHeads * kD + kD) + (size_t) score_rows * nbc + (size_t) kMaxWin * 24 * kPieces * (kHD + 2)) * 4 +
-           (size_t) score_rows * (kTopBlocks + 2) * 4;
+           (size_t) score_rows * (kTopBlocks + 2 + 16) * 4;
 }
 bool alloc_scratch(Scratch& s, int tmax, int score_rows, int ctx, void* stream) {
     sycl::queue& q = Q(stream);
@@ -226,16 +226,17 @@ bool alloc_scratch(Scratch& s, int tmax, int score_rows, int ctx, void* stream) 
     s.score = sycl::malloc_device<float>((size_t) score_rows * s.nb_cap, q);
     s.sel = sycl::malloc_device<int32_t>((size_t) score_rows * kTopBlocks, q);
     s.nsel = sycl::malloc_device<int32_t>((size_t) score_rows, q);
+    s.dbg = sycl::malloc_device<int32_t>((size_t) score_rows * 16, q);
     s.nitems = sycl::malloc_device<int32_t>((size_t) score_rows, q);
     s.pacc = sycl::malloc_device<float>((size_t) kMaxWin * 24 * kPieces * kHD, q);
     s.pm = sycl::malloc_device<float>((size_t) kMaxWin * 24 * kPieces, q);
     s.pl = sycl::malloc_device<float>((size_t) kMaxWin * 24 * kPieces, q);
-    return s.proj && s.qidx && s.raw && s.score && s.sel && s.nsel && s.nitems && s.pacc && s.pm && s.pl;
+    return s.proj && s.qidx && s.raw && s.score && s.sel && s.nsel && s.dbg && s.nitems && s.pacc && s.pm && s.pl;
 }
 void free_scratch(Scratch& s, void* stream) {
     sycl::queue& q = Q(stream);
     sycl::free(s.proj, q); sycl::free(s.qidx, q); sycl::free(s.raw, q); sycl::free(s.score, q); sycl::free(s.sel, q);
-    sycl::free(s.nsel, q); sycl::free(s.nitems, q); sycl::free(s.pacc, q); sycl::free(s.pm, q); sycl::free(s.pl, q);
+    sycl::free(s.nsel, q); sycl::free(s.dbg, q); sycl::free(s.nitems, q); sycl::free(s.pacc, q); sycl::free(s.pm, q); sycl::free(s.pl, q);
     s = Scratch{};
 }
 
@@ -416,63 +417,80 @@ void launch_score(sycl::queue& q, const half* pooled, const float* qidx, Win win
 }
 
 // ---- select: one work-group (1024) a row, the 512 best blocks by 4 passes of an 8-bit radix select, written in ascending order -------
-void launch_select(sycl::queue& q, const float* score, Win win, int nb_cap, int32_t* sel, int32_t* nsel) {
+// Plain SLM only: replicated histograms with local-space atomics (the 16 lanes of a sub-group count into 16 different copies, so the
+// low-entropy top digits - the scores of a row share their exponent - do not queue on one address), explicit scans in SLM (no library
+// group algorithm, no sub-group shuffle).  dbg (16 ints a row) records what the kernel decided: [0] threshold key, [1] rem (scores equal
+// to the threshold that are taken), [2] count above the threshold, [3] count equal to it, [4..7] candidates of pass 0..3, [8] c,
+// [9..12] the bin chosen in pass 0..3, [13] number of ids written.
+void launch_select(sycl::queue& q, const float* score, Win win, int nb_cap, int32_t* sel, int32_t* nsel, int32_t* dbg) {
     q.parallel_for<TagSelect>(sycl::nd_range<1>((size_t) win.nr * 1024, 1024), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
         auto grp = it.get_group();
-        auto& hist = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[256]>(grp);
-        auto& sh = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[2]>(grp);
-        auto sg = it.get_sub_group();
-        const int lane = (int) sg.get_local_id()[0];
+        auto& hist = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[16 * 256]>(grp);
+        auto& hsum = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[256]>(grp);
+        auto& chunk = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[16]>(grp);
+        auto& sh = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[16]>(grp);
+        auto& sa = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[1024]>(grp);
+        auto& sb = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[1024]>(grp);
+        auto& ta = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[64]>(grp);
+        auto& tb = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[64]>(grp);
         const int t = (int) it.get_group(0);
         const int tid = (int) it.get_local_id(0);
         const int c = sycl::min(row_vis_blocks(win, t), nb_cap);
         const float* sc = score + (size_t) t * nb_cap;
         int32_t* out = sel + (size_t) t * kTopBlocks;
+        int32_t* dg = dbg + (size_t) t * 16;
         if (c <= kTopBlocks) {
             for (int i = tid; i < c; i += 1024) out[i] = i;
-            if (tid == 0) nsel[t] = c;
+            if (tid == 0) {
+                nsel[t] = c;
+                for (int k = 0; k < 16; ++k) dg[k] = 0;
+                dg[8] = c; dg[13] = c;
+            }
             return;
         }
         uint32_t prefix = 0;
         int rem = kTopBlocks;
+        const int rep = (tid & 15) * 256;   // this lane's copy of the histogram
         for (int pass = 0; pass < 4; ++pass) {
             const int shift = 24 - 8 * pass;
-            if (tid < 256) hist[tid] = 0;
+            for (int i = tid; i < 16 * 256; i += 1024) hist[i] = 0;
             sycl::group_barrier(grp);
-            // The first two digits are low in entropy (the scores of a row share their exponent: nearly all of the 64K elements fall in a
-            // few bins), so there a sub-group first counts the lanes of equal bin and the lowest of them adds the count once; passes 2 and 3
-            // see only the elements that match the prefix.  (Every lane takes the same trips: the shuffles are convergent.)
-            for (int base = 0; base < c; base += 1024) {
-                const int i = base + tid;
-                int bin = -1;
-                if (i < c) {
-                    const uint32_t u = skey(sc[i]);
-                    if (pass == 0 || (u >> (shift + 8)) == prefix) bin = (int) ((u >> shift) & 255u);
-                }
-                if (pass < 2) {
-                    int cnt = 0, first = 16;
-#pragma unroll
-                    for (int k = 0; k < 16; ++k) {
-                        const int ob = sycl::select_from_group(sg, bin, sycl::id<1>(k));
-                        if (ob == bin) { ++cnt; if (first == 16) first = k; }
-                    }
-                    if (bin >= 0 && first == lane) {
-                        sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::generic_space> a(hist[bin]);
-                        a.fetch_add(cnt);
-                    }
-                } else if (bin >= 0) {
-                    sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::generic_space> a(hist[bin]);
+            for (int i = tid; i < c; i += 1024) {
+                const uint32_t u = skey(sc[i]);
+                if (pass == 0 || (u >> (shift + 8)) == prefix) {
+                    sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::local_space>
+                        a(hist[rep + (int) ((u >> shift) & 255u)]);
                     a.fetch_add(1);
                 }
             }
             sycl::group_barrier(grp);
+            if (tid < 256) {
+                int s = 0;
+                for (int r = 0; r < 16; ++r) s += hist[r * 256 + tid];
+                hsum[tid] = s;
+            }
+            sycl::group_barrier(grp);
+            if (tid < 16) {
+                int s = 0;
+                for (int k = 0; k < 16; ++k) s += hsum[tid * 16 + k];
+                chunk[tid] = s;
+            }
+            sycl::group_barrier(grp);
             if (tid == 0) {
-                int cum = 0, bin = 255;
-                for (; bin > 0; --bin) {
-                    if (cum + hist[bin] >= rem) break;
-                    cum += hist[bin];
+                // the highest bin b with (count in the bins above b) + hsum[b] >= rem
+                int cum = 0, ch = 15, total = 0;
+                for (int k = 0; k < 16; ++k) total += chunk[k];
+                for (; ch > 0; --ch) {
+                    if (cum + chunk[ch] >= rem) break;
+                    cum += chunk[ch];
+                }
+                int bin = ch * 16 + 15;
+                for (; bin > ch * 16; --bin) {
+                    if (cum + hsum[bin] >= rem) break;
+                    cum += hsum[bin];
                 }
                 sh[0] = bin; sh[1] = cum;
+                dg[4 + pass] = total; dg[9 + pass] = bin;
             }
             sycl::group_barrier(grp);
             prefix = (prefix << 8) | (uint32_t) sh[0];
@@ -488,10 +506,35 @@ void launch_select(sycl::queue& q, const float* score, Win win, int nb_cap, int3
             gt += u > prefix;
             eq += u == prefix;
         }
-        const int eq_before = sycl::exclusive_scan_over_group(grp, eq, sycl::plus<int>());
+        // exclusive scans of gt and eq over the 1024 work-items: 64 chunks of 16 in parallel, then the 64 chunk sums by one work-item
+        sa[tid] = gt; sb[tid] = eq;
+        sycl::group_barrier(grp);
+        if (tid < 64) {
+            int g = 0, e = 0;
+            for (int k = 0; k < 16; ++k) {
+                const int i = tid * 16 + k;
+                const int x = sa[i], y = sb[i];
+                sa[i] = g; sb[i] = e;
+                g += x; e += y;
+            }
+            ta[tid] = g; tb[tid] = e;
+        }
+        sycl::group_barrier(grp);
+        if (tid == 0) {
+            int g = 0, e = 0;
+            for (int k = 0; k < 64; ++k) {
+                const int x = ta[k], y = tb[k];
+                ta[k] = g; tb[k] = e;
+                g += x; e += y;
+            }
+            sh[2] = g; sh[3] = e;
+        }
+        sycl::group_barrier(grp);
+        const int gt_before = sa[tid] + ta[tid >> 4];
+        const int eq_before = sb[tid] + tb[tid >> 4];
+        // the work-items before this one take min(rem, eq_before) of the equal scores (each takes the first rem - eq_before_j of its own)
         const int take_eq = sycl::min(sycl::max(rem - eq_before, 0), eq);
-        const int off = sycl::exclusive_scan_over_group(grp, gt + take_eq, sycl::plus<int>());
-        int o = off, seen = 0;
+        int o = gt_before + sycl::min(rem, eq_before), seen = 0;
         for (int i = lo; i < hi; ++i) {
             const uint32_t u = skey(sc[i]);
             if (u > prefix) {
@@ -501,7 +544,10 @@ void launch_select(sycl::queue& q, const float* score, Win win, int nb_cap, int3
                 ++seen;
             }
         }
-        if (tid == 0) nsel[t] = kTopBlocks;
+        if (tid == 0) {
+            nsel[t] = kTopBlocks;
+            dg[0] = (int) prefix; dg[1] = rem; dg[2] = sh[2]; dg[3] = sh[3]; dg[8] = c; dg[13] = sh[2] + sycl::min(rem, sh[3]);
+        }
     });
 }
 
@@ -742,7 +788,7 @@ void select_rows(const LayerState& lyr, const Scratch& sc, const Win& win, void*
         else if (w.nr <= 4) launch_score<4, TagScore4>(q, pooled, qp, w, sc.nb_cap, sp);
         else launch_score<8, TagScore8>(q, pooled, qp, w, sc.nb_cap, sp);
     }
-    launch_select(q, sc.score, win, sc.nb_cap, sc.sel, sc.nsel);
+    launch_select(q, sc.score, win, sc.nb_cap, sc.sel, sc.nsel, sc.dbg);
 }
 
 void attend_rows(const AttendArgs& a, const Win& win, void* stream) {

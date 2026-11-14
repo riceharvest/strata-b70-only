@@ -78,6 +78,7 @@ struct Scratch {
     float* score = nullptr;      // [score_rows][nb_cap]
     int32_t* sel = nullptr;      // [score_rows][512]  the selected blocks of a row, ascending
     int32_t* nsel = nullptr;     // [score_rows]
+    int32_t* dbg = nullptr;      // [score_rows][16]  what the select kernel decided (threshold key, counts, bins: see launch_select)
     int32_t* nitems = nullptr;   // [score_rows]       items (blocks) a row's attention walks
     float* pacc = nullptr;       // [kMaxWin * 24][kPieces][256]
     float* pm = nullptr;         // [kMaxWin * 24][kPieces]
