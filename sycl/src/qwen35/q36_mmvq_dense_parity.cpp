@@ -49,6 +49,7 @@ void dequant_f16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, 
 }
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1518,6 +1519,414 @@ int w4_bench(const char* ncols_s, const std::string& ssel) {
     return bad ? 1 : 0;
 }
 
+double time_graph_warm(sycl::queue& q, int nmat, const std::function<void(int)>& launch, int reps, double warm_sec = 0.4) {
+    sx::command_graph g(q.get_context(), q.get_device());
+    g.begin_recording(q);
+    for (int m = 0; m < nmat; ++m) launch(m);
+    g.end_recording(q);
+    auto ge = g.finalize();
+    q.ext_oneapi_graph(ge);
+    q.wait();
+    const auto t0 = std::chrono::steady_clock::now();
+    do {
+        q.ext_oneapi_graph(ge);
+        q.wait();
+    } while (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < warm_sec);
+    std::vector<double> us;
+    us.reserve(reps);
+    for (int i = 0; i < reps; ++i) {
+        sycl::event e0 = q.ext_oneapi_submit_barrier();
+        q.ext_oneapi_graph(ge);
+        sycl::event e1 = q.ext_oneapi_submit_barrier();
+        e1.wait();
+        us.push_back(double(e1.get_profiling_info<sycl::info::event_profiling::command_end>() -
+                            e0.get_profiling_info<sycl::info::event_profiling::command_start>()) / 1e3 / nmat);
+    }
+    std::sort(us.begin(), us.end());
+    return us[us.size() / 2];
+}
+
+std::vector<double> decode_w4x_act(const std::vector<uint8_t>& hact, int n_in, int nc, int gs) {
+    const int n_g128 = n_in / 128;
+    const int ng = (nc + 7) / 8;
+    const size_t stride = (gs == 32) ? 1216u : 1088u;
+    std::vector<double> xd((size_t) nc * n_in, 0.0);
+    for (int g = 0; g < n_g128; ++g) {
+        for (int col = 0; col < nc; ++col) {
+            const int gi = col >> 3, r = col & 7;
+            const uint8_t* gp = hact.data() + ((size_t) g * ng + gi) * stride;
+            if (gs == 128) {
+                float sa = 0.0f;
+                int32_t sxi_stored = 0;
+                std::memcpy(&sa, gp + 1024u + r * 4u, 4);
+                std::memcpy(&sxi_stored, gp + 1056u + r * 4u, 4);
+                int64_t sum_check = 0;
+                for (int p = 0; p < 2; ++p) {
+                    for (int hh = 0; hh < 2; ++hh) {
+                        for (int da = 0; da < 8; ++da) {
+                            uint32_t pk = 0;
+                            std::memcpy(&pk, gp + ((p * 2 + hh) * 64 + r * 8 + da) * 4u, 4);
+                            const int8_t qe0 = (int8_t) (uint8_t) (pk & 0xffu);
+                            const int8_t qo0 = (int8_t) (uint8_t) ((pk >> 8) & 0xffu);
+                            const int8_t qe1 = (int8_t) (uint8_t) ((pk >> 16) & 0xffu);
+                            const int8_t qo1 = (int8_t) (uint8_t) ((pk >> 24) & 0xffu);
+                            const int k_e = g * 128 + p * 64 + hh * 16 + da * 2;
+                            const int k_o = k_e + 32;
+                            xd[(size_t) col * n_in + k_e + 0] = (double) sa * (double) qe0;
+                            xd[(size_t) col * n_in + k_e + 1] = (double) sa * (double) qe1;
+                            xd[(size_t) col * n_in + k_o + 0] = (double) sa * (double) qo0;
+                            xd[(size_t) col * n_in + k_o + 1] = (double) sa * (double) qo1;
+                            sum_check += qe0 + qe1 + qo0 + qo1;
+                        }
+                    }
+                }
+                if (sum_check != sxi_stored) return {};
+            } else {
+                float sx_stored = 0.0f;
+                std::memcpy(&sx_stored, gp + 1152u + r * 4u, 4);
+                double sx_check = 0.0;
+                for (int sb = 0; sb < 4; ++sb) {
+                    float sa = 0.0f;
+                    std::memcpy(&sa, gp + 1024u + (sb * 8 + r) * 4u, 4);
+                    int64_t ssum = 0;
+                    for (int da = 0; da < 8; ++da) {
+                        uint32_t pk = 0;
+                        std::memcpy(&pk, gp + (sb * 64 + r * 8 + da) * 4u, 4);
+                        for (int b = 0; b < 4; ++b) {
+                            const int8_t qv = (int8_t) (uint8_t) ((pk >> (8 * b)) & 0xffu);
+                            xd[(size_t) col * n_in + g * 128 + sb * 32 + da * 4 + b] = (double) sa * (double) qv;
+                            ssum += qv;
+                        }
+                    }
+                    sx_check += (double) ((float) ssum * sa);
+                }
+                if (std::fabs(sx_check - (double) sx_stored) > 1e-3 * (std::fabs(sx_check) + 1.0)) return {};
+            }
+        }
+    }
+    return xd;
+}
+
+double w4x_f64_rel(const uint32_t* base, const std::vector<double>& xd, const std::vector<float>& hy,
+                   int n_in, int n_out, int nc) {
+    const int REC = 544, bpr = n_in / 256;
+    double ss = 0.0, sd = 0.0;
+    for (int o = 0; o < n_out; ++o) {
+        if (!(o < 32 || o >= n_out - 16)) continue;
+        const int t = o / 16, i = o % 16;
+        for (int j = 0; j < nc; ++j) {
+            double acc = 0.0;
+            for (int c = 0; c < bpr; ++c) {
+                const uint32_t* rec = base + ((size_t) t * bpr + c) * REC;
+                for (int sb = 0; sb < 8; ++sb) {
+                    const int pr = sb >> 1, g = sb >> 2;
+                    const uint32_t meta = rec[512 + 16 * g + i];
+                    const double sc = (double) (float) sycl::bit_cast<sycl::half>((uint16_t) (meta & 0xffff));
+                    const int zero = (int) (meta >> 16);
+                    for (int l = 0; l < 32; ++l) {
+                        const uint32_t by = (rec[128 * pr + 16 * (l >> 2) + i] >> (8 * (l & 3))) & 0xff;
+                        const int qv = (sb & 1) ? (int) (by >> 4) : (int) (by & 15);
+                        acc += sc * (double) (qv - zero) * xd[(size_t) j * n_in + c * 256 + sb * 32 + l];
+                    }
+                }
+            }
+            const double got = hy[(size_t) j * n_out + o];
+            ss += acc * acc;
+            sd += (got - acc) * (got - acc);
+        }
+    }
+    return std::sqrt(sd / std::max(ss, 1e-30));
+}
+
+// --w4x [128|32|all] [ncols] [shape] [ks]: native u4 x s8 parity vs float64 + B70 590 GB/s floor benchmark.
+int w4x_bench(const std::string& mode, const char* ncols_s, const std::string& ssel, int ks_ovr) {
+    const std::vector<int> ncl = parse_list(ncols_s);
+    std::vector<int> gs_list;
+    if (mode == "128") gs_list = {128};
+    else if (mode == "32") gs_list = {32};
+    else if (mode != "gu") gs_list = {128, 32};
+
+    sycl::queue q(sycl::gpu_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()});
+    struct BShape { int n_in, n_out; const char* name; };
+    const BShape shapes[] = {
+        {5120, 17408, "27gu"}, {17408, 5120, "27down"}, {5120, 10240, "27qkv"},
+        {5120, 6144, "27gate"}, {6144, 5120, "27out"}, {5120, 12288, "27q"},
+        {5120, 1024, "27kv"}, {10240, 5120, "27eh"}, {5120, 248320, "27head"}};
+
+    const size_t REC = 544, POOL_DW = ((size_t) 704 << 20) / 4 / REC * REC;   // ~704 MiB (>64 MiB and > 644 MiB head)
+    std::vector<uint32_t> hpool(POOL_DW);
+    {
+        uint64_t st = 0x9E3779B97F4A7C15ull;
+        auto xr = [&] { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
+        for (size_t i = 0; i < POOL_DW; i += 2) { const uint64_t v = xr(); hpool[i] = (uint32_t) v; hpool[i + 1] = (uint32_t) (v >> 32); }
+        for (size_t r = 0; r < POOL_DW / REC; ++r)
+            for (int k = 0; k < 32; ++k) {
+                const uint64_t v = xr();
+                hpool[r * REC + 512 + k] = (0x1400u | (uint32_t) (v & 0x3ff)) | ((1u + (uint32_t) ((v >> 20) & 15)) << 16);
+            }
+    }
+    uint32_t* dpool = (uint32_t*) sycl::aligned_alloc_device(4096, POOL_DW * 4, q);
+    const int maxc = 32, maxout = 248320, maxin = 17408;
+    float* y = sycl::malloc_device<float>((size_t) maxc * maxout, q);
+    float* y_solo = sycl::malloc_device<float>((size_t) maxout, q);
+    float* dh = sycl::malloc_device<float>((size_t) maxc * maxin, q);
+    float* dn = sycl::malloc_device<float>((size_t) maxin, q);
+    float* dir = sycl::malloc_device<float>((size_t) maxc, q);
+    std::vector<float> hx((size_t) maxc * maxin), hu((size_t) maxc * maxin), hn(maxin), hir(maxc);
+    float* dx = sycl::malloc_device<float>(hx.size(), q);
+    float* du = sycl::malloc_device<float>(hu.size(), q);
+    void* dact = sycl::aligned_alloc_device(4096, strata::q36xr::w4x_act_bytes(maxin, maxc, 32) + 4096, q);
+    if (!dpool || !y || !y_solo || !dh || !dn || !dir || !dx || !du || !dact) {
+        std::printf("w4x: could not allocate buffers\n");
+        return 1;
+    }
+    std::mt19937 rng(4242);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (auto& v : hx) v = nd(rng);
+    for (auto& v : hu) v = nd(rng);
+    for (auto& v : hn) v = 0.5f + 0.5f * std::fabs(nd(rng));
+    for (auto& v : hir) v = 0.5f + 0.25f * std::fabs(nd(rng));
+    q.memcpy(dx, hx.data(), hx.size() * 4).wait();
+    q.memcpy(du, hu.data(), hu.size() * 4).wait();
+    q.memcpy(dn, hn.data(), hn.size() * 4).wait();
+    q.memcpy(dir, hir.data(), hir.size() * 4).wait();
+    q.memcpy(dpool, hpool.data(), POOL_DW * 4).wait();
+
+    std::printf("q36_mmvq_dense_parity --w4x on %s (floor 590 GB/s, >=0.4s warmup, ~704 MiB pool)\n",
+                q.get_device().get_info<sycl::info::device::name>().c_str());
+    int bad = 0;
+
+    for (const int gs : gs_list) {
+        const double bound = (gs == 128) ? 5e-5 : 5e-4;
+        // Contract check 1: RMSnorm-apply + quantize (with and without h_out) vs CPU float64
+        {
+            const int nin = 5120, nout = 5120, nc = 8;
+            strata::q36xr::w4x_rms_apply_quantize(dx, nin, dn, dir, dact, dh, nin, nin, nc, gs, &q);
+            strata::q36xr::mmvq_w4x(dpool, dact, y, nin, nout, nc, gs, &q, ks_ovr);
+            q.wait();
+            std::vector<float> hh((size_t) nc * nin), hy((size_t) nc * nout);
+            std::vector<uint8_t> hact(strata::q36xr::w4x_act_bytes(nin, nc, gs));
+            q.memcpy(hh.data(), dh, hh.size() * 4).wait();
+            q.memcpy(hy.data(), y, hy.size() * 4).wait();
+            q.memcpy(hact.data(), dact, hact.size()).wait();
+            double h_ss = 0, h_sd = 0;
+            for (int c = 0; c < nc; ++c)
+                for (int k = 0; k < nin; ++k) {
+                    const double want = (double) hx[(size_t) c * nin + k] * (double) hir[c] * (double) hn[k];
+                    const double got = hh[(size_t) c * nin + k];
+                    h_ss += want * want;
+                    h_sd += (got - want) * (got - want);
+                }
+            const double h_rel = std::sqrt(h_sd / std::max(h_ss, 1e-30));
+            const std::vector<double> xd = decode_w4x_act(hact, nin, nc, gs);
+            const double rel = xd.empty() ? 1.0 : w4x_f64_rel(hpool.data(), xd, hy, nin, nout, nc);
+            // Also verify h_out == nullptr variant writes identical quantized act bytes
+            std::vector<uint8_t> hact_noh(hact.size());
+            strata::q36xr::w4x_rms_apply_quantize(dx, nin, dn, dir, dact, nullptr, 0, nin, nc, gs, &q);
+            q.memcpy(hact_noh.data(), dact, hact_noh.size()).wait();
+            const bool noh_ok = (hact_noh == hact);
+            if (!(h_rel < 1e-6 && rel < bound && noh_ok)) ++bad;
+            std::printf("W4X-%-3d parity rms_apply_quant (h_out rel %.2e, mv rel %.2e, null_h %s)%s\n",
+                        gs, h_rel, rel, noh_ok ? "OK" : "FAIL", (h_rel < 1e-6 && rel < bound && noh_ok) ? "" : "  FAIL");
+        }
+        // Contract check 2: SwiGLU + quantize vs CPU float64
+        {
+            const int nin = 17408, nout = 5120, nc = 8;
+            strata::q36xr::w4x_swiglu_quantize(dx, du, dact, nin, nc, gs, &q);
+            strata::q36xr::mmvq_w4x(dpool, dact, y, nin, nout, nc, gs, &q, ks_ovr);
+            q.wait();
+            std::vector<float> hy((size_t) nc * nout);
+            std::vector<uint8_t> hact(strata::q36xr::w4x_act_bytes(nin, nc, gs));
+            q.memcpy(hy.data(), y, hy.size() * 4).wait();
+            q.memcpy(hact.data(), dact, hact.size()).wait();
+            const std::vector<double> xd = decode_w4x_act(hact, nin, nc, gs);
+            double s_ss = 0, s_sd = 0;
+            if (!xd.empty()) {
+                for (int c = 0; c < nc; ++c)
+                    for (int k = 0; k < nin; ++k) {
+                        const double g = hx[(size_t) c * nin + k], u = hu[(size_t) c * nin + k];
+                        const double want = (g / (1.0 + std::exp(-g))) * u;
+                        s_ss += want * want;
+                        s_sd += (xd[(size_t) c * nin + k] - want) * (xd[(size_t) c * nin + k] - want);
+                    }
+            }
+            const double s_rel = xd.empty() ? 1.0 : std::sqrt(s_sd / std::max(s_ss, 1e-30));
+            const double rel = xd.empty() ? 1.0 : w4x_f64_rel(hpool.data(), xd, hy, nin, nout, nc);
+            if (!(rel < bound && s_rel < 0.02)) ++bad;
+            std::printf("W4X-%-3d parity swiglu_quant    (q_rms %.2e, mv rel %.2e)%s\n",
+                        gs, s_rel, rel, (rel < bound && s_rel < 0.02) ? "" : "  FAIL");
+        }
+        // Contract check 3: Split-K sweep across all compiled KS in {1,2,3,4,5,10}
+        for (const int ks : {1, 2, 3, 4, 5, 10}) {
+            const int nin = 5120, nout = 1024, nc = 16;
+            strata::q36xr::w4x_quantize(dx, nin, dact, nin, nc, gs, &q);
+            strata::q36xr::mmvq_w4x(dpool, dact, y, nin, nout, nc, gs, &q, ks);
+            q.wait();
+            std::vector<float> hy((size_t) nc * nout);
+            std::vector<uint8_t> hact(strata::q36xr::w4x_act_bytes(nin, nc, gs));
+            q.memcpy(hy.data(), y, hy.size() * 4).wait();
+            q.memcpy(hact.data(), dact, hact.size()).wait();
+            const std::vector<double> xd = decode_w4x_act(hact, nin, nc, gs);
+            const double rel = xd.empty() ? 1.0 : w4x_f64_rel(hpool.data(), xd, hy, nin, nout, nc);
+            if (!(rel < bound)) ++bad;
+            std::printf("W4X-%-3d parity ks=%-2d           (5120x1024 nc=16, rel %.2e)%s\n",
+                        gs, ks, rel, rel < bound ? "" : "  FAIL");
+        }
+
+        // Main per-shape benchmark + parity + 32/8 ratio + multi-col vs 1-col check
+        for (const BShape& sh : shapes) {
+            if (!(ssel == "27" || ssel == "all" || ssel == sh.name)) continue;
+            const size_t wb = strata::q36xr::w4_bytes(sh.n_in, sh.n_out), wdw = wb / 4;
+            const size_t ndist_raw = std::max<size_t>(1, POOL_DW / wdw);
+            const int ndist = (int) std::min<size_t>(128, ndist_raw);
+            const int nmat = std::max(ndist, sh.n_out > 100000 ? 1 : 16);
+            const double floor_us = (double) wb / 590e9 * 1e6;
+            double us8 = 0.0;
+
+            for (const int nc : ncl) {
+                if (nc < 1 || nc > maxc) continue;
+                strata::q36xr::w4x_quantize(dx, sh.n_in, dact, sh.n_in, nc, gs, &q);
+                q.wait();
+                const double us = time_graph_warm(q, nmat, [&](int m) {
+                    if (!strata::q36xr::mmvq_w4x(dpool + (size_t) (m % ndist) * wdw, dact, y,
+                                                 sh.n_in, sh.n_out, nc, gs, &q, ks_ovr))
+                        throw std::runtime_error("mmvq_w4x declined bench call");
+                }, wb > (100u << 20) ? 5 : 9, 0.4);
+                q.wait();
+                if (nc == 8) us8 = us;
+
+                std::vector<float> hy((size_t) nc * sh.n_out);
+                std::vector<uint8_t> hact(strata::q36xr::w4x_act_bytes(sh.n_in, nc, gs));
+                q.memcpy(hy.data(), y, hy.size() * 4).wait();
+                q.memcpy(hact.data(), dact, hact.size()).wait();
+                const uint32_t* base = hpool.data() + (size_t) ((nmat - 1) % ndist) * wdw;
+                const std::vector<double> xd = decode_w4x_act(hact, sh.n_in, nc, gs);
+                const double rel = xd.empty() ? 1.0 : w4x_f64_rel(base, xd, hy, sh.n_in, sh.n_out, nc);
+                if (!(rel < bound)) ++bad;
+
+                // Contract check 4: batched column 0 matches solo nc=1 quant+gemv on the same weight copy
+                double solo_rel = 0.0;
+                if (nc > 1 && nc == ncl.back()) {
+                    strata::q36xr::w4x_quantize(dx, sh.n_in, dact, sh.n_in, 1, gs, &q);
+                    strata::q36xr::mmvq_w4x(dpool + (size_t) ((nmat - 1) % ndist) * wdw, dact, y_solo,
+                                            sh.n_in, sh.n_out, 1, gs, &q, ks_ovr);
+                    q.wait();
+                    std::vector<float> hsolo(sh.n_out);
+                    q.memcpy(hsolo.data(), y_solo, hsolo.size() * 4).wait();
+                    double ss = 0.0, sd = 0.0;
+                    for (int o = 0; o < sh.n_out; ++o) {
+                        const double a = hsolo[o], b = hy[o];
+                        ss += a * a;
+                        sd += (a - b) * (a - b);
+                    }
+                    solo_rel = std::sqrt(sd / std::max(ss, 1e-30));
+                    if (!(solo_rel < 1e-6)) ++bad;
+                }
+
+                const double gbps = (double) wb / us / 1e3;
+                const double r_floor = us / floor_us;
+                if (nc == 32 && us8 > 0.0) {
+                    std::printf("W4X-%-3d %-6s %5d x %6d nc %2d  %8.2f us %5.1f GB/s (%4.2fx fl %7.2f)  32/8 %.2fx  rel %.2e (solo %.1e)%s\n",
+                                gs, sh.name, sh.n_in, sh.n_out, nc, us, gbps, r_floor, floor_us, us / us8, rel, solo_rel,
+                                (rel < bound && solo_rel < 1e-6) ? "" : "  FAIL");
+                } else {
+                    std::printf("W4X-%-3d %-6s %5d x %6d nc %2d  %8.2f us %5.1f GB/s (%4.2fx fl %7.2f)  rel %.2e%s\n",
+                                gs, sh.name, sh.n_in, sh.n_out, nc, us, gbps, r_floor, floor_us, rel,
+                                rel < bound ? "" : "  FAIL");
+                }
+                std::fflush(stdout);
+            }
+        }
+    }
+
+    // Optional merged gate+up SwiGLU kernel parity & bench (GS = 128 only)
+    if (mode == "all" || mode == "128" || mode == "gu") {
+        const int nin = 5120, nff = 17408, nout = 5120;
+        const size_t gu_bytes = strata::q36xr::w4x_gu_merged_bytes(nin, nff);
+        const size_t down_bytes = strata::q36xr::w4_bytes(nff, nout);
+        const size_t gu_dw = gu_bytes / 4, dn_dw = down_bytes / 4;
+        const int nd_gu = (int) std::max<size_t>(1, POOL_DW / gu_dw);
+        const size_t act_dn_sz = strata::q36xr::w4x_act_bytes(nff, maxc, 128);
+        if (gu_dw + dn_dw <= POOL_DW) {
+            void* dact_dn = sycl::aligned_alloc_device(4096, act_dn_sz + 4096, q);
+            void* dact_ref = sycl::aligned_alloc_device(4096, act_dn_sz + 4096, q);
+            uint32_t* dgate = (uint32_t*) sycl::aligned_alloc_device(4096, strata::q36xr::w4_bytes(nin, nff), q);
+            uint32_t* dup   = (uint32_t*) sycl::aligned_alloc_device(4096, strata::q36xr::w4_bytes(nin, nff), q);
+            float* d_sg = sycl::malloc_device<float>((size_t) maxc * nff, q);
+            float* d_su = sycl::malloc_device<float>((size_t) maxc * nff, q);
+            const uint32_t* d_down = dpool + gu_dw;
+            const uint32_t* h_down = hpool.data() + gu_dw;
+            if (dact_dn && dact_ref && dgate && dup && d_sg && d_su) {
+                const uint32_t* merged_h = hpool.data();
+                const int n_fg = nff / 128, bpr = nin / 256;
+                std::vector<uint32_t> hgate(strata::q36xr::w4_bytes(nin, nff) / 4);
+                std::vector<uint32_t> hup(strata::q36xr::w4_bytes(nin, nff) / 4);
+                for (int fg = 0; fg < n_fg; ++fg) {
+                    for (int lt = 0; lt < 8; ++lt) {
+                        const int tile = fg * 8 + lt;
+                        for (int kb = 0; kb < bpr; ++kb) {
+                            const uint32_t* mg = merged_h + (((size_t) fg * 8 + lt) * bpr + kb) * 2 * REC;
+                            std::memcpy(&hgate[((size_t) tile * bpr + kb) * REC], mg, REC * 4);
+                            std::memcpy(&hup[((size_t) tile * bpr + kb) * REC], mg + REC, REC * 4);
+                        }
+                    }
+                }
+                q.memcpy(dgate, hgate.data(), hgate.size() * 4).wait();
+                q.memcpy(dup,   hup.data(),   hup.size() * 4).wait();
+                const double floor_gu = (double) gu_bytes / 590e9 * 1e6;
+
+                for (const int nc : ncl) {
+                    if (nc < 1 || nc > maxc) continue;
+                    strata::q36xr::w4x_quantize(dx, nin, dact, nin, nc, 128, &q);
+                    const double us = time_graph_warm(q, std::max(nd_gu, 16), [&](int m) {
+                        strata::q36xr::mmvq_w4x_gu_swiglu(dpool + (size_t) (m % nd_gu) * gu_dw, dact, dact_dn, nin, nff, nc, 128, &q);
+                    }, 9, 0.4);
+                    strata::q36xr::mmvq_w4x_gu_swiglu(dpool, dact, dact_dn, nin, nff, nc, 128, &q);
+                    strata::q36xr::mmvq_w4x(d_down, dact_dn, y, nff, nout, nc, 128, &q, ks_ovr);
+                    strata::q36xr::mmvq_w4x(dgate, dact, d_sg, nin, nff, nc, 128, &q);
+                    strata::q36xr::mmvq_w4x(dup,   dact, d_su, nin, nff, nc, 128, &q);
+                    strata::q36xr::w4x_swiglu_quantize(d_sg, d_su, dact_ref, nff, nc, 128, &q);
+                    q.wait();
+
+                    const size_t act_cur = strata::q36xr::w4x_act_bytes(nff, nc, 128);
+                    std::vector<uint8_t> ha_dn(act_cur), ha_ref(act_cur);
+                    std::vector<float> hy((size_t) nc * nout);
+                    q.memcpy(ha_dn.data(), dact_dn, act_cur).wait();
+                    q.memcpy(ha_ref.data(), dact_ref, act_cur).wait();
+                    q.memcpy(hy.data(), y, hy.size() * 4).wait();
+                    const std::vector<double> xd_dn = decode_w4x_act(ha_dn, nff, nc, 128);
+                    const std::vector<double> xd_ref = decode_w4x_act(ha_ref, nff, nc, 128);
+                    double act_ss = 0.0, act_sd = 0.0;
+                    if (!xd_dn.empty() && !xd_ref.empty()) {
+                        for (size_t i = 0; i < xd_dn.size(); ++i) {
+                            act_ss += xd_ref[i] * xd_ref[i];
+                            act_sd += (xd_dn[i] - xd_ref[i]) * (xd_dn[i] - xd_ref[i]);
+                        }
+                    }
+                    const double act_rel = (xd_dn.empty() || xd_ref.empty()) ? 1.0 : std::sqrt(act_sd / std::max(act_ss, 1e-30));
+                    const double down_rel = xd_dn.empty() ? 1.0 : w4x_f64_rel(h_down, xd_dn, hy, nff, nout, nc);
+                    if (!(act_rel < 2e-3 && down_rel < 5e-5)) ++bad;
+                    std::printf("W4X-GU  gu+swi %5d x %6d nc %2d  %8.2f us %5.1f GB/s (%4.2fx fl %7.2f)  act rel %.2e down rel %.2e%s\n",
+                                nin, nff, nc, us, gu_bytes / us / 1e3, us / floor_gu, floor_gu, act_rel, down_rel,
+                                (act_rel < 2e-3 && down_rel < 5e-5) ? "" : "  FAIL");
+                    std::fflush(stdout);
+                }
+            }
+            if (dact_dn) sycl::free(dact_dn, q);
+            if (dact_ref) sycl::free(dact_ref, q);
+            if (dgate) sycl::free(dgate, q);
+            if (dup) sycl::free(dup, q);
+            if (d_sg) sycl::free(d_sg, q);
+            if (d_su) sycl::free(d_su, q);
+        }
+    }
+
+    sycl::free(dpool, q); sycl::free(y, q); sycl::free(y_solo, q);
+    sycl::free(dh, q); sycl::free(dn, q); sycl::free(dir, q);
+    sycl::free(dx, q); sycl::free(du, q); sycl::free(dact, q);
+    return bad ? 1 : 0;
+}
+
 // --floor: us per launch of a kernel that does nothing but one store, in the same graph replay as --bench
 int floor_bench() {
     sycl::queue q(sycl::gpu_selector_v, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()});
@@ -1773,6 +2182,13 @@ int main(int argc, char** argv) try {
     if (argc > 1 && std::string(argv[1]) == "--floor") return floor_bench();
     if (argc > 1 && std::string(argv[1]) == "--xatt") return xatt_bench(argc > 2 ? argv[2] : "1,5,6,16", argc > 3 ? std::atoi(argv[3]) : 25120, argc > 4 ? std::atoi(argv[4]) : 1);
     if (argc > 1 && std::string(argv[1]) == "--w4") return w4_bench(argc > 2 ? argv[2] : "1,4,5,6,8", argc > 3 ? argv[3] : "27");
+    if (argc > 1 && std::string(argv[1]) == "--w4x") {
+        const std::string mode = argc > 2 ? argv[2] : "all";
+        const char* ncols_s    = argc > 3 ? argv[3] : "1,8,16,32";
+        const std::string ssel = argc > 4 ? argv[4] : "27";
+        const int ks_ovr       = argc > 5 ? std::atoi(argv[5]) : 0;
+        return w4x_bench(mode, ncols_s, ssel, ks_ovr);
+    }
     if (argc > 1 && (std::string(argv[1]) == "--pp" || std::string(argv[1]) == "--pp-bench")) {
         const bool is_pp_bench = std::string(argv[1]) == "--pp-bench";
         int idx = 2;
