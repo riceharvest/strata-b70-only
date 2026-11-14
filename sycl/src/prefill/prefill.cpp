@@ -254,7 +254,7 @@ inline std::FILE* pf_layer_hash_file() {
 inline bool i24_fix_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_I24_FIX");
-        return v != nullptr && std::atoi(v) != 0;
+        return v == nullptr || std::atoi(v) != 0;   // default on (apply_b70_defaults also sets 1)
     }();
     return on;
 }

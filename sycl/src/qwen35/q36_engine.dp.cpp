@@ -2265,15 +2265,16 @@ bool q36_batch_sample_on() {   // STRATA_Q36_BATCH_SAMPLE=1: in a --batch --batc
 // STRATA_Q36_SOLO_WINDOW=1: a request that runs with no slot decoding (the solo path of a --batch N engine) uses the single-session
 // speculative windows (the graph form, with the sampled / penalised draw on the host) and the single-session product choice, so it
 // runs at the single-stream speed whatever its sampler.  0 (default): the solo path of a batch engine is as before (greedy drafts
-// through the eager step, a sampled request one token a step).
+// through the eager step, a sampled request one token a step).  DEFAULT ON since 2026-11-14 (card: one sampled request on a
+// --batch 8 server 34.0 -> 94.2 tok/s, text identical to a single-session server); STRATA_Q36_SOLO_WINDOW=0 turns it off.
 bool q36_solo_window_on() {
-    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_SOLO_WINDOW"); return e && e[0] != '0' && e[0] != '\0'; }();
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_SOLO_WINDOW"); return !(e && e[0] == '0'); }();
     return on;
 }
 // STRATA_Q36_RNG_HAND=1: a sampled request that the server stops to continue it in a batch slot hands its random stream over (the
 // state after the draws of the tokens it showed), so the slot goes on with the next draw instead of starting the stream again.
 bool q36_rng_hand_on() {
-    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_RNG_HAND"); return e && e[0] != '0' && e[0] != '\0'; }();
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_RNG_HAND"); return !(e && e[0] == '0'); }();
     return on;
 }
 // ---- LANE SOLO (end)
@@ -4058,7 +4059,8 @@ struct Engine {
             const char* e = std::getenv("STRATA_Q36_W4A16");
             const char* et = std::getenv("STRATA_Q36_W4H_T");
             const char* ex = std::getenv("STRATA_Q36_W4X");
-            w4x_mode = (ex && ex[0] == '2') ? 2 : (ex && ex[0] == '1') ? 1 : 0;
+            // default 1 since 2026-11-14 (card: 26K answer +5-13%, KL 0.00065 top-1 100%); 0 = off, 2 = gs 32 (slower)
+            w4x_mode = (ex && ex[0] == '2') ? 2 : (ex && ex[0] == '0') ? 0 : 1;
             w4x_gs = (w4x_mode == 2) ? 32 : 128;
             const bool draft_may_w4 = m->draft_w4 || (m->has_mtp && q36_draft_w4());
             // Auto-hybrid W4 (1..8 cols) + W4A16 (9..16 cols) for batched decode (n_sess > 1) or explicit override;

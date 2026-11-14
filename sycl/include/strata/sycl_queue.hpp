@@ -218,8 +218,9 @@ inline void apply_b70_defaults() {
         {"STRATA_SPEC_PROB", "1"},
         {"STRATA_SPEC_COUPLED", "1"},
         {"STRATA_SPEC_PROB_GATE", "top"},
-        // #24: stopping prefill's early_copy at the first unpinned expert keeps FIFO ring order (opt-in diagnostic fix)
-        {"STRATA_I24_FIX", "0"},
+        // #24: stopping prefill's early_copy at the first unpinned expert keeps FIFO ring order.  Card 2026-11-14 (served
+        // UD-IQ1_S pack, caches off): default 1 of 36 pairs differs (long8), fix 36 of 36 bit-identical in 3 of 3 runs.
+        {"STRATA_I24_FIX", "1"},
     };
     std::string applied;
     for (const auto& [k, v] : defaults) {
