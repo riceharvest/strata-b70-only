@@ -2237,18 +2237,34 @@ bool q36_spec_sample_on() {   // STRATA_Q36_SPEC_SAMPLE: a request with a temper
     static const bool on = [] { const char* e = std::getenv("STRATA_Q36_SPEC_SAMPLE"); return !(e && e[0] == '0'); }();
     return on;
 }
-// STRATA_Q36_SPEC_COUPLE=1 (off by default): a request with a temperature draws by Gumbel-max with a key per token
-// (Sampling::coupled, q36_sampling.hpp), and in the one-session verify window's draft CHAIN the draft head makes the same
-// draw from its own logits instead of taking their argmax.  The target's draw is the plain path's either way (same
-// distribution, one output of the stream a token); a seed's text is another than without the switch.
-// Measured on the B70 (2026-11-15, int4 pack, temperature 1.0 / top-p 0.95 / top-k 20, thinking on): no gain.  Most steps of
-// a served request verify a TREE of the draft head's two best tokens (spec_step_tree, head_draft_top2), which this does not
-// touch, so the chain's draw reaches few steps; where it does, the draft head is less sure than the target, and drawing
-// from it as it is misses where the target is sure.  With the same seed the drafts accepted did not move with
-// STRATA_Q36_SPEC_COUPLE_SHARP from 2 to 1000 (26K: 472 of 950 every time; 118K: 474 of 873).  Kept as a switch: the place to
-// take it further is the tree's second candidate (the coupled draw instead of the second best token).
+// STRATA_Q36_SPEC_COUPLE (default 1; 0: as before): a request with a temperature draws by Gumbel-max with a key per token
+// (Sampling::coupled, q36_sampling.hpp), and the verify TREE's drafts follow the draw the target will make: of the draft
+// head's two best tokens the one that draw would take leads as the spine (spec_step_tree).  The target's draw is the plain
+// path's either way (same distribution, one output of the stream a token); a seed's text is another than with 0.
+// Measured on the B70 (2026-11-15, int4 pack, temperature 1.0 / top-p 0.95 / top-k 20, thinking on, the same seeds and so
+// the same texts, the head's best token leading against the coupled one): after a 26K prompt 71.6 -> 77.3 tok/s over 6 seeds
+// (drafts accepted 48.4% -> 53.5%), a short prompt 118.1 -> 122.1 over 8.  STRATA_Q36_SPEC_COUPLE_SHARP (a factor on the
+// head's logits for that choice) did not help: 3 gave 73.3 / 118.2.
 bool q36_spec_couple_on() {
-    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_SPEC_COUPLE"); return e != nullptr && e[0] == '1'; }();
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_SPEC_COUPLE"); return !(e && e[0] == '0'); }();
+    return on;
+}
+// STRATA_Q36_SPEC_COUPLE_CELLS (default 65536; 0: at any length): the coupled draw leads the tree only while the
+// conversation holds fewer cells than this.  After a 118K prompt it measured no gain (5 seeds, the same texts: 59.6 tok/s
+// against 61.3 with the head's best token leading, 2 seeds of 5 ahead), where the trees are small and a row more reads the
+// whole cache; where it turns between 26K and 118K was not measured.  The target's draw is the same either way.
+long long q36_spec_couple_cells() {
+    static const long long n = [] {
+        const char* e = std::getenv("STRATA_Q36_SPEC_COUPLE_CELLS");
+        return e ? std::max(0ll, std::atoll(e)) : 65536ll;
+    }();
+    return n;
+}
+// STRATA_Q36_SPEC_COUPLE_CHAIN=1 (off): the plain draft CHAIN (spec_step_g, the steps that verify no tree) makes the coupled
+// draw on the card from the draft head's logits instead of taking their argmax.  No gain measured: few served steps take
+// the chain, and drawing from the whole head misses where the target is sure (the head is less sure than the target).
+bool q36_spec_couple_chain_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_SPEC_COUPLE_CHAIN"); return e != nullptr && e[0] == '1'; }();
     return on;
 }
 // STRATA_Q36_SPEC_COUPLE_RATIO (default 0.03): the coupled draft picks among the draft head's tokens whose probability is at
@@ -2272,6 +2288,25 @@ float q36_spec_couple_sharp() {
         return v >= 0.05f ? v : 1.f;
     }();
     return r;
+}
+// STRATA_Q36_ADM_CKPT (default 1; 0: as before): a request admitted beside decoding slots (--batch N) uses the prefix
+// checkpoints a request alone uses.  Until this an admission reused a cache only when its prompt was a strict continuation
+// of what a session held; a conversation's next turn is not one when the client sends the answer back without its
+// reasoning, so every turn of an agent that runs beside others read its whole conversation again.  Now the admission (1)
+// restores the deepest checkpoint under the prompt whose cells this slot's cache, or an idle session's (copied first),
+// still holds, and (2) leaves a checkpoint at the end of its own prompt (prompts of STRATA_Q36_ADM_CKPT_MIN tokens or more,
+// default 2048: the last token is read on its own for it, one step).
+bool q36_adm_ckpt_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_ADM_CKPT"); return !(e && e[0] == '0'); }();
+    return on;
+}
+bool q36_adm_ckpt_log() {   // STRATA_Q36_ADM_CKPT_LOG=1: a line an admission (what it looked at, what it took)
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_ADM_CKPT_LOG"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+int q36_adm_ckpt_min() {
+    static const int n = [] { const char* e = std::getenv("STRATA_Q36_ADM_CKPT_MIN"); const int v = e ? std::atoi(e) : 0; return v >= 256 ? v : 2048; }();
+    return n;
 }
 bool q36_batch_sample_on() {   // STRATA_Q36_BATCH_SAMPLE=1: in a --batch --batch-mtp window a sampled / penalised slot drafts too
     static const bool on = [] { const char* e = std::getenv("STRATA_Q36_BATCH_SAMPLE"); return !(e && e[0] == '0'); }();   // (default on; 0: the old one-row step)
@@ -8937,6 +8972,22 @@ work-group size if needed.
                              d_sess_ckpt_ptrs[(size_t) s], d_ckpt_tiles, ckpt_n_tiles, true);
     }
 
+    /// Forget one checkpoint (its VRAM slot is free again).
+    void drop_ckpt(PrefixEntry* e) {
+        if (e == nullptr) return;
+        if (e->vram_slot >= 0 && e->vram_slot < (int) ckpt_vram_owner.size() && ckpt_vram_owner[(size_t) e->vram_slot] == e)
+            ckpt_vram_owner[(size_t) e->vram_slot] = nullptr;
+        for (auto it = ckpt_entries.begin(); it != ckpt_entries.end(); ++it)
+            if (it->get() == e) { ckpt_entries.erase(it); break; }
+    }
+    /// The checkpoint at cell p of these tokens, if there is one.
+    PrefixEntry* find_ckpt(const std::vector<int32_t>& toks, int64_t p) {
+        for (auto& up : ckpt_entries)
+            if (up->pos == p && up->rolling_tag < 0 && (int64_t) up->tokens.size() == p && (size_t) p <= toks.size() &&
+                std::equal(up->tokens.begin(), up->tokens.end(), toks.begin()))
+                return up.get();
+        return nullptr;
+    }
     void restore_ckpt(int s, PrefixEntry& e) {
         if (cur != s) select(s);
         if (e.vram_slot < 0) {
@@ -9145,7 +9196,7 @@ work-group size if needed.
         // The coupled draft (STRATA_Q36_SPEC_COUPLE): a sampled request's draft chain draws as the target will.  Draft d is
         // compared with row d's draw, which takes the d-th next output of the request's stream: those outputs, peeked.
         const bool couple = sel != nullptr && given == nullptr && gum_key != nullptr && head_d.d != nullptr && sel->s->coupled &&
-                            sel->s->temperature > 0.f && D <= kVerify;
+                            sel->s->temperature > 0.f && D <= kVerify && q36_spec_couple_chain_on();
         if (couple) {
             strata::qwen35::peek_draw_keys(*sel->rng, D, gum_h);
             const float sharp = q36_spec_couple_sharp();   // (the margin is in logits: the same share of the sharpened distribution)
@@ -9314,8 +9365,28 @@ work-group size if needed.
         int n_mtp_used = 1;
         std::vector<int> frontier;
         const float thr0 = q36_tree_thr0(), thr1 = q36_tree_thr1();
+        // STRATA_Q36_SPEC_COUPLE (a sampled request): the token after a node of depth L is row L's draw, which takes the L-th
+        // next output of the request's stream as its key.  Of the draft head's two best tokens for that place, the one that
+        // draw would take from the head's own logits (Gumbel-max under the key, q36_sampling.hpp) leads: it is the spine,
+        // which the tree follows deepest, and the head's best token becomes the alternative.  Host code only: the two
+        // candidates and their logits are already here.  The verify window's draw decides as before.
+        uint64_t ckeys[kVerify + 1];
+        const bool couple = sel != nullptr && sel->s->coupled && sel->s->temperature > 0.f &&
+                            (q36_spec_couple_cells() == 0 || pos < q36_spec_couple_cells());
+        if (couple) strata::qwen35::peek_draw_keys(*sel->rng, kVerify + 1, ckeys);
+        const float c_scale = couple ? q36_spec_couple_sharp() / sel->s->temperature : 0.f;
+        const auto lead = [&](TreeTop2 t, int level) -> TreeTop2 {   // level: the depth of the node whose children these are
+            if (!couple || t.id1 == t.id0 || level < 0 || level > kVerify || !(t.v1 > -INFINITY)) return t;
+            const double s0 = (double) t.v0 * c_scale + strata::qwen35::couple_gumbel(ckeys[level], t.id0);
+            const double s1 = (double) t.v1 * c_scale + strata::qwen35::couple_gumbel(ckeys[level], t.id1);
+            if (s1 > s0) {
+                std::swap(t.id0, t.id1);
+                std::swap(t.v0, t.v1);
+            }
+            return t;
+        };
         {
-            const TreeTop2& r0 = h_top2[0];
+            const TreeTop2 r0 = lead(h_top2[0], 0);
             raw.push_back({r0.id0, 0, 1, 0, -1, 0u, true});
             frontier.push_back(1);
             const bool add_alt1 = (r0.v0 - r0.v1) <= thr0 && r0.id1 != r0.id0 && (int) raw.size() < Tmax;
@@ -9383,7 +9454,7 @@ work-group size if needed.
             // Expand spine node first so depth progresses cleanly.
             {
                 const int u0 = frontier[0];
-                const TreeTop2& tp = h_top2[0];
+                const TreeTop2 tp = lead(h_top2[0], d);
                 const int id_sp = (int) raw.size();
                 raw.push_back({tp.id0, u0, d + 1, 0, -1, 0u, true});
                 next_f.push_back(id_sp);
@@ -9399,7 +9470,7 @@ work-group size if needed.
                 if (d >= 2 && rem < 2) break;   // preserve remaining slot for spine's next depth
                 const int u = frontier[(size_t) b];
                 const int id_c = (int) raw.size();
-                raw.push_back({h_top2[b].id0, u, d + 1, 0, -1, 0u, false});
+                raw.push_back({lead(h_top2[b], d).id0, u, d + 1, 0, -1, 0u, false});
                 --rem;
                 if (d == 1 && rem >= 3 && (int) next_f.size() < kTreeFrontMax) next_f.push_back(id_c);
             }
@@ -9880,7 +9951,7 @@ work-group size if needed.
                     strata::qwen35::Sampling ws;
                     ws.temperature = 1.f;
                     ws.top_k = 4;
-                    ws.coupled = q36_spec_couple_on();   // (the graphs a sampled request takes: the coupled draft's, or the argmax draft's)
+                    ws.coupled = q36_spec_couple_on();   // (with STRATA_Q36_SPEC_COUPLE_CHAIN: the graphs with the head's own draw)
                     const std::vector<int32_t> wh(1, filler);
                     std::mt19937_64 wr(1);
                     const SpecSel wsel{&ws, 4, 4, &wh, &wr};
@@ -10914,7 +10985,41 @@ struct Serve {
                 const size_t l = match_len(E.sess[(size_t) i], ids, ir.imgs);
                 if (l > best) { best = l; src = i; }
             }
-            if (src >= 0) {
+            // STRATA_Q36_ADM_CKPT: a checkpoint (the recurrent state at an earlier cell of this prompt) deeper than any live
+            // continuation, over a cache that still holds the prompt up to it: this slot's own, or an idle session's
+            Engine::PrefixEntry* ack = nullptr;
+            int ack_src = -1;
+            if (E.ckpt_on && q36_adm_ckpt_on()) {
+                for (int i = 0; i < E.n_sess; ++i) {
+                    if (q36_adm_ckpt_log())
+                        std::fprintf(stderr, "strata batch: admission to slot %d (%zu tokens): session %d %s, its cache holds %zu of the prompt's "
+                                             "first tokens (of %zu held), %zu checkpoints known\n", s, ids.size(), i,
+                                     E.sess[(size_t) i].active ? "decoding" : "idle", E.kv_lcp(i, ids, ir.imgs),
+                                     i < (int) E.kv_live.size() ? E.kv_live[(size_t) i].size() : (size_t) 0, E.ckpt_entries.size());
+                    if (i != s && E.sess[(size_t) i].active) continue;
+                    const size_t kvl = E.kv_lcp(i, ids, ir.imgs);
+                    for (auto& up : E.ckpt_entries) {
+                        const size_t cp = (size_t) up->pos;
+                        if (cp <= best || cp >= ids.size() || cp > kvl || up->tokens.size() != cp) continue;
+                        if (Engine::imgs_within(ir.imgs, up->pos) == up->imgs &&
+                            std::equal(up->tokens.begin(), up->tokens.end(), ids.begin())) {
+                            best = cp;
+                            ack = up.get();
+                            ack_src = i;
+                        }
+                    }
+                }
+            }
+            if (ack != nullptr) {
+                if (ack_src != s) E.copy_session(ack_src, s);   // (the cells; the state is the checkpoint's)
+                E.restore_ckpt(s, *ack);
+                const Engine::Sess& rs = E.sess[(size_t) s];
+                // (a checkpoint that could not be brought back leaves the session as it was: then only a strict continuation counts)
+                reuse = rs.pos == ack->pos && rs.live.size() == (size_t) ack->pos ? (size_t) ack->pos : match_len(rs, ids, ir.imgs);
+                if (q36_adm_ckpt_log())
+                    std::fprintf(stderr, "strata batch: admission to slot %d: checkpoint at %lld over session %d's cache -> %zu tokens kept\n", s,
+                                 (long long) ack->pos, ack_src, reuse);
+            } else if (src >= 0) {
                 E.copy_session(src, s);
                 reuse = best;
             }
@@ -10992,7 +11097,9 @@ struct Serve {
         const auto t0 = Clock::now();
         const int64_t fresh = (int64_t) (ids.size() - reuse);
         bool cancelled = false;
-        const bool split_tail_ckpt = !adm && E.ckpt_on && ids.size() >= 256 && fresh >= 2;
+        Engine::PrefixEntry* adm_chunk_ckpt = nullptr;   // an admission's read: the chunk checkpoint it keeps (the latest)
+        const bool split_tail_ckpt = E.ckpt_on && fresh >= 2 &&
+                                     (adm ? q36_adm_ckpt_on() && (int64_t) ids.size() >= q36_adm_ckpt_min() : ids.size() >= 256);
         const int64_t first_n = split_tail_ckpt ? fresh - 1 : fresh;
         auto run_pp_cb = [&](int64_t done_ofs, int64_t done_local, int64_t limit_local, bool save_chunks) -> bool {
             const int64_t done = done_ofs + done_local;
@@ -11016,14 +11123,31 @@ struct Serve {
             if (stop.load() && done < fresh) { cancelled = true; return false; }
             if (save_chunks && done_local < limit_local && (int64_t) reuse + done < (int64_t) ids.size() - 1) {
                 const int64_t cpos = (int64_t) reuse + done;
-                if (Engine::imgs_boundary_ok(ir.imgs, cpos))
+                if (Engine::imgs_boundary_ok(ir.imgs, cpos)) {
+                    const bool was_there = adm && E.find_ckpt(ids, cpos) != nullptr;   // (another read's: not this one's to drop)
                     E.save_ckpt(s, ids, ir.imgs, cpos, ss.rdelta, false);
+                    // An admission keeps one of these, the deepest (a request alone keeps every chunk's): the checkpoint at the
+                    // prompt's end is lost to any difference in its last tokens - a client that sends an answer back without its
+                    // reasoning, or an empty one, renders the turn's end another way - and this one is a chunk before it.
+                    if (adm) {
+                        Engine::PrefixEntry* now = E.find_ckpt(ids, cpos);
+                        if (now != nullptr && adm_chunk_ckpt != nullptr && adm_chunk_ckpt != now) {
+                            bool known = false;   // (it may have been pushed out since)
+                            for (auto& up : E.ckpt_entries) known = known || up.get() == adm_chunk_ckpt;
+                            if (known && !adm_chunk_ckpt->pin_turn) E.drop_ckpt(adm_chunk_ckpt);
+                        }
+                        adm_chunk_ckpt = now != nullptr && !was_there ? now : nullptr;
+                    }
+                }
             }
             return true;
         };
         int64_t got = E.process(ids.data() + reuse, first_n, [&](int64_t done) -> bool {
-            return run_pp_cb(0, done, first_n, !adm && E.ckpt_on);
+            return run_pp_cb(0, done, first_n, E.ckpt_on && (!adm || (q36_adm_ckpt_on() && (int64_t) ids.size() >= q36_adm_ckpt_min())));
         });
+        if (adm && q36_adm_ckpt_log())
+            std::fprintf(stderr, "strata batch: slot %d read %lld of %lld tokens; a checkpoint at its end: %s\n", s, (long long) got,
+                         (long long) first_n, split_tail_ckpt && !cancelled && got == first_n ? "yes" : "no");
         if (split_tail_ckpt && !cancelled && got == first_n) {
             E.save_ckpt(s, ids, ir.imgs, (int64_t) reuse + first_n, ss.rdelta, true);
             got += E.process(ids.data() + reuse + first_n, 1, [&](int64_t done) -> bool {
