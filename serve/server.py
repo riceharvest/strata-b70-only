@@ -1470,6 +1470,7 @@ class StrataEngine:
             self.last.update(prompt_read=int(f[14]))
         if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
             self.last.update(offloaded=int(f[15]))
+        solo = {}
         for tok in f[16:]:                                # key=value fields after the positional ones (the prompt's
             key, eq, value = tok.partition("=")           # first chunk and its streamed expert blobs)
             if eq and key in ("chunk", "experts_streamed"):
@@ -1477,6 +1478,24 @@ class StrataEngine:
                     self.last[key] = int(value)
                 except ValueError:
                     pass
+            elif eq and key in ("session", "held") and value.isdigit():
+                solo[key] = int(value)
+        # a request that ran alone on a batch engine: the session (a batch slot's) the engine chose for it and how many of
+        # the request's tokens it holds (see _note_solo_session)
+        self._solo_at = (solo["session"], solo["held"]) if len(solo) == 2 else None
+
+    def _note_solo_session(self, stream: list[int]) -> None:
+        """After the DONE of a request that ran alone (`stream`: its prompt and the tokens it was shown): the engine
+        chose the session it ran in and names it (`session=<slot> held=<tokens>`).  That session is a batch slot's, so
+        the slot holds this chat now and no longer what it held.  Without this the slot counted as what it was before
+        (empty, or another chat): the next request was sent into it and its read replaced the chat while an empty slot
+        stood by, and the chat's next turn read its whole history again."""
+        at, self._solo_at = getattr(self, "_solo_at", None), None
+        if at is None or not 0 <= at[0] < getattr(self, "batch", 0):
+            return
+        with self.slot_cv:
+            self.slot_held[at[0]] = list(stream[:at[1]])
+            self.slot_used[at[0]] = time.time()
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
@@ -2020,6 +2039,7 @@ class StrataEngine:
                         t = pending.pop(0)
                         out.append(t)
                         yield t
+                    self._note_solo_session(list(ids) + out)    # the slot whose session it ran in holds this chat now
                     if self._done_finish() == "nonfinite":    # #879 (never promoted to a slot)
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
@@ -2247,7 +2267,8 @@ class StrataEngine:
                     phase = "none"                      # #1059: it ended on the engine's ERR: no DONE to wait 300 s for
                 if phase == "solo":
                     self._send("STOP")
-                    self._drain_control("DONE", born=born)
+                    if self._drain_control("DONE", born=born) is not None:
+                        self._note_solo_session(list(ids) + out)
                 elif phase == "admit":
                     line = self._drain_control("BADM", born=born)
                     if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:

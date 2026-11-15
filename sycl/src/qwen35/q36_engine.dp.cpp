@@ -10853,6 +10853,23 @@ struct Serve {
     }
 
     /// The length of session ss's held tokens when they are a proper start of `ids` with the same pictures, else 0.
+    /// For the DONE line of a request that ran alone on a batch engine: ` session=<n> held=<tokens>`, the session it ran in
+    /// (the engine chooses it: the one whose cache or checkpoint serves the prompt, else an empty one, else the one used
+    /// longest ago) and how many of the client's tokens (the prompt and what it was shown) that session holds now.  A
+    /// session is a batch slot's, so the server learns which slot holds this chat - and which chat a slot no longer holds
+    /// (without it the server took that slot for what it held before, sent the next request there, and that request's
+    /// read replaced this chat while an empty slot stood by).  Empty for an admission (the server named the slot) and
+    /// for an engine of one session.
+    std::string solo_session_note(bool adm, int s, const std::vector<int32_t>& live, const std::vector<int32_t>& client) const {
+        if (adm || E.n_sess <= 1 || s < 0) return std::string();
+        size_t held = 0;
+        const size_t lim = std::min(live.size(), client.size());
+        while (held < lim && live[held] == client[held]) ++held;
+        char buf[64];
+        std::snprintf(buf, sizeof buf, " session=%d held=%zu", s, held);
+        return std::string(buf);
+    }
+
     size_t match_len(const Engine::Sess& ss, const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs) const {
         const size_t L = ss.live.size();
         if (L == 0 || L >= ids.size() || !std::equal(ss.live.begin(), ss.live.end(), ids.begin())) return 0;
@@ -11172,7 +11189,8 @@ struct Serve {
         E.sess[(size_t) E.cur].pos = E.pos;
         const double prompt_ms = ms_since(t0);
         if (cancelled) {
-            std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0 0 0 0.0 %lld 0\n", ids.size(), prompt_ms, reuse, (long long) got);
+            std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0 0 0 0.0 %lld 0%s\n", ids.size(), prompt_ms, reuse, (long long) got,
+                        solo_session_note(adm, s, ss.live, ids).c_str());
             if (adm) std::printf("BADM %d 0\n", slot);
             std::fflush(stdout);
             return;
@@ -11432,8 +11450,9 @@ struct Serve {
             put_rng_hand(client_live, smp, hr);
         }
         const double decode_ms = ms_since(d0);
-        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
-                    decode_ms, finish, accepted, offered, reuse, (long long) fresh);
+        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0%s\n", produced, ids.size(), prompt_ms,
+                    decode_ms, finish, accepted, offered, reuse, (long long) fresh,
+                    solo_session_note(adm, s, ss.live, client_live).c_str());
         std::fflush(stdout);
         if (E.ckpt_on && !adm && !mid_draft_stop && ss.live.size() >= 256 &&
             ss.live.size() <= client_live.size() && std::equal(ss.live.begin(), ss.live.end(), client_live.begin())) {
