@@ -61,6 +61,18 @@ console.log(JSON.stringify(out));
         # 10M prompt + 5M out = 1.50 + 2.35 = 3.85 -> $3.85
         self.assertEqual(self.run_js("fmtCost(calcCost(10000000, 0, 5000000))"), "$3.85")
 
+    def test_presets_and_tiers(self):
+        # DeepSeek V4.1 Flash 1017: off-peak and peak rates, 1M fresh in + 1M out
+        self.assertAlmostEqual(self.run_js("(pricingChoice.preset='deepseek-v4.1-flash', pricingChoice.tier='off-peak', calcCost(1e6,0,1e6))"), 0.75)
+        self.assertAlmostEqual(self.run_js("(pricingChoice.preset='deepseek-v4.1-flash', pricingChoice.tier='peak', calcCost(1e6,0,1e6))"), 1.5)
+        # cache read is billed on the reused tokens: 1M prompt all reused
+        self.assertAlmostEqual(self.run_js("(pricingChoice.preset='deepseek-v4.1-flash', pricingChoice.tier='peak', calcCost(1e6,1e6,0))"), 0.006)
+        # Qwen 3.8 27B
+        self.assertAlmostEqual(self.run_js("(pricingChoice.preset='qwen-3.8-27b', calcCost(1e6,0,1e6))"), 2.975)
+        # Custom uses the typed rates; a bad value counts as 0
+        self.assertAlmostEqual(self.run_js("(pricingChoice.preset='custom', pricingChoice.custom={inputPerM:1,outputPerM:2,cacheReadPerM:0.5}, calcCost(1e6,0,1e6))"), 3.0)
+        self.assertAlmostEqual(self.run_js("(pricingChoice.preset='custom', pricingChoice.custom={inputPerM:'x',outputPerM:2,cacheReadPerM:0}, calcCost(1e6,0,1e6))"), 2.0)
+
     def test_dashboard_tile_and_tables(self):
         self.assertIn('tile("Cost saved"', self.app_src)
         self.assertIn('title="Estimated cost saved vs Alibaba Cloud Qwen-Flash', self.index_html)
