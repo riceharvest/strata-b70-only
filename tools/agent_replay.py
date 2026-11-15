@@ -16,8 +16,9 @@ result, the next message).  So what the server reads each turn is what an agent'
 result, sometimes a user message.  THREADS threads run at once; each waits `gap` seconds between its turns (the tool
 running).  Nothing leaves the machine but the requests to URL.
 
-keys: gap=1.0, max_tokens=768, start=0 (first assistant turn replayed), ctx=60000 (a thread ends before its prompt passes
-this many tokens, estimated as characters / 3), seed=1 (which sessions), tag=<name> and out=<folder> (the turns are
+keys: gap=1.0, max_tokens=768, start=0 (first assistant turn replayed), min_ctx=0 (a thread starts at its first turn whose
+prompt has at least this many tokens: long conversations), ctx=60000 (a thread ends before its prompt passes this many
+tokens; both estimated as characters / 3), seed=1 (which sessions), tag=<name> and out=<folder> (the turns are
 written to <out>/replay-<tag>.json; no out: not written), stagger=2.0 (seconds between thread starts), same_system=0
 (1: every thread gets the same system prompt).
 
@@ -31,6 +32,7 @@ URL, MODEL, NTHREADS, NTURNS = sys.argv[1].rstrip("/"), sys.argv[2], int(sys.arg
 kv = dict(a.split("=", 1) for a in sys.argv[5:])
 GAP, MAXTOK, START = float(kv.get("gap", 1.0)), int(kv.get("max_tokens", 768)), int(kv.get("start", 0))
 CTX, SEED, TAG, STAGGER = int(kv.get("ctx", 60000)), int(kv.get("seed", 1)), kv.get("tag", "run"), float(kv.get("stagger", 2.0))
+MIN_CTX = int(kv.get("min_ctx", 0))
 SAME_SYSTEM = kv.get("same_system", "0") == "1"
 SESS = kv.get("sessions", "")
 REQS = kv.get("requests", "")
@@ -78,7 +80,22 @@ def clean(m):
     return out
 
 
-def load_sessions(n):
+def prompt_est(rows, upto, prefix):
+    """The estimated tokens of the prompt that asks for the assistant message at rows[upto]."""
+    system, tools = prefix
+    return est_tokens(system or "") + est_tokens(json.dumps(tools or [])) + sum(est_tokens(json.dumps(clean(r))) for r in rows[:upto])
+
+
+def first_turn(rows, prefix):
+    """The first assistant turn a thread replays: `start`, or with min_ctx the first one whose prompt is that long."""
+    a_idx = [k for k, r in enumerate(rows) if r["role"] == "assistant"]
+    for t in range(START, len(a_idx)):
+        if prompt_est(rows, a_idx[t], prefix) >= MIN_CTX:
+            return t
+    return None
+
+
+def load_sessions(n, prefix):
     fs = sorted(glob.glob(os.path.join(SESS, "*.jsonl")), key=os.path.getmtime)
     good = []
     for f in fs:
@@ -87,8 +104,14 @@ def load_sessions(n):
         except Exception:
             continue
         rows = [r for r in rows if r.get("role") in ("user", "assistant", "tool")]
-        if sum(1 for r in rows if r["role"] == "assistant") >= START + NTURNS and rows and rows[0]["role"] == "user":
-            good.append(rows)
+        if not rows or rows[0]["role"] != "user":
+            continue
+        a_idx = [k for k, r in enumerate(rows) if r["role"] == "assistant"]
+        t0 = first_turn(rows, prefix)
+        # (a thread must have its turns, and with min_ctx its first one must fit the context)
+        if t0 is None or t0 + NTURNS > len(a_idx) or (MIN_CTX > 0 and prompt_est(rows, a_idx[t0], prefix) + MAXTOK > CTX):
+            continue
+        good.append(rows)
     random.Random(SEED).shuffle(good)
     return good[:n]
 
@@ -117,7 +140,8 @@ def call(body):
 def thread(i, rows, prefix, res):
     system, tools = prefix
     a_idx = [k for k, r in enumerate(rows) if r["role"] == "assistant"]
-    for turn in range(START, START + NTURNS):
+    t0 = first_turn(rows, prefix)
+    for turn in range(t0, t0 + NTURNS):
         hist = [clean(r) for r in rows[:a_idx[turn]]]
         if est_tokens(system or "") + est_tokens(json.dumps(tools or [])) + sum(est_tokens(json.dumps(m)) for m in hist) + MAXTOK > CTX:
             break
@@ -137,7 +161,7 @@ def thread(i, rows, prefix, res):
 
 def main():
     prefixes = load_prefixes()
-    sessions = load_sessions(NTHREADS)
+    sessions = load_sessions(NTHREADS, prefixes[0])
     if len(sessions) < NTHREADS:
         print("only %d sessions long enough" % len(sessions))
     res = [[] for _ in sessions]
