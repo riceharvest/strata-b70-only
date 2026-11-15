@@ -1,9 +1,8 @@
 # Strix Halo (Ryzen AI Max, gfx1151) on Windows: install, what you get, what to know
 
 This page is for a Windows PC with a Ryzen AI Max "Strix Halo" chip (Radeon 8060S / 8050S, `gfx1151`). It says what Strata does there out
-of the box, what speed to expect with Qwen3.8-Flash-Next IQ3_S and with DeepSeek V4.1-Flash, and the traps on this hardware. The Linux
-build, the toolchain and the opt-in switches are on [STRIX_HALO.md](STRIX_HALO.md); the DeepSeek details are in
-[DEEPSEEK41.md](DEEPSEEK41.md).
+of the box, what speed to expect with Qwen3.8-Flash-Next IQ3_S and with DeepSeek V4.1-Flash (upstream only: this fork removed it), and the traps on this hardware. The Linux
+build, the toolchain and the opt-in switches are on [STRIX_HALO.md](STRIX_HALO.md).
 
 The structure of this page comes from the first Windows guide for this PC, written by HaiYunChuang (pull request #3029). It measured
 engines 0.1.41 to 0.1.47 with a hand-made configuration (`--mmap-experts`, a list of switches, a batch file). Since then the app and
@@ -28,7 +27,7 @@ the engine's own timings; the model is loaded before the clock starts). The numb
 | 32K prompt | **792 tok/s** (40.6 s) |
 | Coding-agent session, 6 turns | 69% of the prompt came from the conversation cache; answers 47 tok/s; 4.5 s to the first token per turn |
 
-**DeepSeek V4.1-Flash 2.00 bpw** (`strata launch --family deepseek41 --model ist-das-2.00bpw`, Faster mode, the drafter on; the 4K row is
+**DeepSeek V4.1-Flash 2.00 bpw** (upstream Strata, 2.00 bpw, Faster mode, the drafter on; the 4K row is
 the default 8K context, the others 64K context with `--context 64k`):
 
 | Test | Result |

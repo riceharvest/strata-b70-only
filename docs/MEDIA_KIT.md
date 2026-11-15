@@ -14,8 +14,8 @@ Suggested opening: **“Run powerful AI on your own computer. Chat, code and wor
 
 1. **Show the desktop app.** A chat and a visible result explain the product quickly.
 2. **Show the choice of interfaces.** The desktop app for a visual workspace; the terminal app for keyboard-driven use.
-3. **Show the three model families.** DeepSeekV4.1-Flash-1017, Qwen3.8-Flash-Next and Qwen3.6-35B-A3B.
-   Explain the [availability limits](AI_REFERENCE.md#model-families): DeepSeek V4.1-Flash is in the app and the Terminal since 0.2.5, on NVIDIA RTX 30, 40 and 50 and the Radeon AI PRO R9700 (Linux).
+3. **Show the two model families.** Qwen3.8-Flash-Next and Qwen3.6-35B-A3B.
+   Explain the [availability limits](AI_REFERENCE.md#model-families).
 4. **Choose a model for the machine.** Prefer ISTA-DASLab, then Unsloth, Gyro and other providers where compatible.
    Gyro is a memory-saving option, currently slower. State the model, quantization and hardware used in any live demo.
 5. **Connect a familiar tool.** Examples include Claude Code, Codex CLI, OpenCode, oh-my-pi, pi.dev and Hermes Agent.
@@ -45,8 +45,7 @@ establish a current default model or universal performance.
 - Use actual footage or label illustrations. Do not invent a successful install, generated answer or speed reading.
 - Keep the provider preference distinct from measured performance. The maintainer's collaboration with ISTA-DASLab
   explains the recommendation order; it does not prove a benchmark result.
-- DeepSeek V4.1-Flash runs in the desktop app and in the Terminal (0.2.5), on NVIDIA RTX 30, 40 and 50 and the Radeon AI PRO R9700 on Linux. Take its sets (1.75, 2.00 and 2.25 bpw), sizes and speeds from
-  [MODELS.md](MODELS.md#deepseek-v41-flash) and name the hardware. Do not invent quants or memory figures.
+- Take model sizes and speeds from [MODELS.md](MODELS.md) and name the hardware. Do not invent quants or memory figures.
 - Do not promise “any PC,” “every model,” or identical results across GPUs. Follow the model and hardware guides.
 - For speed comparisons, use a source report with hardware, model, quantization, engine version and workload.
   Keep reasoning tokens, decode speed, prompt speed and time to first answer distinct.

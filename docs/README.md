@@ -54,8 +54,6 @@ Kept for history and provenance; not part of the active single-B70 Linux setup:
 
 | File | Why it is out of scope here |
 | --- | --- |
-| [DEEPSEEK41.md](DEEPSEEK41.md) | Upstream/unmaintained: DeepSeek-V4.1-Flash (`strata-dsv41`) has not been maintained since 2026-10-30 after 2-bit + pruning quality loss on one B70; off by default (`DSV41=ON` enables the build) |
-| [DEEPSEEK_MAC.md](DEEPSEEK_MAC.md) | Upstream/out-of-scope: DeepSeek-V4.1-Flash on Apple Silicon Metal (`metal/` is removed in this fork) |
 | [STRIX_HALO_WINDOWS.md](STRIX_HALO_WINDOWS.md) | Upstream/out-of-scope: AMD Ryzen AI Max / Strix Halo (`gfx1151`) on Windows |
 | [A770_SPEED_SPEC.md](A770_SPEED_SPEC.md) | Upstream/out-of-scope: Intel Arc A770 Coder IQ1_M optimization campaign spec (not the Arc Pro B70 target) |
 

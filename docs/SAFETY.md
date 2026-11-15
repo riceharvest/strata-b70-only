@@ -10,13 +10,11 @@ you trust can check it. Where Strata does less than you might hope, the page say
   outside model service, you open the server to other devices or to the internet, or the agent searches the web or opens a page
   (see [What the agent can do](#what-the-coding-agent-can-do-on-your-pc)).
 - **There is no telemetry.** Strata sends no usage data, no crash reports and no analytics, and has no account to sign in to.
-- **Starting and running a model never downloads anything**, except that `strata launch` updates an installed DeepSeek
-  engine package by itself when the signed feed has a newer one (below). Other downloads and updates are steps that you start.
+- **Starting and running a model never downloads anything.** Downloads and updates are steps that you start.
 - **The server listens on your PC only.** Reaching it from another device needs an API key.
 - **Once a model is downloaded, Strata runs without internet.** Starting, loading, serving and chatting need no
   connection. Only things you ask for use it: the agent's web search and web pages, an outside model service, the tunnel,
-  and installs and updates (a first model install also fetches llama.cpp's preparation scripts), plus the DeepSeek engine
-  check of `strata launch` (without a connection it gives up after at most 10 s and the launch goes on).
+  and installs and updates (a first model install also fetches llama.cpp's preparation scripts).
 - **Downloads are checked.** Updates come from a signed feed. Every model file has a fixed SHA-256 and size, and an install
   stops if the pinned version of a file is gone (the details are [below](#how-downloads-are-checked)).
 - **In its default mode the coding agent asks before it changes anything**, and once per chat before its first web search or web page.
@@ -63,11 +61,7 @@ That is the full list found in the code. Some details:
 - **Nothing checks for updates in the background.** The app does not check when it starts, and not when you open Settings,
   Engine either: that screen shows the result of your last check, or nothing if you have not checked. The checks in the table
   run when you press a button or run a command. With no connection, the check says so and nothing else happens. The Terminal fetches an engine by itself only when none is
-  installed, and `strata launch` asks first. One exception: `strata launch` with a DeepSeek model first checks whether the
-  signed feed can be reached (at most 10 s; without a connection it says nothing and goes on), then reads it, and when it has
-  a newer DeepSeek engine package for this PC, fetches and checks it, starts it once (`--version`), switches to it and removes
-  the older one. On a failure the installed one keeps running. Not when the launch is given `--dsv41-package` or
-  `STRATA_DSV41_EXE` is set (`strata_cli/launch/runner.py`, `upgrade_dsv41_engine`).
+  installed, and `strata launch` asks first.
 - **Starting and serving never download.** `strata serve` and the app's load button fetch nothing. The app sets
   `STRATA_PACKAGED=1` and `STRATA_NO_ACQUIRE=1` for its parts (`apps/desktop/src-tauri/src/main.rs`), and the downloaders
   refuse to run under them (`strata_control/acquisition.py`, `apps/host/server/acquisition.mjs`). That is why the app

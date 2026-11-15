@@ -123,30 +123,6 @@ tuning presets (`strata presets`), so the app sees them too.
 settings? Answers in progress stop." With `--no-tui` the command refuses with one line naming the running model, its port and settings. Add
 `--restart` or run `strata launch --stop` first. A different `--port` runs beside the first server; two big models may not fit in graphics memory together, and the launch says so.
 
-## DeepSeek V4.1-Flash
-
-DeepSeek V4.1-Flash runs in the Terminal and in the app, on NVIDIA RTX 30, 40 and 50 (Windows and Linux) and on the Radeon AI PRO R9700 (Linux). Hardware, sizes and speeds are in [MODELS.md](MODELS.md#deepseek-v41-flash).
-
-```sh
-strata launch --plan --family deepseek41 --model ist-das-2.00bpw
-strata launch --family deepseek41 --model ist-das-2.00bpw
-```
-
-| Model name | Download |
-| --- | ---: |
-| `ist-das-1.75bpw` | 239 GB |
-| `ist-das-2.00bpw` | 257 GB |
-| `ist-das-2.25bpw` | 274 GB |
-| `ud-q8_k_xl` | 508 GB |
-
-- The context is 8192 tokens (8K), the size the engine was checked at.
-- `--speed faster|full` picks how many of the model's 6 experts it uses per word. Faster uses 5 (a small quality change, usually not noticeable) and is the default on a PC with 16 GB of graphics memory or less and on PCs whose graphics share the computer's memory. Full uses all 6. `--full-quality` is the same as `--speed full`. Both need DeepSeek engine 0.1.50 or newer, which `strata launch` fetches. The engine's own flag is `--experts N`.
-- It answers one request at a time. `--parallel` above 1 is ignored with a note.
-- It reads pictures (on by default) with the engine's own vision tower, loaded with the model; `--vision off` turns them off. Setup fetches the tower's weights (mmproj-BF16.gguf, 1 GB) with the other shared files and packs them with the model.
-- `--tune` runs DeepSeek's own short tuner (drafter on or off, CPU threads), not the Qwen tuner.
-- `--model-path DIR` starts from the shards you already have.
-- `--plan` shows where the model goes on your cards and how much is held in RAM.
-
 ## After the start: the monitor
 
 The monitor has seven views. Press `1` to `7` or use the arrow keys.

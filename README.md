@@ -34,9 +34,7 @@ A model and setting is called usable when it does all of this on one B70:
 
 Anything that misses one of these is labelled "works, not usable".
 
-**DeepSeek V4.1-Flash is not maintained** (since 2026-10-30). The code stays in `sycl/src/dsv41`, and its build is off by default
-(`DSV41=ON` for `sycl/tools/build.sh`). On one B70 the 2-bit pack plus expert pruning cost too much answer quality: a pruned model
-was fluent but had lost knowledge (in our tests it got simple facts wrong). Unpruned, most experts come off the disk on every token.
+DeepSeek V4.1-Flash was removed from this fork: one B70 cannot run it at usable quality (the 2-bit pack plus expert pruning lost knowledge), and upstream Strata still has it.
 
 ## Speed
 

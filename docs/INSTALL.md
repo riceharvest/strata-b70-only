@@ -10,7 +10,6 @@ install does not need a source checkout or a startup `.bat` file.
 | --- | --- |
 | A window with chat | This fork ships no desktop app. Use the [Terminal route](#the-terminal), or the README's Docker build for a B70 |
 | The terminal, or my coding tool | Run the one-line install, then `strata launch` ([steps](#the-terminal)) |
-| DeepSeek V4.1-Flash | Pick it in the app, or run `strata launch --family deepseek41` ([model page](MODELS.md#deepseek-v41-flash)) |
 
 [Requirements](#what-you-need) · [Desktop app](#the-app) · [Terminal](#the-terminal) ·
 [Update](#updating) · [Files and folders](#where-things-are-stored) · [Build from source](SOURCE_INSTALL.md)
@@ -19,8 +18,8 @@ install does not need a source checkout or a startup `.bat` file.
 
 | Computer | Guide |
 | --- | --- |
-| Windows 10/11 or Linux x86-64 with an NVIDIA RTX GPU | Upstream app/Terminal only (removed in this fork); older NVIDIA cards used upstream's CUDA 12 guide. DeepSeek V4.1-Flash runs on RTX 30, 40 and 50 cards upstream. |
-| Windows or Linux x86-64 with a supported AMD Radeon | Upstream AMD/HIP guide (removed in this fork). DeepSeek V4.1-Flash runs on the Radeon AI PRO R9700 under Linux upstream. |
+| Windows 10/11 or Linux x86-64 with an NVIDIA RTX GPU | Upstream app/Terminal only (removed in this fork); older NVIDIA cards used upstream's CUDA 12 guide. |
+| Windows or Linux x86-64 with a supported AMD Radeon | Upstream AMD/HIP guide (removed in this fork). |
 | Linux x86-64 with Intel Arc | [Intel Arc guide](INTEL_ARC.md), [SYCL build notes](INTEL.md), and [B70 branch notes](B70.md); this fork targets one Arc Pro B70 on Linux |
 | Apple Silicon Mac, macOS 15 or newer | Upstream Mac/Metal guide (removed in this fork). Intel Macs were not supported. |
 | AMD Ryzen AI Max / Strix Halo | Upstream Strix Halo Linux guide (removed in this fork; see [Windows notes](STRIX_HALO_WINDOWS.md) for upstream history) |
@@ -48,9 +47,7 @@ On one B70, install through the Docker build in the [README](../README.md) or th
    graphics card with its size and one **Download** button, with progress and resume. If you already downloaded the
    engine file, choose **I already have the file** and it installs without internet. The Mac file keeps its small
    Metal engine inside.
-4. Choose a model and its storage folder, let it download, then chat. DeepSeek V4.1-Flash is in the model list on
-   the supported cards ([model page](MODELS.md#deepseek-v41-flash)); it has three sizes, an 8K context and a **Speed**
-   choice, Faster or Full quality.
+4. Choose a model and its storage folder, let it download, then chat.
 
 The `strata-engine-…` and `strata-control-…` archives on the release page are components, not installers. The
 installer is the same file for a first install and for an update. There is no Intel desktop installer yet; Intel Arc

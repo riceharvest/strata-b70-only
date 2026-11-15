@@ -79,7 +79,7 @@ List exact commands, the revision and environment tested, and observed outcomes.
 and **not run** separate. Include relevant output or a log attachment. A command you suggest running is not
 evidence that it passed; a CI run on a different revision is not validation of the submitted code.
 
-Build the SYCL engine targets a code change touches (`strata`, `strata-dsv41`, the parity tests) before requesting
+Build the SYCL engine targets a code change touches (`strata`, the parity tests) before requesting
 review. For changes that need hardware execution, report that execution separately from compilation. A mock,
 static check, or successful build does not establish hardware correctness. If you lack a required environment,
 keep the PR as a draft, identify the missing checks, and ask for targeted help in the same thread. Do not claim

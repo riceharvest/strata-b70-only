@@ -11,7 +11,7 @@ Strata: upstream has no B70 and cannot reproduce a report made here. The maintai
 A second model family exists in the same binary: the dense Qwen3.8-27B (`sycl/src/qwen35`, [docs/Q36.md](docs/Q36.md)). `strata` reads the
 architecture of the GGUF at start and runs the dense engine for `qwen35`; `Q36=OFF` for `sycl/tools/build.sh` builds the Flash-Next-only `strata`.
 
-DeepSeek V4.1-Flash (`sycl/src/dsv41`) is not maintained since 2026-10-30 and its build is off by default.
+DeepSeek V4.1-Flash was removed from this fork: one B70 cannot run it at usable quality, and upstream Strata still has it.
 
 ## Where things are
 
