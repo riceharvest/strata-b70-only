@@ -12,7 +12,8 @@ const kfmt = (n) => (n == null ? "–" : n >= 1000 ? `${fmt(n / 1000, n >= 10000
 const ctxfmt = (n) => (n && n % 1024 === 0 ? `${fmt(n / 1024)}K` : kfmt(n));
 const gb = (b, d = 1) => (b == null ? "–" : fmt(b / 1073741824, d));   // memory: binary GB, as Windows shows it
 
-// Cloud baseline: Alibaba Cloud Int. rates for Qwen-Flash
+// Cloud baseline: what the same tokens would cost on a hosted API.  Presets hold published rates in $ per million tokens;
+// a preset with `tiers` (peak / off-peak) has one rate set per tier.  "custom" is whatever the person typed.
 const QWEN_FLASH_PRICING = {
   provider: "Alibaba Cloud Int.",
   model: "Qwen-Flash",
@@ -22,12 +23,36 @@ const QWEN_FLASH_PRICING = {
   cacheCreate5mPerM: 0.20,
   cacheRead5mPerM: 0.016,
 };
+const PRICING_PRESETS = {
+  "qwen-flash": {label: "Qwen-Flash", provider: QWEN_FLASH_PRICING.provider, rates: QWEN_FLASH_PRICING},
+  "deepseek-v4.1-flash": {label: "DeepSeek V4.1 Flash 1017", provider: "DeepSeek", tiers: {
+    "off-peak": {inputPerM: 0.15, outputPerM: 0.60, cacheReadPerM: 0.003},
+    "peak": {inputPerM: 0.30, outputPerM: 1.20, cacheReadPerM: 0.006}}},
+  "qwen-3.8-27b": {label: "Qwen 3.8 27B", provider: "Alibaba Cloud", rates: {
+    inputPerM: 0.425, outputPerM: 2.55, cacheReadPerM: 0.085, cacheCreate5mPerM: 0.5313, cacheRead5mPerM: 0.0425}},
+  "custom": {label: "Custom", provider: "your own rates", rates: {inputPerM: 0.15, outputPerM: 0.47, cacheReadPerM: 0.016}},
+};
+let pricingChoice = {preset: "qwen-flash", tier: "off-peak", custom: PRICING_PRESETS.custom.rates};
+function activePricing() {
+  const p = PRICING_PRESETS[pricingChoice.preset] || PRICING_PRESETS["qwen-flash"];
+  const r = p.tiers ? (p.tiers[pricingChoice.tier] || p.tiers["off-peak"]) : pricingChoice.preset === "custom" ? pricingChoice.custom : p.rates;
+  const num = (v) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : 0);
+  return {provider: p.provider, model: p.label + (p.tiers ? ` (${pricingChoice.tier})` : ""), inputPerM: num(r.inputPerM),
+          outputPerM: num(r.outputPerM), cacheReadPerM: num(r.cacheReadPerM),
+          cacheCreate5mPerM: r.cacheCreate5mPerM == null ? null : num(r.cacheCreate5mPerM),
+          cacheRead5mPerM: r.cacheRead5mPerM == null ? null : num(r.cacheRead5mPerM)};
+}
+function pricingTitle() {
+  const P = activePricing(), d = (v) => `$${Number(v.toFixed(4))}`;
+  return `Estimated cost saved vs ${P.provider} ${P.model} (${d(P.inputPerM)}/M input, ${d(P.outputPerM)}/M output, ${d(P.cacheReadPerM)}/M cache read)`;
+}
 function calcCost(promptTokens = 0, reusedTokens = 0, outputTokens = 0) {
+  const P = activePricing();
   const p = Number(promptTokens) || 0;
   const r = Math.min(p, Math.max(0, Number(reusedTokens) || 0));
   const f = Math.max(0, p - r);
   const o = Math.max(0, Number(outputTokens) || 0);
-  return (f * QWEN_FLASH_PRICING.inputPerM + r * QWEN_FLASH_PRICING.cacheReadPerM + o * QWEN_FLASH_PRICING.outputPerM) / 1e6;
+  return (f * P.inputPerM + r * P.cacheReadPerM + o * P.outputPerM) / 1e6;
 }
 function fmtCost(n, precision) {
   if (n == null || Number.isNaN(n)) return "–";
@@ -47,6 +72,8 @@ const store = {
   get(k, d) { try { const v = localStorage.getItem("strata." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem("strata." + k, JSON.stringify(v)); return true; } catch (e) { return false; } },
 };
+{ const saved = store.get("pricing", null);
+  if (saved && typeof saved === "object") pricingChoice = {...pricingChoice, ...saved, custom: {...pricingChoice.custom, ...(saved.custom || {})}}; }
 
 // ------------------------------------------------------------------ toasts
 function toast(kind, title, text = "", ms = 3500, action = null) {
@@ -718,7 +745,7 @@ function renderDash(live, hw, st, eng, h, last, reqs, m) {
   const tiles = [
     tile("Cost saved", fmtCost(lifeCost), "", [
       row(`${chip(todayCost, ydayCost)} <span class="muted">${fmtCost(todayCost)} today</span>`),
-      row(`<span class="muted">${fmtCost(calcCost(lifeFresh, 0, 0))} in · ${fmtCost(calcCost(0, 0, L.output_tokens))} out</span>`)], day(dayCost), "cost", "Estimated API cost saved vs Alibaba Cloud Qwen-Flash ($0.15/M input, $0.47/M output, $0.016/M cache read)"),
+      row(`<span class="muted">${fmtCost(calcCost(lifeFresh, 0, 0))} in · ${fmtCost(calcCost(0, 0, L.output_tokens))} out</span>`)], day(dayCost), "cost", pricingTitle()),
     tile("Input tokens", big(L.prompt_tokens), "", [
       row(`${chip(today.prompt_tokens, yday.prompt_tokens)} <span class="muted">${big(today.prompt_tokens)} today</span>`),
       row(`<span class="muted">${big(L.prompt_tokens - L.reused)} read · ${big(L.reused)} reused</span>`)], day((d) => d.prompt_tokens), "", "All prompt tokens the server has processed, lifetime"),
@@ -967,14 +994,15 @@ function renderAbout(eng, hw, st, m) {
     ["RAM", hw.ram_total ? `${gb(hw.ram_total, 0)} GB` : null],
   ]);
   if ($("facts-cost")) {
+    const P = activePricing();
     facts($("facts-cost"), [
-      ["Provider", QWEN_FLASH_PRICING.provider],
-      ["Model baseline", QWEN_FLASH_PRICING.model],
-      ["Input /M", `$${QWEN_FLASH_PRICING.inputPerM.toFixed(2)}`],
-      ["Output /M", `$${QWEN_FLASH_PRICING.outputPerM.toFixed(2)}`],
-      ["Cache read /M", `$${QWEN_FLASH_PRICING.cacheReadPerM.toFixed(3)}`],
-      ["Cache create (5m) /M", `$${QWEN_FLASH_PRICING.cacheCreate5mPerM.toFixed(2)}`],
-      ["Cache read (5m) /M", `$${QWEN_FLASH_PRICING.cacheRead5mPerM.toFixed(3)}`],
+      ["Provider", P.provider],
+      ["Model baseline", P.model],
+      ["Input /M", `$${P.inputPerM}`],
+      ["Output /M", `$${P.outputPerM}`],
+      ["Cache read /M", `$${P.cacheReadPerM}`],
+      ...(P.cacheCreate5mPerM != null ? [["Cache create (5m) /M", `$${P.cacheCreate5mPerM}`]] : []),
+      ...(P.cacheRead5mPerM != null ? [["Cache read (5m) /M", `$${P.cacheRead5mPerM}`]] : []),
       ["Lifetime saved", `${fmtCost(lifeCost)} (${big(L.prompt_tokens || 0)} input · ${big(L.output_tokens || 0)} output)`],
       ["Today saved", `${fmtCost(todayCost)} (${big(today.prompt_tokens || 0)} input · ${big(today.output_tokens || 0)} output)`],
     ]);
@@ -1030,6 +1058,10 @@ function renderMcp() {
 // A few documented keys of the run config (strata-<model>.json), for every client, from the next start on.  The
 // server lists them, checks every value and keeps every other key of the file as it is.
 let cfgKeys = [];
+function paintSeg(seg) {
+  const v = $(seg.dataset.for).value;
+  seg.querySelectorAll("button").forEach((b) => b.setAttribute("aria-checked", String(b.dataset.v === v)));
+}
 async function loadConfig() {
   let r;
   try { r = await fetch("config", {headers: headers()}); } catch (e) { return; }
@@ -1041,38 +1073,67 @@ async function loadConfig() {
   $("cfg-model").innerHTML = models.map((m) =>
     `<option value="${esc(m.file)}"${m.current ? " selected" : ""}>${esc(m.model)} (${esc(m.file)})${m.current ? " - running" : ""}</option>`).join("");
   $("cfg-file").textContent = c.file || "";
+  // the unit a key is counted in, from its name, so a bare number says what it is
+  const unitOf = (k) => /_mib$|vram_reserve_mib/.test(k.key) ? "MiB" : /_s$/.test(k.key) ? "s" : /_pct$|keep_pct/.test(k.key) ? "%" :
+    /tokens$|_tokens/.test(k.key) ? "tokens" : /_chars$/.test(k.key) ? "chars" : /_us$/.test(k.key) ? "µs" : /_mbps$/.test(k.key) ? "MB/s" : "";
   const row = (k, i) => {
     const id = `cfg-${i}`, v = k.value;
     let input;
     if (k.kind === "bool" || k.kind === "enum") {
-      const opts = k.kind === "bool" ? [["true", "on"], ["false", "off"]] : k.choices.map((x) => [x, x]);
+      const opts = k.kind === "bool" ? [["true", "On"], ["false", "Off"]] : k.choices.map((x) => [x, x]);
       const cur = v == null ? "" : String(v);
       // a value the file holds that the list lacks stays selected, so Save does not read it as "default" and remove it
       if (cur !== "" && !opts.some(([val]) => val === cur)) opts.push([cur, cur]);
-      input = `<select class="st-input" id="${id}"><option value=""${cur === "" ? " selected" : ""}>default</option>` +
-        opts.map(([val, text]) => `<option value="${esc(val)}"${cur === val ? " selected" : ""}>${esc(text)}</option>`).join("") + `</select>`;
+      const all = [["", "Default"], ...opts];
+      // few short choices: a segmented control (one click, all choices visible); a hidden input keeps the value for Save
+      input = all.length <= 4 && all.every(([, t]) => t.length <= 12)
+        ? `<div class="cfg-ctl"><input type="hidden" id="${id}" value="${esc(cur)}"><div class="seg seg--n" role="radiogroup" aria-label="${esc(k.key)}" data-for="${id}">` +
+          all.map(([val, text]) => `<button type="button" role="radio" data-v="${esc(val)}" aria-checked="${cur === val}">${esc(text)}</button>`).join("") + `</div></div>`
+        : `<div class="cfg-ctl"><select class="st-input" id="${id}">` +
+          all.map(([val, text]) => `<option value="${esc(val)}"${cur === val ? " selected" : ""}>${esc(val === "" ? "Default" : text)}</option>`).join("") + `</select></div>`;
     } else {
       const text = v == null ? "" : Array.isArray(v) ? v.join(", ") : String(v);
       // a number field only for a number: a text the file holds (a hand edit) would show empty there and Save would remove it
       const num = k.kind === "number" && (v == null || typeof v === "number");
       const attrs = num ? `type="number" step="${esc(k.step == null ? "any" : k.step)}" min="${esc(k.min == null ? 0 : k.min)}"` +
         (k.max == null ? "" : ` max="${esc(k.max)}"`) : 'type="text"';   // auto: text, a word or a whole number
-      input = `<input class="st-input" id="${id}" ${attrs} value="${esc(text)}" placeholder="default" autocomplete="off">`;
+      const unit = unitOf(k);
+      input = `<div class="cfg-ctl cfg-ctl--num"><input class="st-input" id="${id}" ${attrs} value="${esc(text)}" placeholder="default" autocomplete="off">` +
+        (unit ? `<span class="muted small">${unit}</span>` : "") + `</div>`;
     }
-    return `<label for="${id}" title="${esc(k.help)}">${esc(k.help)}<code>${esc(k.key)}</code></label>${input}`;
+    // the first sentence is the label; the rest (numbers, trade-offs) folds under "More"
+    const cut = k.help.search(/\.\s|:\s/), head = cut > 20 && cut < 160 ? k.help.slice(0, cut + (k.help[cut] === "." ? 1 : 0)) : k.help;
+    const rest = k.help.slice(head.length).trim();
+    return `<div class="cfg-row"><div class="cfg-text"><label for="${id}">${esc(head)}</label><code>${esc(k.key)}</code>` +
+      (rest ? `<details class="cfg-more"><summary>More</summary>${esc(rest)}</details>` : "") + `</div>${input}</div>`;
   };
-  // a small heading per group, in the server's order; inside a group the keys keep the server's order (ids stay the key's index)
+  // one fold per group, in the server's order; inside a group the keys keep the server's order (ids stay the key's index).
+  // The first two groups start open; a group the person already opened or closed keeps its state across a reload of the list.
+  const wasOpen = {};
+  $("cfg-form").querySelectorAll("details[data-g]").forEach((d) => { wasOpen[d.dataset.g] = d.open; });
   const groups = [...new Set([...(c.groups || []), ...cfgKeys.map((k) => k.group || "")])];
-  $("cfg-form").innerHTML = groups.map((g) => {
+  $("cfg-form").innerHTML = groups.map((g, gi) => {
     const rows = cfgKeys.map((k, i) => ((k.group || "") === g ? row(k, i) : "")).join("");
-    return rows && (g ? `<h3 class="cfg-group">${esc(g)}</h3>` : "") + rows;
+    const n = cfgKeys.filter((k) => (k.group || "") === g).length;
+    const open = g in wasOpen ? wasOpen[g] : gi < 2;
+    return rows && `<details class="cfg-group" data-g="${esc(g)}"${open ? " open" : ""}><summary>${esc(g || "Other")}<span class="muted small">${n}</span></summary>` +
+      `<div class="cfg-rows">${rows}</div></details>`;
   }).join("");
+  $("cfg-form").querySelectorAll(".seg[data-for]").forEach((seg) => seg.addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (!b || seg.classList.contains("is-disabled")) return;
+    $(seg.dataset.for).value = b.dataset.v;
+    paintSeg(seg);
+    $(seg.dataset.for).dispatchEvent(new Event("input", {bubbles: true}));
+  }));
   const pi = cfgKeys.findIndex((k) => k.key === "parallel"), bi = cfgKeys.findIndex((k) => k.key === "batch_mtp");
   if (pi >= 0 && bi >= 0) {                          // batch_mtp only means something with 2 or more parallel requests
     const sync = () => {
       const on = Number($(`cfg-${pi}`).value) >= 2, b = $(`cfg-${bi}`);
       b.disabled = !on;
       if (!on) b.value = "";
+      const seg = b.closest(".cfg-ctl") && b.closest(".cfg-ctl").querySelector(".seg");
+      if (seg) { seg.classList.toggle("is-disabled", !on); paintSeg(seg); }
     };
     $(`cfg-${pi}`).addEventListener("input", sync);
     sync();
@@ -1150,6 +1211,47 @@ $("cfg-switch").addEventListener("click", () => {
   if (cur && sel.value === cur.value) { toast("info", "Already running", "Pick another model first."); return; }
   restartServer(sel.value);
 });
+
+// ------------------------------------------------------------------ Cost-saved pricing (this browser only, no restart)
+function paintPricing() {
+  const sel = $("price-preset");
+  if (!sel.options.length) sel.innerHTML = Object.entries(PRICING_PRESETS).map(([k, p]) => `<option value="${esc(k)}">${esc(p.label)}</option>`).join("");
+  const preset = PRICING_PRESETS[pricingChoice.preset] ? pricingChoice.preset : "qwen-flash";
+  sel.value = preset;
+  const p = PRICING_PRESETS[preset], custom = preset === "custom", P = activePricing();
+  $("price-tier-row").hidden = !p.tiers;
+  $("price-tier").querySelectorAll("button").forEach((b) => b.setAttribute("aria-checked", String(b.dataset.v === pricingChoice.tier)));
+  for (const [id, key] of [["price-in", "inputPerM"], ["price-out", "outputPerM"], ["price-cache", "cacheReadPerM"]]) {
+    const el = $(id);
+    el.disabled = !custom;
+    if (document.activeElement !== el) el.value = custom ? pricingChoice.custom[key] : P[key];
+  }
+  $("price-note").textContent = custom ? "Your own rates, in dollars per million tokens."
+    : `Published ${p.provider} rates for ${p.label}. Choose Custom to type your own.`;
+  if ($("cost-blurb")) $("cost-blurb").textContent = `Estimated savings for self-hosting on the B70 vs. ${P.provider} ${P.model}.`;
+  document.querySelectorAll("[data-cost-title]").forEach((el) => { el.title = pricingTitle(); });
+}
+function pricingChanged() { store.set("pricing", pricingChoice); paintPricing(); paintLive(); }
+$("price-preset").addEventListener("change", () => {
+  pricingChoice.preset = $("price-preset").value;
+  if (pricingChoice.preset === "custom" && !store.get("pricing", null)?.custom) {   // start Custom from the rates now shown
+    const P = activePricing(); pricingChoice.custom = {inputPerM: P.inputPerM, outputPerM: P.outputPerM, cacheReadPerM: P.cacheReadPerM};
+  }
+  pricingChanged();
+});
+$("price-tier").addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (b) { pricingChoice.tier = b.dataset.v; pricingChanged(); }
+});
+for (const [id, key] of [["price-in", "inputPerM"], ["price-out", "outputPerM"], ["price-cache", "cacheReadPerM"]]) {
+  $(id).addEventListener("input", () => {
+    const n = Number($(id).value);
+    if ($(id).value.trim() === "" || !Number.isFinite(n) || n < 0) return;
+    pricingChoice.custom = {...pricingChoice.custom, [key]: n};
+    store.set("pricing", pricingChoice); paintLive();
+  });
+}
+paintPricing();
 
 // ------------------------------------------------------------------ Markdown (escaped first, then formatted)
 function inline(s) {
