@@ -39,7 +39,7 @@ def strings(x):
 
 class ExampleConfigs(unittest.TestCase):
     def test_there_are_examples(self):
-        self.assertEqual([p.name for p in CONFIGS], ["serve-27b-128k.json", "serve-27b-256k.json", "serve-27b.json"])
+        self.assertEqual([p.name for p in CONFIGS], ["serve-27b-128k.json", "serve-27b-256k.json", "serve-27b-pack.json", "serve-27b.json"])
 
     def test_each_one_serves_the_27b_on_the_one_strata_binary(self):
         for path in CONFIGS:
@@ -54,12 +54,17 @@ class ExampleConfigs(unittest.TestCase):
                 # Flash-Next server's container has
                 self.assertNotIn(cfg["env"]["STRATA_SYCL_NAME"], ("", "strata-sycl-serve"))
                 a = cfg["args"]
-                self.assertEqual(a[a.index("--mtp") + 1], "3")
+                # the draft depth is the engine's (5 with the GGUF, 15 with a pack, fewer as the conversation grows): a pinned
+                # --mtp 3 was the setting of 2026-11-11 and cost the examples the later defaults
+                self.assertNotIn("--mtp", a)
+                if path.name == "serve-27b-pack.json":
+                    self.assertTrue(a[a.index("--b70-pack") + 1].endswith(".b70w4"))
+                    self.assertEqual(a[a.index("--kv") + 1], "int8")
                 self.assertTrue(a[a.index("--native") + 1].endswith(".gguf"))
                 self.assertGreaterEqual(int(a[a.index("--max-context") + 1]), 32768)
 
     def test_the_context_of_each(self):
-        want = {"serve-27b.json": 32768, "serve-27b-128k.json": 131072, "serve-27b-256k.json": 262144}
+        want = {"serve-27b.json": 32768, "serve-27b-128k.json": 131072, "serve-27b-256k.json": 262144, "serve-27b-pack.json": 262144}
         for path in CONFIGS:
             a = json.loads(path.read_text(encoding="utf-8"))["args"]
             self.assertEqual(int(a[a.index("--max-context") + 1]), want[path.name], path.name)

@@ -937,7 +937,138 @@ void test_rng_hand() {
 
 }  // namespace
 
+
+// ------------------------------------------------------------------------------------------- 9. the coupled draw
+// Sampling::coupled (STRATA_Q36_SPEC_COUPLE): a draw is Gumbel-max with noise from (the draw's key, the token id).  It must
+// be the same distribution and the same use of the stream as the walk; the windows must still give the plain loop's answer;
+// and a drafter that makes the same draw from logits near the target's must be kept more often than its top token is.
+int coupled_draft(const std::vector<float>& q, float temp, uint64_t key, float ratio) {   // the engine's draft kernel, on the host
+    float vm = -INFINITY;
+    for (float v : q) vm = std::max(vm, v);
+    const float inv_t = 1.f / temp, lim = vm + temp * std::log(ratio);
+    float best = -INFINITY;
+    int bi = 0;
+    for (size_t i = 0; i < q.size(); ++i)
+        if (q[i] >= lim) {
+            const float sc = q[i] * inv_t - std::log(-std::log(couple_u24(key, (uint32_t) i)));
+            if (sc > best) { best = sc; bi = (int) i; }
+        }
+    return bi;
+}
+void test_coupled() {
+    std::printf("the coupled draw\n");
+    // the distribution: both draws of one row, many seeds
+    {
+        Sampling a;
+        a.temperature = 0.8f; a.top_k = 8; a.top_p = 0.9f;
+        Sampling b = a;
+        b.coupled = true;
+        const std::vector<float> lg = {2.0f, 1.5f, 1.4f, 0.2f, 0.1f, -1.f, -2.f, 3.0f, 2.9f, -5.f};
+        std::vector<long> ca(lg.size(), 0), cb(lg.size(), 0);
+        const int N = 300000;
+        std::mt19937_64 ra(7), rb(7);
+        const std::vector<int32_t> h;
+        for (int i = 0; i < N; ++i) {
+            auto x = lg;
+            ++ca[(size_t) sample_row(x, a, h, ra)];
+            auto y = lg;
+            ++cb[(size_t) sample_row(y, b, h, rb)];
+        }
+        double worst = 0;
+        int seen_a = 0, seen_b = 0;
+        for (size_t i = 0; i < lg.size(); ++i) {
+            worst = std::max(worst, std::fabs((double) (ca[i] - cb[i])) / N);
+            seen_a += ca[i] > 0;
+            seen_b += cb[i] > 0;
+        }
+        check(worst < 0.006 && seen_a == seen_b, "the coupled draw has the walk's distribution (largest difference " + std::to_string(worst) + " of the draws)");
+        check(ra == rb, "a coupled draw takes one output of the stream, as the walk's draw does");
+        std::mt19937_64 rc(7);
+        advance_draws(rc, N);
+        check(rc == rb, "advance_draws stands where the coupled draws stand");
+    }
+    // the keys a drafter peeks are the keys the draws take
+    {
+        Sampling s;
+        s.temperature = 1.f; s.top_k = 20; s.coupled = true;
+        std::mt19937_64 rng(31), ref(31);
+        uint64_t keys[5];
+        peek_draw_keys(rng, 5, keys);
+        check(rng == ref, "peeking the keys does not advance the stream");
+        bool ok = true;
+        const std::vector<int32_t> h;
+        for (int i = 0; i < 5; ++i) {
+            std::vector<float> lg(50);
+            for (size_t j = 0; j < lg.size(); ++j) lg[j] = (float) ((j * 37 + (size_t) i * 11) % 13) * 0.4f;
+            // the draw, made again by hand from the peeked key
+            std::vector<Cand> c;
+            for (size_t j = 0; j < lg.size(); ++j) c.push_back(Cand{(int32_t) j, lg[j]});
+            std::sort(c.begin(), c.end(), cand_before);
+            c.resize(20);
+            int best = -1;
+            double bv = -INFINITY;
+            for (const Cand& k : c) {
+                const double sc = (double) (k.v - c[0].v) / s.temperature + couple_gumbel(keys[i], k.id);
+                if (sc > bv) { bv = sc; best = k.id; }
+            }
+            ok = ok && best == sample_row(lg, s, h, rng);
+        }
+        check(ok, "draw i is the Gumbel-max under the i-th peeked key");
+    }
+    // a whole answer: windows against the plain loop, coupled
+    {
+        long long runs = 0, bad = 0;
+        uint64_t st = 91;
+        for (Setting se : settings()) {
+            if (se.s.temperature <= 0.f) continue;
+            se.s.coupled = true;
+            for (int trial = 0; trial < 8; ++trial) {
+                const int V = 400 + (int) (splitmix(st) % 300), D = 1 + (int) (splitmix(st) % 7);
+                std::vector<int32_t> prompt((size_t) (1 + splitmix(st) % 40));
+                for (auto& t : prompt) t = 2 + (int32_t) (splitmix(st) % (uint64_t) (V - 2));
+                const uint64_t seed = splitmix(st);
+                const int max_new = 40 + (int) (splitmix(st) % 60);
+                ++runs;
+                bad += gen_plain(se.s, seed, prompt, max_new, V).out != gen_spec(se.s, seed, prompt, max_new, V, D, trial % 4).out;
+            }
+        }
+        check(bad == 0, "coupled: windows give the plain loop's answer for the same seed, " + std::to_string(runs) + " answers");
+    }
+    // a drafter near the target: its coupled draft is kept more often than its top token
+    {
+        uint64_t st = 17;
+        std::mt19937_64 rng(5);
+        Sampling s;
+        s.temperature = 1.0f; s.top_k = 20; s.top_p = 0.95f; s.coupled = true;
+        const std::vector<int32_t> h;
+        long n = 0, kept_top = 0, kept_cpl = 0, agree = 0;
+        for (int trial = 0; trial < 20000; ++trial) {
+            const int V = 600;
+            std::vector<float> p((size_t) V), q((size_t) V);
+            const float sharp = 1.f + 5.f * (float) unit(st);
+            for (int i = 0; i < V; ++i) {
+                p[(size_t) i] = sharp * (float) (unit(st) * 6.0 - 3.0);
+                q[(size_t) i] = p[(size_t) i] + (float) (unit(st) * 1.6 - 0.8);   // the drafter's logits: the target's, off by up to 0.8
+            }
+            uint64_t key;
+            peek_draw_keys(rng, 1, &key);
+            auto pc = p;
+            const int x = sample_row(pc, s, h, rng);
+            const int qa = (int) (std::max_element(q.begin(), q.end()) - q.begin());
+            agree += qa == (int) (std::max_element(p.begin(), p.end()) - p.begin());
+            kept_top += qa == x;
+            kept_cpl += coupled_draft(q, s.temperature, key, 0.03f) == x;
+            ++n;
+        }
+        std::printf("  a near drafter: top tokens agree %.3f; its top token is kept %.3f, its coupled draft %.3f\n", (double) agree / n,
+                    (double) kept_top / n, (double) kept_cpl / n);
+        check(kept_cpl > kept_top + n / 20, "the coupled draft is kept more often than the drafter's top token");
+        check((double) kept_cpl > 0.9 * (double) agree, "... about as often as the two top tokens agree");
+    }
+}
+
 int main() {
+    test_coupled();
     test_keys();
     test_topm_algorithm();
     test_row_vs_plain();
