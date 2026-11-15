@@ -207,6 +207,30 @@ def pack_float_matrix(rows_of, n_in, n_out, fb, off, search=4, check=48, rng=Non
     return ent, off, (se / ss) ** 0.5 if ss > 0 else 0.0, worst
 
 
+def _dequantizer(type_id, type_name):
+    """rows(raw uint8 [m][row bytes], n_in) -> float32 [m][n_in] for a GGUF tensor type, or None when nothing here can read
+    it.  The float types are read as they are; the quantized ones go through gguf-py's dequantize (llama.cpp's package: an
+    installed one, or the copy $STRATA_GGUF_PY / setup.py's clone holds, which knows the newer types)."""
+    if type_name == "F32":
+        return lambda raw, n_in: np.ascontiguousarray(raw).view("<f4").reshape(-1, n_in)
+    if type_name == "F16":
+        return lambda raw, n_in: np.ascontiguousarray(raw).view("<f2").reshape(-1, n_in).astype(np.float32)
+    if type_name == "BF16":
+        return lambda raw, n_in: (np.ascontiguousarray(raw).view("<u2").astype(np.uint32) << 16).view("<f4").reshape(-1, n_in)
+    try:
+        try:
+            from _paths import add_gguf_py
+            add_gguf_py()
+        except (ImportError, SystemExit):
+            pass                              # an installed gguf package serves as well
+        import gguf
+        from gguf.quants import dequantize
+        qt = gguf.GGMLQuantizationType(type_id)
+    except (ImportError, ValueError):
+        return None
+    return lambda raw, n_in: dequantize(np.ascontiguousarray(raw), qt).reshape(-1, n_in).astype(np.float32)
+
+
 def main():
     ap = argparse.ArgumentParser(description="a model's matrices as a pack, the Arc Pro B70's own weight format")
     ap.add_argument("--gguf", nargs="+", required=True, help="the model's GGUF (every shard of a split file)")
@@ -218,13 +242,7 @@ def main():
     ap.add_argument("--list", action="store_true", help="print what would be packed and what is left out, write nothing")
     a = ap.parse_args()
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    try:
-        from _paths import add_gguf_py
-        add_gguf_py()
-    except (ImportError, SystemExit):
-        pass                              # an installed gguf package serves as well
-    import gguf
-    from gguf.quants import dequantize
+    from gguf_reader import GGUFFile          # this repository's reader: the directory of any GGUF, whatever its tensor types
     pat = re.compile(a.match)
     index, off = {}, 0
     worst_err, worst_corr, src_bytes = 0.0, 1.0, 0
@@ -233,8 +251,8 @@ def main():
     fb = None if a.list else open(tmp, "wb")
     try:
         for path in a.gguf:
-            rd = gguf.GGUFReader(path)
-            for t in rd.tensors:
+            g = GGUFFile(path)
+            for t in g.tensors:
                 name = t.name
                 if not pat.search(name):
                     continue
@@ -242,28 +260,32 @@ def main():
                     if int(name.split(".")[1]) >= a.layers:
                         continue
                 shape = [int(x) for x in t.shape]
+                nbytes = t.expected_bytes()
                 if len(shape) != 2 or not shape_ok(shape[0], shape[1]):
-                    print(f"left out: {name} {shape} ({t.tensor_type.name}): not a matrix of inputs % 256 == 0 and rows % 16 == 0")
+                    print(f"left out: {name} {shape} ({t.type_name}): not a matrix of inputs % 256 == 0 and rows % 16 == 0")
+                    continue
+                n_in, n_out = shape
+                deq = _dequantizer(t.type_id, t.type_name)
+                if deq is None or nbytes is None or nbytes % n_out:
+                    print(f"left out: {name} {shape} ({t.type_name}): no reader here for this type (a newer gguf-py: STRATA_GGUF_PY)")
                     continue
                 if name in index:
                     raise SystemExit(f"{name}: in more than one shard")
-                n_in, n_out = shape
                 if a.list:
                     index[name] = {"n_in": n_in, "n_out": n_out}
-                    print(f"pack: {name} {n_in} x {n_out} ({t.tensor_type.name}) -> {pack_bytes(n_in, n_out) / 2 ** 20:.2f} MiB")
+                    print(f"pack: {name} {n_in} x {n_out} ({t.type_name}) -> {pack_bytes(n_in, n_out) / 2 ** 20:.2f} MiB")
                     continue
-                raw = np.asarray(t.data).reshape(n_out, -1)
-                tt = t.tensor_type
+                raw = np.memmap(path, dtype=np.uint8, mode="r", offset=g.data_start + t.offset, shape=(n_out, nbytes // n_out))
 
-                def rows_of(r0, r1, raw=raw, tt=tt, n_in=n_in):
-                    return dequantize(raw[r0:r1], tt).reshape(r1 - r0, n_in).astype(np.float32)
+                def rows_of(r0, r1, raw=raw, deq=deq, n_in=n_in):
+                    return deq(raw[r0:r1], n_in)
 
                 ent, off, rel, corr = pack_float_matrix(rows_of, n_in, n_out, fb, off, a.search, a.check, rng)
                 index[name] = ent
-                src_bytes += int(np.asarray(t.data).nbytes)
+                src_bytes += nbytes
                 worst_err, worst_corr = max(worst_err, rel), min(worst_corr, corr)
                 print("%s: %d x %d (%s) -> %.2f MiB, relative error %.4f, lowest row correlation %.4f"
-                      % (name, n_in, n_out, tt.name, ent["bytes"] / 2 ** 20, rel, corr), flush=True)
+                      % (name, n_in, n_out, t.type_name, ent["bytes"] / 2 ** 20, rel, corr), flush=True)
     finally:
         if fb:
             fb.close()

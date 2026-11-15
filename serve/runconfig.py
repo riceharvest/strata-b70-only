@@ -165,8 +165,10 @@ EDITABLE = [
      "A pack of this model's projection matrices in the B70's own weight format (--b70-pack; tools/b70_pack.py writes one "
      "from the model's GGUF or from an int4 checkpoint). A matrix the pack holds is loaded from it instead of from the GGUF "
      "and runs on the card library's matrix-engine products: 4-bit weights the card multiplies as they are, read once for "
-     "every row of a draft window. The pack is another quantization of those matrices than the GGUF's, so the text can "
-     "differ; check a pack made from a GGUF before serving it (docs/B70_LIB.md). Empty: every matrix from the GGUF"),
+     "every row of a draft window. The pack is another quantization of those matrices than the GGUF's, so the text "
+     "changes. Measured on one B70 with a pack made from the served Flash-Next GGUF: answers 5 to 12% faster, 546 MiB less "
+     "VRAM, and 3.5% worse perplexity (the same top token in 94.8% of 2,871 steps), so it is not a recommendation as it "
+     "is (docs/B70_LIB.md). Empty: every matrix from the GGUF"),
     ("mtp_window", ("arg", "--mtp-window", 0, 2147483647),
      "How far back the draft layer looks (--mtp-window): the last N cells of the context, 0 = every cell. A smaller window is "
      "cheaper to draft on a long context (setup picks 8192 above 64K) and a very small one (2048) costs accepted drafts. A "
