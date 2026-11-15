@@ -18,8 +18,11 @@ tools, the tool results, the turns.
                 extensions: the user's pi configuration is not read or changed.
 --harness-cmd   any other harness: a shell command, `{task}` is the task text (quoted), run in the working copy with
                 OPENAI_BASE_URL / OPENAI_API_BASE and OPENAI_MODEL set.
---sandbox bwrap the harness sees the machine read-only and can write only its own folder (bubblewrap; the network stays,
-                for the server).  none: no sandbox.
+--sandbox bwrap the harness sees the machine read-only and can write only its working copy and its own config folder
+                (bubblewrap; the network stays, for the server).  none: no sandbox.
+--context N     the context window the harness is told (pi's models.json).  Keep it under what one of the server's
+                sessions holds: a harness that believes in more does not shorten its history in time and its task runs
+                into the server's limit.
 --engine-log    copied into the run folder at the end (its `PROF` lines: STRATA_Q36_PROFILE=1).
 
 The run folder gets: run.json (settings, per agent and task: time, exit code, tool calls seen), agent-<i>/ (working copy,
@@ -101,7 +104,13 @@ def pi_command(args, root, task):
 def wrap(args, root, work, cmd, env):
     if args.sandbox != "bwrap":
         return cmd
-    b = ["bwrap", "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--bind", root, root, "--chdir", work]
+    # (the agent can write its working copy and its harness's own folder, not the run's records beside them: an agent
+    # that cleaned up "its" folder once removed the events file of the task before it)
+    b = ["bwrap", "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--ro-bind", root, root, "--bind", work, work]
+    cfg = os.path.join(root, "pi")
+    if os.path.isdir(cfg):
+        b += ["--bind", cfg, cfg]
+    b += ["--chdir", work]
     for k, v in env.items():
         b += ["--setenv", k, v]
     return b + cmd
