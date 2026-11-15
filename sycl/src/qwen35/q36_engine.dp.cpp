@@ -1159,7 +1159,7 @@ inline bool q36_xatt_batch_on() {
     return on;
 }
 /// Single-pass online-softmax ESIMD+DPAS split-K decode attention (q36_xatt.dp.cpp's attend2). Read once; default off (0).
-inline int q36_xatt2_env() {   // 1 forced on, 0 off, -1 default (on for a single-session engine)
+inline int q36_xatt2_env() {   // 1 forced on, 0 off, -1 default (on)
     static const int on = [] {
         const char* e = std::getenv("STRATA_Q36_XATT2");
         return e ? (e[0] == '1' ? 1 : e[0] == '0' ? 0 : -1) : -1;
@@ -4358,9 +4358,15 @@ struct Engine {
             const bool xwant = xsw.want;
             const bool batch_ok = n_sess == 1 || q36_xatt_batch_on();
             const bool xshape = batch_ok && !attn_head && (int) g.head_dim == xa::kHD && (int) g.n_head == xa::kG * (int) g.n_head_kv;
-            // default 2026-11-14: on for a single session (card: 118K answer 50.0 -> 60.9, 250K 39.4 -> 45.9, fact found at both);
-            // off for --batch until the batch path's parity FAIL (5.5e-2) is fixed; STRATA_Q36_XATT2=1/0 forces
-            xatt2_on = q36_xatt2_env() == 1 || (q36_xatt2_env() == -1 && n_sess == 1);
+            // default 2026-11-14: on for a single session (card: 118K answer 50.0 -> 60.9, 250K 39.4 -> 45.9, fact found at both).
+            // 2026-11-15: on for --batch too.  The parity program (q36_mmvq_dense_parity --xatt2) says what the batch path's
+            // "FAIL" is: its forms R8 and RS16 meet the 3e-4 bound against the quantized reference (6e-7), the forms RS8 and
+            // RS16K miss it at 4e-4 to 1.2e-3, alone as in a batch - and RS16K is the one the policy takes above 8 rows, also
+            // for a single session, because the exact ones are no faster than XATT (65K cells, 16 rows: 1,131 us a layer
+            // against 557; XATT 1,159).  That miss is a fifteenth of the 8-bit cache's own error against FP64 (1.85e-2).
+            // Card: two 118K requests decoding together 72 -> 87 tok/s (window 60.2 -> 47.4 ms), 16 recorded agent threads
+            // 69.1 -> 81.2 tok/s of output.  STRATA_Q36_XATT2=0: XATT everywhere.
+            xatt2_on = q36_xatt2_env() != 0;
             if (xwant && xshape) {
                 // the 8-bit cache then stores V transposed (kv_vt) for all sessions and needs no mirror; if the fit fails
                 // below it goes back to the plain layout (kv_vt = false), so V is transposed only when XATT is active
