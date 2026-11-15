@@ -50,6 +50,9 @@ ALLOWED = {"include/strata/artifact/model_family.hpp", "include/strata/artifact/
            "include/strata/core/family_layout.hpp", "sycl/include/strata/core/family_layout.hpp",
            "include/strata/qwen35/dispatch.hpp", "sycl/src/program/generate.cpp"}
 DENSE_BANNER = re.compile(r"^# -+\n# Qwen3\.8-27B \(dense", re.M)
+# headers under the shared include tree that only the dense family's sources include: theirs to change (check 3 holds that
+# nothing else includes them)
+DENSE_HEADERS = ("include/strata/qwen35/sampling.hpp",)
 B70_BANNER = re.compile(r"^# -+\n# The B70 card library", re.M)
 # the two family / library switches: a branch behind either is not part of the Flash-Next-only text
 GUARDS = ("STRATA_Q36_BUILD", "STRATA_B70_LIB")
@@ -144,7 +147,8 @@ def preprocessed_identical(files: list[str]) -> bool:
 
 def check_files() -> bool:
     ok = True
-    changed = [f for f in git("diff", BASE, "--name-only").split("\n") if f and f.startswith(TREES) and not f.startswith(B70_TREES)]
+    changed = [f for f in git("diff", BASE, "--name-only").split("\n")
+               if f and f.startswith(TREES) and not f.startswith(B70_TREES) and f not in DENSE_HEADERS]
     print(f"files under the trees strata compiles that differ from {BASE}: {changed or 'none'}")
     for f in changed:
         old = in_base(f)
@@ -255,6 +259,11 @@ def check_layout() -> bool:
             "option(STRATA_BUILD_Q36" in code_tail and re.search(r"^if\(STRATA_BUILD_Q36\)", code_tail, re.M) is not None
             and "target_sources(strata" in code_tail.split("if(STRATA_BUILD_Q36)", 1)[-1])
     verdict("src/qwen35/q36_main.cpp (the second binary's entry point) is gone", not (ROOT / "src/qwen35/q36_main.cpp").exists())
+    for h in DENSE_HEADERS:
+        users = [f for f in git("grep", "-l", h.split("include/", 1)[1], "--", "include", "src", "sycl/include", "sycl/src", "tests",
+                                check=False).split("\n") if f and f != h]
+        outside = sorted(f for f in users if "qwen35" not in f and "q36" not in f)
+        verdict(f"{h} is included by the dense family's sources only (outside it: {outside or 'none'})", not outside)
     for rel in ("sycl/src/qwen35/q36_engine.dp.cpp", "sycl/src/qwen35/q36_mmvq_dense.dp.cpp", "sycl/src/qwen35/q36_xr_dense.dp.cpp",
                 "src/qwen35/q36_requant.cpp"):
         verdict(f"{rel} has no main()", not re.search(r"^int\s+main\s*\(", (ROOT / rel).read_text(encoding="utf-8"), re.M))
