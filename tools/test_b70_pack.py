@@ -228,6 +228,22 @@ int main(int argc, char** argv) {
                 self.assertEqual(out.strip(), "0 0", name)
 
 
+class Readers(unittest.TestCase):
+    def test_float_types_need_no_gguf_package(self):
+        w = np.array([[1.5, -2.25, 0.0, 3.0]], dtype=np.float32)
+        f32 = bp._dequantizer(0, "F32")(w.view(np.uint8), 4)
+        np.testing.assert_array_equal(f32, w)
+        f16 = bp._dequantizer(1, "F16")(w.astype(np.float16).view(np.uint8), 4)
+        np.testing.assert_array_equal(f16, w)
+        bf16 = bp._dequantizer(30, "BF16")((w.view(np.uint32) >> 16).astype(np.uint16).view(np.uint8), 4)
+        np.testing.assert_array_equal(bf16, w)
+
+    def test_a_type_nothing_reads_is_left_out_not_fatal(self):
+        """A tensor type the installed gguf package does not know (the routed experts' Q2_0 was one) must not stop the tool:
+        the directory comes from this repository's reader, and only the tensors that are packed are dequantized."""
+        self.assertIsNone(bp._dequantizer(9999, "type9999"))
+
+
 class Tool(unittest.TestCase):
     def test_a_gguf_end_to_end(self):
         """A small GGUF through the command line: the matching matrices of a packable shape, under the GGUF's names."""
