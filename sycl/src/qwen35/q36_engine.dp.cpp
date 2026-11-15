@@ -44,6 +44,9 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
+#if defined(__GLIBC__)
+#include <execinfo.h>
+#endif
 #endif
 #include "q36_pp_i8.hpp"
 #include "q36_gdn_wy.hpp"
@@ -2384,8 +2387,9 @@ int64_t q36_park_min() {
 // it, beside its deepest earlier checkpoint.  Until this a parked thread came back at the checkpoint its last prompt left
 // at its end and read its whole last answer again; a thread whose prompt was shorter than a checkpoint asks for had no
 // state at all and read everything.  Recorded agent runs, 16 agents on 8 sessions: two fifths of all the time spent
-// reading prompts went to cells the thread had held.  Not saved for a thread whose client is known to send its answers
-// back in another form (Sess::tail_kept 0: without the reasoning): that state would never be restored.
+// reading prompts went to cells the thread had held.  Not saved for a thread whose last two prompts both left its cells
+// before their end (Sess::tail_miss: a client that sends every answer back without its reasoning): that state would
+// never be restored.  One such prompt is not that: a tool call's arguments came back in another form than written.
 bool q36_park_live_on() {
     static const bool on = [] { const char* e = std::getenv("STRATA_Q36_PARK_LIVE"); return !(e && e[0] == '0'); }();
     return on;
@@ -3814,6 +3818,12 @@ struct Engine {
 #endif
     // verify windows (T <= kVerify): the GDN inputs of every row per layer, kept for the commit
     static constexpr int kVerify = 16;
+    // STRATA_Q36_ROWS (default 32; 16: as before): the rows of a BATCH window over all its slots (a slot still has at most
+    // kVerify, a request alone too).  With 8 slots 16 rows are a token and one draft a slot, and nine in ten of them
+    // gave a token (recorded agent runs): the rows, not the drafts, limited the decode.  32 only on the int4 pack's W4X
+    // products (32 columns a call) with the decode-side state kernels; else it stays 16.
+    static constexpr int kRowsT = 32;
+    int rows_cap = kVerify;
     static constexpr int kTreeFrontMax = 4;
     std::vector<float*> v_qkv, v_hc, v_alpha, v_beta;
     // speculative tree verification state & buffers
@@ -3966,6 +3976,8 @@ struct Engine {
                                             // starts (a request that shares more than that is the same thread); -1: none
         int8_t tail_kept = -1;              // the thread's last prompt went on past every cell it held (1), did not: its client sends
                                             // an answer back in another form (0); -1: not known yet
+        uint8_t tail_miss = 0;              // its prompts in a row that did not (2: a client that always does so; one miss is a
+                                            // tool call sent back in another form than it was written)
     };
     std::vector<Sess> sess;
     int n_sess = 1, cur = 0;
@@ -4166,7 +4178,7 @@ struct Engine {
         kv_vt = false;
         vt_ctxp = 0;
         vision = vision_;
-        tmax = std::max(tmax_, kVerify);
+        tmax = std::max(tmax_, kRowsT);
         const auto& g = m->g;
         const size_t T = (size_t) tmax, N = (size_t) g.n_embd, Kp = (size_t) m->top_k, FF = (size_t) g.n_ff;
         const size_t C = (size_t) g.ssm_conv_channels;
@@ -4186,7 +4198,7 @@ struct Engine {
         // the shared expert's buffers; a dense model's FFN (n_ff wide) uses them
         const size_t FW = (size_t) (m->dense ? g.n_ff : g.n_ff_shexp);
         sg = dalloc(T * FW); su = dalloc(T * FW); shh = dalloc(T * FW); sy = dalloc(T * N);
-        sgate = dalloc(T); ewts = dalloc(T * Kp); logits = dalloc((size_t) kVerify * g.n_vocab);
+        sgate = dalloc(T); ewts = dalloc(T * Kp); logits = dalloc((size_t) kRowsT * g.n_vocab);
         const int max_in = (int) std::max<int64_t>({2 * g.n_embd, g.ssm_value_dim, g.n_head * g.head_dim, g.n_ff_shexp,
                                                     m->dense ? g.n_ff : 0});
         // (+ 64 bytes: the XMX forms load a q8_1 block as 16 dwords, 28 bytes past the last block's end)
@@ -4329,16 +4341,16 @@ struct Engine {
         ent_tok = dalloc_t<int32_t>(T * Kp);
         tok = dalloc_t<int32_t>(T);
         pos0 = dalloc_t<int32_t>(1);
-        pick = dalloc_t<int32_t>(kVerify);
-        amv = dalloc((size_t) kArgBlocks * kVerify);
-        ami = dalloc_t<int32_t>((size_t) kArgBlocks * kVerify);
+        pick = dalloc_t<int32_t>(kRowsT);
+        amv = dalloc((size_t) kArgBlocks * kRowsT);
+        ami = dalloc_t<int32_t>((size_t) kArgBlocks * kRowsT);
         if (q36_spec_pen_on() || q36_spec_sample_on() || q36_batch_sample_on()) {   // (about 0.5 MB of the card and 8 KB of pinned memory)
             sp_nch = (int) ((g.n_vocab + kSpecChunk - 1) / kSpecChunk);
             if (sp_nch >= 1 && sp_nch <= kThreads) {   // (the second stage gives each chunk a work-item)
-                sp_cand = dalloc_t<uint64_t>((size_t) kVerify * (size_t) sp_nch * kSpecTopM);
-                sp_rows = dalloc_t<int32_t>((size_t) kVerify * kSpecRowWords);
+                sp_cand = dalloc_t<uint64_t>((size_t) kRowsT * (size_t) sp_nch * kSpecTopM);
+                sp_rows = dalloc_t<int32_t>((size_t) kRowsT * kSpecRowWords);
                 sp_m = dalloc_t<int32_t>(1);
-                CK(DPCT_CHECK_ERROR(sp_h = sycl::malloc_host<int32_t>(1 + (size_t) kVerify * kSpecRowWords, q_ct1)));
+                CK(DPCT_CHECK_ERROR(sp_h = sycl::malloc_host<int32_t>(1 + (size_t) kRowsT * kSpecRowWords, q_ct1)));
                 if (q36_spec_couple_on()) {
                     gum_key = dalloc_t<uint64_t>(kVerify);
                     gum_par = dalloc(2);
@@ -4360,7 +4372,7 @@ struct Engine {
         // 256-cell chunks over the context
         n_chunk = attn_head ? (ctx + kChunkCells - 1) / kChunkCells
                             : std::max(8, std::min(kAttMaxChunks, std::getenv("STRATA_Q36_ATT_CHUNKS") ? std::atoi(std::getenv("STRATA_Q36_ATT_CHUNKS")) : 96));
-        att_rows = (int) (g.n_head * std::min<int64_t>((int64_t) T, kGemmT));
+        att_rows = (int) (g.n_head * std::min<int64_t>((int64_t) T, kRowsT));
         pacc = dalloc((size_t) att_rows * n_chunk * g.head_dim);
         pm = dalloc((size_t) att_rows * n_chunk);
         pl = dalloc((size_t) att_rows * n_chunk);
@@ -4397,6 +4409,22 @@ struct Engine {
                     std::fprintf(stderr, "strata-q36: W4A16 active for B70W4 matrices at %d..%d columns (STRATA_Q36_W4H_T=%d)\n",
                                  w4h_min_t, kGemmT, w4h_min_t);
                 }
+            }
+            // STRATA_Q36_ROWS: 32 rows a batch window when every product of the layers has its 32-column form (the pack's W4X
+            // matrices) and the rows run on the decode-side kernels, which take a row count of their own
+            if (n_sess > 1) {
+                bool all_w4 = w4a16 && w4x_mode != 0 && m->dense && w4h_min_t <= 1 && w4_max_t() >= kRowsT;
+                for (const Layer& L : m->layers) {
+                    if (L.attn) all_w4 = all_w4 && L.wq.type == kW4Type && L.wk.type == kW4Type && L.wv.type == kW4Type && L.wo.type == kW4Type;
+                    else all_w4 = all_w4 && L.qkv.type == kW4Type && L.zg.type == kW4Type && L.ssm_out.type == kW4Type;
+                    all_w4 = all_w4 && L.ffn_gate.type == kW4Type && L.ffn_up.type == kW4Type && L.ffn_down.type == kW4Type;
+                }
+                const char* er = std::getenv("STRATA_Q36_ROWS");
+                const int want = er && *er ? std::atoi(er) : (int) kRowsT;
+                const bool can = all_w4 && fast_k && rms_fast_on() && gdn_dec_on() && fuse_gdn_rows() && fuse_commit_rows();
+                rows_cap = can ? std::max((int) kVerify, std::min(want, (int) kRowsT)) : (int) kVerify;
+                std::fprintf(stderr, "strata-q36: a batch window has up to %d rows over its slots (STRATA_Q36_ROWS%s)\n", rows_cap,
+                             can ? "" : "; 32 needs the int4 pack's W4X products and the decode-side state kernels");
             }
         }
         {
@@ -4553,10 +4581,10 @@ struct Engine {
             if (L.attn) {
                 for (auto* v : {&v_qkv, &v_hc, &v_alpha, &v_beta}) v->push_back(nullptr);
             } else {
-                v_qkv.push_back(dalloc((size_t) kVerify * C));
-                v_hc.push_back(dalloc((size_t) kVerify * C));
-                v_alpha.push_back(dalloc((size_t) kVerify * g.ssm_v_heads));
-                v_beta.push_back(dalloc((size_t) kVerify * g.ssm_v_heads));
+                v_qkv.push_back(dalloc((size_t) kRowsT * C));
+                v_hc.push_back(dalloc((size_t) kRowsT * C));
+                v_alpha.push_back(dalloc((size_t) kRowsT * g.ssm_v_heads));
+                v_beta.push_back(dalloc((size_t) kRowsT * g.ssm_v_heads));
             }
         }
         if (m->has_mtp) {
@@ -4637,11 +4665,11 @@ struct Engine {
                 CK(DPCT_CHECK_ERROR(d_xmir_tab = sycl::malloc_device<const void*>(hm.size(), q_ct1)));
                 CK(DPCT_CHECK_ERROR(q_ct1.memcpy((void*) d_xmir_tab, hm.data(), hm.size() * sizeof(const void*)).wait()));
             }
-            d_rcell = dalloc_t<int32_t>(kVerify);
-            d_rslot = dalloc_t<int32_t>(kVerify);
-            d_gslot = dalloc_t<int32_t>(kVerify);
-            d_grow0 = dalloc_t<int32_t>(kVerify);
-            d_gcnt = dalloc_t<int32_t>(kVerify);
+            d_rcell = dalloc_t<int32_t>(kRowsT);
+            d_rslot = dalloc_t<int32_t>(kRowsT);
+            d_gslot = dalloc_t<int32_t>(kRowsT);
+            d_grow0 = dalloc_t<int32_t>(kRowsT);
+            d_gcnt = dalloc_t<int32_t>(kRowsT);
             /*
             DPCT1048:1: The original value cudaHostAllocDefault is not
             meaningful in the migrated code and was removed or replaced with 0.
@@ -4649,7 +4677,7 @@ struct Engine {
             */
             CK(DPCT_CHECK_ERROR(hrow = sycl::malloc_host<int32_t>(256, q_ct1)));   // (8 fields of 32: kHr*)
         }
-        d_rdelta = dalloc_t<int32_t>(kVerify);
+        d_rdelta = dalloc_t<int32_t>(kRowsT);
         d_tp0 = dalloc_t<int32_t>(1);
         d_tmask = dalloc_t<uint32_t>(kVerify);
         d_tprev3 = dalloc_t<uint32_t>(kVerify);
@@ -4923,6 +4951,11 @@ struct Engine {
             mmh(w, xb16, out, T);
             return;
         }
+        if (rows_mode && T > kGemmT) {   // batch rows past 16 and a matrix without a 32-column form (the output head): 16 at a time
+            for (int c0 = 0; c0 < T; c0 += kGemmT)
+                mm(w, xin + (size_t) c0 * w.n_in, out + (size_t) c0 * w.n_out, std::min((int) kGemmT, T - c0));
+            return;
+        }
         const int w4_step = w4_max_t();
         if (T > w4_step && w.type == kW4Type && !use_w4_i8(w, T) && !use_w4_f16(w, T) &&
             (int64_t) w.n_in * w.n_out > w4_f16_elems) {
@@ -4943,7 +4976,7 @@ struct Engine {
     /// cuBLAS's FP32 GEMM (the router and the GDN alpha / beta stay in FP32, as llama.cpp keeps them).
     void f32mm(const float *W, const float *xin, float *out, int n_in,
                int n_out, int T) try {
-        if (T <= kGemmT) {
+        if (dec_rows(T)) {
             {
                 auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
@@ -5037,9 +5070,13 @@ struct Engine {
     /// A batch above kGemmT tokens (a prompt chunk) runs its projections as GEMMs (prefill::Gemm::native: the GGUF
     /// blocks dequantized to FP16, the activations FP16); a decode batch on the native MMVQ (q8_1 activations).
     static constexpr int kGemmT = 16;
+    /// The rows of a decode-side forward: at most kGemmT, and for batch rows (rows_mode) at most rows_cap (kRowsT when the
+    /// engine can take it, see rows_cap).  Batch rows are never a prompt chunk: each row is its own session's cell, a slot
+    /// has at most kVerify of them, and the recurrent state and the attention run a slot at a time.
+    bool dec_rows(int T) const { return T <= kGemmT || (rows_mode && T <= rows_cap); }
     static_assert(kDecT >= kGemmT && kDecT >= kVerify, "the decode GDN kernels take every decode-side row count");
     void prep(const float* xin, int n, int T, void* q) {
-        if (T > kGemmT) {
+        if (!dec_rows(T)) {
             if (pp_prefused && pp_x128_src == xin && pp_x128_n == n && pp_x128_T == T) {
                 pp_prefused = false;
                 pp_cur_src = xin;
@@ -5056,7 +5093,7 @@ struct Engine {
         } else quant(xin, n, T, q);
     }
     void apply(const Mat& w, const void* q, float* out, int T) {
-        if (T > kGemmT) {
+        if (!dec_rows(T)) {
             if (use_w4_i8(w, T)) {
                 ensure_pp_x128();
                 if (strata::q36pp::pp3_enabled()) {
@@ -5229,7 +5266,7 @@ struct Engine {
       std::exit(1);
     }
     void prep_in(int T) {
-        if (xq_ready && T <= kGemmT) {
+        if (xq_ready && dec_rows(T)) {
             xq_ready = false;
             return;
         }
@@ -5241,7 +5278,7 @@ struct Engine {
     sycl::queue &q_ct1 = dev_ct1.in_order_queue();
         const int N = (int) m->g.n_embd;
         xq_post = false;
-        if (fast_k && T <= kGemmT) {
+        if (fast_k && dec_rows(T)) {
             if (verify_k) {
                 if (!vx_) {
                     CK(DPCT_CHECK_ERROR(vx_ = (float *)sycl::malloc_device(
@@ -5287,7 +5324,7 @@ struct Engine {
             }
             return;
         }
-        if (T > kGemmT) {
+        if (!dec_rows(T)) {
             invalidate_pp();
             q8_src = nullptr;
             const bool want_x128 = m->dense && use_w4_i8(L.ffn_gate, T) && use_w4_i8(L.ffn_up, T) && pp_dxT != nullptr;
@@ -5828,7 +5865,7 @@ work-group size if needed.
             if (w4x_mode) strata::q36xr::w4x_swiglu_quantize(sg, su, xb16, FF, T, w4x_gs, st);
             else strata::q36xr::w4h_swiglu_pack(sg, su, xb16, FF, T, st);
             mmh(L.ffn_down, xb16, sy, T);
-        } else if (T <= kGemmT) {
+        } else if (dec_rows(T)) {   // (batch rows past 16: the draft block's matrices are not the pack's; mmq takes them 8 columns a call)
             if (!xq_post) quant(h, N, T, xq);
             mmq(L.ffn_gate, xq, sg, T);
             mmq(L.ffn_up, xq, su, T);
@@ -5899,9 +5936,9 @@ work-group size if needed.
             apply(L.ffn_down, nullptr, sy, T);
             }
         }
-        const bool mkq_in = fast_k && T <= kGemmT && wn != nullptr && hout == h && N % 256 == 0;   // the next layer's input
-        const bool mkq_out = !mkq_in && fast_k && T <= kGemmT && wn != nullptr && (hout == hmain || hout == hmtp) && N % 256 == 0;
-        const bool pp_next_q = (T > kGemmT) && next_w4_i8 && wn != nullptr && hout == h && pp_dxT != nullptr;
+        const bool mkq_in = fast_k && dec_rows(T) && wn != nullptr && hout == h && N % 256 == 0;   // the next layer's input
+        const bool mkq_out = !mkq_in && fast_k && dec_rows(T) && wn != nullptr && (hout == hmain || hout == hmtp) && N % 256 == 0;
+        const bool pp_next_q = (!dec_rows(T)) && next_w4_i8 && wn != nullptr && hout == h && pp_dxT != nullptr;
         if (mkq_in || mkq_out) {
             q36k::launch_add_rms_q(x, sy, wn, hout, (q36k::QB *) (mkq_in ? xq : q8), N, T, m->eps, (sycl::queue *) st);   // M2: 1024 threads a row
             if (mkq_out) {
@@ -5909,7 +5946,7 @@ work-group size if needed.
                 q8_stride = N;
                 q8_rows = T;
             }
-        } else if (T > kGemmT && strata::q36pp::rms_pp(x, sy, wn, hout,
+        } else if (!dec_rows(T) && strata::q36pp::rms_pp(x, sy, wn, hout,
                                                       pp_next_q ? q8 : nullptr,
                                                       pp_next_q ? pp_dxT : nullptr,
                                                       N, T, m->eps, st)) {
@@ -6216,7 +6253,7 @@ work-group size if needed.
             }
         }
         // ---- end QSA BLOCK 3
-        if (T > kGemmT) {
+        if (!dec_rows(T)) {
             // M4b: the flash kernel (q36_prefill.dp.hpp) on the FP16 cache unless STRATA_Q36_PATTN=gemm or the shape is not
             // its: q -> q16 below, then flash_prompt_attn instead of the slices, then the gate as before.  The 8-bit cache
             // always takes it (flash_prompt_attn_q8: the blocks dequantized in local memory).
@@ -6625,7 +6662,7 @@ work-group size if needed.
     }
     bool rms_fast(const float *xin, int ldx, const float *add, float *xw, const float *w, float *out, int ld_out, int n, int T,
                   q36k::QB *hq = nullptr) {
-        if (!rms_fast_on() || !fast_k || T < 1 || T > kGemmT || n > 8192 || n % 32 != 0 || w == nullptr) return false;
+        if (!rms_fast_on() || !fast_k || T < 1 || !dec_rows(T) || n > 8192 || n % 32 != 0 || w == nullptr) return false;
         const float eps = m->eps;
         const sycl::nd_range<3> nr(sycl::range<3>(1, 1, (size_t) T * 1024), sycl::range<3>(1, 1, 1024));
         if (add)
@@ -6643,7 +6680,7 @@ work-group size if needed.
         return true;
     }
     bool rms2_cat_q(const float *x0, const float *w0, const float *x1, const float *w1, float *out, q36k::QB *hq, int n, int T) {
-        if (!rms_fast_on() || !fast_k || T < 1 || T > kGemmT || n > 8192 || n % 32 != 0 || !w0 || !w1) return false;
+        if (!rms_fast_on() || !fast_k || T < 1 || !dec_rows(T) || n > 8192 || n % 32 != 0 || !w0 || !w1) return false;
         const float eps = m->eps;
         const sycl::nd_range<3> nr(sycl::range<3>(1, 2, (size_t) T) * sycl::range<3>(1, 1, 1024), sycl::range<3>(1, 1, 1024));
         if (hq) {
@@ -6690,7 +6727,7 @@ work-group size if needed.
                  const float *be_b) try {
         const auto &g = m->g;
         const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, C = (int) g.ssm_conv_channels;
-        if (T < 1 || T > kDecT || C % 128 != 0 || g.ssm_state_size != 128 || g.ssm_d_conv != 4) {
+        if (T < 1 || T > (rows_mode ? rows_cap : kDecT) || C % 128 != 0 || g.ssm_state_size != 128 || g.ssm_d_conv != 4) {   // (batch rows: at most kDecT a slot)
             std::fprintf(stderr, "strata-q36: the decode GDN kernels take 1..%d rows of 128-wide heads (T %d): "
                          "STRATA_Q36_GDN_DEC=0\n", kDecT, T);
             std::exit(1);
@@ -6779,14 +6816,14 @@ work-group size if needed.
             apply2(L.qkv, xq, h, pk16, qkv_b, T);
             apply2(L.zg, xq, h, pk16, z, T);
             static const bool ab2 = [] { const char* e = std::getenv("STRATA_Q36_GDN_AB2"); return !(e && e[0] == '0'); }();
-            if (T <= kGemmT && !ab2) {   // (STRATA_Q36_GDN_AB2=0: the warp-an-output kernel)
+            if (dec_rows(T) && !ab2) {   // (STRATA_Q36_GDN_AB2=0: the warp-an-output kernel)
                 const float *h_ct2 = h;
                 ((sycl::queue *)(st))->parallel_for<dpct_kernel_name<class k_gdn_ab_e24828>>(
                     sycl::nd_range<3>(sycl::range(1, T, rows8(2 * HV)) * sycl::range(1, 1, kThreads), sycl::range(1, 1, kThreads)),
                     [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
                         k_gdn_ab(L.alpha, L.beta, h_ct2, L.dt, L.ssm_a, al_b, be_b, N, HV);
                     });
-            } else if (T <= kGemmT) {
+            } else if (dec_rows(T)) {
                 auto exp_props = sycl::ext::oneapi::experimental::properties{};
 
                 ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
@@ -6801,7 +6838,7 @@ work-group size if needed.
                                           al_b, be_b, N, HV);
                             });
                 });
-            } else if (T > kGemmT && li < ab16_layers.size() && ab16_layers[li] != nullptr && gdn_ab16_on()) {
+            } else if (!dec_rows(T) && li < ab16_layers.size() && ab16_layers[li] != nullptr && gdn_ab16_on()) {
                 strata::q36pp::gdn_ab_pp(ab16_layers[li], h, L.dt, L.ssm_a, al_b, be_b, N, HV, T, st);
             } else {
                 f32mm(L.alpha, h, al_b, N, HV, T);
@@ -6822,7 +6859,7 @@ work-group size if needed.
                 }
             }
             // M4: k_conv_dec / k_gdn_dec / k_gdn_norm_q8; batch rows too with STRATA_Q36_FUSE (their group tables, gdn_dec)
-            const bool dec = gdn_dec_on() && T <= kGemmT && (!rows_mode || fuse_gdn_rows());
+            const bool dec = gdn_dec_on() && dec_rows(T) && (!rows_mode || fuse_gdn_rows());
             if (dec) {
                 gdn_dec(L, li, T, verify, qkv_b, hc_b, al_b, be_b);
             } else if (rows_mode) {   // batch rows: a slot's rows (one, or a verify window's two) in sequence on its own state
@@ -6901,7 +6938,7 @@ work-group size if needed.
                 // differently from k_conv_seq's, a 1-ulp difference in h that the Q8_1 activation rounding can turn into a
                 // flipped near-tie later; with them the KL is the same, 1.05x / 0.81x the floor, but MTP would not be exact.)
                 // a prompt chunk: tiles of kConvTile tokens side by side (tile mode); else one block per head walks the tokens
-                const int tiles = (fast_k && T > kGemmT && !verify) ? (T + kConvTile - 1) / kConvTile : 1;
+                const int tiles = (fast_k && !dec_rows(T) && !verify) ? (T + kConvTile - 1) / kConvTile : 1;
                 {
                     auto exp_props =
                         sycl::ext::oneapi::experimental::properties{};
@@ -6927,7 +6964,7 @@ work-group size if needed.
                                 });
                     });
                 }
-                if (T > kGemmT && !verify) {   // a prompt chunk: the column-split delta rule, then the norm
+                if (!dec_rows(T) && !verify) {   // a prompt chunk: the column-split delta rule, then the norm
                     /*
                     DPCT1049:38: The work-group size passed to the SYCL kernel
                     may exceed the limit. To get the device limit, query
@@ -7172,17 +7209,17 @@ work-group size if needed.
             });
         } // a picture's cells take its rows
         const Layer& L0 = m->layers[0];
-        const bool want_q0 = T <= kGemmT && (L0.attn ? (!a16(L0.wq, T) || !a16(L0.wk, T) || !a16(L0.wv, T))
+        const bool want_q0 = dec_rows(T) && (L0.attn ? (!a16(L0.wq, T) || !a16(L0.wk, T) || !a16(L0.wv, T))
                                                      : (!a16(L0.qkv, T) || !a16(L0.zg, T)));
-        const bool want_pp0 = T > kGemmT && m->dense && pp_dxT != nullptr &&
+        const bool want_pp0 = !dec_rows(T) && m->dense && pp_dxT != nullptr &&
                               (L0.attn ? use_w4_i8(L0.wq, T) : use_w4_i8(L0.qkv, T));
-        if (T > kGemmT) {
+        if (!dec_rows(T)) {
             invalidate_pp();
             q8_src = nullptr;
         }
         if (rms_fast(x, N, nullptr, nullptr, L0.attn_norm, h, N, N, T, want_q0 ? (q36k::QB*) xq : nullptr)) {   // M4: rows of a decode-side forward
             xq_ready = want_q0;
-        } else if (T > kGemmT && strata::q36pp::rms_pp(x, nullptr, L0.attn_norm, h,
+        } else if (!dec_rows(T) && strata::q36pp::rms_pp(x, nullptr, L0.attn_norm, h,
                                                        want_pp0 ? q8 : nullptr,
                                                        want_pp0 ? pp_dxT : nullptr,
                                                        N, T, m->eps, st)) {
@@ -7212,7 +7249,7 @@ work-group size if needed.
         } // later layers: from k_moe_out
         for (size_t l = 0; l < m->layers.size(); ++l) {
             const bool last = l + 1 == m->layers.size();
-            const bool next_w4_i8 = !last && T > kGemmT && m->dense && pp_dxT != nullptr &&
+            const bool next_w4_i8 = !last && !dec_rows(T) && m->dense && pp_dxT != nullptr &&
                                     (m->layers[l + 1].attn ? use_w4_i8(m->layers[l + 1].wq, T)
                                                            : use_w4_i8(m->layers[l + 1].qkv, T));
             layer(m->layers[l], l, T, p0, pos0, graph_mode, verify, last ? m->out_norm : m->layers[l + 1].attn_norm,
@@ -8303,7 +8340,7 @@ work-group size if needed.
     /// A slot's rows of one window: `n` consecutive cells from the session's position (the next token, then the MTP
     /// drafts the window verifies after it).
     struct Group { int slot; int n; int32_t tok[kVerify]; };
-    int32_t rows_pick[kVerify] = {};
+    int32_t rows_pick[kRowsT] = {};
     int rows_G_last = 0;   // groups of the window run last (commit_rows takes their keep counts)
 
     void run_graph_key(int key, const std::function<void()>& body) {
@@ -8610,13 +8647,13 @@ work-group size if needed.
     /// hidden at `seed` (device, n_embd floats); its draft - the block's greedy pick after that row - ends up in
     /// mtp_pick[r], and the block's K / V cells are written.
     struct MtpRow { int slot; int32_t tok; int64_t cell; const float* seed; };
-    int32_t mtp_pick[kVerify] = {};
+    int32_t mtp_pick[kRowsT] = {};   // (a batch window's kept rows all pass the block: up to kRowsT)
     float* logits_mr = nullptr;
     int32_t* pick_mr = nullptr;
     // STRATA_Q36_BATCH_COUPLE: with mtp_top2_on set by the caller, mtp_top2[r] gets row r's two best draft tokens and their
     // logits as well (id0 the best; the same two-stage kernels as the verify tree's draft head)
     bool mtp_top2_on = false;
-    TreeTop2 mtp_top2[kVerify] = {};
+    TreeTop2 mtp_top2[kRowsT] = {};
     TreeTop2* top2_mr = nullptr;
     float* amv_mr2 = nullptr;
     int32_t* ami_mr2 = nullptr;
@@ -8624,14 +8661,14 @@ work-group size if needed.
         const auto& g = m->g;
         const int N = (int) g.n_embd;
         if (!logits_mr) {
-            logits_mr = dalloc((size_t) kVerify * g.n_vocab);
-            pick_mr = dalloc_t<int32_t>(kVerify);
+            logits_mr = dalloc((size_t) kRowsT * g.n_vocab);
+            pick_mr = dalloc_t<int32_t>(kRowsT);
         }
         const bool top2 = mtp_top2_on;
         if (top2 && !top2_mr) {
-            amv_mr2 = dalloc((size_t) kVerify * kArgBlocks * 2);
-            ami_mr2 = dalloc_t<int32_t>((size_t) kVerify * kArgBlocks * 2);
-            top2_mr = dalloc_t<TreeTop2>(kVerify);
+            amv_mr2 = dalloc((size_t) kRowsT * kArgBlocks * 2);
+            ami_mr2 = dalloc_t<int32_t>((size_t) kRowsT * kArgBlocks * 2);
+            top2_mr = dalloc_t<TreeTop2>(kRowsT);
         }
         sess[(size_t) cur].pos = pos;
         CK(DPCT_CHECK_ERROR(st->wait()));
@@ -9099,6 +9136,7 @@ work-group size if needed.
         std::unique_ptr<PrefixEntry> ckpt; // the thread's deepest prefix checkpoint, taken out of the store (its ram_blob; empty while in the file)
         std::unique_ptr<PrefixEntry> ckpt_live;   // STRATA_Q36_PARK_LIVE: the state at the last cell (as ckpt; in the file after it)
         int64_t head = -1;                 // the session's thread_head when it was parked
+        uint8_t tail_miss = 0;             // its Sess::tail_miss
         uint64_t lru = 0;
         size_t total(size_t ckpt_bytes) const { return bytes + (ckpt ? ckpt_bytes : 0) + (ckpt_live ? ckpt_bytes : 0); }
     };
@@ -9394,12 +9432,13 @@ work-group size if needed.
         CK(DPCT_CHECK_ERROR(st->wait()));
         pk->tokens = toks;
         pk->head = sess[(size_t) s].thread_head;
+        pk->tail_miss = sess[(size_t) s].tail_miss;
         pk->ckpt = take_thread_ckpt(toks, pk->head);   // (the recurrent state its next turn restores: it travels with the cells)
         // STRATA_Q36_PARK_LIVE: and the state at its last cell, which the session still holds when it stands there (its slot
         // or its request ended; nothing was restored below since)
         {
             const Sess& ps = sess[(size_t) s];
-            if (q36_park_live_on() && pk->head >= 0 && ps.tail_kept != 0 && ps.pos == n && (int64_t) ps.live.size() == n && ps.imgs.empty() &&
+            if (q36_park_live_on() && pk->head >= 0 && ps.tail_miss < 2 && ps.pos == n && (int64_t) ps.live.size() == n && ps.imgs.empty() &&
                 (!pk->ckpt || pk->ckpt->pos < n) && std::equal(ps.live.begin(), ps.live.end(), toks.begin())) {
                 // (straight to host memory through a staging block of its own: not through the store, where it would push
                 // another checkpoint out to make room and leave again at once)
@@ -9485,6 +9524,7 @@ work-group size if needed.
         kv_live[(size_t) s] = std::move(own->tokens);
         kv_imgs[(size_t) s].clear();
         b.tail_kept = -1;
+        b.tail_miss = own->tail_miss;
         bool back = false;
         for (std::unique_ptr<PrefixEntry>* c : {&own->ckpt, &own->ckpt_live}) {
             if (!*c) continue;
@@ -11271,7 +11311,7 @@ struct Serve {
         const int S = (int) want.size();
         int total = S;
         for (int v : want) total += v;
-        while (total > Engine::kVerify) {
+        while (total > E.rows_cap) {
             int best = -1;
             for (int k = 0; k < S; ++k) {
                 const int i = (mtp_turn + k) % S;
@@ -11625,7 +11665,7 @@ struct Serve {
             int act = 0, greedy = 0;
             for (const Slot& sl : slots)
                 if (sl.active) { ++act; greedy += sl.drafts_ok(); }   // (a slot whose rows' candidates serve it drafts like a greedy one)
-            if (greedy > 0 && Engine::kVerify - act > 0) { window_mtp(); return; }
+            if (greedy > 0 && E.rows_cap - act > 0) { window_mtp(); return; }
         }
         window_plain();
     }
@@ -12113,7 +12153,10 @@ struct Serve {
             // first prompt, else a new one that begins with this prompt
             const int64_t sh = th_from >= 0 ? E.sess[(size_t) th_from].thread_head : -1;
             ss.thread_head = sh >= 0 && (int64_t) reuse > sh ? sh : q36_last_turn(ids);
-            ss.tail_kept = sh >= 0 && (int64_t) reuse > sh ? tail_now : (int8_t) -1;
+            const bool same_thread = sh >= 0 && (int64_t) reuse > sh;
+            const uint8_t miss0 = th_from >= 0 ? E.sess[(size_t) th_from].tail_miss : (uint8_t) 0;
+            ss.tail_kept = same_thread ? tail_now : (int8_t) -1;
+            ss.tail_miss = !same_thread ? (uint8_t) 0 : tail_now == 1 ? (uint8_t) 0 : tail_now == 0 ? (uint8_t) std::min<int>(miss0 + 1, 2) : miss0;
         }
         if (s >= 0 && s < (int) E.kv_live.size()) {
             if (E.kv_live[(size_t) s].size() > reuse) {
@@ -12612,6 +12655,22 @@ int serve(Engine& E) {
 }  // namespace
 
 int strata::qwen35::run(int argc, char** argv) {
+#if defined(__GLIBC__)
+    // An error nothing catches ends the engine: say where it was thrown (addresses for `addr2line -Cfie <binary>`), since the
+    // message alone ("requires non-null ... pointers") does not name the call.
+    std::set_terminate([] {
+        void* fr[48];
+        const int n = backtrace(fr, 48);
+        std::fprintf(stderr, "strata-q36: an error was not caught; the call stack (addr2line -Cfie strata <address>):\n");
+        backtrace_symbols_fd(fr, n, 2);
+        if (std::exception_ptr e = std::current_exception()) {
+            try { std::rethrow_exception(e); }
+            catch (const std::exception& x) { std::fprintf(stderr, "strata-q36: %s\n", x.what()); }
+            catch (...) {}
+        }
+        std::abort();
+    });
+#endif
     std::string model, tokens, force, dump_full, emb_file, kv_cli;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = -1, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
