@@ -16,9 +16,10 @@
 #include <cstdlib>
 #include <utility>
 
-#include "q36_xr_dense.hpp"
+#include "strata/b70/stream.hpp"
+#include "strata/b70/env.hpp"
 
-namespace strata::q36xr {
+namespace strata::b70::stream {
 namespace {
 
 using namespace sycl::ext::intel::esimd;
@@ -696,7 +697,7 @@ void launch_gu_swiglu(sycl::queue& q, const void* gu_weights, const void* act_in
 
 int read_w4x_ks_env() {
     static const int ks = []() {
-        const char* e = std::getenv("STRATA_Q36_W4X_KS");
+        const char* e = strata::b70::env("STRATA_B70_W4X_KS", "STRATA_Q36_W4X_KS");
         return (e && *e) ? std::atoi(e) : 0;
     }();
     return ks;
@@ -822,4 +823,4 @@ bool mmvq_w4x_gu_swiglu(const void* gu_weights, const void* act_in, void* act_do
     return true;
 }
 
-}   // namespace strata::q36xr
+}   // namespace strata::b70::stream

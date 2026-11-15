@@ -12,6 +12,9 @@
 #include "strata/kernels/fused_gr_q8.hpp"
 #include "strata/core/geometry.hpp"
 #include "strata/platform/memory.hpp"
+#if defined(STRATA_B70_LIB)
+#include "strata/b70/pack.hpp"     // STRATA_B70_PACK: projection matrices from the card's own weight format
+#endif
 
 #include <algorithm>
 #include <climits>
@@ -134,6 +137,37 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
 }
+#if defined(STRATA_B70_LIB)
+// STRATA_B70_PACK=<file> (the engine's --b70-pack; Settings: "b70_pack"): a pack (strata/b70/pack.hpp, written by
+// tools/b70_pack.py) that names projection matrices of this model.  A matrix the pack holds with the GGUF's shape is uploaded
+// from it instead of from the GGUF and carries the pack type, so its decode products are the card library's stream product
+// (native_mmvq) and its prompt products the library's dequantize + the FP16 GEMM (Gemm::native).  Only the projections that
+// reach the weights through those two calls are taken: the shared expert's matrices and the PLE key have kernels of their own
+// that read the GGUF's blocks.  Unset: nothing of this runs.
+const strata::b70::pack::File* b70_pack(std::string& err) {
+    static strata::b70::pack::File file;
+    static std::string open_err;
+    static const int state = [] {
+        const char* path = std::getenv("STRATA_B70_PACK");
+        if (path == nullptr || path[0] == 0) return 0;
+        return file.open(path, open_err) ? 1 : -1;
+    }();
+    if (state < 0) err = "STRATA_B70_PACK: " + (open_err.empty() ? std::string("no matrices in the pack") : open_err);
+    return state > 0 ? &file : nullptr;
+}
+bool b70_pack_name(const std::string& name) {
+    static const char* suffixes[] = {".attn_qkv.weight", ".attn_gate.weight", ".ssm_out.weight",
+        ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_output.weight"};
+    if (name.rfind("blk.", 0) != 0) return false;
+    for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
+    return false;
+}
+// the pack's entry for a projection of this shape, or nullptr (no pack, not a pack name, another shape)
+const strata::b70::pack::Entry* b70_pack_entry(const strata::b70::pack::File* pack, const std::string& name, int64_t n_in,
+                                               int64_t n_out) {
+    return pack != nullptr && b70_pack_name(name) ? pack->find(name, n_in, n_out) : nullptr;
+}
+#endif
 struct DeviceFree {
     void
     operator()(void *p) const {
@@ -181,6 +215,10 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, Weigh
     try {
         std::set<std::string> seen;
         uint64_t total = 0;
+#if defined(STRATA_B70_LIB)
+        const strata::b70::pack::File* pack = b70_pack(err);
+        if (!err.empty()) return false;
+#endif
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
             for (const auto& tensor : gguf.tensors()) {
@@ -204,6 +242,12 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, Weigh
                     err = "native dense: incompatible matrix " + tensor.name;
                     return false;
                 }
+#if defined(STRATA_B70_LIB)
+                if (const auto* pe = b70_pack_entry(pack, tensor.name, ref.ne0, ref.ne1)) {   // as `load` takes it
+                    total += alloc_bytes(pe->bytes);
+                    continue;
+                }
+#endif
                 total += alloc_bytes(strata::kernels::native_mmvq_weight_bytes(tensor.type, (int) ref.ne0, (int) ref.ne1));
             }
         }
@@ -261,6 +305,11 @@ bool NativeDense::load(const std::vector<std::string> &shards,
         uint64_t split_count = 0, split_tensors = 0;
         std::set<uint64_t> split_numbers;
         bool have_architecture = false;
+#if defined(STRATA_B70_LIB)
+        const strata::b70::pack::File* pack = b70_pack(err);
+        if (!err.empty()) return false;
+        uint64_t pack_count = 0, pack_bytes = 0;
+#endif
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
             const auto* count = gguf.get("split.count");
@@ -343,6 +392,37 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                     tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {
                     err = "native dense: incompatible matrix " + tensor.name; return false;
                 }
+#if defined(STRATA_B70_LIB)
+                if (const auto* pe = b70_pack_entry(pack, tensor.name, ref.ne0, ref.ne1)) {
+                    // this projection from the pack: its records on a 2 MiB boundary, the pack type instead of the GGUF's
+                    std::vector<uint8_t> host((size_t) pe->bytes);
+                    std::string read_err;
+                    if (!pack->read(*pe, host.data(), read_err)) {
+                        err = "native dense (STRATA_B70_PACK) " + tensor.name + ": " + read_err; return false;
+                    }
+                    void* pack_allocation = nullptr;
+                    auto pack_status = DPCT_CHECK_ERROR(
+                        pack_allocation = (void *)sycl::aligned_alloc_device(
+                            strata::b70::pack::kDeviceAlign, host.size(), dpct::get_in_order_queue()));
+                    DevicePtr pack_data(pack_allocation);
+                    if (pack_status == 0 && pack_allocation != nullptr)
+                        pack_status = DPCT_CHECK_ERROR(
+                            dpct::get_in_order_queue()
+                                .memcpy(pack_data.get(), host.data(), host.size())
+                                .wait());
+                    if (pack_status != 0 || pack_allocation == nullptr) {
+                        err = "native dense (STRATA_B70_PACK) upload " + tensor.name; return false;
+                    }
+                    strata::device_alloc_register(pack_data.get(), host.size());
+                    max_in = (std::max)(max_in, (int) ref.ne0);
+                    total += pe->bytes;
+                    allocated += alloc_bytes(pe->bytes);
+                    ++pack_count;
+                    pack_bytes += pe->bytes;
+                    pending.push_back(Pending{&ref, strata::b70::kTypeW4, pe->bytes, std::move(pack_data), DevicePtr()});
+                    continue;
+                }
+#endif
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
                     tensor.type, (int) ref.ne0, (int) ref.ne1);
                 void* allocation = nullptr;
@@ -553,7 +633,11 @@ bool NativeDense::load(const std::vector<std::string> &shards,
         void* allocation = nullptr;
         const auto status =
             DPCT_CHECK_ERROR(allocation = (void *)strata::malloc_device_guarded(
+#if defined(STRATA_B70_LIB)
+                                 strata::kernels::native_q8_1_bytes(max_in) + 64,   // (+64: a pack product reads 28 bytes past the last block)
+#else
                                  strata::kernels::native_q8_1_bytes(max_in),
+#endif
                                  dpct::get_in_order_queue()));
         DevicePtr scratch(allocation);
         /*
@@ -591,6 +675,12 @@ bool NativeDense::load(const std::vector<std::string> &shards,
             }
             weights_.push_back(item.data.release());
         }
+#if defined(STRATA_B70_LIB)
+        if (pack != nullptr)
+            std::fprintf(stderr, "native dense: STRATA_B70_PACK=%s: %llu projection matrices from the pack (%.1f MiB; int4, the card "
+                                 "library's products), %zu from the GGUF\n", pack->path.c_str(), (unsigned long long) pack_count,
+                         pack_bytes / 1048576.0, pending.size() - (size_t) pack_count);
+#endif
         if (packed_count)
             std::fprintf(stderr, "native dense: STRATA_Q8_PACKED=1 packed %zu Q8_0 matrices for decode (+%.1f MiB)\n",
                          packed_count, packed_bytes / 1048576.0);

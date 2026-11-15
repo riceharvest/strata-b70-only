@@ -13,9 +13,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include "strata/sycl_queue.hpp"
-#include "q36_xr_dense.hpp"
+#include "strata/b70/stream.hpp"
+#include "strata/b70/env.hpp"
 
-namespace strata::q36xr {
+namespace strata::b70::stream {
 namespace {
 using namespace sycl::ext::intel::esimd;
 namespace xmx = sycl::ext::intel::esimd::xmx;
@@ -160,7 +161,7 @@ inline int pool_threads() {
 }
 // STRATA_Q36_W4H_C (1, 2, 4): the threads a tile (4: 17408 x 5120 at 16 / 32 columns 100.6 / 199.0 us, 2: 107.9 / 240.4)
 inline int w4h_chunks() {
-    static const int e = [] { const char* v = std::getenv("STRATA_Q36_W4H_C"); const int n = v ? std::atoi(v) : 0; return n == 1 || n == 2 || n == 4 ? n : 4; }();
+    static const int e = [] { const char* v = strata::b70::env("STRATA_B70_W4H_C", "STRATA_Q36_W4H_C"); const int n = v ? std::atoi(v) : 0; return n == 1 || n == 2 || n == 4 ? n : 4; }();
     return e;
 }
 template <int NC>
@@ -243,4 +244,4 @@ void w4h_swiglu_pack(const float* g, const float* u, uint16_t* x16, int n, int n
     });
 }
 
-}   // namespace strata::q36xr
+}   // namespace strata::b70::stream

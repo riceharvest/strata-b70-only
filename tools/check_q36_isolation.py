@@ -21,8 +21,14 @@ text.  `Q36=OFF` builds that.  Checks:
   5. with g++ at hand, each changed header run through the preprocessor (SYCL headers stubbed, STRATA_Q36_BUILD undefined) gives
      byte for byte BASE's output (nothing, for a header new in this tree).
 
+The B70 card library (sycl/src/b70, sycl/include/strata/b70; docs/B70_LIB.md) is a second switch of the same kind:
+`STRATA_BUILD_B70LIB` builds it and defines STRATA_B70_LIB for every target, and the shared sources reach it only behind
+`#if defined(STRATA_B70_LIB)`.  So "compiled out" means both macros undefined here, the library's own trees are not compared
+with BASE (they are new), the CMake text is compared up to the library's section, and check 6 holds the library's layout:
+its section sits before the dense one, names only src/b70 sources, and nothing outside the allowed files names the macro.
+
     python3 tools/check_q36_isolation.py            # against 86f64dc2
-Exit status 0: all five hold.
+Exit status 0: all six hold.
 """
 from __future__ import annotations
 
@@ -44,6 +50,14 @@ ALLOWED = {"include/strata/artifact/model_family.hpp", "include/strata/artifact/
            "include/strata/core/family_layout.hpp", "sycl/include/strata/core/family_layout.hpp",
            "include/strata/qwen35/dispatch.hpp", "sycl/src/program/generate.cpp"}
 DENSE_BANNER = re.compile(r"^# -+\n# Qwen3\.8-27B \(dense", re.M)
+B70_BANNER = re.compile(r"^# -+\n# The B70 card library", re.M)
+# the two family / library switches: a branch behind either is not part of the Flash-Next-only text
+GUARDS = ("STRATA_Q36_BUILD", "STRATA_B70_LIB")
+# the card library's own trees (new, built by STRATA_BUILD_B70LIB): not compared with BASE
+B70_TREES = ("sycl/include/strata/b70/", "sycl/src/b70/")
+# the shared files that may reach the library (behind STRATA_B70_LIB)
+B70_ALLOWED = {"sycl/src/kernels/cuda/native_mmvq.dp.cpp", "sycl/src/prefill/gemm.dp.cpp", "sycl/src/core/native_dense.cpp",
+               "sycl/src/program/generate.cpp"}
 DENSE_SOURCES = ("q36_engine.dp.cpp", "q36_mmvq_dense.dp.cpp", "q36_xr_dense.dp.cpp", "q36_requant.cpp")
 
 
@@ -65,8 +79,9 @@ def resolve(text: str) -> str:
         if m:
             kind, rest = m.group(1), m.group(2)
             if kind in ("if", "ifdef", "ifndef"):
-                if "STRATA_Q36_BUILD" in rest:
-                    stack.append(kind == "ifndef" or "!" in rest.split("STRATA_Q36_BUILD")[0])   # defined(X) is false here
+                guard = next((g for g in GUARDS if g in rest), None)
+                if guard:
+                    stack.append(kind == "ifndef" or "!" in rest.split(guard)[0])   # defined(X) is false here
                     continue
                 stack.append(None)
             elif stack and stack[-1] is not None:
@@ -129,7 +144,7 @@ def preprocessed_identical(files: list[str]) -> bool:
 
 def check_files() -> bool:
     ok = True
-    changed = [f for f in git("diff", BASE, "--name-only").split("\n") if f and f.startswith(TREES)]
+    changed = [f for f in git("diff", BASE, "--name-only").split("\n") if f and f.startswith(TREES) and not f.startswith(B70_TREES)]
     print(f"files under the trees strata compiles that differ from {BASE}: {changed or 'none'}")
     for f in changed:
         old = in_base(f)
@@ -160,9 +175,53 @@ def check_cmake() -> bool:
     if not mn or not mo:
         print("\nsycl/CMakeLists.txt: the dense section's banner is missing (here or on BASE): False")
         return False
-    head_same = norm_cmake(new[:mn.start()]) == norm_cmake(old[:mo.start()])
-    print(f"\nsycl/CMakeLists.txt: before the dense section (line {new[:mn.start()].count(chr(10)) + 1}) it is {BASE}'s text: {head_same}")
+    mb = B70_BANNER.search(new)   # the card library's section, when there is one, comes first and is not BASE's either
+    cut = mb.start() if mb and mb.start() < mn.start() else mn.start()
+    head_same = norm_cmake(new[:cut]) == norm_cmake(old[:mo.start()])
+    print(f"\nsycl/CMakeLists.txt: before the library and dense sections (line {new[:cut].count(chr(10)) + 1}) it is {BASE}'s text: {head_same}")
     return head_same
+
+
+def check_b70_lib() -> bool:
+    """6. The card library is a switch of its own, before the dense section, and the shared sources reach it behind its macro."""
+    ok = True
+
+    def verdict(what: str, cond: bool) -> None:
+        nonlocal ok
+        ok &= cond
+        print(f"  {what}: {cond}")
+
+    new = (ROOT / "sycl/CMakeLists.txt").read_text(encoding="utf-8")
+    mb, md = B70_BANNER.search(new), DENSE_BANNER.search(new)
+    print("\nthe card library:")
+    if not mb:
+        print("  no card library section in sycl/CMakeLists.txt (a tree from before it): nothing to check")
+        return True
+    verdict("its section sits before the dense section", bool(md) and mb.start() < md.start())
+    sect = re.sub(r"#[^\n]*", "", new[mb.start():md.start()] if md else new[mb.start():])
+    rest = re.sub(r"#[^\n]*", "", new[:mb.start()] + (new[md.start():] if md else ""))
+    verdict("it is a switch: option(STRATA_BUILD_B70LIB ...) and every library line inside if(STRATA_BUILD_B70LIB)",
+            "option(STRATA_BUILD_B70LIB" in sect and re.search(r"^if\(STRATA_BUILD_B70LIB\)", sect, re.M) is not None
+            and "add_library(strata_b70 " in sect.split("if(STRATA_BUILD_B70LIB)", 1)[-1])
+    verdict("it names no model family's sources (no src/qwen35 path)", "qwen35/" not in sect)
+    verdict("no src/b70 source is listed outside it", "src/b70/" not in rest and "_b70_src}" not in rest)
+    listed = set(re.findall(r"\$\{_b70_src\}/([\w.]+)", sect))
+    on_disk = {q.name for q in (ROOT / "sycl/src/b70").glob("*.cpp")}
+    verdict(f"every source in sycl/src/b70 is built by it ({len(on_disk)} files)", listed == on_disk)
+    verdict("STRATA_B70_LIB is defined once, for every target (add_compile_definitions), inside it",
+            len(re.findall(r"STRATA_B70_LIB\b", sect + rest)) == 1 and "add_compile_definitions(STRATA_B70_LIB=1)" in sect)
+    verdict("the dense family refuses a build without it", "if(NOT STRATA_BUILD_B70LIB)" in rest)
+    hits = git("grep", "-l", "STRATA_B70_LIB", "--", "include", "src", "sycl/include", "sycl/src", check=False).split("\n")
+    stray = sorted(f for f in hits if f and f not in B70_ALLOWED and not f.startswith(B70_TREES))
+    verdict(f"only the shared dispatch, the prompt GEMM, the dense loader and the flag parser name STRATA_B70_LIB (stray: {stray or 'none'})",
+            not stray)
+    unguarded = []
+    for f in sorted(B70_ALLOWED):
+        text = (ROOT / f).read_text(encoding="utf-8")
+        if "strata/b70/" in resolve(text) or "strata::b70" in resolve(text):
+            unguarded.append(f)
+    verdict(f"those files name the library only behind the macro (outside it: {unguarded or 'none'})", not unguarded)
+    return ok
 
 
 def check_layout() -> bool:
@@ -222,8 +281,9 @@ def main() -> int:
     a = check_files()
     b = check_cmake()
     c = check_layout()
-    print("\nALL HOLD" if a and b and c else "\nFAILED")
-    return 0 if a and b and c else 1
+    d = check_b70_lib()
+    print("\nALL HOLD" if a and b and c and d else "\nFAILED")
+    return 0 if a and b and c and d else 1
 
 
 if __name__ == "__main__":

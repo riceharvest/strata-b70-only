@@ -27,9 +27,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include "strata/sycl_queue.hpp"
-#include "q36_xatt.hpp"
+#include "strata/b70/attn.hpp"
+#include "strata/b70/env.hpp"
 
-namespace strata::q36xatt {
+namespace strata::b70::attn {
 namespace {
 using namespace sycl::ext::intel::esimd;
 namespace es = sycl::ext::intel::esimd;
@@ -534,7 +535,7 @@ template <int NLS> void launch_values(sycl::queue& q, const Call c) {
 
 // STRATA_XATT_PARTS (a bench switch): the kernels a call runs, a sum of 1 (queries), 2 (scores), 4 (values); default 7
 template <int NLS> void run(sycl::queue& q, const Call& c) {
-    static const int parts = [] { const char* e = std::getenv("STRATA_XATT_PARTS"); return e && *e ? std::atoi(e) : 7; }();
+    static const int parts = [] { const char* e = strata::b70::env("STRATA_B70_XATT_PARTS", "STRATA_XATT_PARTS"); return e && *e ? std::atoi(e) : 7; }();
     if (parts & 1) launch_queries<NLS>(q, c);
     if (parts & 2) {
         if (c.ns == 4) launch_scores<NLS, 4>(q, c);
@@ -547,7 +548,7 @@ template <int NLS> void run(sycl::queue& q, const Call& c) {
 int chunk_cap(int ctx, int nchk) { return chunk_cells_host(ctx + 64, nchk) + 64; }
 
 bool attend(const Call& c0, void* stream) {
-    static const int dbg = [] { const char* e = std::getenv("STRATA_XATT_DBG"); return e && *e ? std::atoi(e) : 0; }();
+    static const int dbg = [] { const char* e = strata::b70::env("STRATA_B70_XATT_DBG", "STRATA_XATT_DBG"); return e && *e ? std::atoi(e) : 0; }();
     Call c = c0;
     c.dbg = dbg;
     if (c.nt < 1 || c.nt > 16 || c.H != kG * c.HKV || c.nchk < 1 || (c.ns != 1 && c.ns != 4) || (c.nt * kG + 15) / 16 > c.max_ls) return false;
@@ -608,23 +609,23 @@ SYCL_ESIMD_FUNCTION inline int hmin8_i(simd<int, 8> v) {
 }
 
 inline int xatt2_env_form() {
-    static const int v = [] { const char* e = std::getenv("STRATA_Q36_XATT2_FORM"); return e && *e ? std::atoi(e) : -1; }();
+    static const int v = [] { const char* e = strata::b70::env("STRATA_B70_XATT2_FORM", "STRATA_Q36_XATT2_FORM"); return e && *e ? std::atoi(e) : -1; }();
     return v;
 }
 inline int xatt2_env_segs() {
-    static const int v = [] { const char* e = std::getenv("STRATA_Q36_XATT2_SEGS"); return e && *e ? std::atoi(e) : 0; }();
+    static const int v = [] { const char* e = strata::b70::env("STRATA_B70_XATT2_SEGS", "STRATA_Q36_XATT2_SEGS"); return e && *e ? std::atoi(e) : 0; }();
     return v;
 }
 inline int xatt2_env_u16() {
-    static const int v = [] { const char* e = std::getenv("STRATA_Q36_XATT2_U16"); return e && *e ? std::atoi(e) : 1; }();
+    static const int v = [] { const char* e = strata::b70::env("STRATA_B70_XATT2_U16", "STRATA_Q36_XATT2_U16"); return e && *e ? std::atoi(e) : 1; }();
     return v;
 }
 inline int xatt2_env_exp() {
-    static const int v = [] { const char* e = std::getenv("STRATA_Q36_XATT2_EXP"); return e && *e ? (std::atoi(e) != 0 ? 1 : 0) : 0; }();
+    static const int v = [] { const char* e = strata::b70::env("STRATA_B70_XATT2_EXP", "STRATA_Q36_XATT2_EXP"); return e && *e ? (std::atoi(e) != 0 ? 1 : 0) : 0; }();
     return v;
 }
 inline int xatt2_env_pfd() {
-    static const int v = [] { const char* e = std::getenv("STRATA_Q36_XATT2_PFD"); return e && *e ? std::atoi(e) : 1; }();
+    static const int v = [] { const char* e = strata::b70::env("STRATA_B70_XATT2_PFD", "STRATA_Q36_XATT2_PFD"); return e && *e ? std::atoi(e) : 1; }();
     return v;
 }
 
@@ -640,7 +641,7 @@ SYCL_ESIMD_FUNCTION inline simd<float, 64> sigm64(simd<float, 64> x) {
 
 inline bool xatt2_dbg_on() {
     static const bool on = [] {
-        const char* e = std::getenv("STRATA_Q36_XATT2_DBG");
+        const char* e = strata::b70::env("STRATA_B70_XATT2_DBG", "STRATA_Q36_XATT2_DBG");
         return e && e[0] == '1';
     }();
     return on;
@@ -2412,7 +2413,7 @@ inline int plan2_seg_cap(const Call2& c) {
 // 768 threads) 480 us; T=1 (W=1, 96 segs, 384 threads) 714 us - a thread keeps about 1 KiB of loads in flight, so the bytes
 // in flight follow the thread count: W=1 gets 1024 threads (hypothesis, Hermes measures: STRATA_Q36_XATT2_THREADS).
 inline int xatt2_env_threads() {
-    static const int v = [] { const char* e = std::getenv("STRATA_Q36_XATT2_THREADS"); return e && *e ? std::atoi(e) : 0; }();
+    static const int v = [] { const char* e = strata::b70::env("STRATA_B70_XATT2_THREADS", "STRATA_Q36_XATT2_THREADS"); return e && *e ? std::atoi(e) : 0; }();
     return v;
 }
 
@@ -2754,4 +2755,4 @@ bool xatt2_exp_probe(void* stream, const float* d_x, float* d_hw, float* d_poly,
     return true;
 }
 
-}   // namespace strata::q36xatt
+}   // namespace strata::b70::attn

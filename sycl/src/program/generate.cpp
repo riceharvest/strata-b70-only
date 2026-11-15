@@ -3648,6 +3648,11 @@ int main(int argc, char **argv) try {
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-spill-dir") o.conversation_cache_spill_dir = next("--conversation-cache-spill-dir");
+#if defined(STRATA_B70_LIB)
+        // a pack of this model's projection matrices in the card's own weight format (strata/b70/pack.hpp; the dense loader reads
+        // STRATA_B70_PACK, so the variable alone does the same)
+        else if (a == "--b70-pack") { const std::string pack_path = next("--b70-pack"); ::setenv("STRATA_B70_PACK", pack_path.c_str(), 1); }
+#endif
         else if (a == "--conversation-cache-spill-verify") o.conversation_cache_spill_verify = true;
         else if (a == "--conversation-cache-park-ssd") o.conversation_cache_park_ssd = true;
         else if (a == "--conversation-cache-auto-max-mib") o.conversation_cache_auto_max_mib = std::max<int64_t>(0, std::atoll(next("--conversation-cache-auto-max-mib")));

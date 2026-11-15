@@ -7,9 +7,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include "strata/sycl_queue.hpp"
-#include "q36_xr_dense.hpp"
+#include "strata/b70/stream.hpp"
+#include "strata/b70/env.hpp"
 
-namespace strata::q36xr {
+namespace strata::b70::stream {
 namespace {
 using namespace sycl::ext::intel::esimd;
 namespace xmx = sycl::ext::intel::esimd::xmx;
@@ -189,7 +190,7 @@ inline int pool_threads() {
 }
 // STRATA_Q36_W4_C (1, 2, 4; unset: 4, a row wider than 16384 2): the W4 form's threads a tile
 inline int w4_chunks(int n_in) {
-    static const int e = [] { const char* v = std::getenv("STRATA_Q36_W4_C"); const int n = v ? std::atoi(v) : 0; return n == 1 || n == 2 || n == 4 ? n : 0; }();
+    static const int e = [] { const char* v = strata::b70::env("STRATA_B70_W4_C", "STRATA_Q36_W4_C"); const int n = v ? std::atoi(v) : 0; return n == 1 || n == 2 || n == 4 ? n : 0; }();
     return e ? e : n_in > 16384 ? 2 : 4;
 }
 template <int NC>
@@ -268,4 +269,4 @@ void w4_dequant_f16(const void* weights, uint16_t* out, int n_in, int n_out, voi
     });
 }
 
-}   // namespace strata::q36xr
+}   // namespace strata::b70::stream

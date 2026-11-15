@@ -555,6 +555,70 @@ endif()
 
 
 # -----------------------------------------------------------------------------
+# The B70 card library (sycl/src/b70, sycl/include/strata/b70; docs/B70_LIB.md)
+# -----------------------------------------------------------------------------
+# Kernels written from the card's measured limits (memory stream, matrix engine, caches) instead of for one model: stream
+# products (a matrix read once against 1-32 activation columns), fat products (a prompt chunk), attention over a cache, on the
+# card's own weight format, the pack (strata/b70/pack.hpp).  Every entry takes its shape as arguments and declines a call it
+# does not take, so any model family of `strata` can call them.  STRATA_B70_LIB is defined for every target when the library
+# is built: the shared dispatch (native_mmvq, the prompt GEMM, the dense loader) reaches the pack forms behind it.
+# STRATA_BUILD_B70LIB=OFF (build.sh: B70LIB=OFF) builds `strata` without the library and without the dense family.
+#   libstrata_b70.so       stream products, attention, the fat products that want 256 registers a thread (own register-file size:
+#                          STRATA_B70_GRF=128 at configure time builds it without -doubleGRF)
+#   libstrata_b70_fat.so   the fat products that need 64 hardware threads a work-group (128 registers)
+# Libraries of their own: a change there recompiles their kernels alone (the executable's AOT link compiles about 1,500).
+option(STRATA_BUILD_B70LIB "Build the B70 card library and link it into strata (OFF: no pack forms, no dense family)" ON)
+if(STRATA_BUILD_B70LIB)
+  add_compile_definitions(STRATA_B70_LIB=1)
+  set(_b70_src ${CMAKE_CURRENT_SOURCE_DIR}/src/b70)
+  add_library(strata_b70 SHARED ${_b70_src}/stream_w4.dp.cpp ${_b70_src}/stream_w4h.dp.cpp ${_b70_src}/stream_w4x.dp.cpp
+              ${_b70_src}/attn_cache.dp.cpp ${_b70_src}/attn_prompt_i8.dp.cpp ${_b70_src}/fat_i8.dp.cpp)
+  add_library(strata_b70_fat SHARED ${_b70_src}/fat_w4i8.dp.cpp)
+  set(_b70_grf " -doubleGRF")   # (256 registers: 5120 x 17408 at 1 / 6 / 8 columns 82.9 / 90.0 / 93.8 us; 128: 83.8 / 92.2 / 97.1)
+  if("$ENV{STRATA_B70_GRF}" STREQUAL "128" OR "$ENV{STRATA_Q36_W4_GRF}" STREQUAL "128")
+    set(_b70_grf "")
+  endif()
+  set(_b70_libs strata_b70 strata_b70_fat)
+  set(_b70_grf_strata_b70 "${_b70_grf}")
+  set(_b70_grf_strata_b70_fat "")
+  if(STRATA_SYCL_PARITY)
+    # the pure-integer fat-product reference and the PP3-v2 layout benchmark (256 registers, as the card's microbenchmark)
+    add_library(strata_b70_fat_bench SHARED ${_b70_src}/fat_bench.dp.cpp)
+    list(APPEND _b70_libs strata_b70_fat_bench)
+    set(_b70_grf_strata_b70_fat_bench " -doubleGRF")
+  endif()
+  foreach(_l ${_b70_libs})
+    target_include_directories(${_l} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    set_target_properties(${_l} PROPERTIES CXX_EXTENSIONS ON)
+    if(STRATA_SYCL_AOT)
+      set_property(TARGET ${_l} PROPERTY COMPILE_OPTIONS -fsycl -fsycl-targets=spir64_gen -O3 -Wno-unused-command-line-argument
+                   -fno-sycl-instrument-device-code -fsycl-device-code-split=per_kernel)
+      if(_l STREQUAL "strata_b70_fat_bench")
+        set(_b70_backend "-device ${STRATA_SYCL_AOT} -options \\\"-doubleGRF\\\"")
+      else()
+        set(_b70_backend "-device ${STRATA_SYCL_AOT} -options \\\"-cl-fp32-correctly-rounded-divide-sqrt${_b70_grf_${_l}}\\\"")
+      endif()
+      set_property(TARGET ${_l} PROPERTY LINK_OPTIONS -fsycl -fsycl-targets=spir64_gen -Wno-unused-command-line-argument
+                   -fsycl-device-code-split=per_kernel
+                   -fsycl-max-parallel-link-jobs=${STRATA_SYCL_LINK_JOBS}
+                   "SHELL:-Xsycl-target-backend=spir64_gen \"${_b70_backend}\"")
+    else()
+      set_property(TARGET ${_l} PROPERTY COMPILE_OPTIONS -fsycl -O3 -Wno-unused-command-line-argument -fno-sycl-instrument-device-code)
+      set_property(TARGET ${_l} PROPERTY LINK_OPTIONS -fsycl)
+    endif()
+  endforeach()
+  # a row's result must not depend on the window's size (a kernel per row or column count), so no fast-math in these
+  set_source_files_properties(${_b70_src}/attn_cache.dp.cpp ${_b70_src}/stream_w4h.dp.cpp ${_b70_src}/stream_w4x.dp.cpp
+                              PROPERTIES COMPILE_OPTIONS -fp-model=precise)
+  # the shared dispatch lives in the kernel and prompt libraries: whatever links them gets the card library with them
+  target_link_libraries(strata_kernels PUBLIC strata_b70 strata_b70_fat)
+  target_link_libraries(strata_prefill PUBLIC strata_b70 strata_b70_fat)
+  target_link_libraries(strata PRIVATE strata_b70 strata_b70_fat)
+  # $ORIGIN, not the build tree's absolute path: the serve wrapper mounts the repo at /work/<repo name>
+  set_target_properties(strata PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
+endif()
+
+# -----------------------------------------------------------------------------
 # Qwen3.8-27B (dense, GGUF architecture qwen35): a model family of the one `strata` binary (docs/Q36.md)
 # -----------------------------------------------------------------------------
 # `strata` serves two families.  main() (src/program/generate.cpp) reads the architecture of the GGUF it is given and hands a
@@ -563,8 +627,9 @@ endif()
 # binary, compiled from the sources of tools/check_q36_isolation.py's base.  Everything the dense family adds to the build is
 # inside this if() block (that tool reads the file without it).
 # q36_engine.dp.cpp began as SYCLomatic's migration of a CUDA engine and has been edited by hand since (nothing is migrated
-# again); the dense qwen35 path (Qwen3.8-27B) is what this build runs.  The 27B's decode kernels stay in their own sources
-# and libraries (libq36_w4.so, libq36_tla.so).
+# again); the dense qwen35 path (Qwen3.8-27B) is what this build runs.  Its int4 products, decode attention and prompt GEMMs
+# are the B70 card library's (the section above); its GGUF decode forms and its recurrence kernel stay in their own sources
+# and libraries (libq36_gdn.so, libq36_tla.so).
 option(STRATA_BUILD_Q36 "Build the dense Qwen3.8-27B family into strata (OFF: the Flash-Next-only strata)" ON)
 # LP3 (libq36_tla.so, the 27B's long-prompt attention on sycl-tla / vllm-xpu-kernels, AOT for Battlemage / Lunar Lake only):
 # AUTO builds it when the two projects are fetched (sycl/tools/get-q36-tla.sh) and says so when it does not; ON stops without them.
@@ -574,6 +639,9 @@ if(NOT STRATA_Q36_TLA MATCHES "^(AUTO|ON|OFF)$")
   message(FATAL_ERROR "STRATA_Q36_TLA must be AUTO, ON or OFF (got '${STRATA_Q36_TLA}')")
 endif()
 if(STRATA_BUILD_Q36)
+  if(NOT STRATA_BUILD_B70LIB)
+    message(FATAL_ERROR "the dense family of strata is built on the B70 card library: STRATA_BUILD_B70LIB=ON, or STRATA_BUILD_Q36=OFF")
+  endif()
   if(NOT STRATA_NATIVE_EXPERTS)
     message(FATAL_ERROR "the dense family of strata needs STRATA_NATIVE_EXPERTS=ON (ggml's CPU dequantizer for q36_requant.cpp); STRATA_BUILD_Q36=OFF builds strata without it")
   endif()
@@ -595,52 +663,24 @@ if(STRATA_BUILD_Q36)
   add_executable(dflash_tree_test ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/dflash_tree_test.cpp)
   target_include_directories(dflash_tree_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
   add_test(NAME dflash_tree_test COMMAND dflash_tree_test)
-  # B70W4 (the int4 pack's kernels, q36_w4.dp.cpp) as a library of its own: a change there recompiles its kernels alone (the
-  # executable's AOT link compiles about 1,500), and they take their own register-file size (STRATA_Q36_W4_GRF=128 at
-  # configure time: without -doubleGRF).
-  add_library(q36_w4 SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4.dp.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xatt.dp.cpp
-              ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4h.dp.cpp
-              ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4x.dp.cpp
-              ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_gdn_wy.dp.cpp
-              ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_fmha_i8.dp.cpp
-              ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_pp_i8.dp.cpp)
-  target_include_directories(q36_w4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35 ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  set_target_properties(q36_w4 PROPERTIES CXX_EXTENSIONS ON)
+  # The int4 pack's products, the decode attention and the prompt GEMMs are the card library's (the section above).  What is
+  # left here is the family's own recurrence kernel (the chunkwise GDN prefill), in a library of its own for its register-file
+  # size (256 registers a thread).
+  add_library(q36_gdn SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_gdn_wy.dp.cpp)
+  target_include_directories(q36_gdn PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35 ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  set_target_properties(q36_gdn PROPERTIES CXX_EXTENSIONS ON)
   if(STRATA_SYCL_AOT)
-    set(_q36_w4_grf " -doubleGRF")   # (256 registers: 5120 x 17408 at 1 / 6 / 8 columns 82.9 / 90.0 / 93.8 us; 128: 83.8 / 92.2 / 97.1)
-    if("$ENV{STRATA_Q36_W4_GRF}" STREQUAL "128")
-      set(_q36_w4_grf "")
-    endif()
-    set_property(TARGET q36_w4 PROPERTY COMPILE_OPTIONS -fsycl -fsycl-targets=spir64_gen -O3 -Wno-unused-command-line-argument
+    set_property(TARGET q36_gdn PROPERTY COMPILE_OPTIONS -fsycl -fsycl-targets=spir64_gen -O3 -Wno-unused-command-line-argument
                  -fno-sycl-instrument-device-code -fsycl-device-code-split=per_kernel)
-    set_property(TARGET q36_w4 PROPERTY LINK_OPTIONS -fsycl -fsycl-targets=spir64_gen -Wno-unused-command-line-argument
+    set_property(TARGET q36_gdn PROPERTY LINK_OPTIONS -fsycl -fsycl-targets=spir64_gen -Wno-unused-command-line-argument
                  -fsycl-device-code-split=per_kernel
                  -fsycl-max-parallel-link-jobs=${STRATA_SYCL_LINK_JOBS}
-                 "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${STRATA_SYCL_AOT} -options \\\"-cl-fp32-correctly-rounded-divide-sqrt${_q36_w4_grf}\\\"\"")
+                 "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${STRATA_SYCL_AOT} -options \\\"-cl-fp32-correctly-rounded-divide-sqrt${_b70_grf}\\\"\"")
   else()
-    set_property(TARGET q36_w4 PROPERTY COMPILE_OPTIONS -fsycl -O3 -Wno-unused-command-line-argument -fno-sycl-instrument-device-code)
-    set_property(TARGET q36_w4 PROPERTY LINK_OPTIONS -fsycl)
+    set_property(TARGET q36_gdn PROPERTY COMPILE_OPTIONS -fsycl -O3 -Wno-unused-command-line-argument -fno-sycl-instrument-device-code)
+    set_property(TARGET q36_gdn PROPERTY LINK_OPTIONS -fsycl)
   endif()
-  # 128-GRF prompt kernels (TagW4I8 requires 64 HW threads/WG on Xe2 + quant_x128/rms_pp/pack_ab16).
-  add_library(q36_pp SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_pp_w4i8.dp.cpp)
-  target_include_directories(q36_pp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35 ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  set_target_properties(q36_pp PROPERTIES CXX_EXTENSIONS ON)
-  if(STRATA_SYCL_AOT)
-    set_property(TARGET q36_pp PROPERTY COMPILE_OPTIONS -fsycl -fsycl-targets=spir64_gen -O3 -Wno-unused-command-line-argument
-                 -fno-sycl-instrument-device-code -fsycl-device-code-split=per_kernel)
-    set_property(TARGET q36_pp PROPERTY LINK_OPTIONS -fsycl -fsycl-targets=spir64_gen -Wno-unused-command-line-argument
-                 -fsycl-device-code-split=per_kernel
-                 -fsycl-max-parallel-link-jobs=${STRATA_SYCL_LINK_JOBS}
-                 "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${STRATA_SYCL_AOT} -options \\\"-cl-fp32-correctly-rounded-divide-sqrt\\\"\"")
-  else()
-    set_property(TARGET q36_pp PROPERTY COMPILE_OPTIONS -fsycl -O3 -Wno-unused-command-line-argument -fno-sycl-instrument-device-code)
-    set_property(TARGET q36_pp PROPERTY LINK_OPTIONS -fsycl)
-  endif()
-  # the attention kernels: a row's result must not depend on the window's size (a kernel per row count), so no fast-math
-  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xatt.dp.cpp PROPERTIES COMPILE_OPTIONS -fp-model=precise)
-  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4h.dp.cpp PROPERTIES COMPILE_OPTIONS -fp-model=precise)
-  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_w4x.dp.cpp PROPERTIES COMPILE_OPTIONS -fp-model=precise)
-  target_link_libraries(strata PRIVATE q36_w4 q36_pp)
+  target_link_libraries(strata PRIVATE q36_gdn)
   set_target_properties(strata PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
   target_include_directories(strata PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35 ${STRATA_ROOT}/third_party/ggml)
   target_link_libraries(strata PRIVATE strata_prefill strata_engine strata_kernels strata_kernels_cpu Threads::Threads)
@@ -699,20 +739,6 @@ if(STRATA_BUILD_Q36)
   endif()
   # the 27B's decode forms against a float64 reference and against native_mmvq on the card (PARITY=ON; docs/Q36.md)
   if(STRATA_SYCL_PARITY)
-    add_library(q36_pp3_bench SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_pp3_bench.dp.cpp)
-    target_include_directories(q36_pp3_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35 ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    set_target_properties(q36_pp3_bench PROPERTIES CXX_EXTENSIONS ON)
-    if(STRATA_SYCL_AOT)
-      set_property(TARGET q36_pp3_bench PROPERTY COMPILE_OPTIONS -fsycl -fsycl-targets=spir64_gen -O3
-                   -Wno-unused-command-line-argument -fno-sycl-instrument-device-code -fsycl-device-code-split=per_kernel)
-      set_property(TARGET q36_pp3_bench PROPERTY LINK_OPTIONS -fsycl -fsycl-targets=spir64_gen
-                   -Wno-unused-command-line-argument -fsycl-device-code-split=per_kernel
-                   -fsycl-max-parallel-link-jobs=${STRATA_SYCL_LINK_JOBS}
-                   "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${STRATA_SYCL_AOT} -options \\\"-doubleGRF\\\"\"")
-    else()
-      set_property(TARGET q36_pp3_bench PROPERTY COMPILE_OPTIONS -fsycl -O3 -Wno-unused-command-line-argument -fno-sycl-instrument-device-code)
-      set_property(TARGET q36_pp3_bench PROPERTY LINK_OPTIONS -fsycl)
-    endif()
     add_executable(q36_mmvq_dense_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense_parity.cpp
                    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_mmvq_dense.dp.cpp
                    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_xr_dense.dp.cpp
@@ -721,7 +747,7 @@ if(STRATA_BUILD_Q36)
                    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_qsa.dp.cpp
                    ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_qsa_parity.cpp)   # --qsa
     target_include_directories(q36_mmvq_dense_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
-    target_link_libraries(q36_mmvq_dense_parity PRIVATE strata_kernels strata_prefill q36_w4 q36_pp q36_pp3_bench)
+    target_link_libraries(q36_mmvq_dense_parity PRIVATE strata_kernels strata_prefill strata_b70 strata_b70_fat strata_b70_fat_bench q36_gdn)
     set_target_properties(q36_mmvq_dense_parity PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
     add_test(NAME q36_mmvq_dense_parity COMMAND q36_mmvq_dense_parity --selftest)
     add_test(NAME q36_dflash_parity COMMAND q36_mmvq_dense_parity --dflash)

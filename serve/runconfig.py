@@ -161,6 +161,12 @@ EDITABLE = [
      "second with it; without it 1,900 on the first read of a start and 2,700 to 2,850 on later ones; the same first "
      "word in 36 of 36 prompts. The products add in another order than the "
      "library's, so the numbers differ in the last bits"),
+    ("b70_pack", ("path", "--b70-pack"),
+     "A pack of this model's projection matrices in the B70's own weight format (--b70-pack; tools/b70_pack.py writes one "
+     "from the model's GGUF or from an int4 checkpoint). A matrix the pack holds is loaded from it instead of from the GGUF "
+     "and runs on the card library's matrix-engine products: 4-bit weights the card multiplies as they are, read once for "
+     "every row of a draft window. The pack is another quantization of those matrices than the GGUF's, so the text can "
+     "differ; check a pack made from a GGUF before serving it (docs/B70_LIB.md). Empty: every matrix from the GGUF"),
     ("mtp_window", ("arg", "--mtp-window", 0, 2147483647),
      "How far back the draft layer looks (--mtp-window): the last N cells of the context, 0 = every cell. A smaller window is "
      "cheaper to draft on a long context (setup picks 8192 above 64K) and a very small one (2048) costs accepted drafts. A "
@@ -355,7 +361,7 @@ SPEC = {k: kind for k, kind, _ in EDITABLE}
 GROUPS = {
     "Model and context": ("max_context", "kv_format", "kv_resident", "vram_reserve_mib", "expert_cache",
                           "expert_copies_max_mib", "expert_copies_margin_mib", "expert_copies_loan_slots", "lazy_load"),
-    "Speed": ("mtp", "spec", "spec_min_p", "spec_probe_min", "spec_probes", "spec_stale_rounds", "iq_xxs_sign_arith", "f16_products_any_format", "mtp_window", "prefill_chunk", "parallel", "batch_mtp", "yields_max",
+    "Speed": ("mtp", "spec", "spec_min_p", "spec_probe_min", "spec_probes", "spec_stale_rounds", "iq_xxs_sign_arith", "f16_products_any_format", "b70_pack", "mtp_window", "prefill_chunk", "parallel", "batch_mtp", "yields_max",
               "admit_short_first"),
     "Parked conversations": ("conversation_cache_slots", "conversation_cache_mib", "conversation_cache_auto_pct",
                              "conversation_cache_auto_max_mib", "conversation_cache_min_free_mib",

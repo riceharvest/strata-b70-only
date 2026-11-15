@@ -38,6 +38,10 @@
 #include <cmath>
 
 #include <dpct/lib_common_utils.hpp>
+#if defined(STRATA_B70_LIB)
+#include "strata/b70/pack.hpp"     // a pack matrix (type strata::b70::kTypeW4) as a weight of Gemm::native
+#include "strata/b70/stream.hpp"
+#endif
 
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
 #include "hipblaslt_tuning.hpp"
@@ -1558,6 +1562,32 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     }
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
     if (beta == 0.0f && (ldx == 0 || ldx == K) && native_mmq(X, ggml_type, W_blocks, Y, T, N, K, ldy)) return;
+#endif
+#if defined(STRATA_B70_LIB)
+    // A pack matrix (strata/b70/pack.hpp): its tiles of 16 rows dequantized to FP16 by the card library's kernel (one thread a
+    // record, block loads and stores), then the FP16 GEMM.  On the compute stream into scratch_, in slices of whole tiles when
+    // the matrix is larger than the scratch: the row-slice path's order below, so the side stream's protocol holds.
+    if (ggml_type == strata::b70::kTypeW4) {
+        if (!strata::b70::pack::shape_ok(K, N)) {
+            std::fprintf(stderr, "prefill gemm: a pack matrix of %lld x %lld (inputs a multiple of 256, rows of 16)\n", (long long) K, (long long) N);
+            std::exit(1);
+        }
+        int64_t rows = scratch_elems_ / K;
+        if (rows > N) rows = N;
+        rows = rows / strata::b70::pack::kTileRows * strata::b70::pack::kTileRows;
+        if (rows <= 0) { std::fprintf(stderr, "prefill gemm: scratch too small for a pack tile of K=%lld\n", (long long) K); std::exit(1); }
+        if (ldy <= 0) ldy = N;
+        for (int64_t r0 = 0; r0 < N; r0 += rows) {
+            const int64_t n = (N - r0 < rows) ? N - r0 : rows;
+            strata::b70::stream::w4_dequant_f16(static_cast<const uint8_t*>(W_blocks) + strata::b70::pack::bytes(K, r0), scratch_,
+                                                (int) K, (int) n, stream_);
+            f16(X, scratch_, Y + r0, T, n, K, ldy, beta);
+        }
+        // the side stream's next dequant into scratch_ waits for these reads and writes of it
+        if (side_scratch_)(void) DPCT_CHECK_ERROR(dpct::sync_barrier(
+            (dpct::event_ptr)side_free_[0], strata::q_of(stream_)));
+        return;
+    }
 #endif
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices.

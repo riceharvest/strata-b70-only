@@ -2,6 +2,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include "strata/b70/stream.hpp"
 
 namespace strata::q36xr {
 /// Once per queue, outside any graph recording: the device tables.
@@ -20,37 +21,7 @@ void quantize(const float* x, int n_in, int ncols, void* act, void* stream);
 bool mmvq(int ggml_type, const void* weights, const void* act, float* y, int n_in, int n_out, int ncols, void* stream, bool q81 = false);
 /// Whether mmvq() takes (ggml_type, n_in, n_out, ncols, q81), including STRATA_Q36_XR16* and STRATA_Q36_XR_IQ4.
 bool handles_call(int ggml_type, int n_in, int n_out, int ncols, bool q81 = true);
-/// B70W4 (tools/qwen35/b70w4_pack.py): the bytes of a packed n_out x n_in matrix (n_in a multiple of 256, n_out of 16).
-std::size_t w4_bytes(int n_in, int n_out);
-/// y[col * n_out + row] = W4 weights . the q8_1 image `xq` (with 28 readable bytes after its last block) for 1-32 columns
-/// (one read of the weights at any count; the columns run as groups of 8).
-/// `weights`: the pack's records, 64-byte aligned.  false: not taken, nothing launched.
-bool mmvq_w4(const void* weights, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream);
-/// The pack as FP16 [n_out][n_in] (a prompt chunk's GEMM operand): n_out x n_in halves at `out`.
-/// The int4 pack against FP16 activations (W4A16, what vLLM runs): the weights as half floats (q - zero, exact), the
-/// DPAS of half floats (16 inputs an instruction), a row's scale once per 128 inputs.  No per-column float work per 32
-/// weights: a column more costs its share of a DPAS.  x16: the columns interleaved by 16 inputs, [n_in / 16][columns
-/// rounded up to 8][16] halfs (w4h_act_halfs of them).  1 .. 32 columns.
-std::size_t w4h_act_halfs(int n_in, int ncols);
-bool mmvq_w4h(const void* weights, const uint16_t* x16, float* y, int n_in, int n_out, int ncols, void* stream);
-/// 8 columns with a chosen decomposition (q36_w4h.dp.cpp: `chunks` in 1, 2, 4, 8, 16 threads a tile, `threads` in all).  Only the DFlash drafter calls it.
-bool mmvq_w4h_8(const void* weights, const uint16_t* x16, float* y, int n_in, int n_out, void* stream, int chunks, int threads);
-/// x [ncols][n_in] floats (rows ldx apart) as x16; the FFN's silu(g) * u as x16.
-void w4h_pack(const float* x, int ldx, uint16_t* x16, int n_in, int ncols, void* stream);
-void w4h_swiglu_pack(const float* g, const float* u, uint16_t* x16, int n, int ncols, void* stream);
-void w4_dequant_f16(const void* weights, uint16_t* out, int n_in, int n_out, void* stream);
-
-/// W4X native u4 x s8 decode/verify path (q36_w4x.dp.cpp, gs = 128 or 32).
-std::size_t w4x_act_bytes(int n_in, int ncols, int gs);
-void w4x_quantize(const float* x, int ldx, void* act, int n_in, int ncols, int gs, void* stream);
-void w4x_rms_apply_quantize(const float* x_res, int ldx, const float* norm_w, const float* inv_rms,
-                            void* act, float* h_out, int ld_out, int n_in, int ncols, int gs, void* stream);
-void w4x_swiglu_quantize(const float* g, const float* u, void* act, int n_in, int ncols, int gs, void* stream);
-bool mmvq_w4x(const void* weights, const void* act, float* y, int n_in, int n_out, int ncols, int gs,
-              void* stream, int ksplit_override = 0);
-
-/// Optional merged gate+up interleaved B70W4 pack: one launch produces gs = 128 activations for ffn_down.
-std::size_t w4x_gu_merged_bytes(int n_in, int n_ff);
-bool mmvq_w4x_gu_swiglu(const void* gu_weights, const void* act_in, void* act_down,
-                        int n_in, int n_ff, int ncols, int gs, void* stream);
+// The int4 pack's stream products (w4_bytes, mmvq_w4, w4_dequant_f16, the W4A16 and W4X forms) are the card library's
+// (strata/b70/stream.hpp); this family's sources go on calling them under their first names.
+using namespace strata::b70::stream;
 }   // namespace strata::q36xr

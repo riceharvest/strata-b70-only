@@ -1,6 +1,6 @@
 // q36_pp3_bench.dp.cpp - PARITY=ON 256-GRF fatgemm pure-int reference & PP3-v2 contiguous-weight benchmark kernels.
 // Compiled into shared library `q36_pp3_bench` with `-O3 -fsycl-device-code-split=per_kernel -doubleGRF`, matching fatgemm.cpp.
-#include "q36_pp3_bench.hpp"
+#include "strata/b70/fat_bench.hpp"
 #include "strata/sycl_queue.hpp"
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
@@ -10,7 +10,7 @@
 #include <random>
 #include <vector>
 
-namespace strata::q36pp::bench {
+namespace strata::b70::fat::bench {
 namespace {
 using namespace sycl::ext::intel::esimd;
 namespace es  = sycl::ext::intel::esimd;
@@ -644,4 +644,4 @@ bool gemm_w4_i8_pp3_v2(const void* weights_v2, const void* xq8, const float* dxT
     return true;
 }
 
-}  // namespace strata::q36pp::bench
+}  // namespace strata::b70::fat::bench

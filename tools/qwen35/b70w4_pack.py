@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""b70w4_pack.py - a GPTQ int4 checkpoint of Qwen3.8-27B as a B70W4 pack for strata-q36 (docs/Q36.md).
+"""b70w4_pack.py - a GPTQ int4 checkpoint of Qwen3.8-27B as a B70W4 pack for the dense family (docs/Q36.md).
+The format and a packer for any model's GGUF: tools/b70_pack.py (docs/B70_LIB.md); this tool keeps a calibrated
+checkpoint's own 4-bit codes and knows this model's tensor names and head order.
 
     python3 tools/qwen35/b70w4_pack.py --ckpt DIR --gguf FILE.gguf --out FILE.b70w4 [--layers N] [--check ROWS]
 
@@ -29,7 +31,10 @@ import sys
 
 import numpy as np
 
-REC_DW = 544   # dwords a record
+# the pack's format (records, the 4-bit quantizer, the file) is the card library's: tools/b70_pack.py
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from b70_pack import REC_DW, deq_rows, pack, quantize_rows_w4   # noqa: E402
+from b70_pack import read_header as read_b70w4_header           # noqa: E402
 
 
 def st_open(path):
@@ -67,48 +72,6 @@ def unpack(path, hdr, base, key):
     if n_in != groups * 128:
         raise SystemExit(f"{key}: {n_in} inputs in {groups} groups: not groups of 128")
     return np.ascontiguousarray(q.T), z, sc   # q [n_out][n_in]; z, sc [groups][n_out]
-
-
-def pack(q, z, sc):
-    n_out, n_in = q.shape
-    if n_out % 16 or n_in % 256:
-        raise SystemExit(f"a matrix of {n_in} x {n_out}: rows must be a multiple of 16, inputs of 256")
-    T, C = n_out // 16, n_in // 256
-    q5 = q.reshape(T, 16, C, 4, 2, 32)                       # tile, row, chunk, pair, half (low / high nibble), byte
-    by = (q5[:, :, :, :, 0, :] | (q5[:, :, :, :, 1, :] << 4)).astype(np.uint8)
-    dw = np.ascontiguousarray(by).view("<u4")                # tile, row, chunk, pair, dword (8)
-    qs = np.ascontiguousarray(dw.transpose(0, 2, 3, 4, 1)).reshape(T, C, 512)
-    m = sc.astype(np.uint32) | (z.astype(np.uint32) << 16)   # [groups][n_out]
-    m = np.ascontiguousarray(m.T.reshape(T, 16, C, 2).transpose(0, 2, 3, 1)).reshape(T, C, 32)
-    return np.concatenate([qs, m], axis=2).astype("<u4")     # [tile][chunk][544]
-
-
-def deq_rows(q, z, sc, rows):
-    g = np.arange(q.shape[1]) // 128
-    s = sc[:, rows].view(np.float16).astype(np.float32)   # [groups][rows]
-    return s[g].T * (q[rows].astype(np.float32) - z[:, rows][g].T.astype(np.float32))
-
-
-def quantize_rows_w4(w_f32):
-    m, n_in = w_f32.shape
-    assert n_in % 128 == 0
-    ng = n_in // 128
-    w = np.asarray(w_f32, dtype=np.float32).reshape(m, ng, 128)
-    wmin = w.min(axis=2)
-    wmax = w.max(axis=2)
-    sc = np.maximum((wmax - wmin) / 15.0, 0.0)
-    nz = sc > 0.0
-    z = np.ones((m, ng), dtype=np.int32)
-    z[nz] = np.clip(np.rint(-wmin[nz] / sc[nz]), 1, 16).astype(np.int32)
-    z = np.where(wmax > 0.0, np.minimum(z, 14), z)
-    z = np.where(wmin >= 0.0, 1, z)
-    sc = np.where(wmin < 0.0, np.maximum(sc, -wmin / z), sc)
-    sc = np.where((wmax > 0.0) & (z < 15), np.maximum(sc, wmax / np.maximum(15 - z, 1)), sc)
-    sc_h = np.where(nz, sc, 0.0).astype(np.float16)
-    sc_f = sc_h.astype(np.float32)
-    inv = np.where(sc_f > 0.0, 1.0 / np.where(sc_f > 0.0, sc_f, 1.0), 0.0)
-    q = np.clip(np.rint(w * inv[:, :, None] + z[:, :, None]), 0, 15).astype(np.int32).reshape(m, n_in)
-    return q, np.ascontiguousarray(z.T), np.ascontiguousarray(sc_h.T.view(np.uint16))
 
 
 def pack_gu_merged(gate_blob, up_blob, n_ff, bpr):
@@ -157,17 +120,6 @@ def pack_output_head(gt, fb, off, index, check_rows, rng):
     print("output.weight: %d x %d -> %.2f MiB (floor @ 590 GB/s: %.1f us), min row corr %.4f"
           % (n_in, n_out, nbytes / 2 ** 20, floor_us, worst), flush=True)
     return off, worst
-
-
-def read_b70w4_header(f):
-    magic = f.read(8)
-    if magic != b"B70W4\0\0\1":
-        raise SystemExit(f"bad B70W4 magic: {magic!r}")
-    (n,) = struct.unpack("<Q", f.read(8))
-    meta = json.loads(f.read(n).decode())
-    hdr_end = 16 + n
-    hdr_end += (-hdr_end) % 4096
-    return meta, hdr_end
 
 
 def main():
