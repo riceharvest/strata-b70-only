@@ -166,9 +166,10 @@ EDITABLE = [
      "from the model's GGUF or from an int4 checkpoint). A matrix the pack holds is loaded from it instead of from the GGUF "
      "and runs on the card library's matrix-engine products: 4-bit weights the card multiplies as they are, read once for "
      "every row of a draft window. The pack is another quantization of those matrices than the GGUF's, so the text "
-     "changes. Measured on one B70 with a pack made from the served Flash-Next GGUF: answers 5 to 12% faster, 546 MiB less "
-     "VRAM, and 3.5% worse perplexity (the same top token in 94.8% of 2,871 steps), so it is not a recommendation as it "
-     "is (docs/B70_LIB.md). Empty: every matrix from the GGUF"),
+     "changes. Measured on one B70 with calibrated packs of the served Flash-Next GGUF: all 156 projections packed make a "
+     "draft window 10.5% shorter and free 546 MiB of VRAM for 1.4% worse perplexity (the same top token in 97.1% of 2,870 "
+     "steps); only attn_gate and attn_q packed, 1 to 4% shorter and 260 MiB for 0.24% (98.5%). A pack that was not "
+     "calibrated cost 3.5% (docs/B70_LIB.md). Empty: every matrix from the GGUF"),
     ("mtp_window", ("arg", "--mtp-window", 0, 2147483647),
      "How far back the draft layer looks (--mtp-window): the last N cells of the context, 0 = every cell. A smaller window is "
      "cheaper to draft on a long context (setup picks 8192 above 64K) and a very small one (2048) costs accepted drafts. A "
