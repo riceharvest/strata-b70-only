@@ -2308,6 +2308,16 @@ int q36_adm_ckpt_min() {
     static const int n = [] { const char* e = std::getenv("STRATA_Q36_ADM_CKPT_MIN"); const int v = e ? std::atoi(e) : 0; return v >= 256 ? v : 2048; }();
     return n;
 }
+// STRATA_Q36_BATCH_COUPLE (default on; 0: the block's best token is the draft, as before): in a --batch --batch-mtp window a
+// sampled slot's drafts follow the draw the target will make, as the single-session verify tree's leading draft does
+// (STRATA_Q36_SPEC_COUPLE, which gives the request its Gumbel-max draw): of the MTP block's two best tokens for a draft the one
+// that draw would take is the draft.  The block's pass returns the two tokens and their logits (two more small kernels on its
+// logits, a graph of its own); the choice is host code with the keys of the slot's next draws, which the slot's random stream
+// gives without advancing it.  The verify window's draw decides as before.  STRATA_Q36_SPEC_COUPLE_CELLS and _SHARP apply.
+bool q36_batch_couple_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_BATCH_COUPLE"); return !(e && e[0] == '0'); }();
+    return on;
+}
 bool q36_batch_sample_on() {   // STRATA_Q36_BATCH_SAMPLE=1: in a --batch --batch-mtp window a sampled / penalised slot drafts too
     static const bool on = [] { const char* e = std::getenv("STRATA_Q36_BATCH_SAMPLE"); return !(e && e[0] == '0'); }();   // (default on; 0: the old one-row step)
     return on;
@@ -8414,12 +8424,25 @@ work-group size if needed.
     int32_t mtp_pick[kVerify] = {};
     float* logits_mr = nullptr;
     int32_t* pick_mr = nullptr;
+    // STRATA_Q36_BATCH_COUPLE: with mtp_top2_on set by the caller, mtp_top2[r] gets row r's two best draft tokens and their
+    // logits as well (id0 the best; the same two-stage kernels as the verify tree's draft head)
+    bool mtp_top2_on = false;
+    TreeTop2 mtp_top2[kVerify] = {};
+    TreeTop2* top2_mr = nullptr;
+    float* amv_mr2 = nullptr;
+    int32_t* ami_mr2 = nullptr;
     void mtp_rows(const MtpRow* rows, int T) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
         if (!logits_mr) {
             logits_mr = dalloc((size_t) kVerify * g.n_vocab);
             pick_mr = dalloc_t<int32_t>(kVerify);
+        }
+        const bool top2 = mtp_top2_on;
+        if (top2 && !top2_mr) {
+            amv_mr2 = dalloc((size_t) kVerify * kArgBlocks * 2);
+            ami_mr2 = dalloc_t<int32_t>((size_t) kVerify * kArgBlocks * 2);
+            top2_mr = dalloc_t<TreeTop2>(kVerify);
         }
         sess[(size_t) cur].pos = pos;
         CK(DPCT_CHECK_ERROR(st->wait()));
@@ -8480,7 +8503,7 @@ work-group size if needed.
             else
                 xbatch_slots.push_back({rows[r].slot, r, 1, rows[r].cell, false});
         }
-        run_rows_graph(3000, 0, T, [&] {
+        run_rows_graph(top2 ? 3001 : 3000, 0, T, [&] {
             q8_src = nullptr;
             xq_ready = false;
             K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok_m, T, N, y, st);
@@ -8608,6 +8631,21 @@ work-group size if needed.
                 const int32_t* const idv = d_draft_ids;
                 st->parallel_for<class q36_mtp_rows_map>(sycl::range<1>((size_t) T), [=](sycl::id<1> i) { pk[i[0]] = idv[pk[i[0]]]; });
             }
+            if (top2) {   // each row's two best and their logits (the draft head's ids mapped to the vocabulary's)
+                const float* const lg2 = logits_mr;
+                float* const amv_ = amv_mr2;
+                int32_t* const ami_ = ami_mr2;
+                TreeTop2* const out = top2_mr;
+                const int32_t* const idv2 = dh ? d_draft_ids : nullptr;
+                st->parallel_for<class q36_mtp_rows_top2_s1>(
+                    sycl::nd_range<3>(sycl::range<3>(1, (size_t) T, (size_t) kArgBlocks) * sycl::range<3>(1, 1, kThreads),
+                                      sycl::range<3>(1, 1, kThreads)),
+                    [=](sycl::nd_item<3>) { k_top2_stage1(lg2, nv, amv_, ami_); });
+                st->parallel_for<class q36_mtp_rows_top2_s2>(
+                    sycl::nd_range<3>(sycl::range<3>(1, (size_t) T, 1) * sycl::range<3>(1, 1, kThreads),
+                                      sycl::range<3>(1, 1, kThreads)),
+                    [=](sycl::nd_item<3>) { k_top2_stage2(amv_, ami_, nv, idv2, out); });
+            }
         });
         rows_deferred = false;
         rows_mode = false;
@@ -8618,6 +8656,7 @@ work-group size if needed.
         API to ensure synchronization behavior.
         */
         CK(DPCT_CHECK_ERROR(st->memcpy(hrow + 128, pick_mr, (size_t)T * 4)));
+        if (top2) CK(DPCT_CHECK_ERROR(st->memcpy(mtp_top2, top2_mr, (size_t) T * sizeof(TreeTop2))));
         CK(DPCT_CHECK_ERROR(st->wait()));
         for (int r = 0; r < T; ++r) mtp_pick[r] = hrow[128 + r];
     }
@@ -10442,6 +10481,10 @@ struct Slot {
     bool ignore_eos = false;   // LANE SOLO: the request's ignore_eos=1: an end-of-answer token is a token like another
     bool eos(int t) const { return !ignore_eos && is_eos(t); }
     strata::qwen35::SpecPlan plan;   // STRATA_Q36_BATCH_SAMPLE: plan.ok = a request that needs the host's draw drafts through the window's top-M rows
+    // STRATA_Q36_BATCH_COUPLE: the keys of the slot's next draws, taken when its drafts are made (key j: the draw of the window's
+    // row j, which decides the token draft j stands for); ckeys_n 0: the block's best token is the draft
+    uint64_t ckeys[Engine::kVerify] = {};
+    int ckeys_n = 0;
     /// Whether the slot takes drafts in a --batch-mtp window: it decodes greedily on the device, or its rows' candidates serve it.
     bool drafts_ok() const { return !smp.needs_logits() || plan.ok; }
 };
@@ -10545,6 +10588,30 @@ struct Serve {
     }
     /// Chains the drafts of the slots in `who` (each holds at least one; row[k] = its row of the last mtp_rows call) up to
     /// want[k]: one mtp_rows call a level.
+    /// STRATA_Q36_BATCH_COUPLE: before slot b's drafts for its next window are made (its random stream stands after the draws
+    /// of the tokens it has shown): the keys of its next draws, for a slot that draws on the host with the coupled draw.
+    /// Returns whether it has them.
+    bool couple_keys(int b) {
+        Slot& sl = slots[(size_t) b];
+        sl.ckeys_n = 0;
+        if (!q36_batch_couple_on() || !sl.smp.coupled || !(sl.smp.temperature > 0.f) || !sl.smp.needs_logits() || !sl.plan.ok) return false;
+        if (q36_spec_couple_cells() != 0 && E.sess[(size_t) b].pos >= q36_spec_couple_cells()) return false;
+        strata::qwen35::peek_draw_keys(sl.rng, Engine::kVerify, sl.ckeys);
+        sl.ckeys_n = Engine::kVerify;
+        return true;
+    }
+    /// Slot b's draft `lvl` (0: the first) from row r of the last mtp_rows call: the block's best token, or, with the slot's
+    /// keys, the one of its two best the draw of the window's row `lvl` would take (the rule of the verify tree's lead).
+    int32_t draft_of(int b, int r, int lvl) const {
+        const Slot& sl = slots[(size_t) b];
+        if (lvl < 0 || lvl >= sl.ckeys_n || !E.mtp_top2_on) return E.mtp_pick[r];
+        const TreeTop2 t = E.mtp_top2[r];
+        if (t.id1 == t.id0 || !(t.v1 > -INFINITY)) return E.mtp_pick[r];
+        const double c = (double) q36_spec_couple_sharp() / (double) sl.smp.temperature;
+        const double s0 = (double) t.v0 * c + strata::qwen35::couple_gumbel(sl.ckeys[lvl], t.id0);
+        const double s1 = (double) t.v1 * c + strata::qwen35::couple_gumbel(sl.ckeys[lvl], t.id1);
+        return s1 > s0 ? t.id1 : E.mtp_pick[r];
+    }
     void chain_drafts(const std::vector<int>& who, const std::vector<int>& want, std::vector<int>& row) {
         const int N = (int) E.m->g.n_embd;
         for (;;) {
@@ -10561,7 +10628,8 @@ struct Serve {
             if (rows.empty()) return;
             E.mtp_rows(rows.data(), (int) rows.size());
             for (size_t r = 0; r < rows.size(); ++r) {
-                slots[(size_t) who[(size_t) of[r]]].drafts.push_back(E.mtp_pick[r]);
+                Slot& sl = slots[(size_t) who[(size_t) of[r]]];
+                sl.drafts.push_back(draft_of(who[(size_t) of[r]], (int) r, (int) sl.drafts.size()));
                 row[(size_t) of[r]] = (int) r;
             }
         }
@@ -10592,11 +10660,13 @@ struct Serve {
         {
             std::vector<Engine::MtpRow> first;
             std::vector<int> who, wn, row;
+            bool first_top2 = false;   // (STRATA_Q36_BATCH_COUPLE: a slot of this pass wants the block's two best)
             for (int i = 0; i < S; ++i) {
                 Slot& sl = slots[(size_t) act[(size_t) i]];
                 if ((int) sl.drafts.size() > want[(size_t) i]) sl.drafts.resize((size_t) want[(size_t) i]);
                 if (want[(size_t) i] > 0 && sl.drafts.empty()) {
                     const Engine::Sess& ss = E.sess[(size_t) act[(size_t) i]];
+                    first_top2 |= couple_keys(act[(size_t) i]);
                     first.push_back({act[(size_t) i], sl.x, ss.pos, ss.hlast});
                     who.push_back(act[(size_t) i]);
                     wn.push_back(want[(size_t) i]);
@@ -10615,12 +10685,14 @@ struct Serve {
                 }
             }
             if (!first.empty()) {
+                E.mtp_top2_on = first_top2;
                 E.mtp_rows(first.data(), (int) first.size());
                 for (size_t k = 0; k < first.size(); ++k) {
-                    slots[(size_t) who[k]].drafts.assign(1, E.mtp_pick[k]);
+                    slots[(size_t) who[k]].drafts.assign(1, draft_of(who[k], (int) k, 0));
                     row.push_back((int) k);
                 }
                 chain_drafts(who, wn, row);
+                E.mtp_top2_on = false;
             }
         }
         lap(0);
@@ -10742,6 +10814,7 @@ struct Serve {
         fit_depths(nwant);
         std::vector<Engine::MtpRow> nx;
         std::vector<int> who, wn, row;
+        bool next_top2 = false;
         for (size_t k = 0; k < nidx.size(); ++k) {
             const int i = nidx[k], b = act[(size_t) i], r0 = row0[(size_t) i], kept = keep[(size_t) i];
             Slot& sl = slots[(size_t) b];
@@ -10749,6 +10822,7 @@ struct Serve {
             const std::vector<int32_t> old = sl.drafts;
             sl.drafts.clear();
             if (nwant[k] <= 0) continue;
+            next_top2 |= couple_keys(b);   // (the slot's stream stands after this window's draws)
             const int64_t p_new = ss.pos;   // commit_rows moved it: the cell of the token the next window feeds
             // the kept drafts' rows (the block's cache takes them), then the row of the next token: its pick is the first draft
             for (int j = 1; j < kept; ++j) nx.push_back({b, old[(size_t) j - 1], p_new - kept + j, E.hmain + (size_t) (r0 + j - 1) * N});
@@ -10774,9 +10848,11 @@ struct Serve {
             }
         }
         if (!nx.empty()) {
+            E.mtp_top2_on = next_top2;
             E.mtp_rows(nx.data(), (int) nx.size());
-            for (size_t k = 0; k < who.size(); ++k) slots[(size_t) who[k]].drafts.assign(1, E.mtp_pick[(size_t) row[k]]);
+            for (size_t k = 0; k < who.size(); ++k) slots[(size_t) who[k]].drafts.assign(1, draft_of(who[k], row[k], 0));
             chain_drafts(who, wn, row);
+            E.mtp_top2_on = false;
         }
         lap(4);
         if (btime) { ++bt_n; bt_end = Clock::now(); }
