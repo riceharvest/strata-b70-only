@@ -391,5 +391,54 @@ class ByteCache(unittest.TestCase):
             self.assertEqual(list(pool.map(decode, texts)), texts)
 
 
+class DeepseekPreTokenizer(unittest.TestCase):
+    """The "deepseek3" pre-tokenizer is llama.cpp's DEEPSEEK3_LLM list: a sequence of splits, not one pattern."""
+
+    def split(self, text):
+        return ST._sequence_findall([ST.regex.compile(p) for p in ST.DEEPSEEK3_PATTERNS], text)
+
+    def test_digits_in_runs_of_three(self):
+        self.assertEqual(self.split("a12345678b"), ["a", "123", "456", "78", "b"])
+
+    def test_cjk_runs(self):
+        self.assertEqual(self.split("你好, world"), ["你好", ",", " world"])
+
+    def test_punctuation_then_letters_and_whitespace(self):
+        self.assertEqual(self.split("x_y.z  \n\nq"), ["x", "_y", ".z", "  \n\n", "q"])
+
+    def test_every_character_is_kept(self):
+        text = "Hello, 世界! 123\t\r\n  é \U0001f600 ｜DSML｜"
+        self.assertEqual("".join(self.split(text)), text)
+
+
+class SpecialTokens(unittest.TestCase):
+    @staticmethod
+    def mini_tokenizer() -> ST.Tokenizer:
+        """The real Tokenizer class over a tiny vocabulary: a few special tokens, then the 256 byte tokens, no merges."""
+        specials = [("<｜begin▁of▁sentence｜>", 3), ("<｜end▁of▁sentence｜>", 3), ("<｜User｜>", 3), ("<｜Assistant｜>", 3),
+                    ("<｜System｜>", 3), ("<｜latest_reminder｜>", 3), ("<think>", 4), ("</think>", 4), ("｜DSML｜", 4)]
+        b2u = ST.bytes_to_unicode()
+        return ST.Tokenizer([s for s, _ in specials] + [b2u[b] for b in range(256)], [],
+                            [t for _, t in specials] + [1] * 256, "deepseek3", {"bos": 0, "eos": 1})
+
+    def test_a_special_token_decodes_to_its_text(self):
+        tok = self.mini_tokenizer()
+        ids = tok.encode("<｜User｜>hi｜DSML｜", parse_special=True)
+        self.assertEqual(ids[0], 2)
+        self.assertEqual(tok.decode(ids), "<｜User｜>hi｜DSML｜")
+        self.assertEqual(tok.token_bytes(8), "｜DSML｜".encode())
+
+    def test_a_user_defined_token_is_matched_without_parse_special_and_a_control_token_is_not(self):
+        tok = self.mini_tokenizer()
+        self.assertEqual(len(tok.encode("｜DSML｜")), 1)
+        self.assertGreater(len(tok.encode("<｜User｜>")), 1)
+
+    def test_qwen_tokens_are_unchanged(self):
+        b2u = ST.bytes_to_unicode()
+        tok = ST.Tokenizer([b2u[b] for b in range(256)] + ["<|im_end|>"], [], [1] * 256 + [3])
+        self.assertEqual(tok.token_bytes(256), b"<|im_end|>")
+        self.assertEqual(tok.encode("a<|im_end|>", parse_special=True), [97, 256])
+
+
 if __name__ == "__main__":
     unittest.main()

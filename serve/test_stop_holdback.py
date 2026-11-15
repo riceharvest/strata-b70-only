@@ -3,7 +3,7 @@
 DeepSeek-V4.1's tokenizer has no single token for Qwen's <|im_end|> / <|endoftext|>: it splits them into '<', '|', 'im', '_end',
 '|', '>' and 'end', 'of', 'text'.  A server that took the ids of those pieces as its stop ids (a config without "arch") ended the
 reply in front of the first "im" it wrote: Nerazim = N, er, az, im.  These tests keep three things true, for the OpenAI and the
-Anthropic route, streamed and not, with and without the family named:
+Anthropic route, streamed and not, without the family named:
 
   * the reply that has no stop string comes out whole (every word that ends in a piece of a stop string or of an end marker);
   * a stop string cuts the reply exactly there, whatever the chunking;
@@ -23,10 +23,36 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 import strata_tokenizer as ST  # noqa: E402
-from serve import frontend, server  # noqa: E402
+from serve import server  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import ByteTokenizer, Detokenizer, Service, StopMatcher, end_token_ids, serve  # noqa: E402
-from serve.test_dsv41 import EOS, SPECIALS, TEMPLATE, DsEngine  # noqa: E402
+from serve.server import ByteTokenizer, Detokenizer, MockEngine, Service, StopMatcher, end_token_ids, serve  # noqa: E402
+
+TEMPLATE = ROOT / "serve" / "chat_template.jinja"
+# the special tokens and the end token of a tokenizer that has no single token for Qwen's <|im_end|> / <|endoftext|>
+SPECIALS = [("<｜begin▁of▁sentence｜>", 3), ("<｜end▁of▁sentence｜>", 3), ("<｜User｜>", 3), ("<｜Assistant｜>", 3), ("<｜System｜>", 3),
+            ("<｜latest_reminder｜>", 3), ("<think>", 4), ("</think>", 4), ("｜DSML｜", 4), ("<｜deepseek_image｜>", 3)]
+EOS = 1
+
+
+class DsEngine(MockEngine):
+    """Replays scripted completions as ids, then the end token."""
+
+    def __init__(self, tok, script, max_context=8192):
+        super().__init__(tok, script, max_context=max_context)
+        self.scripts = [tok.encode(x, parse_special=True) + [EOS] for x in ([script] if isinstance(script, str) else script)]
+        self.script = self.scripts[0]
+        self.last = {}
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        got = 0
+        try:
+            for t in super().generate(ids, max_new, sampling, cancel, embeddings):
+                got += 1
+                yield t
+        finally:      # (the server stops reading at the end token: the engine's DONE comes while it is closed)
+            self.last = {"generated": got, "prompt_tokens": len(ids), "prompt_ms": 50.0, "decode_ms": got * 10.0,
+                         "finish": "stop"}
+
 
 QWEN_STOPS = ["<|im_end|>", "<|im_start|>", "<|endoftext|>", "\nUser:"]
 DEEPSEEK_STOPS = ["<｜end▁of▁sentence｜>", "<｜User｜>", "</s>", "\n\nHuman:"]
@@ -170,26 +196,20 @@ class ByteWise(Fixture):
 
 
 class Routes(Fixture):
-    """The four ways out of the server (OpenAI and Anthropic, streamed and whole), with the family named and without it."""
+    """The four ways out of the server (OpenAI and Anthropic, streamed and whole), the family not named."""
 
-    def start(self, script, named):
-        """A server for `named` (one per test and setting, reused); the engine replays `script` for the next request."""
-        if named in self.servers:
-            engine = self.servers[named]
-            engine.script = self.tok.encode(script) + [EOS]     # (a marker in the script is text the model wrote)
-            self.base = self.bases[named]
-            return engine
-        engine = self.servers[named] = DsEngine(self.tok, script)
+    def start(self, script):
+        """A server (one per test, reused); the engine replays `script` for the next request."""
+        if self.engine is not None:
+            self.engine.script = self.tok.encode(script) + [EOS]     # (a marker in the script is text the model wrote)
+            return self.engine
+        engine = self.engine = DsEngine(self.tok, script)
         engine.script = self.tok.encode(script) + [EOS]
-        svc = Service(engine, self.tok, ChatTemplate(TEMPLATE), model_name="deepseek-v4.1-flash")
-        if named:
-            svc.model_arch = "deepseek41"
-            svc.set_family("deepseek41")
+        svc = Service(engine, self.tok, ChatTemplate(TEMPLATE), model_name="test-model")
         httpd = serve(svc, port=0)
         self.addCleanup(httpd.server_close)
         self.addCleanup(httpd.shutdown)
-        self.addCleanup(frontend.use_family, None)
-        self.base = self.bases[named] = f"http://127.0.0.1:{httpd.server_address[1]}"
+        self.base = f"http://127.0.0.1:{httpd.server_address[1]}"
         return engine
 
     def send(self, route, stream, stops):
@@ -232,30 +252,28 @@ class Routes(Fixture):
         return text, finish, stop_seq
 
     def setUp(self):
-        self.servers = {}
-        self.bases = {}
+        self.engine = None
 
     def every_route(self):
-        for named in (False, True):
-            for route in ("openai", "anthropic"):
-                for stream in (False, True):
-                    yield named, route, stream
+        for route in ("openai", "anthropic"):
+            for stream in (False, True):
+                yield route, stream
 
     def test_nerazim_and_its_kin_come_out_whole_with_no_stop_string(self):
         for word in ("Nerazim", "Nerazimville and Nerazim", "swim", "Zim", "a|b|c|", "x > y", "the end of the text", "im_end", "<", "Nerazim<|im"):
-            for named, route, stream in self.every_route():
-                with self.subTest(word=word, named=named, route=route, stream=stream):
-                    self.start(word, named)
+            for route, stream in self.every_route():
+                with self.subTest(word=word, route=route, stream=stream):
+                    self.start(word)
                     text, finish, _ = self.send(route, stream, None)
                     self.assertEqual(text.strip(), word)
                     self.assertIn(finish, ("stop", "end_turn"))
 
     def test_the_held_tail_is_given_back_when_the_stop_string_never_comes(self):
         for stops in (QWEN_STOPS, DEEPSEEK_STOPS, ["im_end", "|>"]):
-            for named, route, stream in self.every_route():
+            for route, stream in self.every_route():
                 for word in ("My friend Nerazim", "Nerazim <|im", "Nerazim <｜User", "ends with a pipe |"):
-                    with self.subTest(stops=stops, word=word, named=named, route=route, stream=stream):
-                        self.start(word, named)
+                    with self.subTest(stops=stops, word=word, route=route, stream=stream):
+                        self.start(word)
                         text, finish, stop_seq = self.send(route, stream, stops)
                         self.assertEqual(text.strip(), word)
                         self.assertIn(finish, ("stop", "end_turn"))
@@ -263,10 +281,10 @@ class Routes(Fixture):
 
     def test_a_stop_string_cuts_the_reply_there(self):
         for stops in (QWEN_STOPS, DEEPSEEK_STOPS):
-            for named, route, stream in self.every_route():
+            for route, stream in self.every_route():
                 for stop in stops:
-                    with self.subTest(stops=stops, stop=stop, named=named, route=route, stream=stream):
-                        self.start("My friend Nerazim" + stop + "and more", named)
+                    with self.subTest(stops=stops, stop=stop, route=route, stream=stream):
+                        self.start("My friend Nerazim" + stop + "and more")
                         text, finish, stop_seq = self.send(route, stream, stops)
                         self.assertEqual(text.strip(), "My friend Nerazim")
                         self.assertIn(finish, ("stop", "end_turn", "stop_sequence"))

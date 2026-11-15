@@ -1695,7 +1695,7 @@ function openDrawer(open) {
   $("scrim").hidden = !open;
   if (open) { loadDrawer(); loadShared(); loadMcp(); }
 }
-// the model's reasoning effort as a number (DeepSeek-V4.1: health.effort_max): a slider beside the words, which set it
+// the model's reasoning effort as a number (health.effort_max, when the server reports it): a slider beside the words, which set it
 const EFFORT_OF = {low: 50, medium: 62, high: 75};
 function effortShown() { return !!(health && health.effort_max); }
 function loadDrawer(s = settings) {

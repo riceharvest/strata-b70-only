@@ -53,7 +53,7 @@ class ChatTemplate:
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
-        # the tokenizer's BOS text for a template that writes {{ bos_token }} (DeepSeek-V4.1's): undefined, Jinja wrote
+        # the tokenizer's BOS text for a template that writes {{ bos_token }}: undefined, Jinja wrote
         # nothing and every chat ran without the BOS the model was trained with - fluent, but its knowledge gone
         self.bos_token = bos_token
         self.caps = self._detect_caps()
@@ -141,22 +141,6 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
           "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "maximum": "xhigh"}
 
 
-# DeepSeek-V4.1's template takes low, medium, high (its default) and max, or a whole number 1..100 (the "Reasoning
-# Effort: N" line of its prompt).  use_family("deepseek41") switches the table; the other families keep the one above.
-EFFORT_DEEPSEEK = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
-                   "low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
-_EFFORT_QWEN = dict(EFFORT)
-_NUMERIC_EFFORT = False
-
-
-def use_family(family: str | None) -> None:
-    """The reasoning-effort words of the model family this server runs (module state, like ENV_TO_USER)."""
-    global _NUMERIC_EFFORT
-    EFFORT.clear()
-    EFFORT.update(EFFORT_DEEPSEEK if family == "deepseek41" else _EFFORT_QWEN)
-    _NUMERIC_EFFORT = family == "deepseek41"
-
-
 def effort_number(value):
     """A reasoning effort given as a number - 40, 40.0 or "40" (clients send it as a string too) - as an int, else None."""
     if isinstance(value, bool):
@@ -170,8 +154,7 @@ def effort_number(value):
 
 def effort_kwargs(value) -> dict:
     """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400, not a crash.
-    DeepSeek-V4.1 takes a whole number 1..100 as it is (its prompt's "Reasoning Effort: N"; the API's tiers low / high /
-    max are 50 / 75 / 100); a model without that scale gets the nearest word for one."""
+    A whole number 1..100 becomes the nearest word."""
     if value is None or value == "":
         return {}
     if value is False:
@@ -180,13 +163,10 @@ def effort_kwargs(value) -> dict:
     if num is not None:
         if not 1 <= num <= 100:
             raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium, high, max or 1..100")
-        if _NUMERIC_EFFORT:
-            return {"reasoning_effort": num}
         value = "low" if num <= 55 else "medium" if num < 75 else "high"
     key = str(value).strip().lower()
     if key not in EFFORT:
-        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high"
-                         + (", max or 1..100" if _NUMERIC_EFFORT else ""))
+        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high")
     level = EFFORT[key]
     return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
 
@@ -1458,8 +1438,8 @@ class OutputParser:
 
     @property
     def clean(self) -> bool:
-        """Nothing is held back: a clean point to stop the thinking at (a parser that rewrites the model's text, as
-        serve/dsml.py's does, also counts what it holds)."""
+        """Nothing is held back: a clean point to stop the thinking at (a parser that rewrites the model's text
+        would also count what it holds)."""
         return not self.buf and not self._held
 
     def _ok_at(self, p: int) -> bool:

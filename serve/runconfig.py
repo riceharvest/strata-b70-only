@@ -241,7 +241,7 @@ EDITABLE = [
     ("answer_room_min_cap", ("int", 1, None),
      "From this max_tokens on, thinking is closed early to leave room to answer (answer_room; default 1024). Lower: shorter "
      "replies are protected too, and their thinking is cut. Higher: short caps are left as they are and may end in the middle "
-     "of the thinking. (DeepSeek-V4.1 only: caps from 48 up to this are limited to half.) Empty: 1024"),
+     "of the thinking. Empty: 1024"),
     ("answer_reserve_min", ("int", 0, None),
      "The least number of tokens kept for the answer when a thinking budget is cut down to fit max_tokens (default 512; the "
      "reserve is the larger of this and a quarter of max_tokens, at most half). Higher: a safer answer and less thinking. "

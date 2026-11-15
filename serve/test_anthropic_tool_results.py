@@ -10,7 +10,6 @@ from serve.server import ByteTokenizer, MockEngine, Service, serve
 
 
 TEMPLATE = ChatTemplate(Path(__file__).with_name("chat_template.jinja"))
-DEEPSEEK = ChatTemplate(Path(__file__).with_name("fixtures") / "deepseek41" / "chat_template.jinja")
 
 
 def history():
@@ -46,11 +45,9 @@ class AnthropicToolResults(unittest.TestCase):
         before = copy.deepcopy(raw)
         self.assertEqual(results(raw), ["RESULT_FROM_SLOW", "RESULT_FROM_FAST"])
         self.assertEqual(raw, before)
-        for template in (TEMPLATE, DEEPSEEK):
-            with self.subTest(template=str(template)):
-                prompt = template.render(normalized(raw), enable_thinking=False)
-                self.assertEqual(prompt, template.render(normalized(in_call_order()), enable_thinking=False))
-                self.assertLess(prompt.index("RESULT_FROM_SLOW"), prompt.index("RESULT_FROM_FAST"))
+        prompt = TEMPLATE.render(normalized(raw), enable_thinking=False)
+        self.assertEqual(prompt, TEMPLATE.render(normalized(in_call_order()), enable_thinking=False))
+        self.assertLess(prompt.index("RESULT_FROM_SLOW"), prompt.index("RESULT_FROM_FAST"))
 
     def test_already_ordered_and_legacy_prompts_are_identical(self):
         ordered = in_call_order()
