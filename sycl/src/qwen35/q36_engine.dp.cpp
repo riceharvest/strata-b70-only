@@ -7957,6 +7957,7 @@ work-group size if needed.
         for (auto& kv : row_graphs)
             if (kv.second) CK(DPCT_CHECK_ERROR(delete (kv.second)));
         row_graphs.clear();
+        row_graph_used.clear();
     }
     catch (sycl::exception const &exc) {
       std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -8219,6 +8220,41 @@ work-group size if needed.
     long long win_count = 0;
     std::map<std::vector<int>, dpct::experimental::command_graph_exec_ptr>
         row_graphs; // by kind / rows / per-slot XATT slicing: graphs of the windows
+    // STRATA_Q36_ROW_GRAPHS (default 192; 0: no limit, as before): the most window graphs kept.  A batch window's graph is
+    // recorded for the exact slots and rows of that window, so with agents that come and go the patterns never end, and
+    // every recorded graph holds memory of the card: a run of 16 agents on 8 sessions ended with OUT_OF_DEVICE_MEMORY after
+    // ten minutes.  Past the limit the graph used longest ago is released before a new one is recorded.
+    std::map<std::vector<int>, uint64_t> row_graph_used;
+    uint64_t row_graph_clock = 0;
+    long long row_graph_recorded = 0, row_graph_dropped = 0;
+    int row_graph_cap = [] { const char* e = std::getenv("STRATA_Q36_ROW_GRAPHS"); return e && *e ? std::max(0, std::atoi(e)) : 192; }();
+    /// The window graph of `key` (null: not recorded yet; graph_run records it).
+    dpct::experimental::command_graph_exec_ptr& row_graph(const std::vector<int>& key) {
+        const auto it = row_graphs.find(key);
+        if (it != row_graphs.end()) {
+            row_graph_used[key] = ++row_graph_clock;
+            return it->second;
+        }
+        if (row_graph_cap > 0 && (int) row_graphs.size() >= row_graph_cap) {
+            CK(DPCT_CHECK_ERROR(st->wait()));   // (nothing of a graph about to go is still running)
+            while ((int) row_graphs.size() >= row_graph_cap) {
+                auto victim = row_graph_used.begin();
+                for (auto u = row_graph_used.begin(); u != row_graph_used.end(); ++u)
+                    if (u->second < victim->second) victim = u;
+                if (victim == row_graph_used.end()) break;
+                const auto g = row_graphs.find(victim->first);
+                if (g != row_graphs.end()) {
+                    if (g->second) delete g->second;
+                    row_graphs.erase(g);
+                    ++row_graph_dropped;
+                }
+                row_graph_used.erase(victim);
+            }
+        }
+        ++row_graph_recorded;
+        row_graph_used[key] = ++row_graph_clock;
+        return row_graphs[key];
+    }
     /// A slot's rows of one window: `n` consecutive cells from the session's position (the next token, then the MTP
     /// drafts the window verifies after it).
     struct Group { int slot; int n; int32_t tok[kVerify]; };
@@ -8234,14 +8270,15 @@ work-group size if needed.
         if (xatt_now) xatt_catch_up_sess(cur);
         else if (xatt_ready) sess[(size_t) cur].xmir_n = std::min<int64_t>(sess[(size_t) cur].xmir_n, std::max<int64_t>(0, pos - kVerify));   // (a replayed graph's cells)
         if (!use_graph) body();
-        else if (n_sess > 1) graph_run(row_graphs[{key + (xatt2_now ? 2000000 : xatt_now ? 1000000 : 0), cur}], body);   // (LANE SOLO: the graph holds the session's pointers)
-        else graph_run(row_graphs[{key + (xatt2_now ? 2000000 : xatt_now ? 1000000 : 0)}], body);
+        else if (n_sess > 1) graph_run(row_graph({key + (xatt2_now ? 2000000 : xatt_now ? 1000000 : 0), cur}), body);   // (LANE SOLO: the graph holds the session's pointers)
+        else graph_run(row_graph({key + (xatt2_now ? 2000000 : xatt_now ? 1000000 : 0)}), body);
         xatt_now = false;
         xatt2_now = false;
     }
 
     /// Evaluates per-slot XATT eligibility and catches up non-kv_vt mirrors before running/capturing a batch row graph.
-    void run_rows_graph(int kind, int g_arg, int T, const std::function<void()>& body) {
+    /// `eager`: the body runs as it is, without a graph (a pass whose slot and row pattern rarely repeats).
+    void run_rows_graph(int kind, int g_arg, int T, const std::function<void()>& body, bool eager = false) {
         const int xatt_max_nt = xls_max * 16 / strata::q36xatt::kG;
         xbatch_xatt_any = false;
         for (XBatchSlot& bs : xbatch_slots) {
@@ -8274,8 +8311,8 @@ work-group size if needed.
                 gkey.push_back(bs.xatt ? 1 : 0);
             }
         }
-        if (!use_graph) body();
-        else graph_run(row_graphs[gkey], body);
+        if (!use_graph || eager) body();
+        else graph_run(row_graph(gkey), body);
         xbatch_slots.clear();
         xbatch_xatt_any = false;
         xbatch_x2 = false;
@@ -8514,7 +8551,7 @@ work-group size if needed.
             }
         };
         if (!use_graph) commit_body();
-        else graph_run(row_graphs[{2000, G}], commit_body);
+        else graph_run(row_graph({2000, G}), commit_body);
         rows_mode = false;
         CK(DPCT_CHECK_ERROR(st->wait()));
         for (int i = 0; i < G; ++i) {
@@ -8610,6 +8647,11 @@ work-group size if needed.
             else
                 xbatch_slots.push_back({rows[r].slot, r, 1, rows[r].cell, false});
         }
+        // The block's pass over rows of several sessions runs without a graph (STRATA_Q36_MTP_ROWS_GRAPH=1: recorded, as
+        // before).  Its rows are what each slot kept of its drafts in the last window, so its pattern is one of up to 3^slots
+        // and seldom repeats: measured with 16 agents on 8 sessions, a new graph was recorded for one window in three (630
+        // in 116 s), each holding about 2.5 MB of the card.  The pass is one block and a head: little to gain from a graph.
+        static const bool mr_graph = [] { const char* e = std::getenv("STRATA_Q36_MTP_ROWS_GRAPH"); return e != nullptr && e[0] == '1'; }();
         run_rows_graph(top2 ? 3001 : 3000, 0, T, [&] {
             q8_src = nullptr;
             xq_ready = false;
@@ -8753,7 +8795,7 @@ work-group size if needed.
                                       sycl::range<3>(1, 1, kThreads)),
                     [=](sycl::nd_item<3>) { k_top2_stage2(amv_, ami_, nv, idv2, out); });
             }
-        });
+        }, n_sess > 1 && !mr_graph);
         rows_deferred = false;
         rows_mode = false;
         /*
@@ -11127,6 +11169,7 @@ struct Serve {
             bt_ms[5] += gap;
             pw_ms[5] += gap;
         }
+        double w_ms = 0;   // (this window's parts together)
         auto lap = [&](int i) {
             if (btime) {
                 E.st->wait();
@@ -11134,6 +11177,7 @@ struct Serve {
                 const double d = std::chrono::duration<double, std::milli>(t - bt0).count();
                 bt_ms[i] += d;
                 pw_ms[i] += d;
+                w_ms += d;
                 bt0 = t;
             }
         };
@@ -11356,11 +11400,12 @@ struct Serve {
         lap(4);
         if (btime) { ++bt_n; bt_end = Clock::now(); }
         if (q36_profile_on()) {
-            ++pw_n;
-            pw_rows += T;
-            pw_slots += S;
-            for (int i = 0; i < S; ++i) pw_cells = std::max<long long>(pw_cells, (long long) E.sess[(size_t) act[(size_t) i]].pos);
-            if (pw_n >= 64) prof_windows();
+            long long tok = 0, cells = 0;
+            for (int i = 0; i < S; ++i) {
+                tok += keep[(size_t) i];
+                cells = std::max<long long>(cells, (long long) E.sess[(size_t) act[(size_t) i]].pos);
+            }
+            prof_window_done(S, T, tok, w_ms, cells);
         }
     }
     catch (sycl::exception const &exc) {
@@ -11387,6 +11432,7 @@ struct Serve {
         for (int b = 0; b < E.n_sess; ++b)
             if (slots[(size_t) b].active) rows.push_back({b, slots[(size_t) b].x});
         if (rows.empty()) return;
+        const auto wp0 = Clock::now();   // STRATA_Q36_PROFILE: the whole window is its "window" part
         E.step_rows(rows.data(), (int) rows.size());
         const size_t Nb = (size_t) E.m->g.n_embd * 4;
         for (size_t r = 0; r < rows.size(); ++r) {
@@ -11428,6 +11474,14 @@ struct Serve {
             }
         }
         std::fflush(stdout);
+        if (q36_profile_on()) {
+            E.st->wait();
+            const double ms = ms_since(wp0);
+            long long cells = 0;
+            for (const Engine::Row& r : rows) cells = std::max<long long>(cells, (long long) E.sess[(size_t) r.slot].pos);
+            pw_ms[1] += ms;
+            prof_window_done((int) rows.size(), (int) rows.size(), (long long) rows.size(), ms, cells);
+        }
     }
     catch (sycl::exception const &exc) {
       std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -11442,16 +11496,47 @@ struct Serve {
     static double prof_ts() { return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count(); }
     long long prof_req_n = 0;
     // (the batch windows since the last `win` record)
-    long long pw_n = 0, pw_rows = 0, pw_slots = 0, pw_cells = 0;
+    long long pw_n = 0, pw_rows = 0, pw_slots = 0, pw_cells = 0, pw_tok = 0;
     double pw_ms[6] = {};
+    // ... by the slots that decoded in a window (1 .. kVerify): windows, their time, the tokens they gave, their rows -
+    // where the summed decode peaks as slots are added
+    long long ps_n[Engine::kVerify + 1] = {}, ps_tok[Engine::kVerify + 1] = {}, ps_rows[Engine::kVerify + 1] = {};
+    double ps_ms[Engine::kVerify + 1] = {};
     void prof_windows() {
         if (!q36_profile_on() || pw_n == 0) return;
-        std::fprintf(stderr, "PROF {\"ev\":\"win\",\"t\":%.1f,\"ts\":%.3f,\"n\":%lld,\"slots\":%.2f,\"rows\":%.2f,\"cells_max\":%lld,"
-                             "\"ms\":{\"draft0\":%.3f,\"window\":%.3f,\"picks\":%.3f,\"commit\":%.3f,\"drafts\":%.3f,\"between\":%.3f}}\n",
-                     prof_t(), prof_ts(), pw_n, (double) pw_slots / pw_n, (double) pw_rows / pw_n, pw_cells,
-                     pw_ms[0] / pw_n, pw_ms[1] / pw_n, pw_ms[2] / pw_n, pw_ms[3] / pw_n, pw_ms[4] / pw_n, pw_ms[5] / pw_n);
-        pw_n = pw_rows = pw_slots = pw_cells = 0;
+        std::string by;
+        for (int k = 1; k <= Engine::kVerify; ++k) {
+            if (ps_n[k] == 0) continue;
+            char b[96];
+            std::snprintf(b, sizeof b, "%s\"%d\":[%lld,%.1f,%lld,%lld]", by.empty() ? "" : ",", k, ps_n[k], ps_ms[k], ps_tok[k], ps_rows[k]);
+            by += b;
+            ps_n[k] = ps_tok[k] = ps_rows[k] = 0;
+            ps_ms[k] = 0;
+        }
+        size_t vfr = 0, vtot = 0;
+        dpct::get_current_device().get_memory_info(vfr, vtot);
+        std::fprintf(stderr, "PROF {\"ev\":\"win\",\"t\":%.1f,\"ts\":%.3f,\"n\":%lld,\"slots\":%.2f,\"rows\":%.2f,\"tok\":%lld,\"cells_max\":%lld,"
+                             "\"ms\":{\"draft0\":%.3f,\"window\":%.3f,\"picks\":%.3f,\"commit\":%.3f,\"drafts\":%.3f,\"between\":%.3f},"
+                             "\"graphs\":%zu,\"graphs_recorded\":%lld,\"graphs_dropped\":%lld,\"vram_free_mib\":%.0f,\"by_slots\":{%s}}\n",
+                     prof_t(), prof_ts(), pw_n, (double) pw_slots / pw_n, (double) pw_rows / pw_n, pw_tok, pw_cells,
+                     pw_ms[0] / pw_n, pw_ms[1] / pw_n, pw_ms[2] / pw_n, pw_ms[3] / pw_n, pw_ms[4] / pw_n, pw_ms[5] / pw_n,
+                     E.row_graphs.size(), E.row_graph_recorded, E.row_graph_dropped, (double) vfr / 1048576.0, by.c_str());
+        pw_n = pw_rows = pw_slots = pw_cells = pw_tok = 0;
         for (double& v : pw_ms) v = 0;
+    }
+    /// A batch window is done: `S` slots, `rows` rows, `tok` tokens, `ms` of work, the deepest session's cells.
+    void prof_window_done(int S, int rows, long long tok, double ms, long long cells) {
+        ++pw_n;
+        pw_rows += rows;
+        pw_slots += S;
+        pw_tok += tok;
+        pw_cells = std::max(pw_cells, cells);
+        const int k = std::max(1, std::min(S, Engine::kVerify));
+        ++ps_n[k];
+        ps_ms[k] += ms;
+        ps_tok[k] += tok;
+        ps_rows[k] += rows;
+        if (pw_n >= 64) prof_windows();
     }
     void prof_slot(int b, const Slot& sl, const char* fin, int64_t cells) {
         if (!q36_profile_on()) return;

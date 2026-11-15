@@ -13,7 +13,8 @@ and prints, with every part optional when its file is missing:
   3. the cache: how each request got its cells, the share of the prompt that was kept, tokens read a request
   4. decoding alone: tokens a second, a step's time, tokens a step, the steps by kind, drafts accepted (lookups apart),
      by context length
-  5. batch windows: slots and rows a window, a window's parts, tokens a window, drafts accepted
+  5. batch windows: slots and rows a window, a window's parts, tokens a window, drafts accepted; and the decode by
+     the number of streams decoding at once (1: a request alone), which shows where the summed decode peaks
   6. the server's view: the wait before the engine began, time to the first token, a request's time
   7. the slowest requests with what they spent their time on
 """
@@ -182,6 +183,13 @@ def report(prof, metrics, run):
         P("   %.2f tokens a window = %.1f tok/s while windows run; drafts accepted %.1f%% of %d" % (
             tok_slot / n_win, 1000.0 * tok_slot / max(1e-9, wtotal), 100.0 * sum(s["accepted"] for s in slots) / max(1, sum(s["offered"] for s in slots)),
             sum(s["offered"] for s in slots)))
+        gw = [w for w in wins if "graphs" in w]
+        if gw:
+            fr = [w["vram_free_mib"] for w in gw]
+            P("   window graphs: %d kept at the end, %d recorded, %d dropped; the card's free memory %.0f MiB at first, %.0f at the end, %.0f at its lowest" % (
+                gw[-1]["graphs"], gw[-1]["graphs_recorded"], gw[-1]["graphs_dropped"], fr[0], fr[-1], min(fr)))
+            res["graphs"] = {"kept": gw[-1]["graphs"], "recorded": gw[-1]["graphs_recorded"], "dropped": gw[-1]["graphs_dropped"],
+                             "vram_free_mib": [round(fr[0]), round(fr[-1]), round(min(fr))]}
         by = {}
         for w in wins:
             by.setdefault(bucket(w["cells_max"]), []).append(w)
@@ -193,6 +201,37 @@ def report(prof, metrics, run):
                     name, n, sum(w["n"] * w["slots"] for w in ws) / n, sum(w["n"] * w["rows"] for w in ws) / n, sum(w["n"] * w["ms"]["window"] for w in ws) / n,
                     sum(w["n"] * w["ms"]["drafts"] for w in ws) / n))
         res["batch"] = {"windows": n_win, "cycle_ms": round(cyc, 2), "tok_per_window": round(tok_slot / n_win, 2)}
+    # ---- decode by the streams decoding at once: a request alone, then the windows by their slots
+    by = {}
+    for w in wins:
+        for k, v in (w.get("by_slots") or {}).items():
+            a = by.setdefault(int(k), [0, 0.0, 0, 0])
+            a[0] += v[0]; a[1] += v[1]; a[2] += v[2]; a[3] += v[3]
+    if by or solo:
+        P("")
+        P("   Decode by the streams decoding at once (a window's own time: drafts, verify rows, commit)")
+        P("   streams   windows   time   rows a window   ms a window   tokens a window   tok/s in all   tok/s a stream")
+        curve = {}
+        if solo:
+            toks, ms = sum(r["out"] for r in solo), sum(r["dec_ms"] for r in solo)
+            steps = sum(sum(r["steps"].values()) for r in solo)
+            curve[1] = 1000.0 * toks / ms
+            P("   %2d alone %8d %5.0f s   %13s   %11.1f   %15.2f   %12.1f   %14.1f" % (1, steps, ms / 1000.0, "-", ms / max(1, steps), toks / max(1, steps), curve[1], curve[1]))
+        for k in sorted(by):
+            n, ms, tok, rows = by[k]
+            if n == 0 or ms <= 0:
+                continue
+            rate = 1000.0 * tok / ms
+            if k > 1 or 1 not in curve:
+                curve[k] = rate
+            P("   %2d       %8d %5.0f s   %13.1f   %11.1f   %15.2f   %12.1f   %14.1f" % (k, n, ms / 1000.0, rows / n, ms / n, tok / n, rate, rate / k))
+        if curve:
+            # (a count seen in a handful of windows is not a measurement: the peak is taken over those with 200 and more)
+            solid = {k: v for k, v in curve.items() if k == 1 or by.get(k, [0])[0] >= 200} or curve
+            peak = max(solid, key=lambda k: solid[k])
+            P("   the summed decode peaks at %d streams: %.1f tok/s (%.1fx a request alone)" % (peak, solid[peak], solid[peak] / curve[1] if 1 in curve else 0.0))
+            res["decode_by_streams"] = {str(k): round(v, 1) for k, v in sorted(curve.items())}
+            res["decode_peak"] = {"streams": peak, "tok_s": round(solid[peak], 1)}
     # ---- 6. the server's view
     hist = history(metrics)
     if hist:
