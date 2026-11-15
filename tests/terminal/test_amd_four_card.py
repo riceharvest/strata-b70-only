@@ -32,12 +32,11 @@ class Class(unittest.TestCase):
         self.assertFalse(F.card_class([*CARDS[:3], {**R9700, "name": "AMD Radeon RX 9070"}]))
 
     def test_only_the_measured_model(self):
-        for name in ("qwen3.8-flash-next-iq3_xxs", "qwen3.6-35b-a3b-q4", "deepseek-v4.1-flash-2.00bpw"):
+        for name in ("qwen3.8-flash-next-iq3_xxs", "qwen3.6-35b-a3b-q4"):
             with self.subTest(name):
                 self.assertFalse(F.applies(CARDS, fresh(model_name=name, args=["--pack", "/p/x"])))
         self.assertTrue(F.applies(CARDS, fresh()))
         self.assertFalse(F.applies(CARDS, fresh(backend="cuda")))
-        self.assertFalse(F.applies(CARDS, fresh(arch="deepseek41")))
         self.assertFalse(F.applies(CARDS, fresh(args=CFG["args"] + ["--peer-device", "1"])))
 
 

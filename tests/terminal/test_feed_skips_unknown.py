@@ -39,15 +39,19 @@ def parse(d):
 class UnknownEntriesAreSkipped(unittest.TestCase):
     def test_unknown_platform_in_every_member(self):
         f = parse(doc(engine={"packages": [engine(), engine(platform="freebsd-riscv", url="u1")]},
-                      dsv41={"packages": [engine(url="d"), engine(platform="plan9-mips", url="u2")]},
                       control={"version": "0.1.53", "packages": [control(), control(platform="linux-m68k", url="c2")]}))
         self.assertEqual([p.platform for p in f.engine], ["linux-x86_64"])
-        self.assertEqual([p.platform for p in f.dsv41], ["linux-x86_64"])
         self.assertEqual([p.platform for p in f.control], ["linux-x86_64"])
-        self.assertEqual(len(f.skipped), 3)
+        self.assertEqual(len(f.skipped), 2)
         for line in f.skipped:
             self.assertNotIn("\n", line)
             self.assertIn("skipped", line)
+
+    def test_a_member_this_control_does_not_know_is_ignored(self):
+        # a published feed may carry members of a kind that was removed or is not known yet: they are neither used nor a reason to refuse it
+        f = parse(doc(engine={"packages": [engine()]}, some_other_engine={"packages": [engine(url="d")]}, odd_member="not even an object"))
+        self.assertEqual([p.platform for p in f.engine], ["linux-x86_64"])
+        self.assertEqual(f.skipped, ())
 
     def test_unknown_backend_and_format(self):
         f = parse(doc(engine={"packages": [engine(), engine(backend="npu", url="u1"), engine(format="7z", url="u2")]},

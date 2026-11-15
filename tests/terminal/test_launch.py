@@ -109,9 +109,6 @@ class CatalogRules(unittest.TestCase):
             models, families, contexts, source = cat.tables()
             self.assertEqual(source, "setup.py")                       # the same tables setup.py and the app read
             for r in rows:
-                if r.family == "deepseek41":                           # its sizes are in MULTI_FILE_FAMILIES (shards + shared files), not in MODELS
-                    self.assertAlmostEqual(r.download_gb, {"UD-Q8_K_XL": 508.4, "IST-DAS-2.00bpw": 256.8, "IST-DAS-2.25bpw": 273.8, "IST-DAS-1.75bpw": 239.3}[r.model], delta=0.1)
-                    continue
                 self.assertAlmostEqual(r.download_gb, models[r.model]["download_gb"])
             rec = [r for r in rows if r.recommended]
             self.assertEqual([(r.family, r.model) for r in rec], [("qwen", "IQ3_S")])      # 64 + 12 GB: the 64 GB tier
@@ -824,37 +821,6 @@ class FlagsCommand(unittest.TestCase):
         self.assertNotIn("--pool-cores", p["settings"]["extra"])
         self.assertTrue(any("pool-cores" in w for w in p["warnings"]))
 
-    def test_dspark_on_a_mac_is_warned_about_and_not_refused(self):
-        # the drafter has no Metal kernels yet: --dspark on is passed on as asked, with a plain warning (recommend, never force)
-        import sys
-        from unittest import mock
-        with mock.patch.object(sys, "platform", "darwin"):
-            p = self.plan("--model", "q2_0", "--dspark", "on")
-        self.assertEqual(p["settings"]["extra"].get("--dspark"), "on")
-        self.assertTrue(any("DSpark" in w and "Mac" in w for w in p["warnings"]), p["warnings"])
-        p = self.plan("--model", "q2_0", "--dspark", "auto")
-        self.assertFalse(any("DSpark" in w and "Mac" in w for w in p["warnings"]))
-
-    def test_dspark_takes_a_word_and_the_word_reaches_the_engine_line(self):
-        # --set dspark=on used to start strata-dsv41 with a lone "--dspark" ("--dspark needs a value", #3959)
-        from strata_cli.launch import settings as S
-        from strata_control import tune_knobs
-        base = ["--pack", "p", "--max-context", "262144"]
-        for word in ("on", "off", "auto", "none"):
-            a, _ = S.as_argv_changes({"--dspark": word}, tune_knobs.BOOL_FLAGS)
-            self.assertEqual(a, {"--dspark": word})
-            out = tune_knobs.apply_to_argv(base + ["--dspark", "auto"], a)
-            self.assertEqual(out[out.index("--dspark") + 1], word, word)
-            self.assertEqual(out.count("--dspark"), 1)
-        a, _ = S.as_argv_changes({"--dspark": "ON", "--dspark-conf": "0.7"}, tune_knobs.BOOL_FLAGS)
-        self.assertEqual(a, {"--dspark": "on", "--dspark-conf": "0.7"})
-        self.assertEqual(S.as_argv_changes({"--dspark": ""}, tune_knobs.BOOL_FLAGS)[0], {})
-        code, out, _err = run_cli(["launch", "--help"])
-        self.assertIn("--dspark", out)
-        p = self.plan("--model", "q2_0", "--dspark", "on")
-        self.assertEqual(p["settings"]["extra"], {"--dspark": "on"})
-        self.assertIn("--set dspark=on", p["flags"])
-
     def test_api_key_flags(self):
         p = self.plan("--model", "q2_0", "--access", "lan", "--api-key", "sk-mine")
         self.assertEqual(p["settings"]["api_key"], "set")
@@ -966,8 +932,10 @@ class FlagsCommand(unittest.TestCase):
         self.assertTrue(any("cannot read pictures" in w for w in p["warnings"]))
 
     def test_does_not_fit_is_a_warning_with_the_reason(self):
-        p = self.plan("--model", "ud-q8_k_xl")
-        self.assertTrue(any("does not fit" in w for w in p["warnings"]))
+        small = dict(HW_12, ram_gb=16.0, disk_free_gb=500.0)                  # a 43 GB model on 16 GB of RAM + a 12 GB card
+        with mock.patch.object(Catalog, "hardware", lambda self, fresh=False: small):
+            p = self.plan("--model", "iq3_s")
+        self.assertTrue(any("does not fit" in w for w in p["warnings"]), p["warnings"])
 
     def test_human_plan_changes_nothing(self):
         code, out, err = run_cli(["launch", "--plan", "--model", "q2_0", "--save-preset", "X"])

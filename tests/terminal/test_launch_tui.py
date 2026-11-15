@@ -265,11 +265,11 @@ class ModelStep(Base):
         async def case(app, pilot, ctx):
             await press(pilot, "enter", "end", "enter")
             last = ctx.rows[-1]
-            self.assertEqual(last.verdict, "no")                      # the last row does not fit a 12 GB card
+            self.assertEqual(last.verdict, "no")                      # the last row does not fit 8 GB of RAM and a 12 GB card
             self.assertEqual((ctx.settings.family, ctx.settings.model), (last.family, last.model))
             self.assertIn("Where should the model files be stored?", text_of(app))
             self.assertTrue(any("does not fit" in n for n in ctx.notes))
-        self.run_app(case)
+        self.run_app(case, ctx=make_ctx(dict(HW_12, ram_gb=8.0)))
 
     def test_own_files_are_checked_with_the_fingerprint_table(self):
         plan = {"candidate_selection": {"family": "qwen", "model": "IQ3_XXS"}, "issues": [], "file_count": 2, "total_bytes": 44_000_000_000}

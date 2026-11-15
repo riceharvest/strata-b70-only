@@ -2,7 +2,7 @@
 local raw files, by HTTP range requests (resumable, per chunk of experts).  Files: <out>/L<l>_gate_up.bf16 and
 L<l>_down.bf16 (raw bf16, shape [512, 1280, 2560] and [512, 2560, 640]).
 
-  python3 tools/trellis/fetch_orig.py --layers 4,16,28,40 --out /data/dsv41-enc/orig [--workers 48]
+  python3 tools/trellis/fetch_orig.py --layers 4,16,28,40 --out /data/enc/orig [--workers 48]
 """
 from __future__ import annotations
 

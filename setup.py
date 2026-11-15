@@ -23,7 +23,7 @@ What the first run does (each step is skipped when it is already done):
   6. prepares the model for Strata and fetches the MTP draft layer (~5 GB, from the original Qwen checkpoint)
   7. writes the run config (strata-<model>.json) and run-<model>.sh and starts the model
 
-Options: --family qwen|swift|coder|unsloth|gyro|deepseek41, --model Q2_0|IQ2_XS|IQ3_XXS|IQ3_S|..., --context 32768,
+Options: --family qwen|swift|coder|unsloth|gyro, --model Q2_0|IQ2_XS|IQ3_XXS|IQ3_S|..., --context 32768,
 --rope-scaling none|linear|yarn (--rope-scale F; past the trained 262144 the setup adds yarn and the factor is the
 final context over 262144, at least 1 - an explicit --rope-scaling none is refused for such a context), --vision
 yes|no|gpu|cpu, --port 8080, --yes (recommended answers, no questions), --setup (install another model / change
@@ -68,7 +68,6 @@ from strata_control import tls
 tls.install()      # #3722: HTTPS checks the server against the operating system's certificates (what Chrome and curl.exe do)
 from strata_control import atomic
 from strata_control import draft_layer
-from strata_control import dsv41_context
 from strata_control import engine_component
 from strata_control.discovery import in_trash
 from strata_control import user_args
@@ -99,8 +98,6 @@ HF_REVISIONS = {
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
     "unsloth/Qwen3.8-Flash-Next-GGUF": "38bb39ee97821de2c9009abb7e93950eec396e66",                   # 2026-09-30
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": "1ada08422e404aca51ab9df665f089f34c419c6b",           # 2026-10-13
-    "unsloth/DeepSeek-V4.1-Flash-1017-GGUF": "f924b94f19c1fea02c06a65c8475b0a45e2b88b1",             # 2026-10-20 (the port's reference)
-    "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF": "cb02422c900df489cea5833e8a92171224059b3c",    # 2026-10-24 (ISTA-DASLab's final 1.75 / 2.00 / 2.25 bpw sets and Engram)
 }
 
 
@@ -514,138 +511,6 @@ FAMILIES = {
 }
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 
-# DeepSeek-V4.1-Flash (GGUF architecture deepseek41), Unsloth's UD-Q8_K_XL at the revision the port was checked against: a
-# family with an engine of its own (strata-dsv41, src/dsv41, ported from Project Maya's maya-ds4, MIT) that is not a
-# Flash-Next pack and not a single GGUF: nine shards (508.4 GB, the routed experts as MXFP4, the dense weights in BF16, and
-# in shard 8 the 202.8 GB n-gram table that stays on the SSD), the engine's pack folder (tools/dsv41/pack_gguf.py: hash
-# tables, tensor map, the tokenizer and the GGUF's own chat template, a few MB) beside them.  MULTI_FILE_FAMILIES, offered
-# in the same menu and installed by install_dsv41.  Where it fits: strata_control/dsv41_fit.py (real numbers).  The DSpark
-# drafter (dspark-...-Q8_0.gguf, 8.0 GB) and the picture reader (mmproj-BF16.gguf, 1.0 GB) are pinned here but not fetched: the
-# engine does not use them yet.
-DSV41_REPO = "unsloth/DeepSeek-V4.1-Flash-1017-GGUF"
-DSV41_SHARD = "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-{i:05d}-of-00009.gguf"
-DSV41_FILES = {
-    "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00009.gguf": (5780589, "cc15d470afcb030558bbc4d8e2ccd840182e2e95de1a95198138efe63a5fd99f"),
-    "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00002-of-00009.gguf": (50536121984, "9cb2047676bd20e448be2377b480080c97fb38fae117f4846e07de2c65bb8522"),
-    "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00003-of-00009.gguf": (50536121984, "17d398dd327e7ff1991b382677814db75d970b074661757564b6f2ac3d0c8d95"),
-    "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00004-of-00009.gguf": (50536122016, "7ea8da1143b9a6bf1424a361eb1b0d6f66c7ce79eac9711162f212cc4f39c319"),
-    "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00005-of-00009.gguf": (50536122016, "1952da19a841176b46f9681c99ea57c674f8a8861e16d76fb35cec4befe039b2"),
-    "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00006-of-00009.gguf": (50536122016, "d6711781d8effab79b410af9c40920bffcc0c28976e509bc1227ff0c6669c33a"),
-    "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00007-of-00009.gguf": (36097230048, "2ebc8d198d03a14865e8a85df637285ceb5dd79b1ffc78424bd3c3e06df57823"),
-    "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00008-of-00009.gguf": (202758032592, "12df293355efbd104b088a77e13ee22410fb1ec3f7ab3863947f09896e64bec7"),
-    "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00009-of-00009.gguf": (16835109952, "df33722d1dcf5ffe0347ed8406f7acb3b18061f4ded2c13c2b0a184b8d41c9ea"),
-    "dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf": (7976914240, "6ba6ac1b331c540691a209e7fc97dec2a24e295acb1e755c84c7d24a4373927a"),
-    "mmproj-BF16.gguf": (972208288, "9a1ef7c40d0d702c7ed8c5f863f60abae64091387ba3fce0ad19ce9beeda3bf9"),
-}
-# The two OFFICIAL IST-DAS sets (ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF at the revision above, a flat repository; Hub LFS sha256 = what the
-# files hash to): IQ2_XXS is the 2.00 bpw set, IQ2_XS the 2.25 bpw set and IQ1_M the 1.75 bpw set, 4 shards each, plus ONE Engram table (110.6 GB, the same file for both sets:
-# downloaded once into the shared folder) and the DSpark drafter and the 5.8 MB metadata shard of Unsloth's set that pack_gguf --engram-meta reads
-# (both pinned in DSV41_FILES above).  This is the set a normal PC runs (64 GB RAM + a 12 GB card; docs/DEEPSEEK41.md); the UD-Q8_K_XL entry stays
-# for the big machines.
-DSV41_ISTA_REPO = "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF"
-DSV41_ISTA_ENGRAM = "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"
-DSV41_ISTA_SHARD = "DeepSeek-V4.1-Flash-1017-GSQ-RCO-{quant}-{i:05d}-of-00004.gguf"
-DSV41_DSPARK = "dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"
-DSV41_ISTA_FILES = {
-    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf": (39358830464, "6e3f0d5ff53d00428ec32c079db9e8255cb410ccaa435e5342aaa8a47fe1339d"),
-    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00002-of-00004.gguf": (39176113248, "34d68c99fdae9948f9f0af0dafe308e805ce0a78d2c48641b24cc57242fdc0af"),
-    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00003-of-00004.gguf": (39997334720, "a08468c83955e0c4d3a9eb3f7b86c45b7bbac55d99c4640039a296a8a4b327ea"),
-    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00004-of-00004.gguf": (2188841824, "b05f26a92325aa6845cebcb3ec1f93d2e65ebf89bdc3f805695960d2f0681832"),
-    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00004.gguf": (39535776992, "4c65307992ab586c527ca1f6f64062aa96a33b23c02b7fed103f45f75e854798"),
-    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00002-of-00004.gguf": (39494617536, "933461a974fcccee741bf2f9798201e72ab4aa3f8a952be56f849896ca6ea30e"),
-    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00003-of-00004.gguf": (39423838496, "bbf91fa346a85ebaf32dd4fd5c456b534d780d381e54f46ac90783a481373240"),
-    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00004-of-00004.gguf": (36771591232, "e5b2f8781fab688cd4bc3bc7a69651b5dbb90ed94965657c6bead8bb4774f3cf"),
-    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf": (39075714624, "d46efb67ccffd8fb5d7f18b423896381b9e06d8491e161c370ddf3b05b07e050"),
-    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00002-of-00004.gguf": (39388449504, "cec1b2c3da429dc768b8bb9bc4dc4403d81f74d34db660a6a34ee3e555bf2c70"),
-    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00003-of-00004.gguf": (39246891616, "9d9c2140fcb134a0b9a74dedd0e5167e68077af6d08ce7f856bce112f0a35dd3"),
-    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00004-of-00004.gguf": (20527837312, "9b790a2297ed3cdede379fc984f4a52bb95f3b23724c797af11d1fa6a69db059"),
-    "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf": (110595290816, "eb19f30d368d393784e1fc54fdfaffc427ebb2110bf3762fdf5a8fbb9a2d740a"),
-}
-# ISTA re-published the first shard of each set on 2026-10-26 with a larger chat template (images in tool results; their PATCHING.md, and what their
-# patch_chat_template.py makes of a shard 1 already downloaded).  setup downloads the pinned revision (HF_REVISIONS), so DSV41_ISTA_FILES stays the older
-# file; a newer shard 1 "already here" (--gguf-dir) is the same weights with the newer template and is accepted by its own size and SHA-256, never fetched.
-DSV41_NEW_SHARD1 = {
-    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf": (39358841536, "a7be0d5a48e4d1c13c5535f9123d9131ab8964e5acf8a0c01d14970e4b7f4df9"),
-    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00004.gguf": (39535788064, "d9b949d55e27242b8afc7c2928749b888372d4c39682f9a131670d1c2555155e"),
-    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf": (39075725728, "2dfe9711eac1f7814aa59154d11e8f27739f8b96875dc1e667eac9f8c756e1fe"),
-}
-# The files the first release of these sets was downloaded as (helcig/tmp-oct26-2, 2026-10-23: model-2.00bpw-0000N-of-00004.gguf, model-2.25bpw-...,
-# engram-IQ4_NL.gguf, usually in a 2.00bpw/ or 2.25bpw/ folder): testers and our boxes have them.  They are the same weights: shards 2-4 are the
-# same bytes as today's, and shard 1 and the Engram differ only in their GGUF header (metadata).  setup accepts them from "files already here"
-# (size and SHA-256 checked against these pins) and never downloads them.  Not in REPO_PINS: nothing is fetched under these names.
-DSV41_LEGACY_FILES = {
-    "model-2.00bpw-00001-of-00004.gguf": (39075713728, "78ab9efc46a26647c3e94b322c99cd7e2af261dd28b38f2712e128562db1ef47"),
-    "model-2.00bpw-00002-of-00004.gguf": (39388449504, "cec1b2c3da429dc768b8bb9bc4dc4403d81f74d34db660a6a34ee3e555bf2c70"),
-    "model-2.00bpw-00003-of-00004.gguf": (39246891616, "9d9c2140fcb134a0b9a74dedd0e5167e68077af6d08ce7f856bce112f0a35dd3"),
-    "model-2.00bpw-00004-of-00004.gguf": (20527837312, "9b790a2297ed3cdede379fc984f4a52bb95f3b23724c797af11d1fa6a69db059"),
-    "model-2.25bpw-00001-of-00004.gguf": (39535776064, "ddd13aca16faa23b08f5196b5e0daddf90f04688a271f5889eb22fa7d7d65526"),
-    "model-2.25bpw-00002-of-00004.gguf": (39494617536, "933461a974fcccee741bf2f9798201e72ab4aa3f8a952be56f849896ca6ea30e"),
-    "model-2.25bpw-00003-of-00004.gguf": (39423838496, "bbf91fa346a85ebaf32dd4fd5c456b534d780d381e54f46ac90783a481373240"),
-    "model-2.25bpw-00004-of-00004.gguf": (36771591232, "e5b2f8781fab688cd4bc3bc7a69651b5dbb90ed94965657c6bead8bb4774f3cf"),
-    "engram-IQ4_NL.gguf": (110595290720, "1f17d8ae37e9df3bb45f7ef1b4fcd1706d7b759af0413c117bf8e92aed459281"),
-}
-# today's name -> the name it had in the first release
-DSV41_LEGACY_NAMES = {
-    **{DSV41_ISTA_SHARD.format(quant="IQ2_XXS", i=i): "model-2.00bpw-%05d-of-00004.gguf" % i for i in range(1, 5)},
-    **{DSV41_ISTA_SHARD.format(quant="IQ2_XS", i=i): "model-2.25bpw-%05d-of-00004.gguf" % i for i in range(1, 5)},
-    DSV41_ISTA_ENGRAM: "engram-IQ4_NL.gguf",
-}
-# the files every official set shares (name -> where it comes from); they live in models/deepseek-v4.1-flash-shared, once
-DSV41_MMPROJ = "mmproj-BF16.gguf"     # the vision tower's weights (972 MB, pinned): packed into the model's pack when pictures are on (0.2.7)
-DSV41_SHARED = {
-    DSV41_MMPROJ: hf(DSV41_REPO),
-    DSV41_ISTA_ENGRAM: hf(DSV41_ISTA_REPO),
-    DSV41_SHARD.format(i=1): hf(DSV41_REPO) + "UD-Q8_K_XL/",      # only its metadata is read (pack_gguf --engram-meta)
-    DSV41_DSPARK: hf(DSV41_REPO),
-}
-DSV41_ALL_FILES = {**DSV41_FILES, **DSV41_ISTA_FILES, **DSV41_LEGACY_FILES}
-DSV41_PROFILES = ROOT / "data" / "dsv41"           # the shipped hot-expert profiles (profile-2.00.bin, profile-2.25.bin, + .sha256)
-DSV41_CONTEXT = 8192          # the context the engine was checked at (4096 and 8192; 64K is not tried yet)
-DSV41_MAC_VISION = False      # an Apple Silicon Mac: the Metal engine has not run DeepSeek's picture tower (0.2.7.1), so pictures stay off there
-MULTI_FILE_FAMILIES = {
-    "deepseek41": {"title": "DeepSeek-V4.1-Flash", "by": "DeepSeek; the 2-bit GGUFs by IST-DAS, UD-Q8_K_XL by Unsloth", "arch": "deepseek41",
-                   "about": "a big model that runs on a PC with a 12 GB card and 64 GB of RAM (the two official 2-bit versions: 257 or "
-                            "274 GB of disk, about 5-7 tokens a second) or, in Unsloth's 508 GB version, on several graphics cards",
-                   "hf": hf(DSV41_REPO) + "UD-Q8_K_XL/", "tag": "deepseek-v4.1-flash-", "name": "deepseek-v4.1-flash",
-                   "license": "DeepSeek's model license: https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
-                   "models": {"UD-Q8_K_XL": {"about": "Unsloth Dynamic 8-bit: the experts in MXFP4 as DeepSeek made them, the rest "
-                                                       "in BF16 (the checkpoint's own precision)",
-                              "ram_gb": 306, "shards": [DSV41_SHARD.format(i=i) for i in range(1, 10)]}},
-                   "sha256": DSV41_ALL_FILES, "vision": True}     # the engine's own tower (strata-dsv41 --vision on, the default), 0.2.7
-}
-# The official sets first (a normal PC), Unsloth's 508 GB set last.  Each model: its shards, the sub-folder they are in at the repository
-# (and in a --gguf-dir folder), the files shared with the other set ("shared"), the pack recipe and the shipped expert profile.
-MULTI_FILE_FAMILIES["deepseek41"]["models"] = {
-    "IST-DAS-2.00bpw": {
-        "label": "IST-DAS 2.00 bpw",
-        "about": "the smaller official version: 138 GB of model + 111 GB n-gram table + 8 GB drafter (257 GB of disk). Runs on a PC with "
-                 "a 12 GB card and 40-64 GB of RAM at about 5-7 tokens a second; quality about 15.5% above the original model's "
-                 "perplexity (code and agent work 5-9%)",
-        "ram_gb": 40, "recipe": "ista", "subdir": None, "legacy_subdir": "2.00bpw", "profile": "profile-2.00.bin", "hf": hf(DSV41_ISTA_REPO),
-        "shards": [DSV41_ISTA_SHARD.format(quant="IQ2_XXS", i=i) for i in range(1, 5)],
-        "shared": [DSV41_ISTA_ENGRAM, DSV41_SHARD.format(i=1), DSV41_DSPARK]},
-    "IST-DAS-2.25bpw": {
-        "label": "IST-DAS 2.25 bpw",
-        "about": "the better official version: 155 GB of model + 111 GB n-gram table + 8 GB drafter (274 GB of disk, 17 GB more than "
-                 "2.00). About the same speed; quality about 7.3% above the original model's perplexity (code and agent work 2-3%)",
-        "ram_gb": 44, "recipe": "ista", "subdir": None, "legacy_subdir": "2.25bpw", "profile": "profile-2.25.bin", "hf": hf(DSV41_ISTA_REPO),
-        "shards": [DSV41_ISTA_SHARD.format(quant="IQ2_XS", i=i) for i in range(1, 5)],
-        "shared": [DSV41_ISTA_ENGRAM, DSV41_SHARD.format(i=1), DSV41_DSPARK]},
-    "IST-DAS-1.75bpw": {
-        "label": "IST-DAS 1.75 bpw",
-        "about": "the smallest official version: 121 GB of model + 111 GB n-gram table + 8 GB drafter (239 GB of disk, 18 GB less than 2.00). Runs "
-                 "where 2.00 is tight (a 12 GB card and 32-40 GB of RAM). Smallest: fine for code and agent work, noticeably weaker on plain prose; pick 2.00 if it fits",
-        "ram_gb": 34, "recipe": "ista", "subdir": None, "legacy_subdir": None, "profile": "profile-2.00.bin", "hf": hf(DSV41_ISTA_REPO),
-        "shards": [DSV41_ISTA_SHARD.format(quant="IQ1_M", i=i) for i in range(1, 5)],
-        "shared": [DSV41_ISTA_ENGRAM, DSV41_SHARD.format(i=1), DSV41_DSPARK]},
-    "UD-Q8_K_XL": {
-        "label": "Unsloth UD-Q8_K_XL",
-        "about": "Unsloth Dynamic 8-bit: the experts in MXFP4 as DeepSeek made them, the rest in BF16 (the checkpoint's own precision); "
-                 "508 GB, for machines with hundreds of GB of RAM or several cards",
-        "ram_gb": 306, "recipe": "ud", "subdir": "UD-Q8_K_XL", "shards": [DSV41_SHARD.format(i=i) for i in range(1, 10)],
-        "shared": []},
-}
-
 # Every model file Strata downloads has a fixed size and SHA-256: (repository, file name) -> (bytes, sha256).  download()
 # checks the file against it as soon as it is whole (a wrong file is deleted and setup stops), and stops before the
 # download when the server's size is not the pinned one.  The files are fetched from the commits in HF_REVISIONS.
@@ -655,8 +520,6 @@ REPO_PINS = {
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": CODER_FILES,
     "unsloth/Qwen3.8-Flash-Next-GGUF": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS, **UNSLOTH_IQ1_S_SHARDS},
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": GYRO_FILES,
-    "unsloth/DeepSeek-V4.1-Flash-1017-GGUF": DSV41_FILES,
-    "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF": DSV41_ISTA_FILES,
 }
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
 ESP_VECTOR = ROOT / "data" / "experimental-speed-projection" / "Qwen3.8-Flash-Next-experimental-speed-projection.gguf"
@@ -746,7 +609,7 @@ def run(cmd, cwd=None, env=None, check=True, quiet=False):
     if CONTROL:                                        # the app: only this Python running a bundled tool
         argv = [str(c) for c in cmd]
         if len(argv) < 2 or os.path.normcase(argv[0]) != os.path.normcase(sys.executable) or argv[1] == "-m" or \
-                Path(argv[1]).resolve().parent not in ((ROOT / "tools").resolve(), (ROOT / "tools" / "dsv41").resolve()):
+                Path(argv[1]).resolve().parent != (ROOT / "tools").resolve():
             raise acquisition.AcquisitionRefused("the desktop app's installer only runs its bundled preparation tools; "
                                                  + " ".join(argv[:2]))
     say("  > " + " ".join(str(c) for c in cmd))
@@ -3968,15 +3831,6 @@ def choices_from_config(cfg_path: Path) -> dict:
     """The setup answers a config was written with (family, size, context, KV, images, projection, network)."""
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     tag = cfg_path.stem[len("strata-"):]
-    big = next((f for f, d in MULTI_FILE_FAMILIES.items() if tag.startswith(d["tag"])), None)
-    if big is not None:                                # DeepSeek-V4.1-Flash: its own size; no KV / images / projection settings
-        d = MULTI_FILE_FAMILIES[big]
-        size = next((m for m in d["models"] if m.lower() == tag[len(d["tag"]):].lower()), None)
-        a = cfg.get("args", [])
-        ctx = a[a.index("--max-context") + 1] if "--max-context" in a and a.index("--max-context") + 1 < len(a) else None
-        return {"family": big, "model": size, "context": int(ctx) if ctx and ctx.isdigit() else None, "kv": None,
-                "vision": "none", "esp": "off", "host": cfg.get("host"), "api_key": cfg.get("api_key"),
-                "port": cfg.get("port"), "gpu": cfg.get("gpu"), "layer_split": None, "cuda": None, "vram_reserve_mib": None}
     family = next((f for f, d in FAMILIES.items() if d["tag"] and tag.startswith(d["tag"])), "qwen")
     model = (tag[len(FAMILIES[family]["tag"]):] if tag.startswith(FAMILIES[family]["tag"]) else tag).upper()
     if model not in MODELS:                            # (sizes have no dash except UD-Q4_K_XL: the old rule)
@@ -4001,12 +3855,10 @@ def choices_from_config(cfg_path: Path) -> dict:
 def calibration_targets(have: list, model: str | None, family: str | None) -> list:
     """#2036: the installed configs `--calibrate --model X` (and/or --family) means; every config with neither."""
     if not (model or family):
-        return [c for c in have if choices_from_config(c)["family"] not in MULTI_FILE_FAMILIES]
+        return list(have)
     out = []
     for c in have:
         ch = choices_from_config(c)
-        if ch["family"] in MULTI_FILE_FAMILIES:   # the tuning measures Flash-Next's engine settings
-            continue
         if (not model or ch["model"] == model) and (not family or ch["family"] == family):
             out.append(c)
     return out
@@ -4827,534 +4679,6 @@ def engine_step(a, gpu, hip, amd, cuda_tk, vision):
     return llama, eng, meta, meta.get("lib_dirs") or [], gpu, vision
 
 
-# DeepSeek's engine is its own package (feed member "dsv41", strata_control/dsv41_engine.py), downloaded when DeepSeek is chosen and unpacked in
-# <data>/engine-dsv41/<version>-<platform>-<backend>/ beside the engine: the Qwen engine's files are never touched.  Fetched, verified and
-# resumed like an engine update (the signed feed; --feed / STRATA_UPDATE_FEED name another one, as for `strata update`).
-DSV41_ENGINE_DIR = "engine-dsv41"
-
-
-def dsv41_engine_dir(eng: Path) -> Path:
-    """Beside the engine folder; for the app / Terminal (the engine is a component folder Strata does not write into): in Strata's own folder."""
-    return (home() if CONTROL else Path(eng).parent) / DSV41_ENGINE_DIR
-
-
-def local_feed(feed: str | None = None) -> bool:
-    """Is the update feed this run reads a local one (a folder, a file or a loopback address, as a test or an offline copy uses)?  Then
-    nothing is downloaded from GitHub and its being slow or down must not stop the run.  `feed` is --feed, else STRATA_UPDATE_FEED."""
-    src = (feed or os.environ.get("STRATA_UPDATE_FEED") or "").strip()
-    if not src:
-        return False
-    if not re.match(r"^[a-z][a-z0-9+.-]*://", src, re.I) or src.lower().startswith("file://"):
-        return True                                     # a path (a Windows C:\... one too)
-    host = (urllib.parse.urlparse(src).hostname or "").lower()
-    return host in ("localhost", "127.0.0.1", "::1") or host.startswith("127.")
-
-
-def github_reachable(timeout: float = 10.0) -> bool:
-    """Does GitHub answer within `timeout` seconds (any HTTP answer counts; no answer, a refused or timed-out connection does not)?  One quick check
-    instead of minutes of retries when the connection is down (a SYN that is never answered)."""
-    try:
-        _urlopen(urllib.request.Request("https://github.com", method="HEAD", headers={"User-Agent": "strata-setup"}), timeout=timeout).close()
-        return True
-    except urllib.error.HTTPError:
-        return True
-    except (OSError, urllib.error.URLError):
-        return False
-
-
-def dsv41_engine_pending(eng: Path) -> bool:
-    """A DeepSeek engine package file the person put in engine-dsv41/ is there to be installed (no download needed)."""
-    from strata_control import dsv41_engine
-    return bool(dsv41_engine.pending(dsv41_engine_dir(eng)))
-
-
-def dsv41_manual_steps(eng: Path) -> str:
-    return (f"If you downloaded the DeepSeek engine package from the release page (the file strata-dsv41-...-{'windows' if WIN else 'linux'}-....tar.gz), "
-            f"run the same command again with --dsv41-package PATH-OF-THE-FILE (strata launch accepts it too), or put the file in {dsv41_engine_dir(eng)} "
-            "and run it again. Strata checks it before it is used.")
-
-
-def get_dsv41_engine(eng: Path, hip: bool, package: str | None = None, feed: str | None = None) -> Path | None:
-    """The DeepSeek engine package next to the engine `eng`: one the person gave (--dsv41-package) or put in engine-dsv41/ by hand, else downloaded from
-    the signed feed `feed` (--feed; else STRATA_UPDATE_FEED, a remembered https feed, or the release's).  Checked first either way; its
-    strata-dsv41, or None when it cannot be had."""
-    from strata_control import dsv41_engine
-    root = dsv41_engine_dir(eng)
-    if package:
-        exe = dsv41_engine.install_package(root, package, emit=lambda m: say("  " + m))
-        if exe is None:
-            fail("the DeepSeek engine package you gave could not be used", "see the line above; nothing else was changed")
-        return exe
-    for f in dsv41_engine.pending(root):
-        say(f"  Found {f.name} in {root}: checking it ...")
-        exe = dsv41_engine.install_package(root, f, emit=lambda m: say("  " + m))
-        if exe is not None:
-            return exe
-    acquisition.require("the DeepSeek engine")
-    from strata_cli import update_cmd
-    source = update_cmd._feed_source(argparse.Namespace(feed=feed), root.parent)
-    say("  Downloading the DeepSeek engine (its own package, separate from the Strata engine) ...")
-    hw = None
-    if hip:
-        from strata_control import updater
-        hw = {**updater.detect_hardware(), "backend": "sycl", "backend_source": "requested"}
-    exe = dsv41_engine.install(root, source, hardware=hw, emit=lambda m: say("  " + m))
-    if exe is None:
-        warn("no DeepSeek engine package could be fetched (see above)")
-    return exe
-
-
-def upgrade_dsv41_engine(eng: Path, exe: Path, feed: str | None = None) -> Path:
-    """The installed DeepSeek engine package is older than the signed feed's (--feed, else STRATA_UPDATE_FEED, a remembered https feed,
-    or the release's): updated next to it, switched after its test start, the old one removed (strata_control.dsv41_engine.upgrade).
-    Silent when the feed cannot be reached; a failure is one plain line and `exe` keeps running."""
-    from strata_control import dsv41_engine
-    try:
-        from strata_cli import update_cmd
-        root = dsv41_engine_dir(eng)
-        source = update_cmd._feed_source(argparse.Namespace(feed=feed), root.parent)
-        if not dsv41_engine.source_reachable(source):
-            return exe
-        new = dsv41_engine.upgrade(root, source, installed=exe, emit=lambda m: say("  " + m))
-    except Exception:                                      # noqa: BLE001 - never stop a setup for this
-        return exe
-    return new or exe
-
-
-def dsv41_exe(eng: Path) -> Path | None:
-    """The DeepSeek-V4.1 engine (strata-dsv41): STRATA_DSV41_EXE (a build of your own), else its own package folder beside the engine (engine-dsv41/),
-    else beside the engine in `eng` (an older all-in-one package); None when there is none."""
-    own = (os.environ.get("STRATA_DSV41_EXE") or "").strip()
-    if own:
-        return Path(own) if Path(own).is_file() else None
-    name = "strata-dsv41.exe" if WIN else "strata-dsv41"
-    from strata_control import dsv41_engine
-    exe = dsv41_engine.find(dsv41_engine_dir(eng)) or (Path(eng) / name)
-    if exe.is_file() and not WIN and not os.access(exe, os.X_OK):      # a package copied without its modes (scp / tar from Windows): fix it, do not stop
-        try:
-            exe.chmod(0o755)
-        except OSError:
-            pass
-    return exe if exe.is_file() else None
-
-
-def dsv41_folder(a, fam: dict, tag: str, model: str = "UD-Q8_K_XL") -> Path:
-    """Where the model's shards are: --gguf-dir (a folder with the shards, or the repository's folder with the set's own folder inside:
-    UD-Q8_K_XL, 2.00bpw, 2.25bpw), else the models folder's own."""
-    if a.gguf_dir:
-        folder = Path(a.gguf_dir)
-        d = fam["models"][model]
-        names = [n for s in d["shards"] for n in (s, DSV41_LEGACY_NAMES.get(s)) if n]
-        if any((folder / n).exists() for n in names):
-            return folder
-        for sub in (d.get("subdir"), d.get("legacy_subdir"), model):          # the set's own folder inside (the first release used 2.00bpw/, 2.25bpw/)
-            if sub and (folder / sub).is_dir():
-                return folder / sub
-        return folder
-    return Path(a.models_dir) / tag
-
-
-def dsv41_pick(folder: Path, name: str) -> Path:
-    """`name` in `folder`, or the file it was called in the first release (DSV41_LEGACY_NAMES; the same weights) when only that one is there;
-    else `name` (where it will be downloaded to)."""
-    if (folder / name).exists():
-        return folder / name
-    old = DSV41_LEGACY_NAMES.get(name)
-    if old and (folder / old).exists():
-        return folder / old
-    return folder / name
-
-
-def dsv41_shared_dir(a, fam: dict) -> Path:
-    """Where the files the official sets share (the Engram, the DSpark drafter, the metadata shard) are downloaded to: one folder, so
-    installing the second set does not download the 111 GB Engram again."""
-    return Path(a.models_dir) / (fam["tag"] + "shared")
-
-
-def dsv41_find_shared(a, name: str, folder: Path, shared: Path) -> Path:
-    """The file `name` (an Engram, the drafter, ...) the person already has: in the shared folder, beside the shards, or (--gguf-dir) in the
-    folder above them or one folder level down from either; else where it will be downloaded to (the shared folder).  The size must be the
-    pinned one, so a half-copied file is not taken for the file."""
-    names = [n for n in (name, DSV41_LEGACY_NAMES.get(name)) if n]            # today's name, and the first release's (the same weights)
-    roots = [shared, folder]
-    if a.gguf_dir:
-        base = Path(a.gguf_dir)
-        roots += [base, base.parent, base.parent.parent]          # (strata launch hands over the set's own folder: 2.00bpw/)
-    seen = []
-    for r in roots:
-        if r in seen:
-            continue
-        seen.append(r)
-        try:
-            kids = [r] + ([k for k in r.iterdir() if k.is_dir()] if (a.gguf_dir and r != shared) else [])
-        except OSError:
-            continue
-        for k in kids:
-            for n in names:
-                f = k / n
-                try:
-                    if f.is_file() and f.stat().st_size == DSV41_ALL_FILES[n][0]:
-                        return f
-                except OSError:
-                    pass
-    return shared / name
-
-
-def dsv41_pack_has_tower(pack: Path) -> bool:
-    """Does the pack carry the vision tower (pack_gguf.py writes vision.* and image_token_id into ds4.txt when it found the mmproj)?"""
-    try:
-        txt = (Path(pack) / "ds4.txt").read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return False
-    return "\nimage_token_id " in "\n" + txt and "vision.num_hidden_layers" in txt
-
-
-def dsv41_pack_cmd(folder: Path, shards: list, engram: Path, meta: Path, dspark: Path, pack: Path, mmproj: Path | None = None) -> list:
-    """The pack recipe for an official IST-DAS set - this and nothing else: another one (--skip-tensors / --dense-override + engram_fold)
-    packs without an error and gives garbage text (P2003, 2026-10-23).  The drafter's noise token (128799) and markov rank (256) are stated:
-    the IST-DAS GGUFs do not carry them, and a pack with noise id 0 drafts deep less often (decode ~10% slower with DSpark).  --shards names the four files, so an Engram or another
-    set in the same folder is not read as part of the model."""
-    return [sys.executable, str(ROOT / "tools" / "dsv41" / "pack_gguf.py"), "--model", str(folder), "--shards", *[Path(n).name for n in shards],
-            "--engram", str(engram), "--engram-meta", str(meta), "--dspark-gguf", str(dspark),
-            "--dspark-noise-token", "128799", "--dspark-markov-rank", "256", *(["--mmproj", str(mmproj)] if mmproj else []), "--out", str(pack)]
-
-
-def dsv41_prefill_chunk_args(cards, ram_gb) -> list:
-    """A bigger prompt chunk on a unified-memory APU (Ryzen AI Max, gfx1151), where the engine's 1,024-token rule was calibrated on
-    cards that hold most of the experts.  Measured on the 128 GB Strix Halo with the 2.00 bpw set (2026-10-25, engine 0.1.51):
-    4K prompt 78.7 -> 87.2 tok/s, 8K 108.9 -> 125.1, 32K 155.2 -> 176.9; decode unchanged (16.53 -> 16.59 tok/s), because the
-    chunk buffers take ~5 GB from the GPU expert tier and the RAM store's hit rate rises to compensate.  The prompt chunk's
-    summation order changes, not the model: the repo's chunk-size KL check (1024 0.1705 / 2048 0.1692 / 4096 0.1688 / 8192 0.1695)
-    shows no quality move.  Only where the shared pool has room; STRATA_DSV41_NO_BIG_CHUNK=1 leaves the engine's own choice.
-
-    A 16,384-token chunk on the 128 GB box (2026-10-26, engine 0.1.51, the same set, 1-2 runs a point): 8K 119.8 -> 119.4 (nothing,
-    the set is read once a chunk either way), 16K 152.2 -> 158.6 (+4.2%), 32K 174.0 -> 179.7 (+3.3%), decode 17.21 -> 17.27
-    (2+2 interleaved, unchanged) although the bigger chunk moves ~30% more experts to the CPU lane.  So a pool that holds this
-    box's 128 GB takes 16,384; a smaller unified PC keeps 8,192 (not measured below this box)."""
-    if not cards or not any(c.get("uma") for c in cards):
-        return []
-    pool = float(ram_gb or 0) + max([float(c.get('dedicated_gb') or 0.0) for c in cards] or [0.0])
-    if pool < 64.0:                       # the RAM Windows sees plus the GPU's BIOS carve-out
-        return []
-    if os.environ.get("STRATA_DSV41_NO_BIG_CHUNK") == "1":
-        return []
-    return ["--prefill-chunk", "16384" if pool >= 96.0 else "8192"]
-
-
-def dsv41_config_env(cards) -> dict:
-    """Engine env settings for the DeepSeek engine on a unified-memory APU (Ryzen AI Max, gfx1151).
-
-    DS4_ASYNC_T=4: the engine's windowed decode uses the mailbox ("async") path for windows up to this size, 8 by default.  On the
-    128 GB Strix Halo the async path is slower than the synchronous one for the 6-row verify window: measured 2026-10-25 (2.00
-    bpw, engine 0.1.51, 256-token code set, greedy): 15.87-16.33 tok/s with the default against 20.14-21.28 with 4 (+31%); the
-    agent set with the same accepted tokens a round: 15.93 against 18.48 (+16%).  The same bits come out - only the scheduling
-    changes - and the drafter's own single-token windows (T=1) stay on the async path.  A discrete card keeps the engine's
-    default; STRATA_DSV41_ASYNC_T=n overrides the value, STRATA_DSV41_ASYNC_T=8 restores the default."""
-    if not cards or not any(c.get("uma") for c in cards):
-        return {}
-    value = os.environ.get("STRATA_DSV41_ASYNC_T") or "4"
-    return {} if value == "8" else {"DS4_ASYNC_T": value}
-
-
-def dsv41_engine_env(lib_dirs) -> dict:
-    env = dict(os.environ)
-    dirs = [str(d) for d in lib_dirs or [] if d]
-    if dirs:
-        env["PATH" if WIN else "LD_LIBRARY_PATH"] = os.pathsep.join(dirs + [env.get("PATH" if WIN else "LD_LIBRARY_PATH", "")])
-    return env
-
-
-def dsv41_pack_info(exe: Path, pack: Path, lib_dirs) -> tuple[bool, str]:
-    """`strata-dsv41 --pack-info --pack P`: (True, text) when every file of the pack is there (no MISSING line), else (False, text)."""
-    try:
-        r = subprocess.run([str(exe), "--pack-info", "--pack", str(pack)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
-                           env=dsv41_engine_env(lib_dirs))
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return False, f"the engine could not read the pack: {e}"
-    text = (r.stdout or "") + (r.stderr or "")
-    return r.returncode == 0 and "MISSING" not in text and "all present" in text, text
-
-
-def dsv41_smoke(exe: Path, pack: Path, lib_dirs, gpus=None, timeout: int = 5400) -> tuple[bool, str]:
-    """16 tokens of a fixed prompt through the engine (tools/dsv41/smoke.py), the text checked: (True, text) or (False, why).  Takes a
-    few minutes: the engine reads what it needs from the SSD the first time."""
-    cmd = [sys.executable, str(ROOT / "tools" / "dsv41" / "smoke.py"), "--exe", str(exe), "--pack", str(pack)]
-    if gpus:
-        cmd += ["--gpus", ",".join(str(g) for g in gpus)]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
-                           env=dsv41_engine_env(lib_dirs))
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return False, f"the test run did not finish: {e}"
-    text = ((r.stdout or "") + (r.stderr or "")).strip()
-    enc = getattr(sys.stdout, "encoding", None) or "utf-8"            # the reply is printed by say()/fail(): a Windows console code page cannot show DeepSeek's special tokens
-    return r.returncode == 0, text[-1500:].encode(enc, "replace").decode(enc, "replace")
-
-
-def dsv41_cards(gpu: dict, all_cards: list | None, asked: bool) -> list:
-    """The cards the model runs on: the ones asked for (--gpu / --gpus), else every card setup can use (recommend: the model is
-    larger than any one card, so the more graphics memory the more of its experts stay off the CPU)."""
-    if asked or not all_cards:
-        return list(gpu.get("cards") or [gpu])
-    return list(all_cards)
-
-
-def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, all_cards=None):
-    """Steps 2-7 for DeepSeek-V4.1-Flash (MULTI_FILE_FAMILIES): where it fits (strata_control/dsv41_fit.py, said plainly: a 508 GB
-    download and a model larger than most computers' memory are warnings, never a refusal), the engine (strata-dsv41), the nine
-    pinned shards (or your own, --gguf-dir), the engine's pack folder, the tokenizer and chat template from the GGUF, the config.  The
-    engine places the experts itself (as many as the cards hold in graphics memory, the rest computed on the CPU from the files)."""
-    from strata_control import dsv41_fit
-    mac = sys.platform == "darwin"                          # an Apple Silicon Mac (0.2.7.1): the Metal build of the DeepSeek engine, one pool of memory
-    fam = MULTI_FILE_FAMILIES[family]
-    say()
-    say(f"  {fam['title']} - {fam['by']}: {fam['about']}")
-    ok(f"model: {fam['title']}")
-    if fam.get("license"):
-        say(f"  Its license: {fam['license']}")
-    names = list(fam["models"])
-    if a.model and a.model not in names:
-        fail(f"{fam['title']} has no {a.model} model file", "choose: " + ", ".join(names))
-    if a.model:
-        model = a.model
-    else:
-        try:
-            room = free_gb(Path(a.models_dir) if Path(a.models_dir).exists() else Path(a.models_dir).parent)
-        except Exception:                                    # noqa: BLE001 - the disk is only a hint here
-            room = None
-        rec = dsv41_fit.recommend(ram, room)                 # the best version this computer's memory and disk suit; warn-never-refuse
-        for i, m in enumerate(names, 1):
-            say(f"  {i}) {fam['models'][m].get('label', m)}: {fam['models'][m]['about']}" + ("   (recommended)" if m == rec else ""))
-        model = names[int(ask("Which version?", [str(i) for i in range(1, len(names) + 1)], str(names.index(rec) + 1), a.yes)) - 1]
-    ok(f"size: {model}")
-    md = fam["models"][model]
-    say("  Its GGUF files: " + ("IST-DAS / ISTA-DASLab (huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF), with the DSpark drafter and a small metadata file from Unsloth"
-                              if md.get("recipe") == "ista" else "Unsloth (huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)"))
-    ista = md.get("recipe") == "ista"
-    tag = fam["tag"] + model
-    cards = dsv41_cards(gpu, all_cards, bool(a.gpu is not None or a.gpus))
-    ctx = a.context or DSV41_CONTEXT
-    if dsv41_context.problem(ctx):                 # 8K to 1M: the model reads 1,048,576 positions (Project Maya #442); a size it cannot address stops here, before any download
-        fail(dsv41_context.problem(ctx), "--context takes 8192 up to 1048576 (8K, 32K, 64K, 128K, 256K, 512K, 1M); the default is 8192")
-    if dsv41_context.note(ctx):
-        warn(f"context {dsv41_context.label(ctx)}: {dsv41_context.note(ctx)}")
-    folder = dsv41_folder(a, fam, tag, model)
-    shards = [dsv41_pick(folder, n) for n in md["shards"]]
-    shared_dir = dsv41_shared_dir(a, fam)
-    # Pictures are on by default (owner rule): the engine reads them with its own vision tower, which the pack carries when the tower's weights
-    # (mmproj-BF16.gguf, a shared file) were there when it was made.  --vision no leaves the file out and the pack text-only.
-    ds_vision = "off" if a.vision in ("no", "off") or (mac and not DSV41_MAC_VISION) else "on"
-    if mac and not DSV41_MAC_VISION and a.vision not in ("no", "off"):
-        warn("pictures are off for DeepSeek on a Mac: its picture reader has not been run on the Metal engine yet, so it reads text only")
-    shared_names = list(md.get("shared", [])) + ([DSV41_MMPROJ] if ds_vision == "on" else [])
-    shared = [dsv41_find_shared(a, n, folder, shared_dir) for n in shared_names]
-    mmproj_file = shared[len(md.get("shared", []))] if ds_vision == "on" else None
-    own_files = {f: bool(a.gguf_dir) or f.parent != shared_dir for f in shared}         # a file found outside setup's own folder is the person's
-
-    def partial(f: Path) -> int:
-        p = f.with_name(f.name + ".part")
-        return p.stat().st_size if p.is_file() else 0
-
-    left = sum(0 if f.exists() and (done(f) or a.gguf_dir or own_files.get(f) or f.name in DSV41_LEGACY_FILES) else fam["sha256"][f.name][0] - partial(f)
-               for f in [*shards, *shared]) / 1e9
-    probe = folder if folder.exists() else (folder.parent if folder.parent.exists() else Path(a.models_dir))
-    free = free_gb(probe)
-    plan = dsv41_fit.plan([{**c, "vram_gb": float(c.get("vram_gb") or 0)} for c in cards], ram, free if left else None, ctx, model=model)
-    say()
-    for line in plan["lines"]:
-        say("  " + line)
-    if left:
-        say(f"  Download: {left:.0f} GB to fetch (checked against pinned sizes and SHA-256; it resumes if it stops). At 50 MB/s that "
-            f"is {left * 1e9 / 50e6 / 3600:.1f} hours. Files you already have: --gguf-dir DIR.")
-    else:
-        say("  Nothing to download: the files are already here.")
-    unchecked = [f for f in [*shards, *shared] if f.exists() and f"sha256 {fam['sha256'][f.name][1]}" not in
-                 (f.with_name(f.name + ".done").read_text(encoding="utf-8", errors="replace") if done(f) else "")]
-    if unchecked:
-        gb = sum(fam["sha256"][f.name][0] for f in unchecked) / 1e9
-        say(f"  The files already here ({gb:.0f} GB) are checked against their SHA-256 once, now: about {max(1, round(gb / 55))} minutes on a fast "
-            "drive (4-5 minutes for the 257 GB of 2.00), longer on a slow one. The next runs skip it.")
-    for w in plan["warnings"]:
-        if "free disk space" in w:
-            continue                                                      # the disk is a hard limit, said below
-        warn(w)
-    if plan["verdict"] == "spills" and mac:
-        confirm_risk(f"this Mac's memory holds about {plan['vram_experts_gb']:.0f} GB of {model}'s {plan['experts_gb']:.0f} GB of experts and the "
-                     f"other {plan['streamed_gb']:.0f} GB are read from the SSD for every word: much slower than on a Mac with 128 GB (a Mac this "
-                     "small was not measured)", bool(a.model), a.yes,
-                     f"{model} is slow on a Mac with {ram:.0f} GB", f"a Mac with 64 GB or more suits it; --model {model} --yes "
-                     "installs it anyway", "  Install it anyway?")
-        warn(f"installing {model} with {ram:.0f} GB of memory, as you chose")
-    elif plan["verdict"] == "spills":
-        confirm_risk(f"{model} runs best with about {plan['ram_needed_gb']:.0f} GB of RAM beside this PC's graphics memory and this PC has "
-                     f"{ram:.0f} GB: most of its experts are read from the SSD while it answers (slow)", bool(a.model), a.yes,
-                     f"{model} needs about {plan['ram_needed_gb']:.0f} GB of RAM", f"more RAM or cards fix it; --model {model} --yes "
-                     "installs it anyway", "  Install it anyway?")
-        warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
-    if left and free < left:
-        fail(f"not enough free disk space in {folder}: need ~{left:.0f} GB, {free:.0f} GB free",
-             "use --models-dir on a bigger drive (an NVMe drive is best: the n-gram table is read from it while the model "
-             "answers), or --gguf-dir for files you already have")
-    if left and free < left + dsv41_fit.DISK_HEADROOM_GB:
-        warn(f"little free disk space in {folder}: {free:.1f} GB free for about {left:.1f} GB. Setup goes on and should fit")
-    if ctx > 65536:
-        warn(f"{ctx // 1024}K tokens of context: the engine was checked at 4K and 8K; longer is kept as you chose, but untested")
-    # Pictures are on by default (owner rule): the engine reads them with its own vision tower (319 MiB, loaded with the model, no separate
-    # reader process).  --vision no turns them off (--vision off for the engine); gpu / cpu name a Flash-Next reader and mean "on" here.
-    if a.vision in ("gpu", "cpu"):
-        warn(f"{fam['title']} reads pictures with the engine's own tower, so --vision {a.vision} is taken as yes: pictures on")
-    if a.rope_scaling or a.rope_scale or a.kv or a.resident_budget_gib is not None or a.low_ram not in (None, "auto"):
-        warn(f"--rope-scaling / --kv / --resident-budget-gib / --low-ram are Flash-Next settings: {fam['title']} does not use them")
-
-    step(3, "Python packages")
-    pip_install(runtime_packages(),
-                "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil, textual (the screens)")
-
-    # DeepSeek runs on its own engine package: the Strata (Qwen) engine, its llama.cpp source and its CUDA libraries are not needed for it, so none of
-    # them is downloaded or test-started here (they were ~700 MB, and a stop on every one of them when GitHub could not be reached).
-    step(4, "the DeepSeek engine")
-    eng, meta, lib_dirs = ROOT / "engine", {"version": None}, []
-    exe = dsv41_exe(eng)
-    if (exe is None and not getattr(a, "dsv41_package", None) and not dsv41_engine_pending(eng) and not local_feed(getattr(a, "feed", None))
-        and not github_reachable()):
-        fail("Strata can't reach GitHub to download the DeepSeek engine.",
-             "Check the internet connection and run the same command again. " + dsv41_manual_steps(eng))
-    if exe is None and not getattr(a, "build", False):
-        get_dsv41_engine(eng, hip, getattr(a, "dsv41_package", None), getattr(a, "feed", None))
-        exe = dsv41_exe(eng)
-    if (exe is not None and not getattr(a, "dsv41_package", None) and not getattr(a, "build", False)
-            and not (os.environ.get("STRATA_DSV41_EXE") or "").strip() and exe.parent.parent == dsv41_engine_dir(eng)):
-        exe = upgrade_dsv41_engine(eng, exe, getattr(a, "feed", None))   # an installed package older than the signed feed's: updated next to it, switched after it starts
-    if exe is not None and exe.parent != Path(eng):
-        from strata_control import dsv41_engine
-        lib_dirs = [*lib_dirs, *dsv41_engine.lib_dirs(exe)]   # its own package, and the rocm/bin an AMD package keeps the ROCm DLLs in
-    if exe is None:
-        if os.environ.get("STRATA_VERBOSE") == "1" or "--verbose" in sys.argv:
-            say("  Details for developers: build it with cmake -DSTRATA_BUILD_DSV41=ON -DCMAKE_CUDA_ARCHITECTURES=<your card: 86 RTX 30, 89 RTX 40, 120 RTX 50> "
-                "and point STRATA_DSV41_EXE at it (docs/DEEPSEEK41.md, \"Building the engine for your card\").")
-        fail("DeepSeek's engine is not available for this computer yet",
-             "On the Intel Arc it is the SYCL build's strata-dsv41 (build-sycl-aot/strata-dsv41, docs/B70.md). " + dsv41_manual_steps(eng)
-             + " Or update Strata later (a newer version may add your card), or pick another model. Nothing has been downloaded.")
-    ok(f"engine: {exe}")
-
-    step(5, f"downloading {fam['title']} {model}")
-    for f in shards:
-        if f.exists() and done(f):
-            ok(f"{f.name} already downloaded")
-        else:
-            if a.gguf_dir and not f.exists():
-                fail(f"{f} is missing", f"put {f.name} in {folder}, or drop --gguf-dir to download it")
-            if not a.gguf_dir and f.name not in DSV41_LEGACY_FILES:      # (a first-release file is checked, never fetched under its old name)
-                download((md.get("hf") or fam["hf"]) + f.name, f)
-        if f.name in DSV41_LEGACY_FILES:
-            ok(f"{f.name}: a file of the first release of this set (the same weights); it is used as it is")
-        pin = fam["sha256"][f.name]
-        new = DSV41_NEW_SHARD1.get(f.name)
-        if new and a.gguf_dir and f.is_file() and f.stat().st_size == new[0] and f.stat().st_size != pin[0]:      # shard 1 with the 2026-10-26 chat template
-            pin = new
-            ok(f"{f.name}: the version with ISTA's newer chat template (the same weights); it is used as it is")
-        verify_sha256(f, *pin, own=bool(a.gguf_dir) or f.name in DSV41_LEGACY_FILES)
-    for f in shared:                                  # the Engram, the drafter, the metadata shard: once for every official set
-        if f.exists() and (done(f) or own_files[f]):
-            ok(f"{f.name} already here ({f.parent})")
-        else:
-            download(DSV41_SHARED[f.name] + f.name, f)
-        verify_sha256(f, *fam["sha256"][f.name], own=own_files[f])
-    ok(f"model files: {folder} ({len(shards)} shards" + (f"; shared files: {shared_dir if any(not own_files[f] for f in shared) else shared[0].parent}" if shared else "") + ")")
-
-    step(6, "preparing the model for Strata")
-    data, _ = data_folder_for(a)
-    pack = data / "packs" / tag.lower()            # the engine's map of the shards, the hash tables, the tokenizer: a few MB
-    have_pack = (pack / "tokenizer" / "vocab.json").exists() and (pack / "tensors.txt").exists()
-    if have_pack and ds_vision == "on" and mmproj_file is not None and not dsv41_pack_has_tower(pack):
-        warn("the pack from an earlier run was made without the picture reader: building it again with it (a few minutes)")
-        shutil.rmtree(pack, ignore_errors=True)
-        have_pack = False
-    if have_pack and ista:                         # a pack from an earlier run is kept only when the engine finds all of its files
-        good, why = dsv41_pack_info(exe, pack, lib_dirs)
-        if not good:
-            warn("the pack from an earlier run is incomplete; building it again")
-            shutil.rmtree(pack, ignore_errors=True)
-            have_pack = False
-    if not have_pack:
-        if ista:
-            run(dsv41_pack_cmd(folder, [f.name for f in shards], shared[0], shared[1], shared[2], pack, mmproj_file))
-        else:
-            run([sys.executable, str(ROOT / "tools" / "dsv41" / "pack_gguf.py"), "--model", str(folder), "--out", str(pack),
-                 *(["--mmproj", str(mmproj_file)] if mmproj_file else [])])
-    if ista:
-        prof = DSV41_PROFILES / md["profile"]          # which experts are used most: the RAM store starts with them (the engine reads <pack>/expert-profile.bin)
-        if prof.is_file() and not (pack / "expert-profile.bin").exists():
-            pack.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(prof, pack / "expert-profile.bin")
-        good, why = dsv41_pack_info(exe, pack, lib_dirs)
-        if not good:
-            tail = "\n".join(l for l in why.splitlines() if "MISSING" in l)[:600]
-            fail(f"the model's pack is not complete ({tail or why[-300:]})",
-                 f"delete {pack} and run setup again; if it is still incomplete, the files in {folder} may be damaged (setup checks them)")
-        ok(f"pack: {pack} (checked: every file the engine needs is there)")
-        if os.environ.get("STRATA_DSV41_NO_SMOKE") == "1":
-            warn("the 16-word test run was skipped (STRATA_DSV41_NO_SMOKE=1)")
-        else:
-            say("  Testing the model with a short question (a few minutes: the engine reads the first experts from the disk) ...")
-            good, why = dsv41_smoke(exe, pack, lib_dirs, [c["index"] for c in cards] if (a.gpu is not None or a.gpus) else None)
-            if not good:
-                fail("the model does not answer sensibly after the preparation: " + (why.splitlines()[-1] if why else "no answer"),
-                     f"delete {pack} and run setup again so the pack is built fresh; if the test fails again, "
-                     f"tell us (the log is in {home()})")
-            ok("test question answered sensibly")
-    else:
-        ok(f"pack: {pack}")
-    if dsv41_context.problem(ctx, dsv41_context.read_limit(pack)):       # the pack's own limit (ds4.txt) is the last word; no file, no limit
-        fail(dsv41_context.problem(ctx, dsv41_context.read_limit(pack)), f"choose a smaller --context (the pack in {pack} says what it reads)")
-
-    step(7, "writing the start script")
-    # --dspark auto, never off: "off" still LOADS the drafter, and its 7 GB of experts take the graphics memory (found 2026-10-23);
-    # auto keeps it unloaded when the experts are far larger than the card.  The RAM store sizes itself (--ssd-cache auto is the
-    # engine's default), and <pack>/expert-profile.bin is read from the pack folder without a flag.  The layer-major chunked prompt
-    # is the engine's own default (1024 on a single card whose cards hold most of the experts; its own choice for several); on a
-    # unified-memory APU the chunk is written out instead (dsv41_prefill_chunk_args: 8,192 reads 11-15% faster there).
-    # --dspark-conf 0.65: the drafts' confidence floor (H100 replay, DSPARK-DEFAULTS.md: within 0.01-0.02 of the per-class best,
-    # never below 0.3).  The engine has no flag for the draft block (3 in the same table): it reads the block size from the pack,
-    # so only the floor is written.
-    # A Mac (0.2.7.1): the drafter is not loaded at all (--dspark none). It was exact there but not faster (15.1 and 11.0 tokens/s against 15.3
-    # without it on the M5 Max), and the engine's "auto" would load it on a 128 GB Mac: its 7 GB of experts take memory the trunk's experts need.
-    args = ["--pack", str(pack), "--max-context", str(ctx), "--eos", "1", "--vision", ds_vision, "--dspark", "none" if mac else "auto",
-            *(["--dspark-conf", "0.65"] if md.get("recipe") == "ista" and not mac else []), *dsv41_prefill_chunk_args(cards, ram),
-            *plan["args"]]
-    env = dsv41_config_env(cards)
-    cfg = {"exe": str(exe), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
-           "model_name": fam["name"], "arch": fam["arch"], "log": str(home() / f"strata-{tag.lower()}.log"),
-           "lib_dirs": lib_dirs, "port": port, "engine_ready_s": 3600}      # 300+ GB read from the files: a slow disk needs its time
-    if hip:
-        cfg["backend"] = "hip"
-    if mac:
-        cfg["backend"] = "metal"
-    idx = [c["index"] for c in cards]
-    if len(idx) > 1 or a.gpu is not None or a.gpus:
-        cfg["gpu"] = idx if len(idx) > 1 else idx[0]
-        cfg["gpus_asked"] = True
-    if a.host:
-        cfg["host"] = a.host
-    if a.api_key:
-        cfg["api_key"] = a.api_key
-    if a.browser is not None:
-        cfg["open_browser"] = a.browser
-    cfg_path = home() / f"strata-{tag.lower()}.json"
-    write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None, explicit_args(a))
-    script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
-    ok(f"start script: {script.name}")
-    say()
-    say("All set.")
-    say(f"  API (OpenAI):     http://127.0.0.1:{port}/v1   (any API key; model name: anything)")
-    say(f"  API (Anthropic):  http://127.0.0.1:{port}/v1/messages")
-    say(f"  Next time:        just run {'START-HERE.bat' if WIN else './setup.sh'} (or {script.name}) - it starts right away")
-    say("  Loading takes a few minutes: the CPU's share of the experts is read from the files first.")
-    if a.no_start:
-        return 0
-    return start(cfg_path, port)
-
-
 def main() -> int:
     try:                                               # files made by a run as administrator still belong to the user
         from strata_control import private_files as _pf
@@ -5362,10 +4686,9 @@ def main() -> int:
     except Exception:
         pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--family", choices=list(FAMILIES) + list(MULTI_FILE_FAMILIES),
-                    help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5, deepseek41 = DeepSeek-V4.1-Flash "
-                         "(the official 1.75 / 2.00 / 2.25 bpw versions, 239 / 257 / 274 GB; docs/DEEPSEEK41.md)")
-    ap.add_argument("--model", choices=list(dict.fromkeys([*MODELS, *(m for f in MULTI_FILE_FAMILIES.values() for m in f["models"])])))
+    ap.add_argument("--family", choices=list(FAMILIES),
+                    help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5, coder, unsloth, gyro (see the model list)")
+    ap.add_argument("--model", choices=list(MODELS))
     ap.add_argument("--context", type=int)
     ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
                     help="the RoPE extension for a context past the model's trained 262144: linear (position "
@@ -5426,11 +4749,6 @@ def main() -> int:
     ap.add_argument("--set-default-data-dir", action="store_true",
                     help="with --data-dir: remember the new folder as the data folder without moving anything")
     ap.add_argument("--models-dir", help="where the GGUF files go (default: <data folder>/models)")
-    ap.add_argument("--dsv41-package", metavar="FILE", help="DeepSeek: the engine package you downloaded from the release page (a .tar.gz or .zip, "
-                                                           "or its unpacked folder); it is checked and installed instead of being fetched")
-    ap.add_argument("--feed", metavar="URL|DIR",
-                    help="where the signed update feed (the DeepSeek engine package) is: default STRATA_UPDATE_FEED, a remembered https feed, "
-                         "or the release's (as `strata update --feed`; a folder is a local test feed)")
     ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with every shard: "
                                        "<name>-00001-of-0000N.gguf ... -0000N-of-0000N.gguf)")
     ap.add_argument("--yes", action="store_true", help="accept the recommended answers")
@@ -5483,9 +4801,6 @@ def main() -> int:
                     help="sycl = the Intel Arc engine (the default, and the only one: built from sycl/, docs/B70.md). "
                          "hip is internal: sycl/setup_intel.py runs this setup through it")
     a = ap.parse_args()
-    if a.model and a.model not in MODELS and a.family not in MULTI_FILE_FAMILIES:
-        ap.error(f"--model {a.model} is a size of " + ", ".join(f"--family {f}" for f, d in MULTI_FILE_FAMILIES.items()
-                                                              if a.model in d["models"]))
     if a.source:
         os.environ["STRATA_SOURCE"] = a.source
     if a.inspect:                                      # headers only: nothing is installed
@@ -5526,9 +4841,7 @@ def main() -> int:
             a.gpus = ",".join(str(i) for i in order)
         else:
             a.gpu = order[0]
-    say("Strata - " + (MULTI_FILE_FAMILIES[a.family]["title"] if a.family in MULTI_FILE_FAMILIES else
-                       "Qwen3.8-Flash-Next")
-        + " on a normal PC (a GPU + system RAM + CPU)")
+    say("Strata - Qwen3.8-Flash-Next on a normal PC (a GPU + system RAM + CPU)")
     have = installed_configs()
     # A plain start of an installed model finds everything where it already is: it creates, moves and copies nothing
     # (the model paths are in the run config; the data folder is the one settings.json remembers).  Setting up, checking,
@@ -5619,9 +4932,8 @@ def main() -> int:
     # ---- 1. the PC
     step(1, "checking your PC")
     amd = amd_gpus()                                   # setup's card list (sycl/setup_intel.py: the Intel Arc cards)
-    amd_ok = [g for g in amd if amd_problem(g) is None]
     hip = True                                         # the card path sycl/setup_intel.py drives (the only one here)
-    cuda_tk = None                                     # (no CUDA engine; kept for engine_step / install_dsv41's signatures)
+    cuda_tk = None                                     # (no CUDA engine; kept for engine_step's signature)
     # (the say() texts of this branch are rewritten for the Intel card by sycl/setup_intel.py's say_intel: keep them as they are)
     say("  Your AMD GPUs:" if amd else "  No GPU found.")
     for g in amd:
@@ -5705,20 +5017,6 @@ def main() -> int:
                 verdict += " - NVIDIA only so far, untested on AMD"
             any_fits = any_fits or (not verdict.startswith("does not fit") and not d.get("mem_total"))
             say(f"  {m:8s} needs ~{d['ram_gb']} GB {'of VRAM + RAM' if d.get('mem_total') else 'RAM'}: {verdict}")
-        try:                                           # DeepSeek-V4.1-Flash: a line, from the real numbers (strata_control/dsv41_fit.py)
-            from strata_control import dsv41_fit
-            cards_ok = amd_ok
-            for mname in ("IST-DAS-2.00bpw", "IST-DAS-2.25bpw", "IST-DAS-1.75bpw", "UD-Q8_K_XL"):
-                ds = dsv41_fit.plan(cards_ok, ram, None, model=mname)
-                tail = {"fits": f"fits ({ds['experts_in_vram']:,} of {ds['experts_total']:,} experts in graphics memory, the rest on the CPU)",
-                        "tight": ("runs, with the experts RAM cannot hold read from the SSD (about 5-7 tokens a second measured)"
-                                  if ds.get("variant") else "fits, but RAM is tight"),
-                        "spills": (f"works but slow: less RAM than it was measured with (46-64 GB)" if ds.get("variant")
-                                   else f"about {ds['spill_gb']:.0f} GB of its experts would be read from the SSD (slow)"),
-                        "no_card": "needs one or more graphics cards"}.get(ds["verdict"], "not checked")
-                say(f"  DeepSeek-V4.1-Flash {mname}: a {ds['download_gb']:.0f} GB download: {tail}   (--family deepseek41 --model {mname})")
-        except Exception:                              # noqa: BLE001 - a line for information: never break the check
-            pass
         if not any_fits:
             # #977: every size says "does not fit", so the verdict says so too (and the exit code, for scripts). It only
             # reports: --model NAME --yes still installs one anyway.
@@ -5740,18 +5038,11 @@ def main() -> int:
             d = FAMILIES[f]
             say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else "")
                 + family_menu_note(f, hip, gpu, avx2, avx512))
-        for j, f in enumerate(MULTI_FILE_FAMILIES, len(fams) + 1):   # families with an engine path of their own
-            d = MULTI_FILE_FAMILIES[f]
-            say(f"  {j}) {d['title']:20s} {d['by']} - {d['about']}   [new]")
-        allf = fams + list(MULTI_FILE_FAMILIES)
+        allf = fams
         if tier_note(ram, low_ram_vram(gpu)) and rec_fam == "swift":
             say("  " + tier_note(ram, low_ram_vram(gpu)))
         family = allf[int(ask("Which model?", [str(i) for i in range(1, len(allf) + 1)],
                               str(allf.index(rec_fam) + 1), a.yes)) - 1]
-    if family in MULTI_FILE_FAMILIES:                  # DeepSeek-V4.1-Flash: nine shards, its own engine, several cards
-        all_cards = amd_ok
-        gpu = {**gpu, "cards": chosen}
-        return install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, all_cards)
     fam = FAMILIES[family]
     ok(f"model: {fam['title']}")
     if fam.get("license"):

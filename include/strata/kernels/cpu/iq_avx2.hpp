@@ -23,7 +23,7 @@ void iq256_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_
 void iq256_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                 float* const* out, int r0, int r1);
 
-/// The DeepSeek-V4.1 CPU lane's rows (src/dsv41/ds4_gg_cpu.cpp).  The same loops as iq256_rows / iq256_gu_rows with ggml's float
+/// The CPU lane's rows (written for the DeepSeek V4.1 engine, which this fork no longer has).  The same loops as iq256_rows / iq256_gu_rows with ggml's float
 /// order, so a token's dot is ggml-cpu's vec_dot bit for bit at any number of tokens (the main engine's iq256_* are unchanged),
 /// and IQ1_M (29), whose ggml dot is single-token.  The caller checks AVX2 support.
 bool iq256x_supported(int ggml_type) noexcept;

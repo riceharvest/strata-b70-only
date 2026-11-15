@@ -48,7 +48,7 @@ class BuildScript(unittest.TestCase):
     def run_build(self, *targets, **env):
         merged = dict(os.environ, PATH=self.bin.as_posix() + os.pathsep + os.environ["PATH"], REPO=ROOT.as_posix(),
                       BUILD_DIR=self.build.as_posix())
-        for key in ("AOT", "Q36", "DSV41", "PARITY", "I8_ESIMD", "HOST_MARCH"):
+        for key in ("AOT", "Q36", "PARITY", "I8_ESIMD", "HOST_MARCH"):
             merged.pop(key, None)
         merged.update(env)
         return subprocess.run([BASH, BUILD_SH.as_posix(), *targets], env=merged, capture_output=True, text=True, timeout=120)

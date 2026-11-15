@@ -105,14 +105,6 @@ def sycl_engine():
     return exe, None
 
 
-def sycl_dsv41_exe(eng=None):
-    """The SYCL DeepSeek-V4.1 engine (strata-dsv41): STRATA_DSV41_EXE, else build-sycl-aot/strata-dsv41 or build-sycl/strata-dsv41."""
-    own = (os.environ.get("STRATA_DSV41_EXE") or "").strip()
-    if own and Path(own).is_file():
-        return Path(own)
-    return next((b for b in (ROOT / "build-sycl-aot" / "strata-dsv41", ROOT / "build-sycl" / "strata-dsv41") if b.is_file()), None)
-
-
 def sycl_path(path) -> str:
     """A host path as the engine's container sees it: the folder above the Strata checkout (or STRATA_SYCL_ROOT) is
     mounted at /work."""
@@ -637,9 +629,6 @@ def install(argv) -> None:
                 build_vision_sycl(stub, stamp, llama, vsrc)
         return stub
     S.build_engine_hip = build_engine_hip
-    if hasattr(S, "dsv41_exe"):
-        orig_dsv41_exe = S.dsv41_exe
-        S.dsv41_exe = lambda eng: sycl_dsv41_exe(eng) or orig_dsv41_exe(eng)
     S.hipblaslt_table = lambda *a, **k: None
     S.ram_gb = lambda: fake_ram                         # the experts are in VRAM: setup's RAM rule does not apply
     # Gyro (mem_total) counts VRAM + RAM together and is the one family whose experts are NOT streamed from the file into VRAM: on

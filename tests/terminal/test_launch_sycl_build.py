@@ -117,8 +117,7 @@ class SourceBuild(unittest.TestCase):
     def test_the_engine_step_takes_the_source_build_and_fetches_nothing(self):
         seen: list = []
         r = runner(checkout(self.base), seen)
-        with mock.patch.object(Runner, "multi_file", return_value=False), \
-                mock.patch.object(ec, "status", side_effect=AssertionError("no package lookup")), \
+        with mock.patch.object(ec, "status", side_effect=AssertionError("no package lookup")), \
                 mock.patch.object(Runner, "_spawn", side_effect=AssertionError("no strata update")):
             r.ensure_engine()
         self.assertIsNone(r.engine_problem)
@@ -143,7 +142,6 @@ class SourceBuild(unittest.TestCase):
 
         env = dict(os.environ, STRATA_CONTROL_INSTALL="1", STRATA_INSTALL_DIR="/elsewhere", STRATA_NEED_ENGINE="1", STRATA_ALLOW_NO_ENGINE="1")
         with mock.patch.dict(os.environ, env, clear=True), \
-                mock.patch.object(Runner, "multi_file", return_value=False), \
                 mock.patch.object(Runner, "setup_args", return_value=["--yes", "--no-start", "--family", "qwen", "--model", "Q3_S"]), \
                 mock.patch.object(Runner, "progress_job", return_value={}), \
                 mock.patch.object(Runner, "_spawn", side_effect=spawn):
@@ -162,8 +160,7 @@ class SourceBuild(unittest.TestCase):
         src = checkout(self.base, built=False)
         r = runner(src, [])
         spawned: list = []
-        with mock.patch.object(Runner, "multi_file", return_value=False), \
-                mock.patch.object(Runner, "setup_args", return_value=["--yes"]), \
+        with mock.patch.object(Runner, "setup_args", return_value=["--yes"]), \
                 mock.patch.object(Runner, "progress_job", return_value={}), \
                 mock.patch.object(Runner, "_spawn", side_effect=lambda argv, env=None, cwd=None: spawned.append((argv, env)) or FakeProc(code=1)), \
                 mock.patch.object(Runner, "adopt_prepared_files", return_value=None):
@@ -177,8 +174,7 @@ class SourceBuild(unittest.TestCase):
     def test_the_run_serves_with_the_source_build(self):
         seen: list = []
         r = runner(checkout(self.base), seen)
-        with mock.patch.object(Runner, "multi_file", return_value=False), \
-                mock.patch.object(ec, "status", side_effect=AssertionError("no package lookup")), \
+        with mock.patch.object(ec, "status", side_effect=AssertionError("no package lookup")), \
                 mock.patch.object(Runner, "check_own_files"), mock.patch.object(Runner, "check_serving", return_value=None), \
                 mock.patch.object(Runner, "ensure_model", return_value=self.base / "strata-q3_s.json"), \
                 mock.patch.object(Runner, "ensure_drafter"), \
@@ -194,7 +190,7 @@ class SourceBuild(unittest.TestCase):
     def test_the_plan_does_not_promise_an_engine_download(self):
         r = runner(checkout(self.base), [])
         st = mock.Mock(remaining_gb=0.0, own_files=False, installed=True, on_disk_gb=0.0, parts=[])
-        with mock.patch.object(Runner, "multi_file", return_value=False), mock.patch.object(Runner, "model_state", return_value=st), \
+        with mock.patch.object(Runner, "model_state", return_value=st), \
                 mock.patch.object(Runner, "row", return_value=None), \
                 mock.patch.object(ec, "status", side_effect=AssertionError("no package lookup")):
             plan = r.download_plan()

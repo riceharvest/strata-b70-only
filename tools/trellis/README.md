@@ -1,4 +1,4 @@
-# Trellis encoder (research, branch f-dsv41-enc)
+# Trellis encoder (research)
 
 An encoder for the trellis expert formats that Strata already decodes (TQ2_T, TQK6, TQK7 of agentionai's llama.cpp fork)
 and for two experimental lower rates, K5 (22 bytes per 128 weights, 1.375 bpw) and K4 (18 bytes, 1.125 bpw), in two versions:

@@ -25,11 +25,8 @@ UNUSABLE = {"usable": False, "engine": None, "notice": "No engine for this PC wa
 
 
 def qwen_catalog():
-    """A catalog stand-in for a Qwen model: since 0.2.4 the runner asks it whether the family is DeepSeek (which has its own engine and skips this step);
-    a bare Mock answers yes to everything."""
-    cat = mock.Mock()
-    cat.strata.multi_family.return_value = False
-    return cat
+    """A catalog stand-in for a Qwen model."""
+    return mock.Mock()
 
 
 class FakeProc:

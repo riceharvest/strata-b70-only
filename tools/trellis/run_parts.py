@@ -6,7 +6,7 @@ run (retried up to --retries times, a failed try is discarded), and the part fil
 OUT.tsv.seg.json, which `quant_quality.py compare` and swap_compare.py read as usual.  With --dump-dir every part writes its
 STRATA_ACT_DUMP files to <dump-dir>/p<i>/ (only the dumps of finished parts are kept).
 
-  python3 tools/trellis/run_parts.py --runner /data/dsv41-enc/run_qq.sh --cfg CFG --ids IDS --out OUT.tsv --parts 6 \
+  python3 tools/trellis/run_parts.py --runner /data/enc/run_qq.sh --cfg CFG --ids IDS --out OUT.tsv --parts 6 \
       [--env K=V ...] [--dump-dir DIR]
 """
 from __future__ import annotations

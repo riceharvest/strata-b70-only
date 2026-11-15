@@ -17,7 +17,7 @@
 #                      the container must see the same file. 0: the container keeps a private /dev/shm.
 # Passed into the container: every variable of this script's environment that starts with STRATA_ (the config's
 # "env" block arrives that way: the server puts it in the engine's environment), ONEAPI_ (level_zero:* for a
-# two-card split, #423), UR_, IGC_, SYCL_, ZES_ or DS4_ (strata-dsv41's own switches). The port's own defaults (below) are overridden the same way,
+# two-card split, #423), UR_, IGC_, SYCL_ or ZES_. The port's own defaults (below) are overridden the same way,
 # e.g. "env": {"STRATA_VERIFY_NO_HOST": "0"} in the config.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/../.." && pwd)                 # the repo
@@ -37,7 +37,7 @@ declare -A setting=([STRATA_VERIFY_DEVICE_PLAN]=1 [STRATA_VERIFY_NO_HOST]=1 [STR
 while IFS= read -r k; do
     case "$k" in
         STRATA_SYCL_*) ;;                                 # this script's own settings
-        STRATA_*|ONEAPI_*|UR_*|IGC_*|SYCL_*|ZES_*|DS4_*|NEOReadDebugKeys|OverrideDefaultFP64Settings) setting[$k]=${!k} ;;
+        STRATA_*|ONEAPI_*|UR_*|IGC_*|SYCL_*|ZES_*|NEOReadDebugKeys|OverrideDefaultFP64Settings) setting[$k]=${!k} ;;
     esac
 done < <(compgen -e)
 envs=()

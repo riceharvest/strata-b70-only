@@ -9,7 +9,7 @@ reads that file and fails when the two disagree, so the Terminal and the app can
   off switch of an earlier 0.2.7 test build) reads as off, which is what it is now.
 - "Faster answers on 12 GB NVIDIA cards" (residency-biased routing) is OFF by default since 0.2.8 (owner decision, 29 October; #4402: it can repeat itself
   and give weaker results in long agent sessions): ``STRATA_ROUTE_PRIOR=1.5`` turns it on.  The ``STRATA_ROUTE_PRIOR=0`` that 0.2.7's Off wrote is the default state now.
-- "Faster answers on Radeon RX 9000 / AI PRO R9700" and "DeepSeek speed-ups" are ON by default; turning them off writes their entries.
+- "Faster answers on Radeon RX 9000 / AI PRO R9700" is ON by default; turning it off writes its entries.
 
 The Terminal shows the switches as rows of its Advanced table (strata_cli/launch/params.py), only where they apply: ``strata launch --set STRATA_KVA=1``
 turns "Faster long prompts" on, ``--set STRATA_KVA=off`` puts the default back (the same as removing the row).
@@ -28,9 +28,8 @@ class Switch:
     label: str                    # the words the app shows
     effect: str                   # one plain sentence: what it does and what the other choice does
     env: tuple[tuple[str, str], ...]   # the environment entries written when the switch is NOT in its default state
-    only: str                     # "qwen-gpu" | "qwen-cuda-12gb" | "qwen-radeon-9000" | "deepseek" | "qwen-any": where it applies
+    only: str                     # "qwen-gpu" | "qwen-cuda-12gb" | "qwen-radeon-9000" | "qwen-any": where it applies
     default: str = "on"           # "on" | "off": what a launch without the entries does
-    legacy: tuple[tuple[str, str], ...] = ()    # entries an earlier 0.2.7 test build wrote for the same state: they read as the switch being set, and are removed with it
     terminal_only: bool = False   # shown in the Terminal's Advanced table only, never in the app
 
 
@@ -45,14 +44,6 @@ SWITCHES: tuple[Switch, ...] = (
            "Shares the work between the graphics card and the processor in a way that makes answers faster on these cards. "
            "Turn off to go back to the previous setting, which is slower.",
            (("STRATA_PCIE_FRAC_DEFAULT", "old"),), "qwen-radeon-9000"),
-    Switch("deepseek_speedups", "DeepSeek speed-ups",
-           "Reads long prompts faster and loads the parts of the model it needs faster. "
-           "Turn off if DeepSeek stops working or its answers look wrong; it then runs as in version 0.2.6.",
-           # DS4_DEFAULTS=026: the engine's master switch back to the 0.2.6 defaults; the six are what older engines (and the test builds) read
-           (("DS4_DEFAULTS", "026"), ("DS4_FAST_ATTN", "0"), ("DS4_ATTN_SLAB", "0"), ("DS4_COPY_PIN", "0"), ("DS4_COPY_HUGETLB", "0"),
-            ("DS4_STORE_SPARE", "0"), ("DS4_STORE_PUT", "0")), "deepseek",
-           legacy=(("DS4_FAST_ATTN", "0"), ("DS4_ATTN_SLAB", "0"), ("DS4_COPY_PIN", "0"), ("DS4_COPY_HUGETLB", "0"),
-                   ("DS4_STORE_SPARE", "0"), ("DS4_STORE_PUT", "0"))),
     # Troubleshooting only, in the Terminal's Advanced table and nowhere else: every Qwen 0.2.7 default back to its 0.2.6 behaviour.
     Switch("qwen_defaults_026", "Qwen: 0.2.6 behaviour",
            "Starts every Qwen speed setting new in 0.2.7 the way 0.2.6 did, for troubleshooting. Use it if something that worked before no longer does.",
@@ -79,11 +70,6 @@ def _small_nvidia(gpus: Iterable[Mapping[str, Any]] | None) -> bool:
     return False
 
 
-def is_deepseek(cfg: Mapping[str, Any] | None) -> bool:
-    cfg = cfg or {}
-    return cfg.get("arch") == "deepseek41" or bool(re.search(r"strata-dsv41", str(cfg.get("exe") or ""), re.IGNORECASE))
-
-
 def _radeon_9000(gpus: Iterable[Mapping[str, Any]] | None) -> bool:
     for g in gpus or []:
         if g.get("vendor") not in (None, "", "amd"):
@@ -98,10 +84,6 @@ def applies(switch: Switch | str, cfg: Mapping[str, Any] | None, gpus: Iterable[
     """Does the switch make sense for this model on this PC? ``backend`` is the engine's (cuda, hip, sycl, metal, cpu); the run config's own wins.
     "Faster long prompts" is for Qwen3.8-Flash-Next models only (a config without an "arch")."""
     sw = BY_ID[switch] if isinstance(switch, str) else switch
-    if sw.only == "deepseek":
-        return is_deepseek(cfg)
-    if is_deepseek(cfg):
-        return False
     if sw.only == "qwen-any":
         return True
     backend = (cfg or {}).get("backend") or backend
@@ -132,7 +114,7 @@ def is_set(env: Mapping[str, Any] | None, switch: Switch | str) -> bool:
     (``STRATA_KVA=0``), is in the default state and is left alone."""
     sw = BY_ID[switch] if isinstance(switch, str) else switch
     have = lambda entries: bool(entries) and all((env or {}).get(name) == value for name, value in entries)   # noqa: E731
-    return have(sw.env) or have(sw.legacy)
+    return have(sw.env)
 
 
 def is_on(env: Mapping[str, Any] | None, switch: Switch | str) -> bool:
@@ -150,9 +132,6 @@ def set_switch(env: Mapping[str, Any] | None, switch: Switch | str, on: bool) ->
         if write:
             out[name] = value
         else:
-            out.pop(name, None)
-    if not write:
-        for name, _ in sw.legacy:
             out.pop(name, None)
     return out
 

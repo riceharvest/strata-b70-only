@@ -157,9 +157,6 @@ class Feed:
     source: str                    # where it was read from (the base for relative URLs)
     key_id: str                    # who signed it
     raw: bytes = field(default=b"", repr=False)
-    #: the DeepSeek-V4.1 engine packages (feed member ``dsv41``, same entry shape as ``engine``): a separate download that setup fetches when
-    #: DeepSeek is chosen. Kept out of ``engine`` so that `strata update` and select_engine never pick one as THE engine. Older Controls ignore the member.
-    dsv41: tuple[EnginePackage, ...] = ()
     #: entries this Control does not know how to use (a platform, a backend or an archive format added after it was built): left out, one plain line each.
     #: A feed with such an entry is still a feed; only an entry of a kind this Control knows and that is malformed refuses the feed.
     skipped: tuple[str, ...] = ()
@@ -315,21 +312,8 @@ def parse(payload: bytes, *, source: str, key_id: str) -> Feed:
             if ident in seen:
                 raise FeedError(f"the feed lists engine {pkg.label} twice")
             seen.add(ident)
-    dsv41 = []
-    raw_dsv41 = data.get("dsv41")
-    if raw_dsv41 is not None:
-        if not isinstance(raw_dsv41, dict) or not isinstance(raw_dsv41.get("packages"), list):
-            raise FeedError("the feed's dsv41 member lists no packages")
-        dsv41 = [e for e in (_engine_package(item, skipped) for item in raw_dsv41["packages"] if not _foreign(item))
-                 if e is not None]
-        seen = set()
-        for pkg in dsv41:
-            ident = (pkg.version, pkg.platform, pkg.backend, pkg.variant)
-            if ident in seen:
-                raise FeedError(f"the feed lists DeepSeek engine {pkg.label} twice")
-            seen.add(ident)
     return Feed(sequence=sequence, channel=channel, generated_at=generated, expires_at=expires, app=app,
-                control=tuple(control), engine=tuple(engine), source=source, key_id=key_id, raw=payload, dsv41=tuple(dsv41),
+                control=tuple(control), engine=tuple(engine), source=source, key_id=key_id, raw=payload,
                 skipped=tuple(skipped))
 
 
