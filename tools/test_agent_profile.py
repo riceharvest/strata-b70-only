@@ -105,6 +105,27 @@ class Profile(unittest.TestCase):
         self.assertIn("thinking 57.1% of the characters", text)   # (8 of 14 characters)
         self.assertIn("in the agent's tool", text)
 
+    def test_the_figures_of_switches_that_alternate_inside_a_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            w = {"ev": "win", "dr": {"first": [2, 9.0, 40], "chain": [4, 10.0, 32], "chain_g": [4, 6.0, 32]},
+                 "ab": {"0": [10, 800.0, 200, 320, 5, 400.0, 110, 160], "1": [10, 700.0, 190, 280, 5, 350.0, 100, 140]}}
+            ph = {"ev": "wphase", "slots": 8, "rows": 32, "cells_max": 20000, "ms": {"proj": 30.0, "gdn": 10.0, "attn": 20.0, "norm": 5.0, "ffn": 25.0, "embed": 1.0, "head": 9.0}}
+            open(os.path.join(d, "engine.log"), "w").write(
+                "PROF " + json.dumps(w) + "\n" + "PROF " + json.dumps(ph) + "\n"
+                "strata serve: the cells left the card at 3.00 GiB/s (direct, 100 ms)\n"
+                "strata serve: the cells left the card at 6.00 GiB/s (pinned staging, 50 ms)\n"
+                "strata serve: the cells left the card at 1.00 GiB/s (direct, 100 ms)\n")
+            text, res = agent_profile.in_run(d, agent_profile.load(d)[0])
+        self.assertEqual(res["draft_passes"]["chain"], {"calls": 4, "ms": 2.5, "rows": 8.0})
+        self.assertEqual(res["draft_passes"]["chain_g"]["ms"], 1.5)
+        self.assertEqual(res["park_copy"]["direct"], {"parks": 2, "gib_s": 2.0, "ms": 100.0})   # (0.4 GiB in 0.2 s)
+        self.assertEqual(res["park_copy"]["pinned staging"]["gib_s"], 6.0)
+        self.assertIn("a chained level from a graph 4 calls, 1.50 ms each, 8.0 rows", text)
+        self.assertEqual(res["ab"]["0"]["tok_s"], 250.0)
+        self.assertEqual(res["ab"]["1"]["full_tok_s"], 285.7)
+        self.assertEqual(res["window_parts_ms"]["proj"], 30.0)
+        self.assertIn("proj 30.0% (30.0 ms)", text)
+
     def test_a_long_harness_line_stays_a_record(self):
         import agent_bench
         line = json.dumps({"type": "turn_end", "message": {"content": [{"type": "text", "text": "x" * 50000}]}, "n": 3})

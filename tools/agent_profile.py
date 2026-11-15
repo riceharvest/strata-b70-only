@@ -18,7 +18,7 @@ and prints, with every part optional when its file is missing:
   6. the server's view: the wait before the engine began, time to the first token, a request's time
   7. the slowest requests with what they spent their time on
 """
-import json, os, statistics as st, sys, glob
+import json, os, re, statistics as st, sys, glob
 
 
 def pct(v, p):
@@ -392,16 +392,85 @@ def threads(d, prof):
                              "read_again_by_how": {k: h[1] for k, h in hows.items()}, "div_checkpoints": len(div)}
 
 
+def in_run(path, prof):
+    """Section 9: the figures of switches that alternate inside a run (STRATA_Q36_MTP_CHAIN_GRAPH=ab, STRATA_Q36_PARK_PIN=ab),
+    and the draft block's passes by kind."""
+    out, res = [], {}
+    dr = {"first": [0, 0.0, 0], "chain": [0, 0.0, 0], "chain_g": [0, 0.0, 0]}
+    for w in prof:
+        if w.get("ev") == "win":
+            for k, v in (w.get("dr") or {}).items():
+                if k in dr:
+                    for i in range(3):
+                        dr[k][i] += v[i]
+    if any(v[0] for v in dr.values()):
+        out.append("   the draft block's passes: " + "; ".join("%s %d calls, %.2f ms each, %.1f rows" % (
+            {"first": "a window's kept rows", "chain": "a chained level, kernel by kernel", "chain_g": "a chained level from a graph"}[k], v[0], v[1] / v[0], v[2] / v[0])
+            for k, v in dr.items() if v[0]))
+        res["draft_passes"] = {k: {"calls": v[0], "ms": round(v[1] / v[0], 3), "rows": round(v[2] / v[0], 2)} for k, v in dr.items() if v[0]}
+    # the two kinds of 64-window blocks (a switch that alternates: STRATA_Q36_BATCH_BASE_AB, ..._CHAIN_GRAPH=ab)
+    ab = {"0": [0.0] * 8, "1": [0.0] * 8}
+    for w in prof:
+        if w.get("ev") == "win":
+            for k, v in (w.get("ab") or {}).items():
+                if k in ab:
+                    for i in range(8):
+                        ab[k][i] += v[i]
+    if ab["1"][0] > 0:
+        for k, name in (("0", "blocks as set"), ("1", "the other blocks")):
+            v = ab[k]
+            if v[0] > 0:
+                out.append("   %-16s %5d windows: %.1f rows, %.2f tokens in %.1f ms = %.1f tok/s; with every slot decoding %d windows: %.1f rows, %.2f tokens in %.1f ms = %.1f tok/s" % (
+                    name, v[0], v[3] / v[0], v[2] / v[0], v[1] / v[0], 1000.0 * v[2] / max(1e-9, v[1]),
+                    v[4], v[7] / max(1, v[4]), v[6] / max(1, v[4]), v[5] / max(1, v[4]), 1000.0 * v[6] / max(1e-9, v[5])))
+        res["ab"] = {k: {"windows": int(v[0]), "tok_s": round(1000.0 * v[2] / max(1e-9, v[1]), 1), "full_windows": int(v[4]),
+                         "full_tok_s": round(1000.0 * v[6] / max(1e-9, v[5]), 1), "full_rows": round(v[7] / max(1, v[4]), 1),
+                         "full_tokens": round(v[6] / max(1, v[4]), 2), "full_ms": round(v[5] / max(1, v[4]), 1)} for k, v in ab.items() if v[0] > 0}
+    # a sampled window's parts (STRATA_Q36_PROFILE_PHASES=1)
+    wp = [w for w in prof if w.get("ev") == "wphase"]
+    if wp:
+        tot = {}
+        for w in wp:
+            for k, v in w["ms"].items():
+                tot[k] = tot.get(k, 0.0) + v
+        allms = sum(tot.values())
+        out.append("   a window's parts (%d sampled windows run with a wait after each part, %.1f rows, %.1f ms each): %s" % (
+            len(wp), st.mean(w["rows"] for w in wp), allms / len(wp),
+            ", ".join("%s %.1f%% (%.1f ms)" % (k, 100.0 * v / allms, v / len(wp)) for k, v in sorted(tot.items(), key=lambda kv: -kv[1]))))
+        res["window_parts_ms"] = {k: round(v / len(wp), 2) for k, v in tot.items()}
+    log = os.path.join(path, "engine.log") if os.path.isdir(path) else path
+    park = {}
+    if os.path.exists(log):
+        for line in open(log, errors="replace"):
+            m = re.search(r"the cells left the card at ([\d.]+) GiB/s \((pinned staging|direct), ([\d.]+) ms\)", line)
+            if m:
+                e = park.setdefault(m.group(2), [0, 0.0, 0.0])
+                e[0] += 1
+                e[1] += float(m.group(3))
+                e[2] += float(m.group(1)) * float(m.group(3)) / 1000.0   # GiB
+    if park:
+        out.append("   parked cells leaving the card: " + "; ".join("%s %d parks, %.2f GiB/s (%.0f ms each)" % (k, v[0], v[2] / max(1e-9, v[1] / 1000.0), v[1] / v[0])
+                                                              for k, v in sorted(park.items())))
+        res["park_copy"] = {k: {"parks": v[0], "gib_s": round(v[2] / max(1e-9, v[1] / 1000.0), 2), "ms": round(v[1] / v[0], 1)} for k, v in park.items()}
+    if not out:
+        return "", {}
+    return "\n".join(["", "9. Inside the run (the draft block's passes; switches that alternate)"] + out), res
+
+
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     prof, metrics, run = load(sys.argv[1])
     text, res = report(prof, metrics, run)
+    t9, r9 = in_run(sys.argv[1], prof)
     if os.path.isdir(sys.argv[1]):
         t8, r8 = threads(sys.argv[1], prof)
         text += ("\n" + t8) if t8 else ""
         if r8:
             res["threads"] = r8
+    text += ("\n" + t9) if t9 else ""
+    if r9:
+        res["in_run"] = r9
     print(text)
     if "--json" in sys.argv:
         json.dump(res, open(sys.argv[sys.argv.index("--json") + 1], "w"), indent=1)

@@ -2394,6 +2394,31 @@ bool q36_park_live_on() {
     static const bool on = [] { const char* e = std::getenv("STRATA_Q36_PARK_LIVE"); return !(e && e[0] == '0'); }();
     return on;
 }
+// In-run comparisons.  A switch below that reads "ab" alternates its two forms inside one run and says in its record which
+// form a figure belongs to: real agent runs differ by 15% and more from one to the next, so two runs cannot compare a
+// change of a few percent, but the same run's two halves can.
+// STRATA_Q36_MTP_CHAIN_GRAPH (0; 1; ab): the chained draft levels of a batch window (one row a slot, the same pattern
+// window after window) replay a recorded command graph instead of being submitted kernel by kernel.  ab: by blocks of 64
+// windows.
+inline int q36_chain_graph_mode() {
+    static const int v = [] { const char* e = std::getenv("STRATA_Q36_MTP_CHAIN_GRAPH"); return !e || !*e || e[0] == '0' ? 0 : e[0] == 'a' ? 2 : 1; }();
+    return v;
+}
+// STRATA_Q36_PARK_PIN (default 1; 0: as before; ab): a parked cache's cells leave the card through a pinned staging block
+// (64 MiB, then a host copy) instead of straight into the parked buffer's pageable memory.  ab: every other park.
+// Measured inside one run of 16 agents on 8 sessions (46 and 47 parks): 3.02 GiB/s against 2.53.
+inline int q36_park_pin_mode() {
+    static const int v = [] { const char* e = std::getenv("STRATA_Q36_PARK_PIN"); return !e || !*e ? 1 : e[0] == '0' ? 0 : e[0] == 'a' ? 2 : 1; }();
+    return v;
+}
+// STRATA_Q36_PROFILE_PHASES=1 (with STRATA_Q36_PROFILE=1): one batch window in 256 with every slot decoding runs kernel by
+// kernel with a wait after each part of a layer, and a `wphase` record says where its time went (ms): proj (the
+// projections), gdn (the recurrent state), attn, norm, ffn, embed, head.  The waits make that window slower: the record is
+// for the shares, not for the window's time.
+inline bool q36_profile_phases() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_PROFILE_PHASES"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
 // STRATA_Q36_DIV_CKPT (default on; 0: off): a prompt that shares its start with ANOTHER thread's cache (the harness's
 // system prompt and tools) for STRATA_Q36_DIV_CKPT_MIN tokens (256) or more past what it can reuse, with no checkpoint
 // there, is read in two parts and leaves a checkpoint where the two prompts part.  The next thread that starts the same
@@ -2420,6 +2445,8 @@ int64_t q36_div_ckpt_min() {
 //   slot  a batch slot's end: its tokens, its time decoding, its drafts.
 //   win   batch windows: how many, the slots and rows a window, its parts in ms (first drafts, window, picks, commit, next
 //         drafts) and the time between windows (admissions, reads), the deepest cell.
+//         `dr`: the draft block's passes, each [calls, ms, rows]: `first` the pass of the rows a window kept, `chain` a chained
+//         level submitted kernel by kernel, `chain_g` one replayed from a graph (STRATA_Q36_MTP_CHAIN_GRAPH).
 // `t` is ms since the engine began to serve, `ts` the clock's seconds.
 bool q36_profile_on() {
     static const bool on = [] { const char* e = std::getenv("STRATA_Q36_PROFILE"); return e != nullptr && e[0] == '1'; }();
@@ -3824,6 +3851,19 @@ struct Engine {
     // products (32 columns a call) with the decode-side state kernels; else it stays 16.
     static constexpr int kRowsT = 32;
     int rows_cap = kVerify;
+    // STRATA_Q36_PROFILE_PHASES: set by the caller around one run_rows - the parts' sums (kPhases) and the last lap's time;
+    // rows_eager: that window runs without its graph
+    static constexpr int kPhases = 7;   // proj, gdn, attn, norm, ffn, embed, head
+    double* ph = nullptr;
+    std::chrono::steady_clock::time_point ph_t{};
+    bool rows_eager = false;
+    void ph_lap(int i) {
+        if (ph == nullptr) return;
+        st->wait();
+        const auto t = std::chrono::steady_clock::now();
+        ph[i] += std::chrono::duration<double, std::milli>(t - ph_t).count();
+        ph_t = t;
+    }
     static constexpr int kTreeFrontMax = 4;
     std::vector<float*> v_qkv, v_hc, v_alpha, v_beta;
     // speculative tree verification state & buffers
@@ -6859,6 +6899,7 @@ work-group size if needed.
                 }
             }
             // M4: k_conv_dec / k_gdn_dec / k_gdn_norm_q8; batch rows too with STRATA_Q36_FUSE (their group tables, gdn_dec)
+            ph_lap(0);
             const bool dec = gdn_dec_on() && dec_rows(T) && (!rows_mode || fuse_gdn_rows());
             if (dec) {
                 gdn_dec(L, li, T, verify, qkv_b, hc_b, al_b, be_b);
@@ -7057,8 +7098,10 @@ work-group size if needed.
                     });
                 }
             }
+            ph_lap(1);
             if (dec && !a16(L.ssm_out, T)) apply(L.ssm_out, q8, y, T);   // (q8: gdn_y's q8_1 image, from k_gdn_norm_q8)
             else mm(L.ssm_out, gdn_y, y, T);
+            ph_lap(0);
         } else {
             if (!a16(L.wq, T) || !a16(L.wk, T) || !a16(L.wv, T)) prep_in(T);
             else xq_ready = false;
@@ -7066,14 +7109,19 @@ work-group size if needed.
             apply2(L.wq, xq, h, pk16, qg, T);
             apply2(L.wk, xq, h, pk16, kx, T);
             apply2(L.wv, xq, h, pk16, vx, T);
+            ph_lap(0);
             if (kv_f32) attn_core<float>(li, L, T, p0, dpos, graph_mode);
             else if (kv_q8) attn_core<int8_t>(li, L, T, p0, dpos, graph_mode);
             else attn_core<sycl::half>(li, L, T, p0, dpos, graph_mode);
+            ph_lap(2);
             mm(L.wo, att, y, T);
+            ph_lap(0);
         }
         add_rms_post(L, T);
+        ph_lap(3);
         if (m->dense) {
             dense_ffn(L, T, wn, hout, next_w4_i8);
+            ph_lap(4);
             return;
         }
         // routed experts (one token: the router and the shared expert's gate in one product, the gate its last row)
@@ -7247,6 +7295,7 @@ work-group size if needed.
                     });
             });
         } // later layers: from k_moe_out
+        ph_lap(5);
         for (size_t l = 0; l < m->layers.size(); ++l) {
             const bool last = l + 1 == m->layers.size();
             const bool next_w4_i8 = !last && !dec_rows(T) && m->dense && pp_dxT != nullptr &&
@@ -8489,7 +8538,8 @@ work-group size if needed.
         run_rows_graph((verify ? 400000 : 300000) + (sp_M > 0 ? 10000 : 0), G, T, [&] {
             forward(T, pmax, T, use_graph, verify);
             if (sp_M > 0) sp_topm(T);
-        });
+            ph_lap(6);
+        }, rows_eager);
         rows_deferred = false;
         rows_mode = false;
         /*
@@ -8657,6 +8707,7 @@ work-group size if needed.
     TreeTop2* top2_mr = nullptr;
     float* amv_mr2 = nullptr;
     int32_t* ami_mr2 = nullptr;
+    bool mtp_chain_graph = false;   // STRATA_Q36_MTP_CHAIN_GRAPH: set by the caller for a chained level's pass
     void mtp_rows(const MtpRow* rows, int T) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
@@ -8877,7 +8928,7 @@ work-group size if needed.
                                       sycl::range<3>(1, 1, kThreads)),
                     [=](sycl::nd_item<3>) { k_top2_stage2(amv_, ami_, nv, idv2, out); });
             }
-        }, n_sess > 1 && !mr_graph);
+        }, n_sess > 1 && !mr_graph && !mtp_chain_graph);
         rows_deferred = false;
         rows_mode = false;
         /*
@@ -9142,6 +9193,9 @@ work-group size if needed.
     };
     std::vector<std::unique_ptr<Parked>> parked;
     uint8_t* park_stage = nullptr;   // on the card, one checkpoint's size: a parked thread's last state on its way to host memory
+    uint8_t* park_pin = nullptr;     // STRATA_Q36_PARK_PIN: pinned host memory the cells pass through (kParkPin bytes)
+    static constexpr size_t kParkPin = (size_t) 64 << 20;
+    long long park_pin_turn = 0;
     bool park_stage_failed = false;
     size_t park_cap = q36_park_bytes(), park_bytes = 0;   // the memory tier: a fixed budget (park_auto false), in use
     bool park_auto = q36_park_bytes() == 0 && std::getenv("STRATA_Q36_PARK_GIB") == nullptr;   // no budget given: sized by the machine's free memory
@@ -9423,13 +9477,32 @@ work-group size if needed.
         CK(DPCT_CHECK_ERROR(st->wait()));
         size_t off = 0;
         uint8_t* const dst = pk->blob.get();
+        bool pin = q36_park_pin_mode() == 1 || (q36_park_pin_mode() == 2 && (park_pin_turn++ & 1) != 0);
+        if (pin && park_pin == nullptr) {
+            try {
+                park_pin = sycl::malloc_host<uint8_t>(kParkPin, *st);
+            } catch (const sycl::exception&) {
+                park_pin = nullptr;
+            }
+        }
+        pin = pin && park_pin != nullptr;
+        const auto tc0 = Clock::now();
         kv_each(sess[(size_t) s], n, [&](uint8_t* base, size_t stride, size_t bytes) {
             for (size_t h = 0; h < H; ++h) {
-                CK(DPCT_CHECK_ERROR(st->memcpy(dst + off, base + h * stride, bytes)));
+                if (pin) {   // (card -> pinned block -> the parked buffer)
+                    for (size_t o = 0; o < bytes; o += kParkPin) {
+                        const size_t c = std::min(kParkPin, bytes - o);
+                        CK(DPCT_CHECK_ERROR(st->memcpy(park_pin, base + h * stride + o, c).wait()));
+                        std::memcpy(dst + off + o, park_pin, c);
+                    }
+                } else {
+                    CK(DPCT_CHECK_ERROR(st->memcpy(dst + off, base + h * stride, bytes)));
+                }
                 off += bytes;
             }
         });
         CK(DPCT_CHECK_ERROR(st->wait()));
+        const double cells_ms = ms_since(tc0);
         pk->tokens = toks;
         pk->head = sess[(size_t) s].thread_head;
         pk->tail_miss = sess[(size_t) s].tail_miss;
@@ -9468,6 +9541,8 @@ work-group size if needed.
         park_bytes += pk->total(ckpt_bytes);
         ++park_n;
         park_ms += ms_since(t0);
+        std::fprintf(stderr, "strata serve: the cells left the card at %.2f GiB/s (%s, %.0f ms)\n", (double) need / 1073741824.0 / std::max(1e-6, cells_ms / 1000.0),
+                     pin ? "pinned staging" : "direct", cells_ms);
         std::fprintf(stderr, "strata serve: parked session %d's cache (%lld cells, %.2f GiB%s) in %.0f ms; %zu parked, in memory %.2f GiB\n", s, (long long) n,
                      (double) need / 1073741824.0, pk->ckpt_live ? (pk->ckpt ? ", with its last state and its checkpoint" : ", with its last state") : pk->ckpt ? ", with its checkpoint" : ", no checkpoint of its own", ms_since(t0), parked.size() + 1,
                      (double) park_bytes / 1073741824.0);
@@ -11305,6 +11380,11 @@ struct Serve {
     // the depth a slot falls back to after a miss (STRATA_Q36_BATCH_BASE, default 3: 4 requests 168.6 tok/s at 1, 182.2
     // at 3; the one-request steps use 5)
     int bdepth_base = [] { const char* e = std::getenv("STRATA_Q36_BATCH_BASE"); return e && *e ? std::max(1, std::atoi(e)) : 3; }();
+    // STRATA_Q36_BATCH_BASE_AB=<n>: every other block of 64 windows falls back to depth n instead (an in-run comparison:
+    // the `win` records carry both blocks' windows, tokens and time under `ab`)
+    int bdepth_ab = [] { const char* e = std::getenv("STRATA_Q36_BATCH_BASE_AB"); return e && *e ? std::max(1, std::atoi(e)) : 0; }();
+    int ab_arm() const { return (int) ((win_seq >> 6) & 1); }
+    int base_now() const { return bdepth_ab > 0 && ab_arm() == 1 ? bdepth_ab : bdepth_base; }
     /// The rows a window can give to drafts, shared: want[i] cut down (the largest first, from the turn's slot on) until
     /// one row a slot plus the drafts fit.
     void fit_depths(std::vector<int>& want) {
@@ -11362,7 +11442,17 @@ struct Serve {
                 of.push_back((int) k);
             }
             if (rows.empty()) return;
-            E.mtp_rows(rows.data(), (int) rows.size());
+            {
+                const bool gr = q36_chain_graph_mode() == 1 || (q36_chain_graph_mode() == 2 && ((win_seq >> 6) & 1) != 0);
+                const auto tc = Clock::now();
+                E.mtp_chain_graph = gr;
+                E.mtp_rows(rows.data(), (int) rows.size());
+                E.mtp_chain_graph = false;
+                const int k = gr ? 2 : 1;
+                ++pd_n[k];
+                pd_rows[k] += (long long) rows.size();
+                pd_ms[k] += ms_since(tc);
+            }
             for (size_t r = 0; r < rows.size(); ++r) {
                 Slot& sl = slots[(size_t) who[(size_t) of[r]]];
                 sl.drafts.push_back(draft_of(who[(size_t) of[r]], (int) r, (int) sl.drafts.size()));
@@ -11404,7 +11494,7 @@ struct Serve {
             const Slot& sl = slots[(size_t) act[(size_t) i]];
             if (sl.drafts_ok())
                 want[(size_t) i] = sl.look && !sl.drafts.empty() ? std::min((int) sl.drafts.size(), maxd)   // (a copy: all of it the rows allow)
-                                                                 : std::max(1, std::min(std::max(sl.depth, bdepth_base), maxd));
+                                                                 : std::max(1, std::min(std::max(sl.depth, base_now()), maxd));
         }
         fit_depths(want);
         ++mtp_turn;
@@ -11470,7 +11560,24 @@ struct Serve {
             const Slot& sl = slots[(size_t) act[(size_t) i]];
             if (sl.smp.needs_logits() && sl.plan.ok) sp_M = std::max(sp_M, sl.plan.M);
         }
+        double phase[Engine::kPhases] = {};
+        const bool phs = q36_profile_on() && q36_profile_phases() && S == E.n_sess && (win_seq & 255) == 128;
+        if (phs) {
+            E.st->wait();
+            E.ph = phase;
+            E.ph_t = Clock::now();
+            E.rows_eager = true;
+        }
         E.run_rows(gr.data(), S, true, sp_M);
+        if (phs) {
+            E.ph = nullptr;
+            E.rows_eager = false;
+            long long cm = 0;
+            for (int i = 0; i < S; ++i) cm = std::max<long long>(cm, (long long) E.sess[(size_t) act[(size_t) i]].pos);
+            std::fprintf(stderr, "PROF {\"ev\":\"wphase\",\"t\":%.1f,\"slots\":%d,\"rows\":%d,\"cells_max\":%lld,\"ms\":{\"proj\":%.2f,\"gdn\":%.2f,\"attn\":%.2f,"
+                                 "\"norm\":%.2f,\"ffn\":%.2f,\"embed\":%.2f,\"head\":%.2f}}\n",
+                         prof_t(), S, T, cm, phase[0], phase[1], phase[2], phase[3], phase[4], phase[5], phase[6]);
+        }
         lap(1);
         // the picks: emit, decide how many rows each slot keeps
         std::vector<int> keep((size_t) S, 1);
@@ -11510,7 +11617,7 @@ struct Serve {
             if (sl.look) {   // (a copy's drafts: counted apart, and they say nothing about the depth the MTP chain should have)
                 sl.look_off += D;
                 sl.look_acc += a;
-            } else if (D > 0) sl.depth = a >= D ? std::min(maxd, D + (D < 8 ? 1 : 2)) : std::max(bdepth_base, a + 1);
+            } else if (D > 0) sl.depth = a >= D ? std::min(maxd, D + (D < 8 ? 1 : 2)) : std::max(base_now(), a + 1);
             const int rows_kept = 1 + a;
             keep[(size_t) i] = rows_kept;
             bool done = false;
@@ -11566,7 +11673,7 @@ struct Serve {
             Slot& sl = slots[(size_t) b];
             if (!alive[(size_t) i]) { sl.drafts.clear(); continue; }
             nidx.push_back(i);
-            int w = sl.drafts_ok() ? std::max(1, std::min(std::max(sl.depth, bdepth_base), maxd)) : 0;
+            int w = sl.drafts_ok() ? std::max(1, std::min(std::max(sl.depth, base_now()), maxd)) : 0;
             int lk = 0;
             if (w > 0 && q36_batch_lookup_on()) {
                 // the slot's lookup: what this window did with its drafts, the tokens the session holds now, then the copy that
@@ -11636,20 +11743,28 @@ struct Serve {
         }
         if (!nx.empty()) {
             E.mtp_top2_on = next_top2;
-            E.mtp_rows(nx.data(), (int) nx.size());
+            {
+                const auto tc = Clock::now();
+                E.mtp_rows(nx.data(), (int) nx.size());
+                ++pd_n[0];
+                pd_rows[0] += (long long) nx.size();
+                pd_ms[0] += ms_since(tc);
+            }
             for (size_t k = 0; k < who.size(); ++k) slots[(size_t) who[k]].drafts.assign(1, draft_of(who[k], row[k], 0));
             chain_drafts(who, wn, row);
             E.mtp_top2_on = false;
         }
         lap(4);
         if (btime) { ++bt_n; bt_end = Clock::now(); }
+        const int arm_done = ab_arm();
+        ++win_seq;
         if (q36_profile_on()) {
             long long tok = 0, cells = 0;
             for (int i = 0; i < S; ++i) {
                 tok += keep[(size_t) i];
                 cells = std::max<long long>(cells, (long long) E.sess[(size_t) act[(size_t) i]].pos);
             }
-            prof_window_done(S, T, tok, w_ms, cells);
+            prof_window_done(S, T, tok, w_ms, cells, arm_done);
         }
     }
     catch (sycl::exception const &exc) {
@@ -11742,6 +11857,14 @@ struct Serve {
     // (the batch windows since the last `win` record)
     long long pw_n = 0, pw_rows = 0, pw_slots = 0, pw_cells = 0, pw_tok = 0;
     double pw_ms[6] = {};
+    // the draft block's passes since the last record: [0] the pass of a window's kept rows, [1] a chained level submitted
+    // kernel by kernel, [2] a chained level replayed from a graph - calls, ms, rows
+    long long pd_n[3] = {}, pd_rows[3] = {};
+    double pd_ms[3] = {};
+    long long win_seq = 0;   // batch windows so far (STRATA_Q36_MTP_CHAIN_GRAPH=ab alternates by blocks of 64)
+    // the windows of each block kind (ab_arm()) since the last record: all of them [0..3] and those with every slot decoding
+    // [4..7] - windows, ms, tokens, rows
+    double pa[2][8] = {};
     // ... by the slots that decoded in a window (1 .. kVerify): windows, their time, the tokens they gave, their rows -
     // where the summed decode peaks as slots are added
     long long ps_n[Engine::kVerify + 1] = {}, ps_tok[Engine::kVerify + 1] = {}, ps_rows[Engine::kVerify + 1] = {};
@@ -11761,15 +11884,27 @@ struct Serve {
         dpct::get_current_device().get_memory_info(vfr, vtot);
         std::fprintf(stderr, "PROF {\"ev\":\"win\",\"t\":%.1f,\"ts\":%.3f,\"n\":%lld,\"slots\":%.2f,\"rows\":%.2f,\"tok\":%lld,\"cells_max\":%lld,"
                              "\"ms\":{\"draft0\":%.3f,\"window\":%.3f,\"picks\":%.3f,\"commit\":%.3f,\"drafts\":%.3f,\"between\":%.3f},"
-                             "\"graphs\":%zu,\"graphs_recorded\":%lld,\"graphs_dropped\":%lld,\"vram_free_mib\":%.0f,\"spare_hits\":%lld,\"spare_misses\":%lld,\"by_slots\":{%s}}\n",
+                             "\"graphs\":%zu,\"graphs_recorded\":%lld,\"graphs_dropped\":%lld,\"vram_free_mib\":%.0f,\"spare_hits\":%lld,\"spare_misses\":%lld,"
+                             "\"dr\":{\"first\":[%lld,%.1f,%lld],\"chain\":[%lld,%.1f,%lld],\"chain_g\":[%lld,%.1f,%lld]},"
+                             "\"ab\":{\"0\":[%.0f,%.1f,%.0f,%.0f,%.0f,%.1f,%.0f,%.0f],\"1\":[%.0f,%.1f,%.0f,%.0f,%.0f,%.1f,%.0f,%.0f]},\"by_slots\":{%s}}\n",
                      prof_t(), prof_ts(), pw_n, (double) pw_slots / pw_n, (double) pw_rows / pw_n, pw_tok, pw_cells,
                      pw_ms[0] / pw_n, pw_ms[1] / pw_n, pw_ms[2] / pw_n, pw_ms[3] / pw_n, pw_ms[4] / pw_n, pw_ms[5] / pw_n,
-                     E.row_graphs.size(), E.row_graph_recorded, E.row_graph_dropped, (double) vfr / 1048576.0, E.spare_hits, E.spare_misses, by.c_str());
+                     E.row_graphs.size(), E.row_graph_recorded, E.row_graph_dropped, (double) vfr / 1048576.0, E.spare_hits, E.spare_misses,
+                     pd_n[0], pd_ms[0], pd_rows[0], pd_n[1], pd_ms[1], pd_rows[1], pd_n[2], pd_ms[2], pd_rows[2],
+                     pa[0][0], pa[0][1], pa[0][2], pa[0][3], pa[0][4], pa[0][5], pa[0][6], pa[0][7],
+                     pa[1][0], pa[1][1], pa[1][2], pa[1][3], pa[1][4], pa[1][5], pa[1][6], pa[1][7], by.c_str());
+        for (int i = 0; i < 3; ++i) { pd_n[i] = pd_rows[i] = 0; pd_ms[i] = 0; }
+        for (auto& a : pa) for (double& v : a) v = 0;
         pw_n = pw_rows = pw_slots = pw_cells = pw_tok = 0;
         for (double& v : pw_ms) v = 0;
     }
     /// A batch window is done: `S` slots, `rows` rows, `tok` tokens, `ms` of work, the deepest session's cells.
-    void prof_window_done(int S, int rows, long long tok, double ms, long long cells) {
+    void prof_window_done(int S, int rows, long long tok, double ms, long long cells, int arm = 0) {
+        {
+            double* a = pa[arm & 1];
+            a[0] += 1; a[1] += ms; a[2] += (double) tok; a[3] += rows;
+            if (S == E.n_sess) { a[4] += 1; a[5] += ms; a[6] += (double) tok; a[7] += rows; }
+        }
         ++pw_n;
         pw_rows += rows;
         pw_slots += S;
