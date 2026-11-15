@@ -1,0 +1,18 @@
+[
+ {"id": "explain-format", "kind": "read + prose",
+  "prompt": "Read tools/b70_pack.py and docs/B70_LIB.md. Then write docs/PACK_FORMAT.md: a plain-prose explanation of the pack file format for someone who has never seen it, with one small worked example of how a record is laid out. Do not change any code."},
+ {"id": "add-stats", "kind": "new code + test",
+  "prompt": "Add a --stats option to tools/b70_pack.py that, for a pack file given with --list, also prints for each matrix the smallest and largest row scale. Add a test for it in tools/test_b70_pack.py and run the tests until they pass."},
+ {"id": "rename", "kind": "edit across files",
+  "prompt": "Rename the function quantize_rows_w4 to quantize_rows_int4 everywhere in this project (definition, callers, tests, comments). Run the tests in tools/test_b70_pack.py to check nothing broke and tell me what you changed."},
+ {"id": "review", "kind": "review prose",
+  "prompt": "Review tools/gguf_reader.py for robustness problems: malformed files, wrong sizes, unchecked assumptions. Write REVIEW.md with your findings ranked from most to least serious, each with the line it is about and one sentence on how to fix it. Do not change the code."},
+ {"id": "new-tool", "kind": "code from scratch",
+  "prompt": "Write tools/pack_diff.py: a command line tool that takes two pack files and prints, per matrix present in both, the relative error between their dequantized weights, and lists matrices present in only one. Use the helpers in tools/b70_pack.py, include argparse and a main(), and write tools/test_pack_diff.py with small synthetic packs. Run the test."},
+ {"id": "bug-hunt", "kind": "tests + fix",
+  "prompt": "Run the tests in tools/test_b70_pack.py. Then add a test that packs a matrix whose rows are all zeros and one whose rows are all the same non-zero value, unpacks them again and checks the values come back. If a test fails, find the cause in tools/b70_pack.py and fix it."},
+ {"id": "calibration-notes", "kind": "analysis + small change",
+  "prompt": "Explain how the GPTQ calibration in tools/b70_pack.py works (gptq_factor and what calls it): write NOTES.md with the steps in order and two concrete ideas to improve it. Then implement the simpler of the two ideas behind a new command line option, off by default."},
+ {"id": "todo-sweep", "kind": "shell + summary",
+  "prompt": "Find every TODO, FIXME, XXX and 'not done' remark in this project with shell commands. Write TODO.md that groups them by file with the line number and a one-line summary each, and at the top name the three that look most worth doing."}
+]

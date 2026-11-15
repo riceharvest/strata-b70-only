@@ -2380,6 +2380,21 @@ int64_t q36_park_min() {
     static const int64_t n = [] { const char* e = std::getenv("STRATA_Q36_PARK_MIN"); const long long v = e && *e ? std::atoll(e) : 0; return v > 0 ? (int64_t) v : (int64_t) 4096; }();
     return n;
 }
+// STRATA_Q36_PROFILE=1: a record a request, a record a batch slot that ends and a record every 64 batch windows, each a line
+// `PROF {json}` on stderr (the engine's log): what tools/agent_profile.py adds up into where a run's time went.
+//   req   a request on the control lines: how it got its cache (live: it continues the session; ckpt: a prefix checkpoint
+//         restored in place; copy: a prefix or a session copied from another session; unpark: its parked cache came back;
+//         none), the cells kept, the tokens read and the read's time, the time of the session work before the read (with
+//         what parking and bringing back took), the tokens written alone with their steps by kind (tree, chain, lookup,
+//         drafter) and the drafts offered and accepted (lookups apart), the cells at the end.
+//   slot  a batch slot's end: its tokens, its time decoding, its drafts.
+//   win   batch windows: how many, the slots and rows a window, its parts in ms (first drafts, window, picks, commit, next
+//         drafts) and the time between windows (admissions, reads), the deepest cell.
+// `t` is ms since the engine began to serve, `ts` the clock's seconds.
+bool q36_profile_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_PROFILE"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
 bool q36_adm_ckpt_busy() {   // STRATA_Q36_ADM_CKPT_BUSY (default on): an admission may copy a prefix from a session that is decoding
     static const bool on = [] { const char* e = std::getenv("STRATA_Q36_ADM_CKPT_BUSY"); return !(e && e[0] == '0'); }();
     return on;
@@ -11105,10 +11120,23 @@ struct Serve {
         }
     }
     void window_mtp() try {
-        static const bool btime = [] { const char* e = std::getenv("STRATA_Q36_BATCH_TIME"); return e && e[0] == '1'; }();
+        static const bool btime = [] { const char* e = std::getenv("STRATA_Q36_BATCH_TIME"); return (e && e[0] == '1') || q36_profile_on(); }();
         auto bt0 = Clock::now();
-        if (btime && bt_n > 0) bt_ms[5] += std::chrono::duration<double, std::milli>(bt0 - bt_end).count();
-        auto lap = [&](int i) { if (btime) { E.st->wait(); const auto t = Clock::now(); bt_ms[i] += std::chrono::duration<double, std::milli>(t - bt0).count(); bt0 = t; } };
+        if (btime && bt_n > 0) {
+            const double gap = std::chrono::duration<double, std::milli>(bt0 - bt_end).count();
+            bt_ms[5] += gap;
+            pw_ms[5] += gap;
+        }
+        auto lap = [&](int i) {
+            if (btime) {
+                E.st->wait();
+                const auto t = Clock::now();
+                const double d = std::chrono::duration<double, std::milli>(t - bt0).count();
+                bt_ms[i] += d;
+                pw_ms[i] += d;
+                bt0 = t;
+            }
+        };
         poll_control();
         const int N = (int) E.m->g.n_embd;
         const int maxd = std::min({E.mtp_d, bdepth_max, Engine::kVerify - 1});
@@ -11243,6 +11271,7 @@ struct Serve {
                                              "between %.2f ms each\n", bt_n, bt_ms[0] / bt_n, bt_ms[1] / bt_n, bt_ms[2] / bt_n, bt_ms[3] / bt_n,
                                      bt_ms[4] / bt_n, bt_ms[5] / bt_n);
                     std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms_since(sl.t0));
+                    prof_slot(b, sl, fin, ss.pos + j + 1);
                     if (sl.offered > 0)
                         std::fprintf(stderr, "strata batch: slot %d: %lld of %lld MTP drafts accepted\n", b, sl.accepted, sl.offered);
                     sl.active = false;
@@ -11326,6 +11355,13 @@ struct Serve {
         }
         lap(4);
         if (btime) { ++bt_n; bt_end = Clock::now(); }
+        if (q36_profile_on()) {
+            ++pw_n;
+            pw_rows += T;
+            pw_slots += S;
+            for (int i = 0; i < S; ++i) pw_cells = std::max<long long>(pw_cells, (long long) E.sess[(size_t) act[(size_t) i]].pos);
+            if (pw_n >= 64) prof_windows();
+        }
     }
     catch (sycl::exception const &exc) {
       std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -11383,6 +11419,7 @@ struct Serve {
                               : ss.pos + 1 > E.ctx ? "length" : nullptr;
             if (fin) {
                 std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms_since(sl.t0));
+                prof_slot(b, sl, fin, ss.pos);
                 sl.active = false;
                 ss.active = false;
                 --n_active;
@@ -11399,6 +11436,31 @@ struct Serve {
     }
 
     /// The length of session ss's held tokens when they are a proper start of `ids` with the same pictures, else 0.
+    // STRATA_Q36_PROFILE
+    Clock::time_point prof_t0 = Clock::now();
+    double prof_t() const { return ms_since(prof_t0); }
+    static double prof_ts() { return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count(); }
+    long long prof_req_n = 0;
+    // (the batch windows since the last `win` record)
+    long long pw_n = 0, pw_rows = 0, pw_slots = 0, pw_cells = 0;
+    double pw_ms[6] = {};
+    void prof_windows() {
+        if (!q36_profile_on() || pw_n == 0) return;
+        std::fprintf(stderr, "PROF {\"ev\":\"win\",\"t\":%.1f,\"ts\":%.3f,\"n\":%lld,\"slots\":%.2f,\"rows\":%.2f,\"cells_max\":%lld,"
+                             "\"ms\":{\"draft0\":%.3f,\"window\":%.3f,\"picks\":%.3f,\"commit\":%.3f,\"drafts\":%.3f,\"between\":%.3f}}\n",
+                     prof_t(), prof_ts(), pw_n, (double) pw_slots / pw_n, (double) pw_rows / pw_n, pw_cells,
+                     pw_ms[0] / pw_n, pw_ms[1] / pw_n, pw_ms[2] / pw_n, pw_ms[3] / pw_n, pw_ms[4] / pw_n, pw_ms[5] / pw_n);
+        pw_n = pw_rows = pw_slots = pw_cells = 0;
+        for (double& v : pw_ms) v = 0;
+    }
+    void prof_slot(int b, const Slot& sl, const char* fin, int64_t cells) {
+        if (!q36_profile_on()) return;
+        prof_windows();
+        std::fprintf(stderr, "PROF {\"ev\":\"slot\",\"t\":%.1f,\"ts\":%.3f,\"slot\":%d,\"out\":%lld,\"ms\":%.1f,\"offered\":%lld,\"accepted\":%lld,"
+                             "\"finish\":\"%s\",\"cells\":%lld}\n",
+                     prof_t(), prof_ts(), b, (long long) sl.produced, ms_since(sl.t0), sl.offered, sl.accepted, fin, (long long) cells);
+    }
+
     /// STRATA_Q36_PARK_GIB: session s's cache is about to be given to this request.  When it holds another thread (the
     /// request does not share that thread's first prompt, Sess::thread_head) of some length, it is parked first.
     void park_before(int s, const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const Engine::Parked* keep = nullptr) {
@@ -11565,6 +11627,11 @@ struct Serve {
         }
         stop.store(false);
         E.park_pressure();   // (the conversation cache's memory tier follows the machine's free memory)
+        // STRATA_Q36_PROFILE: this request's record
+        const auto pr_t0 = Clock::now();
+        const double pr_park0 = E.park_ms, pr_unpark0 = E.unpark_ms;
+        const long long pr_unpark_n0 = E.unpark_n, pr_spill0 = E.spill_n, pr_unspill0 = E.unspill_n;
+        bool pr_copy = false, pr_ckpt = false;
         // ---- the session: live continuation when possible, else restore an earlier GDN checkpoint over valid KV
         Engine::PrefixEntry* pick_ckpt = nullptr;
         size_t reuse = 0;
@@ -11618,6 +11685,8 @@ struct Serve {
                 }
             }
             th_from = ack != nullptr ? ack_src : src >= 0 ? src : s;
+            pr_ckpt = ack != nullptr;
+            pr_copy = (ack != nullptr && ack_src != s) || (ack == nullptr && src >= 0);
             if (reuse == 0 || ack != nullptr || src >= 0) park_before(s, ids, ir.imgs);   // (what the slot held goes: another thread's is parked)
             if (ack != nullptr) {
                 if (ack_src != s) E.copy_session(ack_src, s, ack->pos);   // (the prefix's cells; the state is the checkpoint's)
@@ -11695,6 +11764,7 @@ struct Serve {
                 const int t = free_empty >= 0 ? free_empty : lru;
                 if (head >= 0 && shared <= head && t >= 0 && t != s) {
                     park_before(t, ids, ir.imgs);   // (what session t held goes)
+                    pr_copy = true;
                     E.copy_session(s, t, pick_ckpt->pos);
                     if (q36_adm_ckpt_log())
                         std::fprintf(stderr, "strata serve: a request alone shares %lld tokens with session %d, whose thread's first prompt ends at %lld: "
@@ -11703,6 +11773,7 @@ struct Serve {
                     s = t;
                 }
             }
+            pr_ckpt = pick_ckpt != nullptr;
             if (pick_ckpt != nullptr || reuse == 0) park_before(s, ids, ir.imgs);   // (what session s held goes, unless this is its own thread)
             if (pick_ckpt != nullptr) {
                 E.restore_ckpt(s, *pick_ckpt);
@@ -11721,6 +11792,23 @@ struct Serve {
             }
         }
         Engine::Sess& ss = E.sess[(size_t) s];
+        const double pr_sess_ms = ms_since(pr_t0);   // (the session work: parking, bringing back, copies, the checkpoint)
+        const char* const pr_how = E.unpark_n > pr_unpark_n0 ? "unpark" : pr_copy && pr_ckpt ? "copy+ckpt" : pr_copy ? "copy" : pr_ckpt ? "ckpt"
+                                   : reuse > 0 ? "live" : "none";
+        const long long pr_id = ++prof_req_n;
+        // one record at the request's end: `out` tokens written here in `dec_ms` over `steps` steps (0: an admission's one token)
+        const auto prof_req = [&](long long out, double read_ms, double dec_ms, const char* fin, long long tokens_read, long long offered_, long long accepted_,
+                                  long long look_off, long long look_acc, long long n_tree, long long n_chain, long long n_look, long long n_df) {
+            if (!q36_profile_on()) return;
+            std::fprintf(stderr, "PROF {\"ev\":\"req\",\"id\":%lld,\"t\":%.1f,\"ts\":%.3f,\"kind\":\"%s\",\"sess\":%d,\"prompt\":%zu,\"kept\":%zu,\"how\":\"%s\","
+                                 "\"read\":%lld,\"read_ms\":%.1f,\"sess_ms\":%.1f,\"park_ms\":%.1f,\"unpark_ms\":%.1f,\"to_drive\":%lld,\"from_drive\":%lld,"
+                                 "\"out\":%lld,\"dec_ms\":%.1f,\"steps\":{\"tree\":%lld,\"chain\":%lld,\"lookup\":%lld,\"drafter\":%lld},"
+                                 "\"offered\":%lld,\"accepted\":%lld,\"look_offered\":%lld,\"look_accepted\":%lld,\"finish\":\"%s\",\"cells\":%lld,"
+                                 "\"slots_busy\":%d,\"total_ms\":%.1f}\n",
+                         pr_id, prof_t(), prof_ts(), adm ? "adm" : "solo", s, ids.size(), reuse, pr_how, tokens_read, read_ms, pr_sess_ms,
+                         E.park_ms - pr_park0, E.unpark_ms - pr_unpark0, E.spill_n - pr_spill0, E.unspill_n - pr_unspill0, out, dec_ms, n_tree, n_chain, n_look, n_df,
+                         offered_, accepted_, look_off, look_acc, fin, (long long) E.pos, n_active, ms_since(pr_t0));
+        };
         {   // the thread this session holds from here on: the one the reused cells belong to when the request shares more than its
             // first prompt, else a new one that begins with this prompt
             const int64_t sh = th_from >= 0 ? E.sess[(size_t) th_from].thread_head : -1;
@@ -11820,6 +11908,7 @@ struct Serve {
         E.sess[(size_t) E.cur].pos = E.pos;
         const double prompt_ms = ms_since(t0);
         if (cancelled) {
+            prof_req(0, prompt_ms, 0.0, "cancel", (long long) got, 0, 0, 0, 0, 0, 0, 0, 0);
             std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0 0 0 0.0 %lld 0%s\n", ids.size(), prompt_ms, reuse, (long long) got,
                         solo_session_note(adm, s, ss.live, ids).c_str());
             if (adm) std::printf("BADM %d 0\n", slot);
@@ -11837,6 +11926,7 @@ struct Serve {
         int depth_cap = q36_draft_base_at(E.pos, E.mtp_d);   // (the next step's drafts: q36_next_cap)
         std::vector<int32_t> given;                // a lookup's drafts
         long long looked = 0, look_ok = 0, df_steps = 0, df_acc = 0, dt_steps = 0, dt_rows = 0, dt_nodes_acc = 0, dt_chain = 0, dt_off = 0;
+        long long pr_tree = 0, pr_chain = 0, pr_look = 0;   // STRATA_Q36_PROFILE: the steps by kind
         const size_t graphs0 = E.row_graphs.size(), dgraphs0 = E.df_graphs.size();   // (graphs recorded during this request: ~60 ms each at first use)
         DfRule dfr;   // DFLASH BLOCK
         Lookup& look = looks[s];
@@ -11876,6 +11966,7 @@ struct Serve {
             const char* fin = (!ignore_eos && is_eos(nx)) ? "stop" : stop.load() ? "cancel" : max_new <= 1 ? "length"
                               : E.pos + 1 > E.ctx ? "length" : nullptr;
             const bool cont = fin == nullptr;
+            prof_req(produced, prompt_ms, ms_since(d0), cont ? "slot" : fin, (long long) fresh, 0, 0, 0, 0, 0, 0, 0, 0);
             std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
                         ms_since(d0), cont ? "length" : fin, reuse, (long long) fresh);
             if (cont) {
@@ -12008,6 +12099,7 @@ struct Serve {
                     look.result(a, D, picks[a]);
                     looked += D;
                     look_ok += a;
+                    ++pr_look;
                 } else if (E.tree_ok(max_drafts) && !df_avail) {   // (not with the drafter loaded: a tree window's row r is not position pos + r, so the staging rows
                                                                   //  of the drafter's context would be the wrong nodes' and spec_step_tree never tells it the rows)
                     std::vector<std::vector<int32_t>> side_paths;
@@ -12016,11 +12108,13 @@ struct Serve {
                     int tree_D = d_lim;
                     a = E.spec_step_tree(nx, fix, max_drafts, d_lim, side_paths, tree_D, drafts, picks, &stop, plan.ok ? &sel : nullptr);
                     D = tree_D;
+                    ++pr_tree;
                     depth_cap = q36_next_cap(D, a, E.mtp_d, E.pos);
                     look.observe(drafts, a, picks[a]);
                 } else {
                     D = std::min({q36_depth_at(E.pos, std::min(E.mtp_d, depth_cap)), E.lookup_depth(), max_drafts});   // (the window fits the attention's scratch)
                     a = E.spec_step(nx, fix, D, drafts, picks, &stop, plan.ok ? &sel : nullptr);
+                    ++pr_chain;
                     depth_cap = q36_next_cap(D, a, E.mtp_d, E.pos);
                     look.observe(drafts, a, picks[a]);
                 }
@@ -12081,6 +12175,7 @@ struct Serve {
             put_rng_hand(client_live, smp, hr);
         }
         const double decode_ms = ms_since(d0);
+        prof_req(produced, prompt_ms, decode_ms, finish, (long long) fresh, offered, accepted, looked, look_ok, pr_tree, pr_chain, pr_look, df_steps);
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0%s\n", produced, ids.size(), prompt_ms,
                     decode_ms, finish, accepted, offered, reuse, (long long) fresh,
                     solo_session_note(adm, s, ss.live, client_live).c_str());
