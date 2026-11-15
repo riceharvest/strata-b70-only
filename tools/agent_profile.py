@@ -183,6 +183,11 @@ def report(prof, metrics, run):
         P("   %.2f tokens a window = %.1f tok/s while windows run; drafts accepted %.1f%% of %d" % (
             tok_slot / n_win, 1000.0 * tok_slot / max(1e-9, wtotal), 100.0 * sum(s["accepted"] for s in slots) / max(1, sum(s["offered"] for s in slots)),
             sum(s["offered"] for s in slots)))
+        lo, la = sum(x.get("look_offered", 0) for x in slots), sum(x.get("look_accepted", 0) for x in slots)
+        if lo:
+            P("   of the slots' drafts, lookup copies: %.1f%% stood of %d (%.1f%% of the slots' tokens); the MTP chain's: %.1f%% of %d" % (
+                100.0 * la / lo, lo, 100.0 * la / max(1, tok_slot), 100.0 * (sum(x["accepted"] for x in slots) - la) / max(1, sum(x["offered"] for x in slots) - lo),
+                sum(x["offered"] for x in slots) - lo))
         gw = [w for w in wins if "graphs" in w]
         if gw:
             fr = [w["vram_free_mib"] for w in gw]
@@ -201,6 +206,8 @@ def report(prof, metrics, run):
                     name, n, sum(w["n"] * w["slots"] for w in ws) / n, sum(w["n"] * w["rows"] for w in ws) / n, sum(w["n"] * w["ms"]["window"] for w in ws) / n,
                     sum(w["n"] * w["ms"]["drafts"] for w in ws) / n))
         res["batch"] = {"windows": n_win, "cycle_ms": round(cyc, 2), "tok_per_window": round(tok_slot / n_win, 2)}
+        if lo:
+            res["batch"]["lookup"] = {"offered": lo, "accepted": la}
     # ---- decode by the streams decoding at once: a request alone, then the windows by their slots
     by = {}
     for w in wins:

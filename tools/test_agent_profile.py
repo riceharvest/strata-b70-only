@@ -24,7 +24,8 @@ class Profile(unittest.TestCase):
              "ms": {"draft0": 0.1, "window": 40.0, "picks": 0.1, "commit": 2.0, "drafts": 3.0, "between": 5.0},
              "graphs": 40, "graphs_recorded": 55, "graphs_dropped": 15, "vram_free_mib": 2500.0,
              "by_slots": {"2": [300, 13500.0, 1500, 2400], "4": [250, 12500.0, 2500, 4000], "3": [10, 400.0, 100, 120]}},
-            {"ev": "slot", "t": 9500.0, "ts": 1.0, "slot": 1, "out": 320, "ms": 2900.0, "offered": 300, "accepted": 150, "finish": "stop", "cells": 42320},
+            {"ev": "slot", "t": 9500.0, "ts": 1.0, "slot": 1, "out": 320, "ms": 2900.0, "offered": 300, "accepted": 150, "look_offered": 100, "look_accepted": 90,
+             "finish": "stop", "cells": 42320},
         ]
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, "engine.log"), "w") as f:
@@ -46,7 +47,8 @@ class Profile(unittest.TestCase):
         self.assertEqual(res["time_s"]["batch windows"], round(64 * 45.2 / 1000.0, 2))
         self.assertEqual(res["time_s"]["parking a cache"], 0.7)
         self.assertEqual(res["solo"]["tok_s"], 100.0)                    # 400 tokens in 4 s
-        self.assertEqual(res["batch"], {"windows": 64, "cycle_ms": 45.2, "tok_per_window": 5.0})
+        self.assertEqual(res["batch"], {"windows": 64, "cycle_ms": 45.2, "tok_per_window": 5.0, "lookup": {"offered": 100, "accepted": 90}})
+        self.assertIn("lookup copies: 90.0% stood of 100 (28.1% of the slots' tokens); the MTP chain's: 30.0% of 200", text)
         self.assertIn("drafts 43.5% of 510 (lookups 95.0% of 40)", text)   # the lookups are counted apart from the model's drafts
         # the decode by streams: alone 100 tok/s, two streams 111.1, four 200; three were seen in 10 windows only, so no peak there
         self.assertEqual(res["decode_by_streams"], {"1": 100.0, "2": 111.1, "3": 250.0, "4": 200.0})
