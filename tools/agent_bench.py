@@ -11,7 +11,8 @@ tools, the tool results, the turns.
                  [--engine-log <file>]
 
 --agents N      N harness processes at once; agent i takes tasks i, i + N, ... of the list, --rounds of them, one after
-                another (so the load is continuous while agents come and go between their tool calls).
+                another (so the load is continuous while agents come and go between their tool calls).  Past the end
+                of the list it starts over, each time in a fresh working copy.
 --project-files the files (relative to the repository) each agent's working copy starts with.
 --harness pi    `pi -p --mode json` with its own config folder (a provider that points at --url), no session, no
                 extensions: the user's pi configuration is not read or changed.
@@ -123,9 +124,11 @@ def agent(args, i, tasks, files, rec):
     work = make_copy(root, files)
     for r in range(args.rounds):
         k = i + r * args.agents
+        t = dict(tasks[k % len(tasks)])   # (more agents than tasks: the list starts over, each turn of it in a fresh working copy)
         if k >= len(tasks):
-            break
-        run_task(args, i, root, work, tasks[k], rec)
+            t["id"] = "%s-%d" % (t["id"], k // len(tasks) + 1)
+            work = make_copy(os.path.join(root, "again-%d" % k), files)
+        run_task(args, i, root, work, t, rec)
 
 
 def main():

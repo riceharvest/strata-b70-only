@@ -21,7 +21,9 @@ class Profile(unittest.TestCase):
             req(2, "solo", "ckpt", 41000, 40000, 1000, 500.0, 100, 1000.0, {"tree": 40, "chain": 0, "lookup": 0, "drafter": 0}, 150, 60),
             req(3, "adm", "unpark", 42000, 41000, 1000, 600.0, 1, 30.0, {"tree": 0, "chain": 0, "lookup": 0, "drafter": 0}, 0, 0, park=700.0, unpark=100.0),
             {"ev": "win", "t": 9000.0, "ts": 1.0, "n": 64, "slots": 2.0, "rows": 8.0, "cells_max": 42000,
-             "ms": {"draft0": 0.1, "window": 40.0, "picks": 0.1, "commit": 2.0, "drafts": 3.0, "between": 5.0}},
+             "ms": {"draft0": 0.1, "window": 40.0, "picks": 0.1, "commit": 2.0, "drafts": 3.0, "between": 5.0},
+             "graphs": 40, "graphs_recorded": 55, "graphs_dropped": 15, "vram_free_mib": 2500.0,
+             "by_slots": {"2": [300, 13500.0, 1500, 2400], "4": [250, 12500.0, 2500, 4000], "3": [10, 400.0, 100, 120]}},
             {"ev": "slot", "t": 9500.0, "ts": 1.0, "slot": 1, "out": 320, "ms": 2900.0, "offered": 300, "accepted": 150, "finish": "stop", "cells": 42320},
         ]
         with tempfile.TemporaryDirectory() as d:
@@ -46,6 +48,11 @@ class Profile(unittest.TestCase):
         self.assertEqual(res["solo"]["tok_s"], 100.0)                    # 400 tokens in 4 s
         self.assertEqual(res["batch"], {"windows": 64, "cycle_ms": 45.2, "tok_per_window": 5.0})
         self.assertIn("drafts 43.5% of 510 (lookups 95.0% of 40)", text)   # the lookups are counted apart from the model's drafts
+        # the decode by streams: alone 100 tok/s, two streams 111.1, four 200; three were seen in 10 windows only, so no peak there
+        self.assertEqual(res["decode_by_streams"], {"1": 100.0, "2": 111.1, "3": 250.0, "4": 200.0})
+        self.assertEqual(res["decode_peak"], {"streams": 4, "tok_s": 200.0})
+        self.assertIn("the summed decode peaks at 4 streams: 200.0 tok/s (2.0x a request alone)", text)
+        self.assertEqual(res["graphs"], {"kept": 40, "recorded": 55, "dropped": 15, "vram_free_mib": [2500, 2500, 2500]})
         self.assertIn("before the engine began on a request", text)
         self.assertIn("unpark", text)
 
@@ -83,8 +90,9 @@ class Bench(unittest.TestCase):
             srv.shutdown()
             self.assertEqual(r.returncode, 0, r.stderr)
             run = json.load(open(os.path.join(out, "run.json")))
-            # agent 0 takes tasks a and c, agent 1 task b (there is no fourth)
-            self.assertEqual(sorted((t["agent"], t["task"]) for t in run["tasks"]), [(0, "a"), (0, "c"), (1, "b")])
+            # agent 0 takes tasks a and c, agent 1 task b and then the list again from its start, in a fresh working copy
+            self.assertEqual(sorted((t["agent"], t["task"]) for t in run["tasks"]), [(0, "a"), (0, "c"), (1, "a-2"), (1, "b")])
+            self.assertTrue(os.path.exists(os.path.join(out, "agent-1", "again-3", "work", "tools", "b70_pack.py")))
             self.assertTrue(all(t["exit"] == 0 and not t["timed_out"] and t["tool_lines"] == 1 for t in run["tasks"]))
             ev = [json.loads(l)["line"] for l in open(os.path.join(out, "agent-0", "events-a.jsonl"))]
             self.assertIn("task=say it's done url=http://127.0.0.1:%d/v1" % srv.server_address[1], ev[0])
