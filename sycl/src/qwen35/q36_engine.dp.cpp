@@ -1159,7 +1159,7 @@ inline bool q36_xatt_batch_on() {
     return on;
 }
 /// Single-pass online-softmax ESIMD+DPAS split-K decode attention (q36_xatt.dp.cpp's attend2). Read once; default off (0).
-inline int q36_xatt2_env() {   // 1 forced on, 0 off, -1 default (on)
+inline int q36_xatt2_env() {   // 1 forced on, 0 off, -1 default (on for a single-session engine)
     static const int on = [] {
         const char* e = std::getenv("STRATA_Q36_XATT2");
         return e ? (e[0] == '1' ? 1 : e[0] == '0' ? 0 : -1) : -1;
@@ -2415,6 +2415,16 @@ int q36_adm_ckpt_min() {
 // gives without advancing it.  The verify window's draw decides as before.  STRATA_Q36_SPEC_COUPLE_CELLS and _SHARP apply.
 bool q36_batch_couple_on() {
     static const bool on = [] { const char* e = std::getenv("STRATA_Q36_BATCH_COUPLE"); return !(e && e[0] == '0'); }();
+    return on;
+}
+// STRATA_Q36_BATCH_LOOKUP (default on; 0: as before, MTP drafts only): in a --batch --batch-mtp window a slot whose text is
+// running along an earlier stretch of its conversation (a copy: a file it read, code it edits) takes its drafts from there,
+// as a request alone does (the lookup of q36_ngram), in place of the MTP chain's.  Why: of what real agents wrote alone,
+// a quarter came from lookup steps (one step in ten, 9.7 tokens each), and a batch window had none of them: such a stretch
+// took about three windows a slot.  The drafts cost no draft pass, and a slot takes as many as the window has rows to
+// spare.  The MTP block still sees the slot's rows (its cache stays whole for the next MTP draft).
+bool q36_batch_lookup_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_BATCH_LOOKUP"); return !(e && e[0] == '0'); }();
     return on;
 }
 bool q36_batch_sample_on() {   // STRATA_Q36_BATCH_SAMPLE=1: in a --batch --batch-mtp window a sampled / penalised slot drafts too
@@ -4380,8 +4390,15 @@ struct Engine {
             // for a single session, because the exact ones are no faster than XATT (65K cells, 16 rows: 1,131 us a layer
             // against 557; XATT 1,159).  That miss is a fifteenth of the 8-bit cache's own error against FP64 (1.85e-2).
             // Card: two 118K requests decoding together 72 -> 87 tok/s (window 60.2 -> 47.4 ms), 16 recorded agent threads
-            // 69.1 -> 81.2 tok/s of output.  STRATA_Q36_XATT2=0: XATT everywhere.
-            xatt2_on = q36_xatt2_env() != 0;
+            // 69.1 -> 81.2 tok/s of output.
+            // The same day, OFF again for --batch (STRATA_Q36_XATT2=1 turns it on there): real pi agents on sessions of 65K
+            // (tools/agent_bench.py), the windows whose deepest session held 32,768 cells or more: with XATT2 a window was
+            // 37.7 ms against 45.3 ms, but 57.4% of the drafts stood against 65.5%, 6.0 tokens a window against 7.6: 130
+            // against 135 tok/s.  Fewer drafts standing means logits further from the exact ones (at 15K cells, forced:
+            // KL 0.169 against XATT's 0.001 to the FP32 kernel, the top token another one on 11 of 128 rows), which a
+            // faster window does not pay for.  Do not lower STRATA_Q36_XATT2_MIN either: from 4,096 cells the drafts that
+            // stood fell from 74.2% to 50.7%.
+            xatt2_on = q36_xatt2_env() == 1 || (q36_xatt2_env() == -1 && n_sess == 1);
             if (xwant && xshape) {
                 // the 8-bit cache then stores V transposed (kv_vt) for all sessions and needs no mirror; if the fit fails
                 // below it goes back to the plain layout (kv_vt = false), so V is transposed only when XATT is active
@@ -8981,10 +8998,75 @@ work-group size if needed.
     std::vector<std::vector<ImgKey>> kv_imgs;
 
     // ---- STRATA_Q36_PARK_GIB: parked caches (the cells of a thread whose session another thread needed, in host memory)
+    // ---- host buffers kept for the next copy from the card (STRATA_Q36_HOST_SPARE_GIB, default 4; 0: none, as before).
+    // A copy from the card into memory that was just allocated faults every page in: measured on recorded agent runs, a
+    // cache parked at 1.4 GiB/s and came back (from memory that existed) at 11.5 GiB/s, and every turn's checkpoint
+    // spill - 150 MiB from the card to a new, zeroed buffer - made a read of 30 tokens take 160 ms alone and 250 ms beside
+    // decoding slots, which wait for it.  A buffer a checkpoint or a parked cache no longer needs is kept and used again.
+    // The spares are the machine's memory too: they go first when it is short (park_pressure).
+    size_t host_spare_cap = [] { const char* e = std::getenv("STRATA_Q36_HOST_SPARE_GIB"); const double g = e && *e ? std::atof(e) : 4.0;
+                                 return g > 0 ? (size_t) (g * 1073741824.0) : (size_t) 0; }();
+    std::vector<std::vector<uint8_t>> ckpt_spare;                               // checkpoint blobs (ckpt_bytes each)
+    std::vector<std::pair<size_t, std::unique_ptr<uint8_t[]>>> park_spare;     // parked caches' buffers: capacity, buffer
+    size_t park_spare_bytes = 0;
+    long long spare_hits = 0, spare_misses = 0;
+    /// `v` becomes a checkpoint blob of ckpt_bytes: a spare one, else a new one.
+    void ckpt_blob_take(std::vector<uint8_t>& v) {
+        if (v.size() == ckpt_bytes) return;
+        if (!ckpt_spare.empty()) {
+            v = std::move(ckpt_spare.back());
+            ckpt_spare.pop_back();
+            ++spare_hits;
+        } else {
+            v.assign(ckpt_bytes, 0);
+            ++spare_misses;
+        }
+    }
+    /// A checkpoint blob nothing needs: kept (up to 8 of them, within the spares' budget), else freed.
+    void ckpt_blob_give(std::vector<uint8_t>& v) {
+        if (ckpt_bytes > 0 && v.size() == ckpt_bytes && ckpt_spare.size() < 8 && (ckpt_spare.size() + 1) * ckpt_bytes + park_spare_bytes <= host_spare_cap)
+            ckpt_spare.push_back(std::move(v));
+        std::vector<uint8_t>().swap(v);
+    }
+    /// A buffer of at least `need` bytes for a parked cache (`cap`: what it holds): the smallest spare that fits, else a new
+    /// one with a quarter to spare (a thread's next parking is a little longer; pages not written are not memory).
+    std::unique_ptr<uint8_t[]> park_buf_take(size_t need, size_t& cap) {
+        int best = -1;
+        for (size_t i = 0; i < park_spare.size(); ++i)
+            if (park_spare[i].first >= need && (best < 0 || park_spare[i].first < park_spare[(size_t) best].first)) best = (int) i;
+        if (best >= 0) {
+            cap = park_spare[(size_t) best].first;
+            std::unique_ptr<uint8_t[]> b = std::move(park_spare[(size_t) best].second);
+            park_spare.erase(park_spare.begin() + best);
+            park_spare_bytes -= cap;
+            ++spare_hits;
+            return b;
+        }
+        ++spare_misses;
+        cap = host_spare_cap > 0 ? need + need / 4 : need;
+        return std::unique_ptr<uint8_t[]>(new uint8_t[cap]);
+    }
+    void park_buf_give(std::unique_ptr<uint8_t[]>& b, size_t cap) {
+        if (b && cap > 0 && park_spare_bytes + cap + ckpt_spare.size() * ckpt_bytes <= host_spare_cap) {
+            park_spare.emplace_back(cap, std::move(b));
+            park_spare_bytes += cap;
+        }
+        b.reset();
+    }
+    /// The spares go (the machine's memory is short, or the tier needs room).  Returns the bytes given back.
+    size_t spare_release() {
+        const size_t freed = park_spare_bytes + ckpt_spare.size() * ckpt_bytes;
+        park_spare.clear();
+        park_spare_bytes = 0;
+        ckpt_spare.clear();
+        return freed;
+    }
+
     struct Parked {
         std::vector<int32_t> tokens;   // what the cells hold (cell i = tokens[i])
         std::unique_ptr<uint8_t[]> blob;   // in host memory: the pieces of kv_each, a KV head after the other (not zeroed: every byte is copied in)
         size_t bytes = 0;                  // the cells' bytes
+        size_t cap = 0;                    // the buffer's size (it may be a spare one, larger than the cells)
         std::string file;                  // in the spill folder (blob null): the cells' bytes, then the checkpoint's
         std::unique_ptr<PrefixEntry> ckpt; // the thread's deepest prefix checkpoint, taken out of the store (its ram_blob; empty while in the file)
         int64_t head = -1;                 // the session's thread_head when it was parked
@@ -9012,8 +9094,9 @@ work-group size if needed.
     }
     /// Other programs took memory: the oldest parked caches leave the memory tier until the floor holds again.
     void park_pressure() {
-        if (!park_auto || park_floor == 0 || park_bytes == 0) return;
+        if (!park_auto || park_floor == 0 || (park_bytes == 0 && park_spare_bytes == 0 && ckpt_spare.empty())) return;
         size_t avail = q36_meminfo("MemAvailable");
+        if (avail < park_floor) avail += spare_release();   // (the spare buffers first: they hold nothing)
         while (avail < park_floor) {
             int victim = -1;
             for (size_t i = 0; i < parked.size(); ++i)
@@ -9055,6 +9138,8 @@ work-group size if needed.
     void park_drop(size_t i) {
         Parked& pk = *parked[i];
         if (pk.blob) park_bytes -= pk.total(ckpt_bytes);
+        park_buf_give(pk.blob, pk.cap);
+        if (pk.ckpt) ckpt_blob_give(pk.ckpt->ram_blob);
 #if !defined(_WIN32)
         if (!pk.file.empty()) { ::unlink(pk.file.c_str()); spill_bytes -= pk.total(ckpt_bytes); }
 #endif
@@ -9098,8 +9183,8 @@ work-group size if needed.
         if (ok) (void) posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);   // (not kept twice: the page cache is the machine's memory too)
         ::close(fd);
         if (!ok) { ::unlink(path.c_str()); return false; }
-        pk.blob.reset();
-        if (pk.ckpt) { pk.ckpt->ram_blob.clear(); pk.ckpt->ram_blob.shrink_to_fit(); }
+        park_buf_give(pk.blob, pk.cap);
+        if (pk.ckpt) ckpt_blob_give(pk.ckpt->ram_blob);
         pk.file = path;
         park_bytes -= tot;
         spill_bytes += tot;
@@ -9128,10 +9213,11 @@ work-group size if needed.
             }
             return true;
         };
-        std::unique_ptr<uint8_t[]> b(new uint8_t[pk.bytes]);
+        size_t bcap = 0;
+        std::unique_ptr<uint8_t[]> b = park_buf_take(pk.bytes, bcap);
         bool ok = get(b.get(), pk.bytes);
         if (ok && pk.ckpt) {
-            pk.ckpt->ram_blob.resize(ckpt_bytes);
+            ckpt_blob_take(pk.ckpt->ram_blob);
             ok = get(pk.ckpt->ram_blob.data(), ckpt_bytes);
         }
         ::close(fd);
@@ -9140,6 +9226,7 @@ work-group size if needed.
         pk.file.clear();
         if (!ok) return false;
         pk.blob = std::move(b);
+        pk.cap = bcap;
         park_bytes += pk.total(ckpt_bytes);
         ++unspill_n;
         std::fprintf(stderr, "strata serve: a parked cache (%zu cells) came back from the spill folder in %.0f ms\n", pk.tokens.size(), ms_since(t0));
@@ -9148,7 +9235,8 @@ work-group size if needed.
     }
     /// Room for `tot` bytes in the memory tier: the oldest parked caches go to the spill folder, else they are dropped.
     bool park_room(size_t tot, const Parked* keep) {
-        const size_t cap = park_limit();
+        size_t cap = park_limit();
+        if (tot > cap && park_auto) cap += spare_release();   // (room the spares held)
         if (tot > cap) return false;
         while (park_bytes + tot > cap) {
             int victim = -1;
@@ -9174,7 +9262,7 @@ work-group size if needed.
         if (best->vram_slot >= 0) {
             CK(DPCT_CHECK_ERROR(st->wait()));
             if (best->ram_blob.size() != ckpt_bytes) {
-                best->ram_blob.resize(ckpt_bytes);
+                ckpt_blob_take(best->ram_blob);
                 CK(DPCT_CHECK_ERROR(st->memcpy(best->ram_blob.data(), ckpt_vram[(size_t) best->vram_slot], ckpt_bytes).wait()));
             }
             ckpt_vram_owner[(size_t) best->vram_slot] = nullptr;
@@ -9191,6 +9279,7 @@ work-group size if needed.
                 e->vram_slot = -1;
             }
             if (e == best && best->ram_blob.size() == ckpt_bytes) out = std::move(*it);
+            else ckpt_blob_give(e->ram_blob);
             it = ckpt_entries.erase(it);
         }
         return out;
@@ -9252,7 +9341,7 @@ work-group size if needed.
         if (!in_mem && (spill_dir.empty() || tot_max > spill_cap)) return false;
         const auto t0 = Clock::now();
         auto pk = std::make_unique<Parked>();
-        pk->blob.reset(new uint8_t[need]);
+        pk->blob = park_buf_take(need, pk->cap);
         pk->bytes = need;
         sess[(size_t) cur].pos = pos;
         CK(DPCT_CHECK_ERROR(st->wait()));
@@ -9316,7 +9405,8 @@ work-group size if needed.
                 off += bytes;
             }
         });
-        CK(DPCT_CHECK_ERROR(st->wait()));   // (the blob ends with this call)
+        CK(DPCT_CHECK_ERROR(st->wait()));   // (the blob's bytes are on the card)
+        park_buf_give(own->blob, own->cap);
         Sess& b = sess[(size_t) s];
         b.pos = 0;
         b.xmir_n = 0;
@@ -9451,6 +9541,7 @@ work-group size if needed.
                 }
             }
             if (ram_cnt <= ckpt_ram_cap || victim < 0) break;
+            ckpt_blob_give(ckpt_entries[(size_t) victim]->ram_blob);
             ckpt_entries.erase(ckpt_entries.begin() + victim);
         }
     }
@@ -9461,7 +9552,7 @@ work-group size if needed.
         CK(DPCT_CHECK_ERROR(st->wait()));
         if (ckpt_ram_cap > 0 && old->rolling_tag < 0) {
             if (old->ram_blob.empty()) {
-                old->ram_blob.resize(ckpt_bytes);
+                ckpt_blob_take(old->ram_blob);
                 CK(DPCT_CHECK_ERROR(st->memcpy(old->ram_blob.data(), ckpt_vram[(size_t) vslot], ckpt_bytes).wait()));
             }
             old->vram_slot = -1;
@@ -9532,7 +9623,7 @@ work-group size if needed.
         target->pin_turn = pin_turn;
         target->lru = ++ckpt_clock;
         target->vram_slot = vslot;
-        target->ram_blob.clear();
+        ckpt_blob_give(target->ram_blob);
         ckpt_vram_owner[(size_t) vslot] = target;
         q36_launch_ckpt_copy(st, reinterpret_cast<uint32_t*>(ckpt_vram[(size_t) vslot]),
                              d_sess_ckpt_ptrs[(size_t) s], d_ckpt_tiles, ckpt_n_tiles, true);
@@ -9543,6 +9634,7 @@ work-group size if needed.
         if (e == nullptr) return;
         if (e->vram_slot >= 0 && e->vram_slot < (int) ckpt_vram_owner.size() && ckpt_vram_owner[(size_t) e->vram_slot] == e)
             ckpt_vram_owner[(size_t) e->vram_slot] = nullptr;
+        ckpt_blob_give(e->ram_blob);
         for (auto it = ckpt_entries.begin(); it != ckpt_entries.end(); ++it)
             if (it->get() == e) { ckpt_entries.erase(it); break; }
     }
@@ -11012,6 +11104,10 @@ struct Slot {
     // row j, which decides the token draft j stands for); ckeys_n 0: the block's best token is the draft
     uint64_t ckeys[Engine::kVerify] = {};
     int ckeys_n = 0;
+    // STRATA_Q36_BATCH_LOOKUP: the drafts the slot holds are a lookup's (a copy), the lookup was asked for them (so the
+    // window's outcome is told to it), and what its lookup drafts did
+    bool look = false, look_told = false;
+    long long look_off = 0, look_acc = 0;
     /// Whether the slot takes drafts in a --batch-mtp window: it decodes greedily on the device, or its rows' candidates serve it.
     bool drafts_ok() const { return !smp.needs_logits() || plan.ok; }
 };
@@ -11193,7 +11289,9 @@ struct Serve {
         std::vector<int> want((size_t) S, 0);
         for (int i = 0; i < S; ++i) {
             const Slot& sl = slots[(size_t) act[(size_t) i]];
-            if (sl.drafts_ok()) want[(size_t) i] = std::max(1, std::min(std::max(sl.depth, bdepth_base), maxd));
+            if (sl.drafts_ok())
+                want[(size_t) i] = sl.look && !sl.drafts.empty() ? std::min((int) sl.drafts.size(), maxd)   // (a copy: all of it the rows allow)
+                                                                 : std::max(1, std::min(std::max(sl.depth, bdepth_base), maxd));
         }
         fit_depths(want);
         ++mtp_turn;
@@ -11208,6 +11306,7 @@ struct Serve {
                 if ((int) sl.drafts.size() > want[(size_t) i]) sl.drafts.resize((size_t) want[(size_t) i]);
                 if (want[(size_t) i] > 0 && sl.drafts.empty()) {
                     const Engine::Sess& ss = E.sess[(size_t) act[(size_t) i]];
+                    sl.look = false;   // (the block's own drafts)
                     first_top2 |= couple_keys(act[(size_t) i]);
                     first.push_back({act[(size_t) i], sl.x, ss.pos, ss.hlast});
                     who.push_back(act[(size_t) i]);
@@ -11295,7 +11394,10 @@ struct Serve {
             }
             sl.offered += D;
             sl.accepted += a;
-            if (D > 0) sl.depth = a >= D ? std::min(maxd, D + (D < 8 ? 1 : 2)) : std::max(bdepth_base, a + 1);
+            if (sl.look) {   // (a copy's drafts: counted apart, and they say nothing about the depth the MTP chain should have)
+                sl.look_off += D;
+                sl.look_acc += a;
+            } else if (D > 0) sl.depth = a >= D ? std::min(maxd, D + (D < 8 ? 1 : 2)) : std::max(bdepth_base, a + 1);
             const int rows_kept = 1 + a;
             keep[(size_t) i] = rows_kept;
             bool done = false;
@@ -11334,7 +11436,7 @@ struct Serve {
         lap(3);
         // the hidden state after each slot's last kept row (the seed of a later first draft), then the next window's
         // drafts: its depths are fixed here, among the slots still decoding
-        std::vector<int> nwant, nidx;
+        std::vector<int> nwant, nidx, nlook;
         for (int i = 0; i < S; ++i) {
             const int b = act[(size_t) i];
             Engine::Sess& ss = E.sess[(size_t) b];
@@ -11351,7 +11453,26 @@ struct Serve {
             Slot& sl = slots[(size_t) b];
             if (!alive[(size_t) i]) { sl.drafts.clear(); continue; }
             nidx.push_back(i);
-            nwant.push_back(sl.drafts_ok() ? std::max(1, std::min(std::max(sl.depth, bdepth_base), maxd)) : 0);
+            int w = sl.drafts_ok() ? std::max(1, std::min(std::max(sl.depth, bdepth_base), maxd)) : 0;
+            int lk = 0;
+            if (w > 0 && q36_batch_lookup_on()) {
+                // the slot's lookup: what this window did with its drafts, the tokens the session holds now, then the copy that
+                // runs after the slot's next token (none: the MTP chain drafts)
+                Lookup& look = looks[b];
+                const int a_i = keep[(size_t) i] - 1, d_i = gr[(size_t) i].n - 1;
+                if (sl.look_told) {
+                    if (sl.look) look.result(a_i, d_i, last[(size_t) i]);
+                    else look.observe(sl.drafts, a_i, last[(size_t) i]);
+                }
+                look.sync(ss.live);
+                std::vector<int32_t> g;
+                look.propose(last[(size_t) i], std::min(E.lookup_depth(), maxd), g);
+                sl.look_told = true;
+                lk = (int) g.size();
+                if (lk > 0) w = lk;
+            }
+            nlook.push_back(lk);
+            nwant.push_back(w);
         }
         std::fflush(stdout);
         fit_depths(nwant);
@@ -11370,6 +11491,16 @@ struct Serve {
             // the kept drafts' rows (the block's cache takes them), then the row of the next token: its pick is the first draft
             for (int j = 1; j < kept; ++j) nx.push_back({b, old[(size_t) j - 1], p_new - kept + j, E.hmain + (size_t) (r0 + j - 1) * N});
             nx.push_back({b, last[(size_t) i], p_new, E.hmain + (size_t) (r0 + kept - 1) * N});
+            sl.look = false;
+            if (nlook[k] > 0) {   // a copy: its drafts for the rows the slot got (the same proposal, cut to them)
+                std::vector<int32_t> g;
+                looks[b].propose(last[(size_t) i], nwant[k], g);
+                if (!g.empty()) {
+                    sl.drafts = g;
+                    sl.look = true;
+                    continue;   // (its rows are in the block's pass for the block's cache; its pick there is not used)
+                }
+            }
             who.push_back(b);
             wn.push_back(nwant[k]);
             row.push_back((int) nx.size() - 1);
@@ -11517,10 +11648,10 @@ struct Serve {
         dpct::get_current_device().get_memory_info(vfr, vtot);
         std::fprintf(stderr, "PROF {\"ev\":\"win\",\"t\":%.1f,\"ts\":%.3f,\"n\":%lld,\"slots\":%.2f,\"rows\":%.2f,\"tok\":%lld,\"cells_max\":%lld,"
                              "\"ms\":{\"draft0\":%.3f,\"window\":%.3f,\"picks\":%.3f,\"commit\":%.3f,\"drafts\":%.3f,\"between\":%.3f},"
-                             "\"graphs\":%zu,\"graphs_recorded\":%lld,\"graphs_dropped\":%lld,\"vram_free_mib\":%.0f,\"by_slots\":{%s}}\n",
+                             "\"graphs\":%zu,\"graphs_recorded\":%lld,\"graphs_dropped\":%lld,\"vram_free_mib\":%.0f,\"spare_hits\":%lld,\"spare_misses\":%lld,\"by_slots\":{%s}}\n",
                      prof_t(), prof_ts(), pw_n, (double) pw_slots / pw_n, (double) pw_rows / pw_n, pw_tok, pw_cells,
                      pw_ms[0] / pw_n, pw_ms[1] / pw_n, pw_ms[2] / pw_n, pw_ms[3] / pw_n, pw_ms[4] / pw_n, pw_ms[5] / pw_n,
-                     E.row_graphs.size(), E.row_graph_recorded, E.row_graph_dropped, (double) vfr / 1048576.0, by.c_str());
+                     E.row_graphs.size(), E.row_graph_recorded, E.row_graph_dropped, (double) vfr / 1048576.0, E.spare_hits, E.spare_misses, by.c_str());
         pw_n = pw_rows = pw_slots = pw_cells = pw_tok = 0;
         for (double& v : pw_ms) v = 0;
     }
@@ -11542,8 +11673,8 @@ struct Serve {
         if (!q36_profile_on()) return;
         prof_windows();
         std::fprintf(stderr, "PROF {\"ev\":\"slot\",\"t\":%.1f,\"ts\":%.3f,\"slot\":%d,\"out\":%lld,\"ms\":%.1f,\"offered\":%lld,\"accepted\":%lld,"
-                             "\"finish\":\"%s\",\"cells\":%lld}\n",
-                     prof_t(), prof_ts(), b, (long long) sl.produced, ms_since(sl.t0), sl.offered, sl.accepted, fin, (long long) cells);
+                             "\"look_offered\":%lld,\"look_accepted\":%lld,\"finish\":\"%s\",\"cells\":%lld}\n",
+                     prof_t(), prof_ts(), b, (long long) sl.produced, ms_since(sl.t0), sl.offered, sl.accepted, sl.look_off, sl.look_acc, fin, (long long) cells);
     }
 
     /// STRATA_Q36_PARK_GIB: session s's cache is about to be given to this request.  When it holds another thread (the

@@ -2203,6 +2203,7 @@ class StrataEngine:
                 live.update(state="decoding", first_token=time.time(), generated=len(out))
                 gen0 = len(out) - 1                         # the admission's own token: the slot feeds it first
                 going_solo = False
+                heard_slot, stall_slot = time.monotonic(), {}
                 while True:
                     try:
                         line = self.slot_q[slot].get(timeout=10.0)
@@ -2210,8 +2211,15 @@ class StrataEngine:
                         if cancel.is_set() and not stop_sent:
                             self._send(f"BSTOP {slot}")
                             stop_sent = True
+                        # #1317 for a slot: an engine that froze while slots decode (seen after it ran out of the card's memory:
+                        # it said nothing more and did not end) held every request in a slot until its client gave up.  The
+                        # same check as on the control lines: no line, no CPU, no I/O and an idle GPU for ENGINE_STALL_S ends it,
+                        # and the request fails now.
+                        if (ENGINE_STALL_S or 0) > 0 and self.gen == born:
+                            self._stall_check(heard_slot, stall_slot, ENGINE_STALL_S)
                         yield None
                         continue
+                    heard_slot, stall_slot = time.monotonic(), {}
                     if line is None:
                         phase = "none"
                         raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
