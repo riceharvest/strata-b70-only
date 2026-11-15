@@ -765,6 +765,7 @@ On top of `GEN` / `GENI`:
 | `BSTOP <slot>` | in | end that slot at its next window |
 | `BYIELD <slot>` | in | the prompt being read gives way at its next chunk boundary; its part read waits in `<slot>` (the admission's own, or a free slot for a solo request) |
 | `YIELDED <slot> <tokens>` | out | before the `DONE cancel` of a read that gave way: the request is sent again later and goes on from there |
+| `DONE ... session=<slot> held=<tokens>` | out | the dense family, after a `GEN` on an engine with slots: the session (a slot's) the engine chose for the request and how many of its tokens (the prompt and what it was shown) that session holds. The server then counts that slot as holding the chat |
 | `INFO ... batch_slots=N` | out | the slots the engine runs (only with `--batch`) |
 
 `tools/batch_test.py` drives the engine directly: the same prompts alone, then together, compared token by token,

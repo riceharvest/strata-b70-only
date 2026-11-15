@@ -186,8 +186,10 @@ while True:
             out += 1
             time.sleep(STEP)
         fin = "stop" if out and toks[out - 1] == 257 else ("cancel" if stop.is_set() else "length")
+        solo_at = int(args[args.index("--solo-session") + 1]) if "--solo-session" in args and slot is None else None
         print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} 0 0 {reused(ids)}" +
-              (f" 0 0 0 0 0.0 {len(ids) - reused(ids)}" if READF else ""), flush=True)
+              (f" 0 0 0 0 0.0 {len(ids) - reused(ids)}" if READF or solo_at is not None else "") +
+              (f" 0 session={solo_at} held={len(ids) + max(0, out - 1)}" if solo_at is not None else ""), flush=True)
         if slot is not None:
             cont = fin == "length" and max_new > 1
             if cont:
@@ -291,6 +293,31 @@ class PickSlot(unittest.TestCase):
         # the whole held stream continued is still the longer match
         e.slot_held = [held_a, held_b + [T, 1, 2]]
         self.assertEqual(e.pick_slot(held_b + [T, 1, 2, 3, 4]), 1)
+
+    def test_a_lone_requests_session_is_its_slot(self):
+        # the engine chooses the session a request alone runs in and names it on its DONE line; that session is a batch
+        # slot's.  Before, the slot counted as what it held earlier: the next request was sent into it (its read replaced
+        # the chat) while an empty slot stood by, and the chat's next turn read all of it again.
+        e = self.engine(3)
+        e.slot_cv = threading.Condition()
+        e.slot_held = [[], [1, 2, 3], []]
+        e._parse_done("DONE 4 10 1.0 2.0 stop 0 0 0 0 0 0 0 0.0 10 0 session=1 held=13")
+        self.assertEqual(e._solo_at, (1, 13))
+        stream = list(range(100, 114))                                  # 10 prompt tokens + the 4 it was shown
+        e._note_solo_session(stream)
+        self.assertEqual(e.slot_held, [[], stream[:13], []])            # (the last token was shown, not fed)
+        self.assertGreater(e.slot_used[1], 0.0)
+        self.assertEqual(e.pick_slot(stream + [5, 6]), 1)               # its continuation: the slot of its session
+        self.assertEqual(e.pick_slot([7, 8]), 0)                        # another chat: an empty slot, not that one
+        self.assertIsNone(e._solo_at)                                   # read once
+        e._note_solo_session([9, 9, 9])                                 # nothing named: nothing changes
+        self.assertEqual(e.slot_held[1], stream[:13])
+        for line in ("DONE 4 10 1.0 2.0 stop 0 0 0 0 0 0 0 0.0 10 0",                       # an engine that names none
+                     "DONE 4 10 1.0 2.0 stop 0 0 0 0 0 0 0 0.0 10 0 session=7 held=13",     # no such slot
+                     "DONE 4 10 1.0 2.0 stop 0 0 0 0 0 0 0 0.0 10 0 session=2"):            # half of it
+            e._parse_done(line)
+            e._note_solo_session(stream)
+            self.assertEqual(e.slot_held, [[], stream[:13], []])
 
     def test_batch_groups_spread_requests_over_the_groups(self):
         # #1249: with --batch-groups 2 over 4 slots (groups {0,1} and {2,3}) a second request goes to the other group,
@@ -432,6 +459,16 @@ class ParallelService(FakeEngineCase):
         time.sleep(0.5)
         self.assertEqual(self.engine.slot_busy, [False, False])
         self.assertEqual(self.chat("fine again")["choices"][0]["message"]["content"], "ok, done.")
+
+    def test_a_request_alone_leaves_its_chat_in_the_slot_the_engine_names(self):
+        # over HTTP: the engine runs the lone request in session 1 and says so; slot 1 then holds the chat (the prompt and
+        # all but the last token shown) and the next chat is sent to an empty slot
+        self.start(3, more=["--solo-session", "1"])
+        r = self.chat("alone")
+        u = r["usage"]
+        self.assertEqual([len(h) for h in self.engine.slot_held], [0, u["prompt_tokens"] + u["completion_tokens"] - 1, 0])
+        self.assertEqual(self.engine.pick_slot([7, 8]), 0)
+        self.assertEqual(self.engine.pick_slot(self.engine.slot_held[1] + [5]), 1)
 
     def test_engine_reports_fewer_slots(self):
         self.start(4, fit=2)
