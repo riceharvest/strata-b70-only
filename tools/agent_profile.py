@@ -18,7 +18,7 @@ and prints, with every part optional when its file is missing:
   6. the server's view: the wait before the engine began, time to the first token, a request's time
   7. the slowest requests with what they spent their time on
 """
-import json, os, statistics as st, sys
+import json, os, statistics as st, sys, glob
 
 
 def pct(v, p):
@@ -268,11 +268,140 @@ def report(prof, metrics, run):
     return "\n".join(out), res
 
 
+def harness_turns(d):
+    """The model turns the harness recorded (agent-<i>/events-<task>.jsonl, pi's --mode json): when the request went out, its
+    first and last streamed piece, the characters and the time by kind (thinking, toolcall, text), its usage, its tool's time."""
+    res = []
+    for f in sorted(glob.glob(os.path.join(d, "agent-*", "events-*.jsonl"))):
+        agent = os.path.basename(os.path.dirname(f))
+        task = os.path.basename(f)[7:-6]
+        cur = None
+        last_t = sent = None
+
+        def close():
+            nonlocal cur
+            if cur is not None:
+                cur["end"] = last_t
+                res.append(cur)
+                cur = None
+        for l in open(f, errors="replace"):
+            try:
+                j = json.loads(l)
+            except ValueError:
+                continue
+            t, line = j.get("t", 0.0), j.get("line", "")
+            try:
+                e = json.loads(line)
+            except ValueError:   # (a line cut by an older recorder: its type is still there)
+                e = {"type": line[9:line.index('"', 9)]} if line.startswith('{"type":"') and '"' in line[9:] else {}
+            ty = e.get("type")
+            if ty == "turn_start":
+                close()
+                sent = t
+            elif ty == "message_update":
+                ame = e.get("assistantMessageEvent") or {}
+                k = ame.get("type", "")
+                if cur is None:
+                    cur = {"agent": agent, "task": task, "sent": sent if sent is not None else t, "first": t, "chars": {}, "time": {}, "tool_s": 0.0, "usage": {}}
+                    last_t = t
+                kind = k.split("_")[0]
+                if k.endswith("_delta"):
+                    cur["chars"][kind] = cur["chars"].get(kind, 0) + len(ame.get("delta") or "")
+                    cur["time"][kind] = cur["time"].get(kind, 0.0) + (t - last_t)
+                last_t = t
+                if k.endswith("_end") and e.get("usage"):
+                    cur["usage"] = e["usage"]
+            elif ty == "tool_execution_end" and cur is not None:
+                cur["tool_s"] = t - last_t
+            elif ty in ("agent_settled", "agent_end"):
+                close()
+        close()
+    return res
+
+
+def threads(d, prof):
+    """Section 8: the harness's record joined to the engine's, a turn to its requests (by time and prompt size)."""
+    T = sorted(harness_turns(d), key=lambda t: t["sent"])
+    reqs = sorted((dict(r) for r in prof if r.get("ev") == "req" and "ts" in r), key=lambda r: r["ts"] - r["total_ms"] / 1000.0)
+    if not T or not reqs:
+        return "", {}
+    for r in reqs:
+        r["start"] = r["ts"] - r["total_ms"] / 1000.0
+        r["used"] = False
+    for t in T:
+        u = t["usage"]
+        t["P"], t["out"], t["reqs"] = u.get("input", 0) + u.get("cacheRead", 0), u.get("output", 0), []
+        for r in reqs:
+            if r["used"] or r["start"] < t["sent"] - 0.3 or r["start"] > t["end"] + 0.3:
+                continue
+            if abs(r["prompt"] - t["P"]) <= 2:
+                r["used"] = True
+                t["reqs"].append(r)
+                if r["finish"] != "cancel":   # (a request alone that the server moved into a slot: the admission follows)
+                    break
+    J = [t for t in T if t["reqs"]]
+    out = []
+    P = out.append
+    P("")
+    P("8. The agents' threads (the harness's record joined to the engine's: %d of %d turns)" % (len(J), len(T)))
+    if not J:
+        return "\n".join(out), {}
+    dur = sum(t["end"] - t["sent"] for t in J)
+    ttft = sum(t["first"] - t["sent"] for t in J)
+    wait = sum(max(0.0, t["reqs"][0]["start"] - t["sent"]) for t in J)
+    read = sum(sum(r["read_ms"] for r in t["reqs"]) for t in J) / 1000.0
+    sess = sum(sum(r["sess_ms"] for r in t["reqs"]) for t in J) / 1000.0
+    P("   a turn's time: %.1f%% before its first piece (%.1f%% waiting for a session, %.1f%% its prompt read, %.1f%% session work), %.1f%% in the agent's tool" % (
+        100.0 * ttft / dur, 100.0 * wait / dur, 100.0 * read / dur, 100.0 * sess / dur, 100.0 * sum(t["tool_s"] for t in J) / dur))
+    ch, tm = {}, {}
+    for t in J:
+        for k, v in t["chars"].items():
+            ch[k] = ch.get(k, 0) + v
+        for k, v in t["time"].items():
+            tm[k] = tm.get(k, 0.0) + v
+    if sum(ch.values()) > 0:
+        P("   what the model wrote: " + "; ".join("%s %.1f%% of the characters, %.1f%% of the time (%.0f chars/s)" % (
+            k, 100.0 * ch[k] / sum(ch.values()), 100.0 * tm.get(k, 0.0) / max(1e-9, sum(tm.values())), ch[k] / max(1e-9, tm.get(k, 0.0)))
+            for k in sorted(ch, key=lambda k: -ch[k])))
+    # the cells a thread held when its last turn ended (its prompt and what it wrote) that its next turn read again
+    last, hows = {}, {}
+    for t in J:
+        key, r0 = (t["agent"], t["task"]), t["reqs"][0]
+        if key in last:
+            had = last[key]["P"] + last[key]["out"]
+            again = max(0, min(had, r0["prompt"]) - r0["kept"])
+            h = hows.setdefault(r0["how"], [0, 0, 0, 0.0])
+            h[0] += 1
+            h[1] += again
+            h[2] += r0["read"]
+            h[3] += r0["read_ms"] * again / max(1, r0["read"]) / 1000.0
+        last[key] = t
+    all_read = sum(r["read_ms"] for r in reqs) / 1000.0
+    again_s = sum(h[3] for h in hows.values())
+    P("   later turns, the cells their thread held that they read again: %d tokens, %.1f s = %.1f%% of all the time reading prompts" % (
+        sum(h[1] for h in hows.values()), again_s, 100.0 * again_s / max(1e-9, all_read)))
+    for k in sorted(hows, key=lambda k: -hows[k][1]):
+        h = hows[k]
+        P("     %-10s %4d turns: %7d tokens read again (%.0f%% of what they read)" % (k, h[0], h[1], 100.0 * h[1] / max(1, h[2])))
+    div = [r for r in reqs if r.get("div", 0) > 0]
+    if div:
+        P("   checkpoints left where a prompt parts from another thread's: %d (at cell %s)" % (len(div), ", ".join(str(r["div"]) for r in div[:6])))
+    return "\n".join(out), {"turns": len(T), "joined": len(J), "before_first_pct": round(100.0 * ttft / dur, 1), "waiting_pct": round(100.0 * wait / dur, 1),
+                             "read_again_tokens": sum(h[1] for h in hows.values()), "read_again_s": round(again_s, 1),
+                             "read_again_pct_of_reads": round(100.0 * again_s / max(1e-9, all_read), 1),
+                             "read_again_by_how": {k: h[1] for k, h in hows.items()}, "div_checkpoints": len(div)}
+
+
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     prof, metrics, run = load(sys.argv[1])
     text, res = report(prof, metrics, run)
+    if os.path.isdir(sys.argv[1]):
+        t8, r8 = threads(sys.argv[1], prof)
+        text += ("\n" + t8) if t8 else ""
+        if r8:
+            res["threads"] = r8
     print(text)
     if "--json" in sys.argv:
         json.dump(res, open(sys.argv[sys.argv.index("--json") + 1], "w"), indent=1)

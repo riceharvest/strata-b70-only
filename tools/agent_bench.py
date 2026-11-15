@@ -52,6 +52,28 @@ def parse():
     return a.parse_args()
 
 
+def shrink(v, cap=2000):
+    """A long harness line stays a JSON record: its long strings are cut (with what was cut counted), the rest is kept."""
+    if isinstance(v, str):
+        return v if len(v) <= cap else v[:cap] + "...[+%d chars]" % (len(v) - cap)
+    if isinstance(v, list):
+        return [shrink(x, cap) for x in v]
+    if isinstance(v, dict):
+        return {k: shrink(x, cap) for k, x in v.items()}
+    return v
+
+
+def keep_line(line, limit=20000):
+    """The line as it is written to events-<task>.jsonl: whole up to `limit` characters, else its JSON with long strings cut
+    (a tool result or a turn's end with a file in it), else its first `limit` characters."""
+    if len(line) <= limit:
+        return line
+    try:
+        return json.dumps(shrink(json.loads(line)), separators=(",", ":"))
+    except Exception:
+        return line[:limit]
+
+
 def make_copy(root, files):
     work = os.path.join(root, "work")
     os.makedirs(work, exist_ok=True)
@@ -107,7 +129,7 @@ def run_task(args, i, root, work, task, rec):
         with open(ev_path, "w") as ev:
             for line in p.stdout:
                 lines += 1
-                ev.write(json.dumps({"t": round(time.time(), 3), "line": line.rstrip("\n")[:20000]}) + "\n")
+                ev.write(json.dumps({"t": round(time.time(), 3), "line": keep_line(line.rstrip("\n"))}) + "\n")
                 if '"tool' in line and ('"toolCall"' in line or '"tool_execution_start"' in line or '"tool_call"' in line or '"type":"tool_use"' in line):
                     tools += 1
         code = p.wait()

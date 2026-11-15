@@ -2377,7 +2377,30 @@ size_t q36_park_bytes() {
     return b;
 }
 int64_t q36_park_min() {
-    static const int64_t n = [] { const char* e = std::getenv("STRATA_Q36_PARK_MIN"); const long long v = e && *e ? std::atoll(e) : 0; return v > 0 ? (int64_t) v : (int64_t) 4096; }();
+    static const int64_t n = [] { const char* e = std::getenv("STRATA_Q36_PARK_MIN"); const long long v = e && *e ? std::atoll(e) : 0; return v > 0 ? (int64_t) v : (int64_t) 256; }();
+    return n;
+}
+// STRATA_Q36_PARK_LIVE (default on; 0: as before): a thread that is parked takes the recurrent state at its LAST cell with
+// it, beside its deepest earlier checkpoint.  Until this a parked thread came back at the checkpoint its last prompt left
+// at its end and read its whole last answer again; a thread whose prompt was shorter than a checkpoint asks for had no
+// state at all and read everything.  Recorded agent runs, 16 agents on 8 sessions: two fifths of all the time spent
+// reading prompts went to cells the thread had held.  Not saved for a thread whose client is known to send its answers
+// back in another form (Sess::tail_kept 0: without the reasoning): that state would never be restored.
+bool q36_park_live_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_PARK_LIVE"); return !(e && e[0] == '0'); }();
+    return on;
+}
+// STRATA_Q36_DIV_CKPT (default on; 0: off): a prompt that shares its start with ANOTHER thread's cache (the harness's
+// system prompt and tools) for STRATA_Q36_DIV_CKPT_MIN tokens (256) or more past what it can reuse, with no checkpoint
+// there, is read in two parts and leaves a checkpoint where the two prompts part.  The next thread that starts the same
+// way copies those cells and restores that state: it reads its own part only.  The split point is found, not configured:
+// it works for any harness, whatever it puts first.
+bool q36_div_ckpt_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_DIV_CKPT"); return !(e && e[0] == '0'); }();
+    return on;
+}
+int64_t q36_div_ckpt_min() {
+    static const int64_t n = [] { const char* e = std::getenv("STRATA_Q36_DIV_CKPT_MIN"); const long long v = e && *e ? std::atoll(e) : 0; return v >= 16 ? (int64_t) v : (int64_t) 256; }();
     return n;
 }
 // STRATA_Q36_PROFILE=1: a record a request, a record a batch slot that ends and a record every 64 batch windows, each a line
@@ -2387,6 +2410,9 @@ int64_t q36_park_min() {
 //         none), the cells kept, the tokens read and the read's time, the time of the session work before the read (with
 //         what parking and bringing back took), the tokens written alone with their steps by kind (tree, chain, lookup,
 //         drafter) and the drafts offered and accepted (lookups apart), the cells at the end.
+//         `src_cells` / `src_shared`: the cells of the cache it continues and how many of them the prompt shares (shared
+//         - kept = cells it held and read again); `tail`: 1 when the prompt went on past all of them (Sess::tail_kept);
+//         `div`: the cell of the checkpoint it left where it parts from another thread (STRATA_Q36_DIV_CKPT; 0: none).
 //   slot  a batch slot's end: its tokens, its time decoding, its drafts.
 //   win   batch windows: how many, the slots and rows a window, its parts in ms (first drafts, window, picks, commit, next
 //         drafts) and the time between windows (admissions, reads), the deepest cell.
@@ -3938,6 +3964,8 @@ struct Engine {
         uint64_t used = 0;                  // when it was last used (the LRU pick)
         int64_t thread_head = -1;           // the thread it holds: the cell where the last turn of that thread's first prompt here
                                             // starts (a request that shares more than that is the same thread); -1: none
+        int8_t tail_kept = -1;              // the thread's last prompt went on past every cell it held (1), did not: its client sends
+                                            // an answer back in another form (0); -1: not known yet
     };
     std::vector<Sess> sess;
     int n_sess = 1, cur = 0;
@@ -9069,11 +9097,14 @@ work-group size if needed.
         size_t cap = 0;                    // the buffer's size (it may be a spare one, larger than the cells)
         std::string file;                  // in the spill folder (blob null): the cells' bytes, then the checkpoint's
         std::unique_ptr<PrefixEntry> ckpt; // the thread's deepest prefix checkpoint, taken out of the store (its ram_blob; empty while in the file)
+        std::unique_ptr<PrefixEntry> ckpt_live;   // STRATA_Q36_PARK_LIVE: the state at the last cell (as ckpt; in the file after it)
         int64_t head = -1;                 // the session's thread_head when it was parked
         uint64_t lru = 0;
-        size_t total(size_t ckpt_bytes) const { return bytes + (ckpt ? ckpt_bytes : 0); }
+        size_t total(size_t ckpt_bytes) const { return bytes + (ckpt ? ckpt_bytes : 0) + (ckpt_live ? ckpt_bytes : 0); }
     };
     std::vector<std::unique_ptr<Parked>> parked;
+    uint8_t* park_stage = nullptr;   // on the card, one checkpoint's size: a parked thread's last state on its way to host memory
+    bool park_stage_failed = false;
     size_t park_cap = q36_park_bytes(), park_bytes = 0;   // the memory tier: a fixed budget (park_auto false), in use
     bool park_auto = q36_park_bytes() == 0 && std::getenv("STRATA_Q36_PARK_GIB") == nullptr;   // no budget given: sized by the machine's free memory
     size_t park_floor = 0;                                // ... the host memory that stays available (0: none known, the tier is off)
@@ -9140,6 +9171,7 @@ work-group size if needed.
         if (pk.blob) park_bytes -= pk.total(ckpt_bytes);
         park_buf_give(pk.blob, pk.cap);
         if (pk.ckpt) ckpt_blob_give(pk.ckpt->ram_blob);
+        if (pk.ckpt_live) ckpt_blob_give(pk.ckpt_live->ram_blob);
 #if !defined(_WIN32)
         if (!pk.file.empty()) { ::unlink(pk.file.c_str()); spill_bytes -= pk.total(ckpt_bytes); }
 #endif
@@ -9179,12 +9211,14 @@ work-group size if needed.
             }
             return true;
         };
-        const bool ok = put(pk.blob.get(), pk.bytes) && (!pk.ckpt || put(pk.ckpt->ram_blob.data(), ckpt_bytes));
+        const bool ok = put(pk.blob.get(), pk.bytes) && (!pk.ckpt || put(pk.ckpt->ram_blob.data(), ckpt_bytes)) &&
+                        (!pk.ckpt_live || put(pk.ckpt_live->ram_blob.data(), ckpt_bytes));
         if (ok) (void) posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);   // (not kept twice: the page cache is the machine's memory too)
         ::close(fd);
         if (!ok) { ::unlink(path.c_str()); return false; }
         park_buf_give(pk.blob, pk.cap);
         if (pk.ckpt) ckpt_blob_give(pk.ckpt->ram_blob);
+        if (pk.ckpt_live) ckpt_blob_give(pk.ckpt_live->ram_blob);
         pk.file = path;
         park_bytes -= tot;
         spill_bytes += tot;
@@ -9219,6 +9253,10 @@ work-group size if needed.
         if (ok && pk.ckpt) {
             ckpt_blob_take(pk.ckpt->ram_blob);
             ok = get(pk.ckpt->ram_blob.data(), ckpt_bytes);
+        }
+        if (ok && pk.ckpt_live) {
+            ckpt_blob_take(pk.ckpt_live->ram_blob);
+            ok = get(pk.ckpt_live->ram_blob.data(), ckpt_bytes);
         }
         ::close(fd);
         ::unlink(pk.file.c_str());
@@ -9336,7 +9374,7 @@ work-group size if needed.
         kv_each(sess[(size_t) s], n, [&](uint8_t*, size_t, size_t bytes) { need += bytes * H; });
         if (need == 0) return false;
         // room: in the memory tier (older ones move to the spill folder), else this one goes straight to the folder below
-        const size_t tot_max = need + ckpt_bytes;
+        const size_t tot_max = need + 2 * ckpt_bytes;
         const bool in_mem = park_room(tot_max, keep);
         if (!in_mem && (spill_dir.empty() || tot_max > spill_cap)) return false;
         const auto t0 = Clock::now();
@@ -9357,12 +9395,42 @@ work-group size if needed.
         pk->tokens = toks;
         pk->head = sess[(size_t) s].thread_head;
         pk->ckpt = take_thread_ckpt(toks, pk->head);   // (the recurrent state its next turn restores: it travels with the cells)
+        // STRATA_Q36_PARK_LIVE: and the state at its last cell, which the session still holds when it stands there (its slot
+        // or its request ended; nothing was restored below since)
+        {
+            const Sess& ps = sess[(size_t) s];
+            if (q36_park_live_on() && pk->head >= 0 && ps.tail_kept != 0 && ps.pos == n && (int64_t) ps.live.size() == n && ps.imgs.empty() &&
+                (!pk->ckpt || pk->ckpt->pos < n) && std::equal(ps.live.begin(), ps.live.end(), toks.begin())) {
+                // (straight to host memory through a staging block of its own: not through the store, where it would push
+                // another checkpoint out to make room and leave again at once)
+                if (park_stage == nullptr && ckpt_bytes > 0 && !park_stage_failed) {
+                    try {
+                        park_stage = (uint8_t*) sycl::aligned_alloc_device((size_t) 2 << 20, ckpt_bytes, *st);
+                    } catch (const sycl::exception&) {
+                        park_stage = nullptr;
+                    }
+                    park_stage_failed = park_stage == nullptr;   // (no room on the card: parked as before)
+                }
+                if (park_stage != nullptr && (size_t) s < d_sess_ckpt_ptrs.size()) {
+                    auto e = std::make_unique<PrefixEntry>();
+                    e->tokens = toks;
+                    e->pos = n;
+                    e->rdelta = ps.rdelta;
+                    e->lru = ++ckpt_clock;
+                    ckpt_blob_take(e->ram_blob);
+                    q36_launch_ckpt_copy(st, reinterpret_cast<uint32_t*>(park_stage), d_sess_ckpt_ptrs[(size_t) s], d_ckpt_tiles, ckpt_n_tiles, true);
+                    CK(DPCT_CHECK_ERROR(st->wait()));
+                    CK(DPCT_CHECK_ERROR(st->memcpy(e->ram_blob.data(), park_stage, ckpt_bytes).wait()));
+                    pk->ckpt_live = std::move(e);
+                }
+            }
+        }
         pk->lru = ++park_clock;
         park_bytes += pk->total(ckpt_bytes);
         ++park_n;
         park_ms += ms_since(t0);
         std::fprintf(stderr, "strata serve: parked session %d's cache (%lld cells, %.2f GiB%s) in %.0f ms; %zu parked, in memory %.2f GiB\n", s, (long long) n,
-                     (double) need / 1073741824.0, pk->ckpt ? ", with its checkpoint" : ", no checkpoint of its own", ms_since(t0), parked.size() + 1,
+                     (double) need / 1073741824.0, pk->ckpt_live ? (pk->ckpt ? ", with its last state and its checkpoint" : ", with its last state") : pk->ckpt ? ", with its checkpoint" : ", no checkpoint of its own", ms_since(t0), parked.size() + 1,
                      (double) park_bytes / 1073741824.0);
         Parked* const raw = pk.get();
         parked.push_back(std::move(pk));
@@ -9416,12 +9484,17 @@ work-group size if needed.
         b.thread_head = own->head;
         kv_live[(size_t) s] = std::move(own->tokens);
         kv_imgs[(size_t) s].clear();
-        if (own->ckpt && own->ckpt->ram_blob.size() == ckpt_bytes) {   // its checkpoint is in the store again: the request restores it as any other
-            own->ckpt->lru = ++ckpt_clock;
-            own->ckpt->pin_turn = true;
-            ckpt_entries.push_back(std::move(own->ckpt));
-            trim_ram_ckpts();
+        b.tail_kept = -1;
+        bool back = false;
+        for (std::unique_ptr<PrefixEntry>* c : {&own->ckpt, &own->ckpt_live}) {
+            if (!*c) continue;
+            if ((*c)->ram_blob.size() != ckpt_bytes) { ckpt_blob_give((*c)->ram_blob); continue; }
+            (*c)->lru = ++ckpt_clock;   // its checkpoints are in the store again: the request restores the deepest its prompt reaches
+            (*c)->pin_turn = true;
+            ckpt_entries.push_back(std::move(*c));
+            back = true;
         }
+        if (back) trim_ram_ckpts();
         if (s == cur) load_cur();
         ++unpark_n;
         unpark_ms += ms_since(t0);
@@ -11848,11 +11921,20 @@ struct Serve {
         const double pr_park0 = E.park_ms, pr_unpark0 = E.unpark_ms;
         const long long pr_unpark_n0 = E.unpark_n, pr_spill0 = E.spill_n, pr_unspill0 = E.unspill_n;
         bool pr_copy = false, pr_ckpt = false;
+        long long pr_div = 0;   // STRATA_Q36_DIV_CKPT: the cell of the checkpoint this request left where it parts from another thread (0: none)
         // ---- the session: live continuation when possible, else restore an earlier GDN checkpoint over valid KV
         Engine::PrefixEntry* pick_ckpt = nullptr;
         size_t reuse = 0;
         int s = -1;
         int th_from = -1;   // the session the reused cells come from: its thread is this request's when it shares more than that thread's head
+        int8_t tail_now = -1;   // Sess::tail_kept for this request: its prompt goes on past every cell that session holds (before it is cut)
+        long long pr_tcells = 0, pr_tlcp = 0;   // the profile: the cells the session it continues held, and how many of them the prompt shares
+        auto tail_of = [&](int i) -> int8_t {
+            if (i < 0 || i >= (int) E.kv_live.size() || E.kv_live[(size_t) i].empty()) return (int8_t) -1;
+            pr_tcells = (long long) E.kv_live[(size_t) i].size();
+            pr_tlcp = (long long) E.kv_lcp(i, ids, ir.imgs);
+            return (int8_t) (pr_tlcp >= pr_tcells ? 1 : 0);
+        };
         if (adm) {
             s = slot;
             if (ir.imgs.empty() && !E.parked.empty()) {   // the conversation cache: this thread's parked cache comes back into its slot
@@ -11901,6 +11983,7 @@ struct Serve {
                 }
             }
             th_from = ack != nullptr ? ack_src : src >= 0 ? src : s;
+            tail_now = tail_of(th_from);
             pr_ckpt = ack != nullptr;
             pr_copy = (ack != nullptr && ack_src != s) || (ack == nullptr && src >= 0);
             if (reuse == 0 || ack != nullptr || src >= 0) park_before(s, ids, ir.imgs);   // (what the slot held goes: another thread's is parked)
@@ -11972,6 +12055,7 @@ struct Serve {
             }
             if (s < 0) s = free_empty >= 0 ? free_empty : lru;
             th_from = s;
+            tail_now = tail_of(s);
             if (pick_ckpt != nullptr && E.n_sess > 1 && q36_solo_keep_on()) {
                 // STRATA_Q36_SOLO_KEEP: session s holds a thread.  A request that does not share its system turn and first user
                 // message is another thread: the prefix goes to an empty session, else the one used longest ago, and s keeps its own
@@ -12020,15 +12104,16 @@ struct Serve {
                                  "\"read\":%lld,\"read_ms\":%.1f,\"sess_ms\":%.1f,\"park_ms\":%.1f,\"unpark_ms\":%.1f,\"to_drive\":%lld,\"from_drive\":%lld,"
                                  "\"out\":%lld,\"dec_ms\":%.1f,\"steps\":{\"tree\":%lld,\"chain\":%lld,\"lookup\":%lld,\"drafter\":%lld},"
                                  "\"offered\":%lld,\"accepted\":%lld,\"look_offered\":%lld,\"look_accepted\":%lld,\"finish\":\"%s\",\"cells\":%lld,"
-                                 "\"slots_busy\":%d,\"total_ms\":%.1f}\n",
+                                 "\"slots_busy\":%d,\"total_ms\":%.1f,\"div\":%lld,\"src_cells\":%lld,\"src_shared\":%lld,\"tail\":%d}\n",
                          pr_id, prof_t(), prof_ts(), adm ? "adm" : "solo", s, ids.size(), reuse, pr_how, tokens_read, read_ms, pr_sess_ms,
                          E.park_ms - pr_park0, E.unpark_ms - pr_unpark0, E.spill_n - pr_spill0, E.unspill_n - pr_unspill0, out, dec_ms, n_tree, n_chain, n_look, n_df,
-                         offered_, accepted_, look_off, look_acc, fin, (long long) E.pos, n_active, ms_since(pr_t0));
+                         offered_, accepted_, look_off, look_acc, fin, (long long) E.pos, n_active, ms_since(pr_t0), pr_div, pr_tcells, pr_tlcp, (int) ss.tail_kept);
         };
         {   // the thread this session holds from here on: the one the reused cells belong to when the request shares more than its
             // first prompt, else a new one that begins with this prompt
             const int64_t sh = th_from >= 0 ? E.sess[(size_t) th_from].thread_head : -1;
             ss.thread_head = sh >= 0 && (int64_t) reuse > sh ? sh : q36_last_turn(ids);
+            ss.tail_kept = sh >= 0 && (int64_t) reuse > sh ? tail_now : (int8_t) -1;
         }
         if (s >= 0 && s < (int) E.kv_live.size()) {
             if (E.kv_live[(size_t) s].size() > reuse) {
@@ -12053,6 +12138,31 @@ struct Serve {
         const bool split_tail_ckpt = E.ckpt_on && fresh >= 2 &&
                                      (adm ? q36_adm_ckpt_on() && (int64_t) ids.size() >= q36_adm_ckpt_min() : ids.size() >= 256);
         const int64_t first_n = split_tail_ckpt ? fresh - 1 : fresh;
+        // STRATA_Q36_DIV_CKPT: the longest start of this prompt that ANOTHER thread's cache holds (a session's, a parked one's;
+        // not this thread's own earlier cells: more than the other thread's head is the same thread).  When that is well past
+        // what this request reuses and no checkpoint is there, the read stops there once and leaves one.
+        int64_t div_n = 0;   // the tokens read before that point (0: no split)
+        if (E.ckpt_on && q36_div_ckpt_on() && (!adm || q36_adm_ckpt_on()) && fresh >= 2) {
+            size_t share = 0;
+            for (int i = 0; i < E.n_sess; ++i) {
+                if (i == s) continue;
+                const size_t l = E.kv_lcp(i, ids, ir.imgs);
+                const int64_t h = E.sess[(size_t) i].thread_head;
+                if (h >= 0 && (int64_t) l > h) continue;
+                share = std::max(share, l);
+            }
+            if (ir.imgs.empty())
+                for (const auto& up : E.parked) {
+                    const std::vector<int32_t>& pt = up->tokens;
+                    size_t l = 0;
+                    while (l < pt.size() && l < ids.size() && pt[l] == ids[l]) ++l;
+                    if (up->head >= 0 && (int64_t) l > up->head) continue;
+                    share = std::max(share, l);
+                }
+            if (share >= reuse + (size_t) q36_div_ckpt_min() && (int64_t) (share - reuse) < first_n &&
+                Engine::imgs_boundary_ok(ir.imgs, (int64_t) share) && E.find_ckpt(ids, (int64_t) share) == nullptr)
+                div_n = (int64_t) (share - reuse);
+        }
         auto run_pp_cb = [&](int64_t done_ofs, int64_t done_local, int64_t limit_local, bool save_chunks) -> bool {
             const int64_t done = done_ofs + done_local;
             /*
@@ -12094,9 +12204,20 @@ struct Serve {
             }
             return true;
         };
-        int64_t got = E.process(ids.data() + reuse, first_n, [&](int64_t done) -> bool {
-            return run_pp_cb(0, done, first_n, E.ckpt_on && (!adm || (q36_adm_ckpt_on() && (int64_t) ids.size() >= q36_adm_ckpt_min())));
-        });
+        const bool chunk_ckpts = E.ckpt_on && (!adm || (q36_adm_ckpt_on() && (int64_t) ids.size() >= q36_adm_ckpt_min()));
+        int64_t got = 0;
+        if (div_n > 0) {
+            got = E.process(ids.data() + reuse, div_n, [&](int64_t done) -> bool { return run_pp_cb(0, done, div_n, chunk_ckpts); });
+            if (!cancelled && got == div_n) {
+                E.save_ckpt(s, ids, ir.imgs, (int64_t) reuse + div_n, ss.rdelta, true);   // (kept as a turn's: every thread of this harness starts on it)
+                pr_div = (long long) reuse + div_n;
+                std::fprintf(stderr, "strata serve: session %d: a checkpoint at cell %lld, where this prompt leaves another thread's\n", s, pr_div);
+            }
+        }
+        if (!cancelled && got == div_n)
+            got += E.process(ids.data() + reuse + div_n, first_n - div_n, [&](int64_t done) -> bool {
+                return run_pp_cb(div_n, done, first_n - div_n, chunk_ckpts);
+            });
         if (adm && q36_adm_ckpt_log())
             std::fprintf(stderr, "strata batch: slot %d read %lld of %lld tokens; a checkpoint at its end: %s\n", s, (long long) got,
                          (long long) first_n, split_tail_ckpt && !cancelled && got == first_n ? "yes" : "no");

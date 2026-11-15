@@ -67,6 +67,54 @@ class Profile(unittest.TestCase):
         self.assertNotIn("The server's view", text)
 
 
+    def test_the_harness_record_is_joined_to_the_engines(self):
+        # one agent, two turns: the second finds its 100-token prompt and 40-token answer gone but for 100 cells (a checkpoint)
+        def ev(t, e):
+            return json.dumps({"t": t, "line": json.dumps(e)}) + "\n"
+
+        def upd(t, kind, delta=None, usage=None):
+            a = {"type": kind}
+            if delta is not None:
+                a["delta"] = delta
+            e = {"type": "message_update", "assistantMessageEvent": a}
+            if usage:
+                e["usage"] = usage
+            return ev(t, e)
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "agent-0"))
+            with open(os.path.join(d, "agent-0", "events-a.jsonl"), "w") as f:
+                f.write(ev(10.0, {"type": "turn_start"}))
+                f.write(upd(11.0, "thinking_delta", "abcd"))
+                f.write(upd(13.0, "thinking_delta", "efgh"))
+                f.write(upd(14.0, "toolcall_delta", "xy"))
+                f.write(upd(14.0, "toolcall_end", usage={"input": 100, "cacheRead": 0, "output": 40}))
+                f.write('{"t": 14.5, "line": "{\\"type\\":\\"tool_execution_end\\",\\"cut"}\n')   # (an older recorder cut long lines)
+                f.write(ev(15.0, {"type": "turn_start"}))
+                f.write(upd(17.0, "text_delta", "done"))
+                f.write(upd(18.0, "text_end", usage={"input": 60, "cacheRead": 100, "output": 5}))
+                f.write(ev(18.0, {"type": "agent_settled"}))
+            r1 = dict(req(1, "solo", "none", 100, 0, 100, 500.0, 40, 3000.0, {"tree": 4, "chain": 0, "lookup": 0, "drafter": 0}, 10, 8), ts=14.0)
+            r2 = dict(req(2, "solo", "ckpt", 160, 100, 60, 1000.0, 5, 1000.0, {"tree": 1, "chain": 0, "lookup": 0, "drafter": 0}, 4, 4), ts=18.0, div=64)
+            open(os.path.join(d, "engine.log"), "w").write("".join("PROF " + json.dumps(r) + "\n" for r in (r1, r2)))
+            text, res = agent_profile.threads(d, agent_profile.load(d)[0])
+        self.assertEqual((res["turns"], res["joined"]), (2, 2))
+        self.assertEqual(res["read_again_tokens"], 40)            # (140 cells held, 100 kept)
+        self.assertEqual(res["read_again_by_how"], {"ckpt": 40})
+        self.assertAlmostEqual(res["read_again_s"], 1.0 * 40 / 60, places=1)
+        self.assertEqual(res["div_checkpoints"], 1)
+        self.assertIn("thinking 57.1% of the characters", text)   # (8 of 14 characters)
+        self.assertIn("in the agent's tool", text)
+
+    def test_a_long_harness_line_stays_a_record(self):
+        import agent_bench
+        line = json.dumps({"type": "turn_end", "message": {"content": [{"type": "text", "text": "x" * 50000}]}, "n": 3})
+        kept = json.loads(agent_bench.keep_line(line))
+        self.assertEqual((kept["type"], kept["n"]), ("turn_end", 3))
+        self.assertTrue(kept["message"]["content"][0]["text"].endswith("...[+48000 chars]"))
+        self.assertEqual(agent_bench.keep_line("short"), "short")
+        self.assertEqual(len(agent_bench.keep_line("y" * 30000)), 20000)   # (not JSON: cut as before)
+
+
 class Bench(unittest.TestCase):
     def test_a_run_folder(self):
         class H(http.server.BaseHTTPRequestHandler):
