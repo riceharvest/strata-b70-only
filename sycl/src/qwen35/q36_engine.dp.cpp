@@ -34,6 +34,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "q36_mmvq_dense.hpp"
 #include "q36_xr_dense.hpp"
+#include "strata/b70/pack.hpp"
 #include "q36_xatt.hpp"
 #include "q36_qsa.hpp"    // QSA BLOCK: Qwen Sparse Attention (STRATA_Q36_QSA=<indexer file>; unset: nothing of it runs)
 #include "q36_darb.hpp"
@@ -103,48 +104,9 @@ namespace K = strata::kernels;
 // engine).  A matrix the pack names is loaded from it and not from the GGUF; everything else (norms, embeddings, the head, the
 // MTP block, the small GDN tensors) is the GGUF's.  Decode: the W4 form of q36_xr_dense.dp.cpp.  A prompt chunk: the pack
 // dequantized to FP16, then the FP16 GEMM.
-constexpr int kW4Type = 1004;   // (not a ggml type id)
-struct W4Ent { uint64_t off = 0, bytes = 0; int n_in = 0, n_out = 0; };
-struct W4Pack {
-    std::string path;
-    uint64_t blobs = 0;   // the file offset of the blob area
-    std::unordered_map<std::string, W4Ent> t;
-    bool open(const std::string& p, std::string& err) {
-        FILE* f = std::fopen(p.c_str(), "rb");
-        if (!f) { err = "cannot open " + p; return false; }
-        char magic[8];
-        uint64_t n = 0;
-        if (std::fread(magic, 1, 8, f) != 8 || std::memcmp(magic, "B70W4\0\0\1", 8) != 0 || std::fread(&n, 8, 1, f) != 1 || n > (64u << 20)) {
-            std::fclose(f);
-            err = p + " is not a B70W4 pack";
-            return false;
-        }
-        std::string js((size_t) n, '\0');
-        const bool ok = std::fread(js.data(), 1, (size_t) n, f) == (size_t) n;
-        std::fclose(f);
-        if (!ok) { err = p + ": short index"; return false; }
-        blobs = (16 + n + 4095) / 4096 * 4096;
-        size_t at = js.find("\"tensors\"");
-        if (at == std::string::npos) { err = p + ": no tensor index"; return false; }
-        at = js.find('{', at);
-        for (;;) {
-            const size_t q0 = js.find('"', at + 1);
-            if (q0 == std::string::npos) break;
-            const size_t q1 = js.find('"', q0 + 1);
-            if (q1 == std::string::npos) break;
-            W4Ent e;
-            unsigned long long off = 0, bytes = 0;
-            if (std::sscanf(js.c_str() + q1 + 1, ": {\"off\": %llu, \"bytes\": %llu, \"n_in\": %d, \"n_out\": %d}", &off, &bytes, &e.n_in, &e.n_out) != 4) break;
-            e.off = off;
-            e.bytes = bytes;
-            t[js.substr(q0 + 1, q1 - q0 - 1)] = e;
-            at = js.find('}', q1);
-            if (at == std::string::npos) break;
-        }
-        path = p;
-        return !t.empty();
-    }
-};
+constexpr int kW4Type = strata::b70::kTypeW4;   // (not a ggml type id)
+using W4Ent = strata::b70::pack::Entry;   // the pack's file and index are the card library's (strata/b70/pack.hpp)
+using W4Pack = strata::b70::pack::File;
 std::string g_w4_path;   // --w4
 W4Pack g_w4;
 
@@ -11364,7 +11326,7 @@ int strata::qwen35::run(int argc, char** argv) {
                                       "drafts)\n", v.c_str());
         }
         else if (a == "--draft-vocab") draft_vocab = std::atoi(next().c_str());   // the MTP drafts pick among N token ids (0: all)
-        else if (a == "--w4") g_w4_path = next();                                 // a B70W4 pack of the model's matrices
+        else if (a == "--w4" || a == "--b70-pack") g_w4_path = next();                                 // a B70W4 pack of the model's matrices
         else if (a == "--draft-tokens") draft_tokens = next();                     // ... the first ones of this list (M2), then the lowest ids
         else if (a == "--vision") vision = true;                                  // pictures (GENI): the encoder is strata-vision's
         else if (a == "--batch" || a == "--slots") batch = std::atoi(next().c_str());   // sessions decoding together

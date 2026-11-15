@@ -19,9 +19,10 @@
 #include <cstdlib>
 #include <utility>
 #include "strata/sycl_queue.hpp"
-#include "q36_pp_i8.hpp"
+#include "strata/b70/fat.hpp"
+#include "strata/b70/env.hpp"
 
-namespace strata::q36pp {
+namespace strata::b70::fat {
 namespace {
 using namespace sycl::ext::intel::esimd;
 namespace es = sycl::ext::intel::esimd;
@@ -966,7 +967,7 @@ void launch_w4f16(sycl::queue& q, const uint32_t* W, const uint32_t* X16, float*
 
 inline int w4f16_cfg_override() {
     static const int v = [] {
-        const char* e = std::getenv("STRATA_Q36_W4F16_CFG");
+        const char* e = strata::b70::env("STRATA_B70_W4F16_CFG", "STRATA_Q36_W4F16_CFG");
         return e ? std::atoi(e) : -1;
     }();
     return v;
@@ -1280,7 +1281,7 @@ using pp_util::fast_div;
 
 inline uint32_t env_pp2_wgs() noexcept {
     static const uint32_t v = []() -> uint32_t {
-        const char* e = std::getenv("STRATA_Q36_PP2_WGS");
+        const char* e = strata::b70::env("STRATA_B70_PP2_WGS", "STRATA_Q36_PP2_WGS");
         const int x = e ? std::atoi(e) : 0;
         return x > 0 ? static_cast<uint32_t>(x) : 32u;
     }();
@@ -1691,7 +1692,7 @@ SYCL_ESIMD_FUNCTION inline simd<sycl::half, 16> half_raw_of(simd<uint32_t, 16> h
 
 inline uint32_t env_pp3_max_thr() noexcept {
     static const uint32_t v = []() -> uint32_t {
-        const char* e = std::getenv("STRATA_Q36_PP3_THR");
+        const char* e = strata::b70::env("STRATA_B70_PP3_THR", "STRATA_Q36_PP3_THR");
         const int x = e ? std::atoi(e) : 0;
         return x > 0 ? static_cast<uint32_t>(x) : 1024u;
     }();
@@ -1701,7 +1702,7 @@ inline uint32_t env_pp3_max_thr() noexcept {
 // Column panel in columns (STRATA_Q36_PP3_PANEL, read once, default 1024: 18 MiB of activations at K = 17408, inside the 24 MiB LLC).
 inline uint32_t env_pp3_panel() noexcept {
     static const uint32_t v = []() -> uint32_t {
-        const char* e = std::getenv("STRATA_Q36_PP3_PANEL");
+        const char* e = strata::b70::env("STRATA_B70_PP3_PANEL", "STRATA_Q36_PP3_PANEL");
         const int x = e ? std::atoi(e) : 0;
         return (x >= 128 && x <= 8192) ? static_cast<uint32_t>(x) : 1024u;
     }();
@@ -2559,4 +2560,4 @@ bool gemm_w4_i8_gu_swiglu_pp3(const void* w_gate, const void* w_up,
     return true;
 }
 
-}  // namespace strata::q36pp
+}  // namespace strata::b70::fat

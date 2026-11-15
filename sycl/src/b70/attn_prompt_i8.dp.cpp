@@ -1,4 +1,4 @@
-#include "q36_fmha_i8.hpp"
+#include "strata/b70/attn_prompt.hpp"
 
 #include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
@@ -6,7 +6,7 @@
 #include <cmath>
 #include <cstdint>
 
-namespace strata::q36fmha {
+namespace strata::b70::attn_prompt {
 namespace {
 
 namespace es = sycl::ext::intel::esimd;
@@ -595,4 +595,4 @@ void forward(sycl::queue& q, int vt, const sycl::half* q16, const int8_t* kc, co
     else       launch_fmha_i8<false>(q, vt, q16, kc, vc, out, T, p0, H, HKV, ctx);
 }
 
-}  // namespace strata::q36fmha
+}  // namespace strata::b70::attn_prompt

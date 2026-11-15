@@ -44,6 +44,8 @@
 #include "q36_xatt.hpp"
 #include "q36_pp_i8.hpp"
 #include "q36_pp3_bench.hpp"
+#include "strata/b70/pack.hpp"      // the pack type in the shared dispatch (--w4)
+#include "strata/prefill/gemm.hpp"
 
 namespace strata::kernels {
 void dequant_f16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out, void* stream);
@@ -1409,6 +1411,55 @@ int w4_bench(const char* ncols_s, const std::string& ssel) {
                         sh.n_in, sh.n_out, ud, (double) sh.n_in * sh.n_out * 2 / ud / 1e3, wrong, seen, wrong ? "  FAIL" : "");
             std::fflush(stdout);
         }
+        {   // The shared prompt GEMM with the pack type (Gemm::native, what a second model family calls): with a scratch that
+            // holds the matrix it is the FP16 GEMM on the image above, bit for bit; with a scratch of a third of it, the
+            // same products in slices of whole tiles (within float rounding of the GEMM).
+            const int T = maxc;   // (hx holds maxc rows of the widest shape)
+            const uint32_t* dlast = dpool + (size_t) ((nmat - 1) % ndist) * wdw;   // (df holds this matrix's FP16 image)
+            std::vector<uint16_t> hx16((size_t) T * sh.n_in);
+            for (size_t i = 0; i < hx16.size(); ++i) hx16[i] = sycl::bit_cast<uint16_t>((sycl::half) hx[i]);
+            uint16_t* dxh = sycl::malloc_device<uint16_t>(hx16.size(), q);
+            const size_t ny = (size_t) T * sh.n_out;
+            float* yr = sycl::malloc_device<float>(ny, q);
+            float* yw = sycl::malloc_device<float>(ny, q);
+            float* ys = sycl::malloc_device<float>(ny, q);
+            const int64_t slice_rows = std::max<int64_t>(16, sh.n_out / 3 / 16 * 16);
+            strata::prefill::Gemm gw, gs;
+            std::string gerr;
+            bool ok = dxh && yr && yw && ys && gw.init(&q, (int64_t) sh.n_in * sh.n_out, gerr) &&
+                      gs.init(&q, slice_rows * sh.n_in + 7, gerr);
+            double rel = -1;
+            long long differ = -1;
+            if (ok) {
+                q.memcpy(dxh, hx16.data(), hx16.size() * 2).wait();
+                gw.f16(dxh, df, yr, T, sh.n_out, sh.n_in);
+                gw.native(dxh, strata::b70::kTypeW4, dlast, yw, T, sh.n_out, sh.n_in);
+                gs.native(dxh, strata::b70::kTypeW4, dlast, ys, T, sh.n_out, sh.n_in);
+                q.wait();
+                std::vector<float> hr(ny), hw(ny), hs(ny);
+                q.memcpy(hr.data(), yr, ny * 4).wait();
+                q.memcpy(hw.data(), yw, ny * 4).wait();
+                q.memcpy(hs.data(), ys, ny * 4).wait();
+                differ = 0;
+                double ss = 0, sd = 0;
+                for (size_t i = 0; i < ny; ++i) {
+                    if (std::memcmp(&hr[i], &hw[i], 4) != 0) ++differ;
+                    ss += (double) hr[i] * hr[i];
+                    sd += ((double) hs[i] - hr[i]) * ((double) hs[i] - hr[i]);
+                }
+                rel = std::sqrt(sd / std::max(ss, 1e-30));
+                ok = differ == 0 && rel < 1e-5 && ss > 0;
+            }
+            if (!ok) ++bad;
+            std::printf("W4     %-6s %5d x %6d Gemm::native(pack type), %d tokens: %lld of %zu outputs differ from the FP16 GEMM; in "
+                        "slices of %lld rows rms diff / rms %.2e%s%s\n", sh.name, sh.n_in, sh.n_out, T, differ, ny, (long long) slice_rows,
+                        rel, ok ? "" : "  FAIL", gerr.empty() ? "" : (" (" + gerr + ")").c_str());
+            std::fflush(stdout);
+            sycl::free(dxh, q);
+            sycl::free(yr, q);
+            sycl::free(yw, q);
+            sycl::free(ys, q);
+        }
         for (const int nc : ncl) {
             if (nc < 1 || nc > maxc) continue;
             k::native_quantize_q8_1(dx, xq, sh.n_in * nc, 1, &q);
@@ -1462,6 +1513,19 @@ int w4_bench(const char* ncols_s, const std::string& ssel) {
             std::printf("W4     %-6s %5d x %6d nc %d  %8.2f us %5.1f GB/s  rms diff / rms %.2e%s\n", sh.name, sh.n_in, sh.n_out, nc, us,
                         wb / us / 1e3, rel, rel < 1e-4 ? "" : "  FAIL");
             std::fflush(stdout);
+            {   // the shared decode dispatch (native_mmvq with the pack type, what a second model family calls) is that launch
+                bool same = k::native_mmvq_supported(strata::b70::kTypeW4) &&
+                            k::native_mmvq_weight_bytes(strata::b70::kTypeW4, sh.n_in, sh.n_out) == wb;
+                k::native_mmvq(strata::b70::kTypeW4, dpool + (size_t) ((nmat - 1) % ndist) * wdw, xq, y, sh.n_in, sh.n_out, nc, &q);
+                q.wait();
+                std::vector<float> hy2(hy.size());
+                q.memcpy(hy2.data(), y, hy2.size() * 4).wait();
+                same = same && std::memcmp(hy.data(), hy2.data(), hy.size() * 4) == 0;
+                if (!same) ++bad;
+                std::printf("W4     %-6s %5d x %6d nc %d  native_mmvq(pack type) is that product bit for bit: %s\n", sh.name, sh.n_in,
+                            sh.n_out, nc, same ? "yes" : "NO  FAIL");
+                std::fflush(stdout);
+            }
         }
         // W4A16: the same matrices against FP16 activations (mmvq_w4h)
         for (const int nc : ncl) {

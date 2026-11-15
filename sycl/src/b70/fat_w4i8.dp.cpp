@@ -8,9 +8,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include "strata/sycl_queue.hpp"
-#include "q36_pp_i8.hpp"
+#include "strata/b70/fat.hpp"
+#include "strata/b70/env.hpp"
 
-namespace strata::q36pp {
+namespace strata::b70::fat {
 namespace {
 
 using namespace sycl::ext::intel::esimd;
@@ -681,7 +682,7 @@ bool pp2_enabled() noexcept {
 bool pp2_fuse_enabled() noexcept {
     static const bool on = []() {
         if (!pp2_enabled() && !pp3_enabled()) return false;
-        const char* e = std::getenv("STRATA_Q36_PP2_FUSE");
+        const char* e = strata::b70::env("STRATA_B70_PP2_FUSE", "STRATA_Q36_PP2_FUSE");
         return e ? (std::atoi(e) != 0) : true;
     }();
     return on;
@@ -820,4 +821,4 @@ void* pack_ab16(const float* alpha, const float* beta, int HV, int N, void* stre
     return dst;
 }
 
-}  // namespace strata::q36pp
+}  // namespace strata::b70::fat

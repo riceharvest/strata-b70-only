@@ -7,6 +7,8 @@
 #   Q36=OFF builds the Flash-Next-only strata. With AOT=bmg-g31 the family's long-prompt attention (LP3, libq36_tla.so) needs the
 #   two projects bash sycl/tools/get-q36-tla.sh fetches into third_party/: without them the build goes on without LP3 and says so
 #   (Q36_TLA=ON stops instead, Q36_TLA=OFF never builds it).
+#   The B70 card library (docs/B70_LIB.md: libstrata_b70.so, libstrata_b70_fat.so beside the binary) is built in too;
+#   B70LIB=OFF leaves it out (then Q36=OFF as well: the dense family is built on it).
 #   BUILD_DIR=...       build folder (default <repo>/build-sycl)
 #   HOST_MARCH=x86-64-v3  -march of the engine's host code (empty: baseline x86-64; native: this PC only). Gain not measured.
 #   AOT=bmg-g31         ahead-of-time device code (empty: SPIR-V, JIT at the first start)
@@ -75,15 +77,17 @@ if [[ ! "${Q36:-ON}" =~ ^(OFF|off|0|FALSE|false|NO|no)$ ]] && [[ "${Q36_TLA:-AUT
 fi
 [ -f $b/build.ninja ] || cmake -S $repo/sycl -B $b -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
     -DSTRATA_SYCL_AOT="${AOT:-}" -DSTRATA_SYCL_SPIN_MAX="${SPIN_MAX:-}" -DSTRATA_SYCL_I8_ESIMD="${I8_ESIMD:-AUTO}" -DSTRATA_SYCL_IQ_DECODE_FAST="${IQ_DECODE_FAST:-ON}" \
-    -DSTRATA_HOST_MARCH="${HOST_MARCH:-}" -DSTRATA_SYCL_PARITY="${PARITY:-OFF}" -DSTRATA_BUILD_Q36="${Q36:-ON}" -DSTRATA_Q36_TLA="${Q36_TLA:-AUTO}" 2>&1 | tail -15
+    -DSTRATA_HOST_MARCH="${HOST_MARCH:-}" -DSTRATA_SYCL_PARITY="${PARITY:-OFF}" -DSTRATA_BUILD_Q36="${Q36:-ON}" -DSTRATA_Q36_TLA="${Q36_TLA:-AUTO}" -DSTRATA_BUILD_B70LIB="${B70LIB:-ON}" 2>&1 | tail -15
 # an existing build folder keeps its cache: a switch given now reaches it (only this one, so AOT and the rest stay as configured)
 [ -z "${I8_ESIMD:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_SYCL_I8_ESIMD="$I8_ESIMD" >/dev/null 2>&1
 [ -z "${HOST_MARCH+x}" ] || cmake -S $repo/sycl -B $b -DSTRATA_HOST_MARCH="$HOST_MARCH" >/dev/null 2>&1
 [ -z "${PARITY:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_SYCL_PARITY="$PARITY" >/dev/null 2>&1
+[ -z "${B70LIB:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_BUILD_B70LIB="$B70LIB" 2>&1 | grep -E 'CMake Error' | head -5
 [ -z "${Q36:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_BUILD_Q36="$Q36" 2>&1 | grep -E 'CMake Error|needs third_party|get-q36-tla' | head -5
 [ -z "${Q36_TLA:-}" ] || cmake -S $repo/sycl -B $b -DSTRATA_Q36_TLA="$Q36_TLA" 2>&1 | grep -E 'CMake Error|needs third_party|get-q36-tla' | head -5
 # which families this build holds (a folder configured before the dense family was built in keeps its cache: Q36=ON reaches it)
 echo "build.sh: dense Qwen3.8-27B family in strata: $(sed -n 's/^STRATA_BUILD_Q36:BOOL=//p' $b/CMakeCache.txt 2>/dev/null | head -1)"
+echo "build.sh: B70 card library in strata: $(sed -n 's/^STRATA_BUILD_B70LIB:BOOL=//p' $b/CMakeCache.txt 2>/dev/null | head -1)"
 cmake --build $b -j ${JOBS:-12} --target ${@:-strata} -- -k 0 2>&1 | tee $b/build.log | grep -E '^FAILED|error:|^ninja: build stopped|Linking|^\[[0-9]+/[0-9]+\] Linking' | tail -40
 rc=${PIPESTATUS[0]}                       # cmake's status, kept: the script ends with this, not with the status of the greps below (#2990)
 echo "BUILD EXIT $rc"

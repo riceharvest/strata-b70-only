@@ -30,6 +30,10 @@
 #include "strata/sycl_math.hpp"
 #include "strata/sycl_queue.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#if defined(STRATA_B70_LIB)
+#include "strata/b70/pack.hpp"     // a pack matrix (type strata::b70::kTypeW4) is a weight type of this dispatch
+#include "strata/b70/stream.hpp"
+#endif
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/iq4_lut.hpp"
@@ -6506,6 +6510,9 @@ void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
 }
 
 bool native_mmvq_supported(int ggml_type) noexcept {
+#if defined(STRATA_B70_LIB)
+    if (ggml_type == strata::b70::kTypeW4) return true;   // a pack matrix (strata/b70/pack.hpp)
+#endif
     return ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 11 ||
            ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
            ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
@@ -6513,6 +6520,13 @@ bool native_mmvq_supported(int ggml_type) noexcept {
 }
 
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
+#if defined(STRATA_B70_LIB)
+    if (ggml_type == strata::b70::kTypeW4) {
+        if (!strata::b70::pack::shape_ok(n_in, n_out))
+            throw std::invalid_argument("a pack matrix needs n_in a multiple of 256 and n_out a multiple of 16");
+        return strata::b70::pack::bytes(n_in, n_out);
+    }
+#endif
     int block_elems, block_bytes;
     switch (ggml_type) {
     case 2: block_elems = 32; block_bytes = 18; break;
@@ -6541,6 +6555,26 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
 
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream) {
+#if defined(STRATA_B70_LIB)
+    // A pack matrix (strata/b70/pack.hpp): the card library's stream product on the same q8_1 image, up to 32 columns in one
+    // read of the weights.  The image needs 28 readable bytes after its last block (the callers' buffers have them).
+    if (ggml_type == strata::b70::kTypeW4) {
+        validate_pointer(weights);
+        validate_pointer(x_q8_1);
+        validate_pointer(y);
+        validate_stream(stream);
+        if (ncols < 1) throw std::invalid_argument("native MMVQ requires ncols >= 1");
+        const std::size_t col_blocks = std::size_t(n_in / Q8K);
+        for (int j = 0; j < ncols; j += strata::b70::pack::kMaxCols) {
+            const int nj = (ncols - j < strata::b70::pack::kMaxCols) ? (ncols - j) : strata::b70::pack::kMaxCols;
+            if (!strata::b70::stream::mmvq_w4(weights, static_cast<const Q81Block*>(x_q8_1) + std::size_t(j) * col_blocks,
+                                              y + std::size_t(j) * std::size_t(n_out), n_in, n_out, nj, stream))
+                throw std::invalid_argument("native MMVQ: the pack form did not take the call (n_in a multiple of 256, n_out of 16, "
+                                            "weights 64-byte aligned, activations 4-byte aligned)");
+        }
+        return;
+    }
+#endif
     // more columns than one launch takes: ceil(ncols / MAX_NCOLS) passes over the same weights.  Every column of a
     // multi-column pass is bitwise the single-column result (bench/micro/native_mmvq_multi.cpp), so the split changes no
     // arithmetic.  Column j starts at activation block j * (n_in / Q8K) and writes y + j * n_out.  (Never reached by a
