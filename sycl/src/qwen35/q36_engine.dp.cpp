@@ -2313,10 +2313,13 @@ bool q36_adm_ckpt_on() {
 // the session keeps its thread for that thread's next turn.  Before, the request took the session over, and the other
 // thread's next turn read everything past the shared prefix again - with agents that share a tool list (the template renders
 // it first: about 22K tokens of every prompt) that was every request of another agent.
-// Another thread: the request does not share the session's system turn and first user message (the cell where the stream's
-// third turn starts, STRATA_Q36_TURN_TOKEN, default 248045 = <|im_start|>).  A thread's own next turn shares them, and so
-// does the same thread after it rewrote its later history (a client that compacts old tool results): those take the session
-// over as before, nobody else needs its tail.
+// Another thread: the request does not share the whole FIRST prompt of the thread the session holds, up to that prompt's
+// last turn (Sess::thread_head: the cell of the last STRATA_Q36_TURN_TOKEN, default 248045 = <|im_start|>, of the prompt
+// that began the thread here; a prompt without one: its last cell).  That holds for any client: with or without a system
+// prompt or tools, whatever it renders first.  A thread's own next turn shares its first prompt, and so does the same
+// thread after it rewrote its later history (a client that compacts old tool results): those take the session over as
+// before, nobody else needs its tail.  A client that changes the start of its prompt every turn (a clock in the system
+// prompt) has no thread to keep: each of its requests is a new one to this rule, as it is to any prefix cache.
 bool q36_solo_keep_on() {
     static const bool on = [] { const char* e = std::getenv("STRATA_Q36_SOLO_KEEP"); return !(e && e[0] == '0'); }();
     return on;
@@ -2325,14 +2328,12 @@ int32_t q36_turn_token() {
     static const int32_t t = [] { const char* e = std::getenv("STRATA_Q36_TURN_TOKEN"); return e && *e ? (int32_t) std::atoi(e) : 248045; }();
     return t;
 }
-/// The cell where the third turn of a token stream starts (after the system turn and the first user message); -1: the stream
-/// has fewer turns (not a chat this rule can tell from another).
-inline int64_t q36_thread_head(const std::vector<int32_t>& toks) {
+/// The cell where a prompt's last turn starts (the turn the model is to write); a prompt without a turn token: its last cell.
+inline int64_t q36_last_turn(const std::vector<int32_t>& toks) {
     const int32_t turn = q36_turn_token();
-    int n = 0;
-    for (size_t i = 0; i < toks.size(); ++i)
-        if (toks[i] == turn && ++n == 3) return (int64_t) i;
-    return -1;
+    for (size_t i = toks.size(); i-- > 0;)
+        if (toks[i] == turn) return (int64_t) i;
+    return toks.empty() ? -1 : (int64_t) toks.size() - 1;
 }
 // --conversation-cache-mib N / STRATA_Q36_PARK_GIB (default 0: off): host memory for PARKED caches, the dense family's part of
 // the conversation cache (the Settings keys of the Flash-Next cache: conversation_cache_mib, conversation_cache_min_tokens,
@@ -2341,6 +2342,11 @@ inline int64_t q36_thread_head(const std::vector<int32_t>& toks) {
 // parked cache goes there when the memory budget is full, and is dropped only when the folder's quota or the drive's free
 // space say so).  A parked thread takes its deepest prefix checkpoint (the recurrent state, about 150 MiB) with it, so the
 // threads an engine can hold do not depend on the checkpoint store's size.
+// The memory tier's size.  --conversation-cache-mib N (STRATA_Q36_PARK_GIB): a fixed budget (0: off).  Not given: it follows
+// the machine - a cache is parked while that leaves --conversation-cache-min-free-mib of host memory available (not given:
+// a fifth of the machine's memory, at least 2560 MiB; MemAvailable of /proc/meminfo), and when other programs take memory
+// the oldest parked caches leave it again (to the spill folder, else dropped): looked at before every park, at every
+// request and every two seconds while the engine is idle.
 // STRATA_Q36_PARK_GIB (default 0: off): host memory for PARKED caches.  An engine holds as many threads as it has sessions
 // (--batch N, each a whole context of VRAM).  With more agent threads than sessions a thread's cache used to be thrown away
 // when another thread needed its session, and its next turn read its whole conversation again (measured with 8 recorded
@@ -2349,6 +2355,22 @@ inline int64_t q36_thread_head(const std::vector<int32_t>& toks) {
 // come back into whatever session the thread's next request gets; the recurrent state comes from the thread's prefix
 // checkpoint as for any reuse.  The oldest parked caches are dropped when the budget is full.  Only threads of at least
 // STRATA_Q36_PARK_MIN tokens (4096) without pictures are parked.  Host memory is the machine's: nothing is taken unless set.
+/// A line of /proc/meminfo in bytes ("MemAvailable", "MemTotal"); 0: not there (another system).
+size_t q36_meminfo(const char* key) {
+    size_t out = 0;
+    if (std::FILE* f = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        const size_t kl = std::strlen(key);
+        while (std::fgets(line, sizeof line, f)) {
+            if (std::strncmp(line, key, kl) == 0 && line[kl] == ':') {
+                out = (size_t) std::strtoull(line + kl + 1, nullptr, 10) << 10;
+                break;
+            }
+        }
+        std::fclose(f);
+    }
+    return out;
+}
 size_t q36_park_bytes() {
     static const size_t b = [] { const char* e = std::getenv("STRATA_Q36_PARK_GIB"); const double g = e && *e ? std::atof(e) : 0.0;
                                  return g > 0 ? (size_t) (g * 1073741824.0) : (size_t) 0; }();
@@ -3889,6 +3911,8 @@ struct Engine {
         std::vector<float*> xks, xvs;
         bool active = false;                // a batch slot is decoding in it
         uint64_t used = 0;                  // when it was last used (the LRU pick)
+        int64_t thread_head = -1;           // the thread it holds: the cell where the last turn of that thread's first prompt here
+                                            // starts (a request that shares more than that is the same thread); -1: none
     };
     std::vector<Sess> sess;
     int n_sess = 1, cur = 0;
@@ -8848,6 +8872,7 @@ work-group size if needed.
         b.rdelta = a.rdelta;
         b.live = a.live;
         b.imgs = a.imgs;
+        b.thread_head = cells < 0 ? a.thread_head : -1;   // (a prefix alone is no thread: the request that asked for it says which it is)
         if (src < (int) kv_live.size() && dst < (int) kv_live.size()) {
             kv_live[(size_t) dst] = kv_live[(size_t) src];
             kv_imgs[(size_t) dst] = kv_imgs[(size_t) src];
@@ -8899,18 +8924,45 @@ work-group size if needed.
         size_t bytes = 0;                  // the cells' bytes
         std::string file;                  // in the spill folder (blob null): the cells' bytes, then the checkpoint's
         std::unique_ptr<PrefixEntry> ckpt; // the thread's deepest prefix checkpoint, taken out of the store (its ram_blob; empty while in the file)
+        int64_t head = -1;                 // the session's thread_head when it was parked
         uint64_t lru = 0;
         size_t total(size_t ckpt_bytes) const { return bytes + (ckpt ? ckpt_bytes : 0); }
     };
     std::vector<std::unique_ptr<Parked>> parked;
-    size_t park_cap = q36_park_bytes(), park_bytes = 0;   // the memory tier: budget, in use
+    size_t park_cap = q36_park_bytes(), park_bytes = 0;   // the memory tier: a fixed budget (park_auto false), in use
+    bool park_auto = q36_park_bytes() == 0 && std::getenv("STRATA_Q36_PARK_GIB") == nullptr;   // no budget given: sized by the machine's free memory
+    size_t park_floor = 0;                                // ... the host memory that stays available (0: none known, the tier is off)
     int64_t park_min = q36_park_min();                    // tokens a thread needs to be parked
     std::string spill_dir;                                // the drive tier's folder (empty: none)
     size_t spill_cap = (size_t) 24576 << 20, spill_min_free = (size_t) 40960 << 20, spill_bytes = 0;
     uint64_t park_clock = 0, spill_seq = 0;
     long long park_n = 0, unpark_n = 0, park_drop_n = 0, spill_n = 0, unspill_n = 0;
     double park_ms = 0, unpark_ms = 0;
-    bool park_on() const { return park_cap > 0 || !spill_dir.empty(); }
+    bool park_on() const { return (park_auto ? park_floor > 0 : park_cap > 0) || !spill_dir.empty(); }
+    /// The memory tier's room now: the fixed budget, or what the machine has available above the floor on top of what the
+    /// tier holds.
+    size_t park_limit() const {
+        if (!park_auto) return park_cap;
+        if (park_floor == 0) return 0;
+        const size_t avail = q36_meminfo("MemAvailable");
+        return park_bytes + (avail > park_floor ? avail - park_floor : 0);
+    }
+    /// Other programs took memory: the oldest parked caches leave the memory tier until the floor holds again.
+    void park_pressure() {
+        if (!park_auto || park_floor == 0 || park_bytes == 0) return;
+        size_t avail = q36_meminfo("MemAvailable");
+        while (avail < park_floor) {
+            int victim = -1;
+            for (size_t i = 0; i < parked.size(); ++i)
+                if (parked[i]->blob && (victim < 0 || parked[i]->lru < parked[(size_t) victim]->lru)) victim = (int) i;
+            if (victim < 0) return;
+            const size_t freed = parked[(size_t) victim]->total(ckpt_bytes);
+            std::fprintf(stderr, "strata serve: host memory is short (%.1f GiB available, %.1f GiB to stay free): a parked cache leaves it\n",
+                         (double) avail / 1073741824.0, (double) park_floor / 1073741824.0);
+            if (!to_drive(*parked[(size_t) victim], nullptr)) park_drop((size_t) victim);
+            avail += freed;
+        }
+    }
 
     /// The tier's files do not outlive the engine yet: its own go when it ends (park_end), and a start removes the files
     /// of this family that are a day old (an engine that was killed; another engine's live files in the same folder stay).
@@ -9033,12 +9085,14 @@ work-group size if needed.
     }
     /// Room for `tot` bytes in the memory tier: the oldest parked caches go to the spill folder, else they are dropped.
     bool park_room(size_t tot, const Parked* keep) {
-        while (park_bytes + tot > park_cap) {
+        const size_t cap = park_limit();
+        if (tot > cap) return false;
+        while (park_bytes + tot > cap) {
             int victim = -1;
             for (size_t i = 0; i < parked.size(); ++i)
                 if (parked[i]->blob && parked[i].get() != keep && (victim < 0 || parked[i]->lru < parked[(size_t) victim]->lru)) victim = (int) i;
             if (victim < 0) return false;
-            if (!to_drive(*parked[(size_t) victim], keep)) park_drop((size_t) victim);
+            if (!to_drive(*parked[(size_t) victim], keep)) park_drop((size_t) victim);   // (the limit stays: what the tier gave back is the machine's again)
         }
         return true;
     }
@@ -9046,8 +9100,7 @@ work-group size if needed.
     /// taken out of the store with its bytes in host memory; nullptr: none.  The thread's other checkpoints leave the store
     /// too: nothing restores them while it is parked, and they would push out the ones threads share (measured with 16
     /// threads: the checkpoint of the shared start of the prompt was evicted and two threads read everything again).
-    std::unique_ptr<PrefixEntry> take_thread_ckpt(const std::vector<int32_t>& toks) {
-        const int64_t head = q36_thread_head(toks);
+    std::unique_ptr<PrefixEntry> take_thread_ckpt(const std::vector<int32_t>& toks, int64_t head) {
         PrefixEntry* best = nullptr;
         for (auto& up : ckpt_entries) {
             if (up->rolling_tag >= 0 || !up->imgs.empty() || (int64_t) up->tokens.size() != up->pos || up->pos <= head || (size_t) up->pos > toks.size()) continue;
@@ -9118,7 +9171,7 @@ work-group size if needed.
             size_t l = 0;
             while (l < pt.size() && l < toks.size() && pt[l] == toks[l]) ++l;
             if (l == toks.size()) return false;                                        // this stream is parked already (or more of it)
-            const int64_t ph = q36_thread_head(pt);
+            const int64_t ph = parked[i]->head;
             if ((l == pt.size() || (ph >= 0 && (int64_t) l > ph)) && parked[i].get() != keep) {   // an earlier state of this thread: replaced
                 park_drop(i);
                 --park_drop_n;
@@ -9132,7 +9185,7 @@ work-group size if needed.
         if (need == 0) return false;
         // room: in the memory tier (older ones move to the spill folder), else this one goes straight to the folder below
         const size_t tot_max = need + ckpt_bytes;
-        const bool in_mem = tot_max <= park_cap && park_room(tot_max, keep);
+        const bool in_mem = park_room(tot_max, keep);
         if (!in_mem && (spill_dir.empty() || tot_max > spill_cap)) return false;
         const auto t0 = Clock::now();
         auto pk = std::make_unique<Parked>();
@@ -9150,14 +9203,15 @@ work-group size if needed.
         });
         CK(DPCT_CHECK_ERROR(st->wait()));
         pk->tokens = toks;
-        pk->ckpt = take_thread_ckpt(toks);   // (the recurrent state its next turn restores: it travels with the cells)
+        pk->head = sess[(size_t) s].thread_head;
+        pk->ckpt = take_thread_ckpt(toks, pk->head);   // (the recurrent state its next turn restores: it travels with the cells)
         pk->lru = ++park_clock;
         park_bytes += pk->total(ckpt_bytes);
         ++park_n;
         park_ms += ms_since(t0);
-        std::fprintf(stderr, "strata serve: parked session %d's cache (%lld cells, %.2f GiB%s) in %.0f ms; %zu parked, in memory %.2f of %.2f GiB\n", s, (long long) n,
+        std::fprintf(stderr, "strata serve: parked session %d's cache (%lld cells, %.2f GiB%s) in %.0f ms; %zu parked, in memory %.2f GiB\n", s, (long long) n,
                      (double) need / 1073741824.0, pk->ckpt ? ", with its checkpoint" : ", no checkpoint of its own", ms_since(t0), parked.size() + 1,
-                     (double) park_bytes / 1073741824.0, (double) park_cap / 1073741824.0);
+                     (double) park_bytes / 1073741824.0);
         Parked* const raw = pk.get();
         parked.push_back(std::move(pk));
         if (!in_mem && !to_drive(*raw, keep)) {   // (no room in memory and the folder did not take it)
@@ -9206,6 +9260,7 @@ work-group size if needed.
         b.rdelta = 0;
         b.live.clear();
         b.imgs.clear();
+        b.thread_head = own->head;
         kv_live[(size_t) s] = std::move(own->tokens);
         kv_imgs[(size_t) s].clear();
         if (own->ckpt && own->ckpt->ram_blob.size() == ckpt_bytes) {   // its checkpoint is in the store again: the request restores it as any other
@@ -11339,13 +11394,13 @@ struct Serve {
 
     /// The length of session ss's held tokens when they are a proper start of `ids` with the same pictures, else 0.
     /// STRATA_Q36_PARK_GIB: session s's cache is about to be given to this request.  When it holds another thread (the
-    /// request does not share its system turn and first user message) of some length, it is parked first.
+    /// request does not share that thread's first prompt, Sess::thread_head) of some length, it is parked first.
     void park_before(int s, const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const Engine::Parked* keep = nullptr) {
         if (!E.park_on() || s < 0 || s >= (int) E.kv_live.size()) return;
         const std::vector<int32_t>& held = E.kv_live[(size_t) s];
         if ((int64_t) held.size() < E.park_min) return;
-        const int64_t head = q36_thread_head(held);
-        if (head < 0 || (int64_t) E.kv_lcp(s, ids, imgs) > head) return;   // (the same thread goes on, or no chat: its tail is not needed again)
+        const int64_t head = E.sess[(size_t) s].thread_head;
+        if (head < 0 || (int64_t) E.kv_lcp(s, ids, imgs) > head) return;   // (the same thread goes on, or none: its tail is not needed again)
         E.park(s, keep);
     }
     /// The parked cache of this request's thread when it holds more of the prompt than `have` cells (what a session
@@ -11356,7 +11411,7 @@ struct Serve {
             const std::vector<int32_t>& pt = up->tokens;
             size_t l = 0;
             while (l < pt.size() && l < ids.size() && pt[l] == ids[l]) ++l;
-            const int64_t head = q36_thread_head(pt);
+            const int64_t head = up->head;
             if (head < 0 || (int64_t) l <= head || l <= have) continue;
             // worth it: from host memory a few hundred tokens saved are; from the spill folder the whole file is read (about 36 KB a
             // cell: a SATA drive brings back some 14K cells a second, a prompt read some 1.7K tokens), so it must save an eighth of it
@@ -11503,10 +11558,12 @@ struct Serve {
             if (!ve.empty()) { std::printf("ERR %s\n", ve.c_str()); std::fflush(stdout); return; }
         }
         stop.store(false);
+        E.park_pressure();   // (the conversation cache's memory tier follows the machine's free memory)
         // ---- the session: live continuation when possible, else restore an earlier GDN checkpoint over valid KV
         Engine::PrefixEntry* pick_ckpt = nullptr;
         size_t reuse = 0;
         int s = -1;
+        int th_from = -1;   // the session the reused cells come from: its thread is this request's when it shares more than that thread's head
         if (adm) {
             s = slot;
             if (ir.imgs.empty() && !E.parked.empty()) {   // the conversation cache: this thread's parked cache comes back into its slot
@@ -11554,6 +11611,7 @@ struct Serve {
                     }
                 }
             }
+            th_from = ack != nullptr ? ack_src : src >= 0 ? src : s;
             if (reuse == 0 || ack != nullptr || src >= 0) park_before(s, ids, ir.imgs);   // (what the slot held goes: another thread's is parked)
             if (ack != nullptr) {
                 if (ack_src != s) E.copy_session(ack_src, s, ack->pos);   // (the prefix's cells; the state is the checkpoint's)
@@ -11622,17 +11680,18 @@ struct Serve {
                 }
             }
             if (s < 0) s = free_empty >= 0 ? free_empty : lru;
+            th_from = s;
             if (pick_ckpt != nullptr && E.n_sess > 1 && q36_solo_keep_on()) {
                 // STRATA_Q36_SOLO_KEEP: session s holds a thread.  A request that does not share its system turn and first user
                 // message is another thread: the prefix goes to an empty session, else the one used longest ago, and s keeps its own
-                const int64_t head = s < (int) E.kv_live.size() ? q36_thread_head(E.kv_live[(size_t) s]) : -1;
+                const int64_t head = E.sess[(size_t) s].thread_head;
                 const int64_t shared = (int64_t) E.kv_lcp(s, ids, ir.imgs);
                 const int t = free_empty >= 0 ? free_empty : lru;
                 if (head >= 0 && shared <= head && t >= 0 && t != s) {
                     park_before(t, ids, ir.imgs);   // (what session t held goes)
                     E.copy_session(s, t, pick_ckpt->pos);
                     if (q36_adm_ckpt_log())
-                        std::fprintf(stderr, "strata serve: a request alone shares %lld tokens with session %d, whose thread's third turn starts at %lld: "
+                        std::fprintf(stderr, "strata serve: a request alone shares %lld tokens with session %d, whose thread's first prompt ends at %lld: "
                                              "the prefix up to %lld goes to session %d, session %d keeps its thread\n", (long long) shared, s, (long long) head,
                                      (long long) pick_ckpt->pos, t, s);
                     s = t;
@@ -11656,6 +11715,11 @@ struct Serve {
             }
         }
         Engine::Sess& ss = E.sess[(size_t) s];
+        {   // the thread this session holds from here on: the one the reused cells belong to when the request shares more than its
+            // first prompt, else a new one that begins with this prompt
+            const int64_t sh = th_from >= 0 ? E.sess[(size_t) th_from].thread_head : -1;
+            ss.thread_head = sh >= 0 && (int64_t) reuse > sh ? sh : q36_last_turn(ids);
+        }
         if (s >= 0 && s < (int) E.kv_live.size()) {
             if (E.kv_live[(size_t) s].size() > reuse) {
                 E.kv_live[(size_t) s].resize(reuse);
@@ -12067,7 +12131,13 @@ struct Serve {
             bool have = false;
             {
                 std::unique_lock<std::mutex> lk(mu);
-                if (n_active == 0) cv.wait(lk, [&] { return eof || !lines.empty(); });
+                if (n_active == 0) {   // idle: every two seconds a look at the machine's memory (the conversation cache gives it back)
+                    while (!cv.wait_for(lk, std::chrono::seconds(2), [&] { return eof || !lines.empty(); })) {
+                        lk.unlock();
+                        E.park_pressure();
+                        lk.lock();
+                    }
+                }
                 if (!lines.empty()) {
                     line = lines.front();
                     lines.pop_front();
@@ -12109,7 +12179,7 @@ int strata::qwen35::run(int argc, char** argv) {
     double expert_vram = -1.0;
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
-    long long conv_mib = -1, conv_min_tokens = -1, spill_mib = -1, spill_min_free_mib = -1;   // the conversation cache's options (-1: not given)
+    long long conv_mib = -1, conv_min_tokens = -1, conv_min_free_mib = -1, spill_mib = -1, spill_min_free_mib = -1;   // the conversation cache's options (-1: not given)
     std::string conv_spill_dir;
     std::string draft_tokens = "tools/qwen35/q36_draft_vocab_64k.json";
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false;
@@ -12159,6 +12229,7 @@ int strata::qwen35::run(int argc, char** argv) {
         // the conversation cache (the Flash-Next engine's options of the same names): memory for parked threads, the spill folder
         else if (a == "--conversation-cache-mib") conv_mib = std::atoll(next().c_str());
         else if (a == "--conversation-cache-min-tokens") conv_min_tokens = std::atoll(next().c_str());
+        else if (a == "--conversation-cache-min-free-mib") conv_min_free_mib = std::atoll(next().c_str());
         else if (a == "--conversation-cache-spill-dir") conv_spill_dir = next();
         else if (a == "--conversation-cache-spill-mib") spill_mib = std::atoll(next().c_str());
         else if (a == "--conversation-cache-spill-min-free-mib") spill_min_free_mib = std::atoll(next().c_str());
@@ -12391,17 +12462,28 @@ int strata::qwen35::run(int argc, char** argv) {
     E.mtp_d = m.has_mtp ? mtp_d : 0;
     if (draft_vocab < 0 && std::getenv("STRATA_Q36_DRAFT_VOCAB") != nullptr) draft_vocab = std::atoi(std::getenv("STRATA_Q36_DRAFT_VOCAB"));
     E.draft_n = std::max(0, draft_vocab);
-    // the conversation cache's tiers (off unless asked for: --conversation-cache-mib / STRATA_Q36_PARK_GIB, --conversation-cache-spill-dir / STRATA_Q36_SPILL_DIR)
-    if (conv_mib >= 0) E.park_cap = (size_t) conv_mib << 20;
+    // the conversation cache's tiers: the memory tier follows the machine's free memory unless a budget is given
+    // (--conversation-cache-mib / STRATA_Q36_PARK_GIB; 0: off), the spill folder is there when one is named
+    if (conv_mib >= 0) { E.park_cap = (size_t) conv_mib << 20; E.park_auto = false; }
+    if (E.park_auto) {
+        const size_t total = q36_meminfo("MemTotal");
+        E.park_floor = conv_min_free_mib >= 0 ? (size_t) conv_min_free_mib << 20 : total > 0 ? std::max<size_t>((size_t) 2560 << 20, total / 5) : 0;
+        if (total == 0 || q36_meminfo("MemAvailable") == 0) E.park_floor = 0;   // (no /proc/meminfo: nothing to size it by)
+    }
     if (conv_min_tokens > 0) E.park_min = conv_min_tokens;
     if (conv_spill_dir.empty() && std::getenv("STRATA_Q36_SPILL_DIR") != nullptr) conv_spill_dir = std::getenv("STRATA_Q36_SPILL_DIR");
     E.spill_dir = conv_spill_dir;
     if (spill_mib >= 0) E.spill_cap = (size_t) spill_mib << 20;
     if (spill_min_free_mib >= 0) E.spill_min_free = (size_t) spill_min_free_mib << 20;
     E.spill_clean();
-    if (E.park_on())
-        std::fprintf(stderr, "strata-q36: conversation cache: parked threads in %.1f GiB of host memory%s%s (a thread of at least %lld tokens)\n",
-                     (double) E.park_cap / 1073741824.0, E.spill_dir.empty() ? "" : ", then in ", E.spill_dir.c_str(), (long long) E.park_min);
+    if (E.park_on()) {
+        char mem[160];
+        if (E.park_auto) std::snprintf(mem, sizeof mem, "host memory while %.1f GiB of it stay available (%.1f GiB available now)", (double) E.park_floor / 1073741824.0,
+                                       (double) q36_meminfo("MemAvailable") / 1073741824.0);
+        else std::snprintf(mem, sizeof mem, "%.1f GiB of host memory", (double) E.park_cap / 1073741824.0);
+        std::fprintf(stderr, "strata-q36: conversation cache: parked threads in %s%s%s (a thread of at least %lld tokens)\n", mem,
+                     E.spill_dir.empty() ? "" : ", then in ", E.spill_dir.c_str(), (long long) E.park_min);
+    }
     // M2: the dense model's drafts pick among kDraftVocab token ids by default (the verify window reads the whole head, so the
     // answer is the plain greedy one whatever the subset; only the acceptance moves): the ids of --draft-tokens in its order, then
     // the lowest.  The default list is the 64K draft vocabulary of the vLLM B70 cookbook (built from public text, HF tokenizer ids
