@@ -1,0 +1,11 @@
+{
+ "engine": "strata",
+ "arch": "qwen35",
+ "model_name": "qwen3.8-27b",
+ "exe": "sycl/serve/strata-sycl.sh",
+ "args": ["--native", "/path/to/models/Qwen3.8-27B-UD-Q4_K_M.gguf", "--b70-pack", "/path/to/models/qwen38-27b.b70w4",
+          "--max-context", "262144", "--kv", "int8"],
+ "env": {"STRATA_SYCL_MOUNTS": "/path/to/models",
+         "STRATA_SYCL_NAME": "strata-27b-serve"},
+ "tokenizer": "/path/to/data/qwen38-27b/tokenizer"
+}

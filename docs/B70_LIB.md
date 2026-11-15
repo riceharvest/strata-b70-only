@@ -29,7 +29,8 @@ The stream products have three activation forms, by what the caller already has:
 
 Measured on the 27B, the only model that runs them so far ([Q36.md](Q36.md) has the tables): the W4X stream product at 1.03 to
 1.17 times the memory floor for 1 to 16 columns, the one-pass decode attention at 87 to 91% of the memory floor for 3 to 5 rows
-at 118K to 256K cells, the prompt GEMM at 184 to 186 TOPS (the card's microbenchmark kernel reaches 308 to 325: open).
+at 118K to 256K cells, the prompt GEMM at 207 to 222 TOPS on most shapes (186 to 189 on the 17,408-wide one, 184 to 188 for the
+fused FFN pair; `q36_mmvq_dense_parity --pp3-bench`, 2026-11-15).
 
 ## The pack
 
@@ -199,5 +200,8 @@ Tuning switches of the kernels. Each still answers to the name it had in the den
 - The attention kernels are fixed at a head dimension of 256 and 6 query heads per KV head.
 - The routed experts stay in their GGUF formats (about 2 bits a weight). 2-bit integers are a native matrix-engine operand
   on this card, but a 2-bit pack is another quantization of those weights and its quality is not known.
-- The fat product is at 184 to 186 TOPS against the 308 to 325 the card's microbenchmark kernel reaches.
+- The fat product is at 78 to 80% of a pure-integer product on the same shapes and the same records (207-222 against 262-282
+  TOPS, 72% on the 17,408-wide shape; measured 2026-11-15). The difference is the scale and zero of every group of 128 inputs,
+  which the format needs: the room left is about a quarter, not the 1.7 times the microbenchmark's 308-325 TOPS suggested
+  (that figure was another shape, 8,192 inputs, without scales). A layout with the weights contiguous measured no faster.
 - The GGUF decode forms tuned for the 27B's shapes (`q36_mmvq_dense`, `q36_xr_dense`) are still that family's sources.

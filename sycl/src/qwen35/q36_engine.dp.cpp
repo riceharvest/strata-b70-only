@@ -2237,6 +2237,42 @@ bool q36_spec_sample_on() {   // STRATA_Q36_SPEC_SAMPLE: a request with a temper
     static const bool on = [] { const char* e = std::getenv("STRATA_Q36_SPEC_SAMPLE"); return !(e && e[0] == '0'); }();
     return on;
 }
+// STRATA_Q36_SPEC_COUPLE=1 (off by default): a request with a temperature draws by Gumbel-max with a key per token
+// (Sampling::coupled, q36_sampling.hpp), and in the one-session verify window's draft CHAIN the draft head makes the same
+// draw from its own logits instead of taking their argmax.  The target's draw is the plain path's either way (same
+// distribution, one output of the stream a token); a seed's text is another than without the switch.
+// Measured on the B70 (2026-11-15, int4 pack, temperature 1.0 / top-p 0.95 / top-k 20, thinking on): no gain.  Most steps of
+// a served request verify a TREE of the draft head's two best tokens (spec_step_tree, head_draft_top2), which this does not
+// touch, so the chain's draw reaches few steps; where it does, the draft head is less sure than the target, and drawing
+// from it as it is misses where the target is sure.  With the same seed the drafts accepted did not move with
+// STRATA_Q36_SPEC_COUPLE_SHARP from 2 to 1000 (26K: 472 of 950 every time; 118K: 474 of 873).  Kept as a switch: the place to
+// take it further is the tree's second candidate (the coupled draw instead of the second best token).
+bool q36_spec_couple_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_Q36_SPEC_COUPLE"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+// STRATA_Q36_SPEC_COUPLE_RATIO (default 0.03): the coupled draft picks among the draft head's tokens whose probability is at
+// least this share of its best token's (the draft head has no top-k / top-p list on the device; this stands in for them).
+float q36_spec_couple_ratio() {
+    static const float r = [] {
+        const char* e = std::getenv("STRATA_Q36_SPEC_COUPLE_RATIO");
+        const float v = e ? (float) std::atof(e) : 0.f;
+        return v > 0.f && v < 1.f ? v : 0.03f;
+    }();
+    return r;
+}
+// STRATA_Q36_SPEC_COUPLE_SHARP (default 1): the draft head's logits are multiplied by this before the coupled draw.  The
+// draft head is less sure than the target (it guesses further ahead with one block), so drawing from it as it is misses
+// where the target is sure; a factor above 1 makes its distribution as sharp as the target's tends to be.  A very large
+// factor is the draft head's top token (the rule before the coupled draft).
+float q36_spec_couple_sharp() {
+    static const float r = [] {
+        const char* e = std::getenv("STRATA_Q36_SPEC_COUPLE_SHARP");
+        const float v = e ? (float) std::atof(e) : 0.f;
+        return v >= 0.05f ? v : 1.f;
+    }();
+    return r;
+}
 bool q36_batch_sample_on() {   // STRATA_Q36_BATCH_SAMPLE=1: in a --batch --batch-mtp window a sampled / penalised slot drafts too
     static const bool on = [] { const char* e = std::getenv("STRATA_Q36_BATCH_SAMPLE"); return !(e && e[0] == '0'); }();   // (default on; 0: the old one-row step)
     return on;
@@ -3505,6 +3541,13 @@ struct Engine {
     int32_t* sp_rows = nullptr;    // [kVerify][kSpecRowWords]: a row's ids, then its logits' bits (second stage)
     int32_t* sp_m = nullptr;       // [1] the candidates a row returns, set before each window (the kernels read it)
     int32_t* sp_h = nullptr;       // pinned: [0] the M to send, [1 ..] the rows as copied back
+    // the coupled draft (STRATA_Q36_SPEC_COUPLE): the keys of the window's next draws, and 1 / temperature and the logit margin
+    uint64_t* gum_key = nullptr;   // [kVerify] on the card
+    float* gum_par = nullptr;      // [2] on the card: 1 / temperature, the margin below the best logit
+    uint64_t* gum_h = nullptr;     // pinned: [kVerify] keys, then the two floats' bits in one word
+    float* gum_v = nullptr;        // [kArgBlocks] the first stage's best scores
+    int32_t* gum_i = nullptr;      // [kArgBlocks] ... and their rows of the draft head
+    int gum_at = -1;               // while a coupled window's graph is recorded: the index of the next draft's key (-1: argmax drafts)
     int sp_nch = 0;                // chunks of a logit row
     /// The host's say in a verify window (its rows are drawn by the host after the one wait): the request's sampler.
     struct SpecSel {
@@ -4112,6 +4155,13 @@ struct Engine {
                 sp_rows = dalloc_t<int32_t>((size_t) kVerify * kSpecRowWords);
                 sp_m = dalloc_t<int32_t>(1);
                 CK(DPCT_CHECK_ERROR(sp_h = sycl::malloc_host<int32_t>(1 + (size_t) kVerify * kSpecRowWords, q_ct1)));
+                if (q36_spec_couple_on()) {
+                    gum_key = dalloc_t<uint64_t>(kVerify);
+                    gum_par = dalloc(2);
+                    gum_v = dalloc(kArgBlocks);
+                    gum_i = dalloc_t<int32_t>(kArgBlocks);
+                    CK(DPCT_CHECK_ERROR(gum_h = sycl::malloc_host<uint64_t>((size_t) kVerify + 1, q_ct1)));
+                }
             }
         }
         /*
@@ -7085,6 +7135,54 @@ work-group size if needed.
             st->parallel_for<class q36_draft_argmax1>(
                 sycl::nd_range<3>(sycl::range<3>(1, 1, kArgBlocks * kThreads), sycl::range<3>(1, 1, kThreads)),
                 [=](sycl::nd_item<3>) { k_argmax(lg, nd, pk, amv_, ami_, false); });
+            if (gum_at >= 0 && gum_key != nullptr) {
+                // The coupled draft: not the head's top token but the draw the target's sampler will make for this position,
+                // made from the draft head's logits - the highest (logit / temperature + noise(key, token id)) among the tokens
+                // within a margin of the best logit (amv: the argmax's first-stage block maxima).  The key is the stream output
+                // the target's draw of this position will take (spec_step_g uploads the window's keys); the noise is that
+                // draw's, to 24 bits.  A draft only proposes: the verify window's draw decides.
+                const int kd = gum_at++;
+                const uint64_t* keys = gum_key;
+                const float* par = gum_par;
+                float* gv = gum_v;
+                int32_t* gi = gum_i;
+                st->parallel_for<class q36_draft_gum1>(
+                    sycl::nd_range<1>(sycl::range<1>((size_t) kArgBlocks * kThreads), sycl::range<1>(kThreads)),
+                    [=](sycl::nd_item<1> it) {
+                        const int tid = (int) it.get_local_id(0), blk = (int) it.get_group(0);
+                        float vm = -INFINITY;
+                        for (int i = tid; i < kArgBlocks; i += kThreads) vm = sycl::fmax(vm, amv_[i]);
+                        vm = sycl::reduce_over_group(it.get_group(), vm, sycl::maximum<float>());
+                        const uint64_t key = keys[kd];
+                        const float inv_t = par[0], lim = vm - par[1];
+                        float best = -INFINITY;
+                        int bi = 0x7fffffff;
+                        for (int i = blk * kThreads + tid; i < nd; i += kArgBlocks * kThreads) {
+                            const float v = lg[i];
+                            if (v >= lim) {
+                                const float u = strata::qwen35::couple_u24(key, (uint32_t) idv[i]);
+                                const float sc = v * inv_t - sycl::log(-sycl::log(u));
+                                if (sc > best || (sc == best && i < bi)) { best = sc; bi = i; }
+                            }
+                        }
+                        const float gb = sycl::reduce_over_group(it.get_group(), best, sycl::maximum<float>());
+                        const int gbi = sycl::reduce_over_group(it.get_group(), best == gb ? bi : 0x7fffffff, sycl::minimum<int>());
+                        if (tid == 0) { gv[blk] = gb; gi[blk] = gbi; }
+                    });
+                st->parallel_for<class q36_draft_gum2>(
+                    sycl::nd_range<1>(sycl::range<1>(kThreads), sycl::range<1>(kThreads)),
+                    [=](sycl::nd_item<1> it) {
+                        const int tid = (int) it.get_local_id(0);
+                        float best = -INFINITY;
+                        int bi = 0x7fffffff;
+                        for (int i = tid; i < kArgBlocks; i += kThreads)
+                            if (gv[i] > best || (gv[i] == best && gi[i] < bi)) { best = gv[i]; bi = gi[i]; }
+                        const float gb = sycl::reduce_over_group(it.get_group(), best, sycl::maximum<float>());
+                        const int gbi = sycl::reduce_over_group(it.get_group(), best == gb ? bi : 0x7fffffff, sycl::minimum<int>());
+                        if (tid == 0) pk[0] = idv[gbi >= 0 && gbi < nd ? gbi : 0];
+                    });
+                return;
+            }
             st->parallel_for<class q36_draft_argmax2>(
                 sycl::nd_range<3>(sycl::range<3>(1, 1, kThreads), sycl::range<3>(1, 1, kThreads)),
                 [=](sycl::nd_item<3>) { k_argmax(lg, kArgBlocks, pk, amv_, ami_, true); });
@@ -9044,6 +9142,18 @@ work-group size if needed.
             sp_h[0] = sel->M;
             CK(DPCT_CHECK_ERROR(st->memcpy(sp_m, sp_h, 4)));
         }
+        // The coupled draft (STRATA_Q36_SPEC_COUPLE): a sampled request's draft chain draws as the target will.  Draft d is
+        // compared with row d's draw, which takes the d-th next output of the request's stream: those outputs, peeked.
+        const bool couple = sel != nullptr && given == nullptr && gum_key != nullptr && head_d.d != nullptr && sel->s->coupled &&
+                            sel->s->temperature > 0.f && D <= kVerify;
+        if (couple) {
+            strata::qwen35::peek_draw_keys(*sel->rng, D, gum_h);
+            const float sharp = q36_spec_couple_sharp();   // (the margin is in logits: the same share of the sharpened distribution)
+            const float par[2] = {sharp / sel->s->temperature, -sel->s->temperature * std::log(q36_spec_couple_ratio()) / sharp};
+            std::memcpy(gum_h + kVerify, par, 8);
+            CK(DPCT_CHECK_ERROR(st->memcpy(gum_key, gum_h, (size_t) D * 8)));
+            CK(DPCT_CHECK_ERROR(st->memcpy(gum_par, gum_h + kVerify, 8)));
+        }
         if (given != nullptr) {   // the window's tokens after x, from the host
             for (int d = 0; d < D; ++d) hpin[160 + d] = (*given)[(size_t) d];
             CK(DPCT_CHECK_ERROR(st->memcpy(tok + 1, hpin + 160, (size_t) D * 4)));
@@ -9082,6 +9192,7 @@ work-group size if needed.
             if (sel == nullptr) run_graph_key(kb + gk * 16 + D, body_given);
             else run_graph_key(ks + gk * 16 + D, [&] { body_given(); sp_topm(T); });
         } else if (sel == nullptr) run_graph_key(50000 + T0 * 16 + D, body);   // (greedy: the graph as before)
+        else if (couple) run_graph_key(250000 + T0 * 16 + D, [&] { gum_at = 0; body(); gum_at = -1; sp_topm(T); });   // (the draft head draws)
         else run_graph_key(70000 + T0 * 16 + D, [&] { body(); sp_topm(T); });
         rows_deferred = false;
         if (sel == nullptr) CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 64, pick, (size_t) T * 4)));
@@ -9769,6 +9880,7 @@ work-group size if needed.
                     strata::qwen35::Sampling ws;
                     ws.temperature = 1.f;
                     ws.top_k = 4;
+                    ws.coupled = q36_spec_couple_on();   // (the graphs a sampled request takes: the coupled draft's, or the argmax draft's)
                     const std::vector<int32_t> wh(1, filler);
                     std::mt19937_64 wr(1);
                     const SpecSel wsel{&ws, 4, 4, &wh, &wr};
@@ -10720,6 +10832,7 @@ struct Serve {
         }
         const long long max_new = std::strtoll(p, &p, 10);
         Sampling smp;
+        smp.coupled = q36_spec_couple_on();   // (how a draw maps the random stream to a token: every path of this request, plain or window)
         bool ignore_eos = false;   // LANE SOLO: ignore_eos=1 (the server sends it for a request that asked: a benchmark's fixed length)
         std::vector<uint64_t> img_keys;
         for (;;) {

@@ -12,6 +12,12 @@ struct Sampling {
     float temperature = 0.f, top_p = 1.f, min_p = 0.f, repeat = 1.f, freq = 0.f, present = 0.f;
     int top_k = 20, last_n = 0;
     unsigned long long seed = 0;
+    /// How a draw turns the request's random stream into a token (q36_sampling.hpp draw()).  false: one uniform number walks the
+    /// ranked candidates' cumulative weights.  true: Gumbel-max - every candidate gets a noise value that depends only on
+    /// the draw's key (one output of the stream) and the token id, and the highest (logit / temperature + noise) wins.  Both
+    /// draw from the same distribution; with the second a drafter that knows the key can make the SAME draw from its own
+    /// logits, which is right whenever its distribution is close to the target's (STRATA_Q36_SPEC_COUPLE).
+    bool coupled = false;
     bool needs_logits() const { return temperature > 0.f || repeat != 1.f || freq != 0.f || present != 0.f; }
 };
 

@@ -89,8 +89,35 @@ inline void apply_penalties_row(std::vector<float>& lg, const Sampling& s, const
     }
 }
 
+// ------------------------------------------------------------------------------------------- the coupled draw's noise
+// A draw of a request with Sampling::coupled takes one 64-bit output of the stream as its key (what one uniform draw took,
+// so the stream stands where it stood), and every candidate's noise is a function of (key, token id) alone.  Plain integer
+// code: the engine's draft kernel calls couple_hash with the same key and makes the float part itself (24 bits of it).
+inline uint64_t couple_hash(uint64_t key, uint32_t id) {   // splitmix64 of the key stepped by the id
+    uint64_t z = key + 0x9E3779B97F4A7C15ull * ((uint64_t) id + 1ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+/// The Gumbel noise of token `id` under `key`: -log(-log(u)), u in (0, 1) from the hash's high 53 bits.
+inline double couple_gumbel(uint64_t key, int32_t id) {
+    const double u = ((double) (couple_hash(key, (uint32_t) id) >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+    return -std::log(-std::log(u));
+}
+/// The same noise's uniform number to 24 bits, as a float in (0, 1): what the engine's draft kernel takes (it has no doubles
+/// to spare); its noise is -log(-log(u)) of this.
+inline float couple_u24(uint64_t key, uint32_t id) {
+    return ((float) (uint32_t) (couple_hash(key, id) >> 40) + 0.5f) * (1.0f / 16777216.0f);
+}
+/// The keys of the next n draws of `rng`, which is not advanced: what a drafter needs to make the draws the target will make.
+inline void peek_draw_keys(const std::mt19937_64& rng, int n, uint64_t* keys) {
+    std::mt19937_64 c = rng;
+    for (int i = 0; i < n; ++i) keys[i] = c();
+}
+
 /// The draw: temperature, then min_p and top_p over the ranked candidates (at most the cap), then one draw of `rng`.
-/// `top` is ranked by cand_before and already cut to the cap.  One call takes exactly one draw.
+/// `top` is ranked by cand_before and already cut to the cap.  One call takes exactly one draw (one output of the stream:
+/// the uniform draw's, or the coupled draw's key).
 inline int draw(const std::vector<Cand>& top, const Sampling& s, std::mt19937_64& rng) {
     std::vector<double> p(top.size());
     const double mx = top[0].v;
@@ -104,6 +131,16 @@ inline int draw(const std::vector<Cand>& top, const Sampling& s, std::mt19937_64
         if (cum >= s.top_p) { keep = i + 1; break; }
     }
     keep = std::max<size_t>(1, keep);
+    if (s.coupled) {   // Gumbel-max over the kept candidates: P(i) = p[i] / sum of the kept, as the walk below
+        const uint64_t key = rng();
+        size_t best = 0;
+        double bv = -INFINITY;
+        for (size_t i = 0; i < keep; ++i) {
+            const double sc = (double) (top[i].v - mx) / s.temperature + couple_gumbel(key, top[i].id);
+            if (sc > bv) { bv = sc; best = i; }
+        }
+        return top[best].id;
+    }
     double tot = 0;
     for (size_t i = 0; i < keep; ++i) tot += p[i];
     std::uniform_real_distribution<double> u(0.0, tot);
