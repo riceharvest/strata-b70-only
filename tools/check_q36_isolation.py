@@ -57,7 +57,7 @@ GUARDS = ("STRATA_Q36_BUILD", "STRATA_B70_LIB")
 B70_TREES = ("sycl/include/strata/b70/", "sycl/src/b70/")
 # the shared files that may reach the library (behind STRATA_B70_LIB)
 B70_ALLOWED = {"sycl/src/kernels/cuda/native_mmvq.dp.cpp", "sycl/src/prefill/gemm.dp.cpp", "sycl/src/core/native_dense.cpp",
-               "sycl/src/program/generate.cpp"}
+               "sycl/src/program/generate.cpp", "sycl/src/prefill/prefill.cpp"}   # (prefill.cpp: the calibration dump)
 DENSE_SOURCES = ("q36_engine.dp.cpp", "q36_mmvq_dense.dp.cpp", "q36_xr_dense.dp.cpp", "q36_requant.cpp")
 
 

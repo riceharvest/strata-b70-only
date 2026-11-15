@@ -53,17 +53,30 @@ model's GGUF gives it, so an engine that loads matrices by name can take them fr
     python3 tools/b70_pack.py --gguf model.gguf --out x --list                         # what would be packed, nothing written
 
 `tools/b70_pack.py` takes every 2-D tensor whose name matches `--match` (default: the attention, recurrence and FFN
-projections) and whose shape the pack takes, dequantizes it, and quantizes it again to 4 bits with a clip search per group
-of 128 inputs (`--search`, default 4 narrower ranges tried). It prints each matrix's relative error and lowest row
-correlation with its source.
+projections) and whose shape the pack takes, dequantizes it, and quantizes it again to 4 bits. It reads the GGUF's directory
+with this repository's reader, so a tensor type the installed gguf package does not know does not stop it. `--match` picks
+the kinds: `--match '\.(attn_gate|attn_q)\.weight$'` packs only those two.
 
-A pack made this way is a second quantization of the GGUF's values: it is as good as its source at best, and the lowest
-error comes from a higher-precision GGUF (F16, BF16, Q8_0). A checkpoint that was quantized to int4 with calibration (GPTQ,
-AutoRound, AWQ) keeps its own codes instead: `tools/qwen35/b70w4_pack.py` packs one for the dense family and stays the way
-the 27B's pack is made.
+**With calibration** (GPTQ: the error each input's rounding leaves is moved onto the inputs not yet rounded, weighted by how
+the model's real inputs vary together, so the products change least instead of the weights). The engine supplies the
+inputs:
 
-**Check a pack made from a GGUF on the card before serving it.** The one that has been run (Flash-Next, below) was faster and
-measurably worse.
+1. Start the model as it is served, with `STRATA_B70_CALIB_DIR=<folder>` in the engine's environment and no prompt reuse
+   (`--prompt-cache 0 --conversation-cache-mib 0`), and send it text of the kind it will see: about 20,000 tokens in
+   prompts of a few thousand each (`max_tokens` 1), then one more prompt that is held out. The prompt path writes the FP16
+   inputs of every projection a pack can hold into the folder (about 0.84 MB a token for Flash-Next: 20 GB for that run).
+   Nothing else changes in that start; it is slow on purpose.
+2. `python3 tools/b70_pack.py --gguf ... --out model.b70w4 --calib <folder>` (36 minutes on a 32-thread CPU for
+   Flash-Next's 156 matrices). Each matrix's line gives the error of its products on the held-out prompt, calibrated and
+   not: for Flash-Next 0.35 -> 0.08 on `attn_output`, 0.14 -> 0.07 on `ssm_out`, about 1.4 times lower on the rest.
+3. Delete the folder.
+
+Without `--calib` the tool rounds to nearest with a clip search per group of 128 inputs (`--search`). A pack made from a
+GGUF is a second quantization of the GGUF's values either way: it is as good as its source at best. A checkpoint that was
+quantized to int4 with calibration from the original weights (GPTQ, AutoRound, AWQ) keeps its own codes instead:
+`tools/qwen35/b70w4_pack.py` packs one for the dense family and stays the way the 27B's pack is made.
+
+**Check a pack on the card before serving it** (the table under "Flash-Next with a pack" is such a check).
 
 ### Loading one
 
@@ -94,40 +107,55 @@ blocks. Without the flag nothing of this runs. The start prints how many matrice
 
 ## Flash-Next with a pack (measured 2026-11-15)
 
-The first second model on the library: the served Flash-Next setup (UD-IQ1_S, the config of [B70.md](B70.md)) with its 156
-attention and recurrence projections from a pack that `tools/b70_pack.py` made from the served GGUF. In that file those
-matrices are Q5_K and Q6_K (5.5 and 6.6 bits a weight), so the pack is fewer bytes as well as a cheaper product, and it is
-a coarser quantization: the tool reports a relative error of 11 to 14% a matrix.
+The first second model on the library: the served Flash-Next setup (UD-IQ1_S, the config of [B70.md](B70.md)) with its
+attention and recurrence projections from a pack. In the served GGUF those 156 matrices are Q5_K and Q6_K (5.5 and 6.6 bits
+a weight), so a pack is fewer bytes as well as a cheaper product, and it is a coarser quantization. Same binary in every
+row; "GGUF" is the served setup.
 
-Same binary, three starts in the order GGUF, pack, GGUF; greedy, the two leaderboard prompts on a fixed text, 512 tokens,
-three runs a start:
+**Speed, like for like** (`STRATA_DECODE_TIMING=1`: the verify time of a draft window by its size, which does not depend on
+the text an arm happens to write; two requests a start):
 
-| | GGUF (first start) | Pack | GGUF (third start) |
-| --- | --- | --- | --- |
-| reasoning text, tok/s | 124.2 / 131.0 / 127.3 | 141.2 / 142.5 / 143.7 | 125.6 / 127.5 / 129.0 |
-| code text, tok/s | 103.8 / 108.3 / 106.4 | 110.5 / 112.8 / 111.4 | 106.7 / 107.5 / 106.3 |
-| answer after a 19.6K-token prompt, tok/s | 113.3 | 125.6 | 117.5 |
-| projection weights in VRAM | 2,784 MiB | 2,238 MiB | 2,784 MiB |
-
-That is about 12% faster on the reasoning text and 5% on the code text. The 19.6K prompt was read at 1,492 / 2,161 / 2,312
-tok/s in that order: the two GGUF starts differ more than the pack differs from either, so the prompt read is not decided.
-Six short questions with one right answer were answered correctly in every start; the texts differ from the first words on.
-
-What it costs, with the KL kit of the 2026-11-11 check (the GGUF start captures greedy streams, the pack start replays the
-same tokens; both starts repeat themselves bit for bit):
-
-| | Pack against GGUF | For scale: the served kernels against exact ones (2026-11-11) |
+| Window | GGUF | Calibrated pack, all 156 |
 | --- | --- | --- |
-| first token after a prompt, 36 prompts | KL mean 0.0017, highest 0.012, same top token 36 of 36 | KL mean 0.00006, 36 of 36 |
-| decode, 2,871 forced rows | KL mean 0.037 (median 0.0006), same top token 94.8% | KL 0.0009, 99.1% |
-| perplexity of the forced stream | +3.5% | +0.07% |
+| 2 rows | 16.4-16.7 ms | 14.9 |
+| 3 rows | 18.3 | 16.7-17.0 |
+| 4 rows | 20.3-20.4 | 18.5 |
+| 5 rows | 23.4 | 20.2-20.4 |
+| 6 rows | 25.8-26.0 | 22.4-22.6 |
+| a whole window, average | 22.9-23.3 | 20.6-20.8 |
 
-So a pack made from this GGUF is a real loss of quality for the speed: about the distance between two backends running the
-same file (the repository's yardstick for that is KL 0.038, 94.5% same top token). **It stays off, and this pack is not a
-recommendation.** What the run shows is that the hooks work on a second model and what the lever is worth. The loss is the
-quantizer's (round to nearest on values that were already quantized, no calibration), not the format's: the 27B's pack keeps
-a calibrated checkpoint's own codes. A calibrated 4-bit quantization of these 156 matrices from the original weights is the
-way to keep the speed without this cost; it has not been made.
+A window is 10.5% shorter. On generated text (greedy, 512 tokens, three runs a start) that shows as 124-131 -> 134-144
+tok/s on the reasoning leaderboard prompt in every pack start; the code prompt moves between 102 and 125 tok/s from one
+pack to the next (GGUF 104-108), because each pack writes another text and the drafts hold differently on it, so read the
+window table. Projection weights in VRAM: 2,784 -> 2,238 MiB. The prompt read was not changed measurably: a 19.6K-token
+prompt at 2,161 tok/s with a pack against 1,958-2,312 for the GGUF at the same place in a session (the first start of a
+session read it at 1,128-1,492 with or without a pack).
+
+**What it costs** (the KL kit of the 2026-11-11 check: a GGUF start captures greedy streams, each pack start replays the
+same tokens; every start repeats itself bit for bit, and six short questions with one right answer were answered correctly
+in every start):
+
+| Pack | Matrices | VRAM saved | First token: KL, same top token (36 prompts) | Decode: KL, same top token (2,870 rows) | Perplexity |
+| --- | --- | --- | --- | --- | --- |
+| round to nearest, all | 156 | 546 MiB | 0.0017, 36 of 36 | 0.037, 94.8% | +3.47% |
+| calibrated, all | 156 | 546 MiB | 0.00067, 36 of 36 | 0.0103, 97.1% | +1.42% |
+| calibrated, without `ssm_out` and `attn_output` | 108 | 409 MiB | 0.00055, 36 of 36 | 0.0076, 97.3% | +1.04% |
+| calibrated, `attn_qkv` only | 36 | 141 MiB | 0.00026, 36 of 36 | 0.0042, 97.9% | +0.57% |
+| calibrated, `attn_gate` and `attn_q` only | 48 | 260 MiB | 0.00023, 36 of 36 | 0.0027, 98.5% | +0.24% |
+
+For scale: the served kernels against exact ones measured KL 0.0009, 99.1% and +0.07% on this kit; two backends running
+the same file are at KL 0.038 in the repository's notes.
+
+**Reading.** Calibration (GPTQ on the projections' own inputs, captured from the engine) takes the loss from 3.5% to 1.4%
+and keeps all of the speed. It does not reach the level of the served kernels: 4 bits a weight is the limit here, not the
+calibration (half the calibration tokens moved a typical matrix's held-out error from 0.055 to 0.058; damping from 0.001 to
+0.2 moved it by less). The loss is spread over the projections, so the choice is a trade:
+
+- `attn_gate` and `attn_q` only: +0.24% perplexity, a window 1 to 4% shorter (two requests: 22.0 and 24.1 ms a window
+  against 22.9-23.3; its 3-row windows 17.7-18.1 ms against 18.3), 260 MiB of VRAM.
+- all 156: +1.42%, a window 10.5% shorter, 546 MiB.
+
+**Nothing is on by default.** Both packs are choices for whoever serves the model (`--b70-pack`, Settings "b70_pack").
 
 ## Calling it from a model family
 
@@ -162,10 +190,12 @@ Tuning switches of the kernels. Each still answers to the name it had in the den
 
 ## Not done
 
-- **A good pack for Flash-Next.** The one measured above costs 3.5% perplexity. A calibrated 4-bit quantization of its
-  projections from the original weights has not been made.
-- The prompt read with a pack is not decided (see the table's note), and the pack's prompt product is still the dequantize
-  and the FP16 GEMM, not the integer fat product the 27B uses.
+- **A pack of all of Flash-Next's projections at the served kernels' quality.** Calibrated it costs 1.4% perplexity; at 4 bits
+  a weight that looks like the limit. A finer scale (one per 32 inputs, 4.5 bits a weight) or 5 bits for the matrices that
+  cost most are the formats that could close it; neither exists in the kernels.
+- Calibration on the engine's inputs uses the unquantized model's activations for every matrix; the usual refinement (each
+  layer calibrated on the inputs the already quantized layers produce) is not built.
+- A pack's prompt product is the dequantize and the FP16 GEMM, not the integer fat product the 27B uses.
 - The attention kernels are fixed at a head dimension of 256 and 6 query heads per KV head.
 - The routed experts stay in their GGUF formats (about 2 bits a weight). 2-bit integers are a native matrix-engine operand
   on this card, but a 2-bit pack is another quantization of those weights and its quality is not known.

@@ -3,6 +3,7 @@
 
     python3 tools/b70_pack.py --gguf FILE.gguf [FILE-00002-of-N.gguf ...] --out FILE.b70w4
                               [--match REGEX] [--layers N] [--search STEPS] [--check ROWS] [--list]
+                              [--calib FOLDER [--holdout N]]
 
 Any model.  Every 2-D tensor of the GGUF (all the shards given) whose name matches --match and whose shape the pack takes
 (inputs a multiple of 256, rows a multiple of 16) is dequantized, quantized again to 4 bits (asymmetric, a scale and a zero
@@ -11,6 +12,10 @@ An engine then loads those matrices from the pack and everything else from the G
 
     Flash-Next family    strata --b70-pack FILE.b70w4 ...     (Settings: "b70_pack"; or STRATA_B70_PACK=FILE)
     dense family         strata --w4 FILE.b70w4 ...           (--b70-pack is the same flag)
+
+--calib FOLDER quantizes with calibration (GPTQ) on the projections' own inputs, which the engine writes in a calibration
+run (STRATA_B70_CALIB_DIR; docs/B70_LIB.md, "Making one"): the error of each matrix's products on held-out inputs is printed
+beside the uncalibrated one.
 
 A pack made here is a second quantization of the GGUF's values: it is as good as its source at best.  The lowest error
 comes from a higher-precision GGUF (F16, BF16, Q8_0).  A checkpoint that was quantized to int4 with calibration (GPTQ,
@@ -109,14 +114,10 @@ def _quantize_range(w, wmin, wmax):
     return q, z, sc_h
 
 
-def quantize_rows_w4(w_f32, search=0):
-    """Rows of float32 [m][n_in] (n_in a multiple of 128) to the pack's 4 bits: q int32 [m][n_in], z [groups][m], sc fp16 bits
-    [groups][m].  search = 0: each group's range is its minimum and maximum.  search = N: N narrower ranges are tried too
-    (down to 0.6 of the range) and each group keeps the one with the smallest squared error."""
-    m, n_in = w_f32.shape
-    assert n_in % 128 == 0
-    ng = n_in // 128
-    w = np.asarray(w_f32, dtype=np.float32).reshape(m, ng, 128)
+def _group_params(w, search=0):
+    """w float32 [m][groups][128] -> (q int32 [m][groups][128], z int32 [m][groups], sc_h float16 [m][groups]): each group's
+    range is its minimum and maximum, or with search = N the best of that and N narrower ranges (down to 0.6 of it) by
+    squared error."""
     wmin = w.min(axis=2)
     wmax = w.max(axis=2)
     q, z, sc_h = _quantize_range(w, wmin, wmax)
@@ -134,7 +135,72 @@ def quantize_rows_w4(w_f32, search=0):
                 q = np.where(take[:, :, None], q2, q)
                 z = np.where(take, z2, z)
                 sc_h = np.where(take, s2, sc_h)
+    return q, z, sc_h
+
+
+def quantize_rows_w4(w_f32, search=0):
+    """Rows of float32 [m][n_in] (n_in a multiple of 128) to the pack's 4 bits: q int32 [m][n_in], z [groups][m], sc fp16 bits
+    [groups][m].  search = 0: each group's range is its minimum and maximum.  search = N: N narrower ranges are tried too
+    (down to 0.6 of the range) and each group keeps the one with the smallest squared error."""
+    m, n_in = w_f32.shape
+    assert n_in % 128 == 0
+    ng = n_in // 128
+    w = np.asarray(w_f32, dtype=np.float32).reshape(m, ng, 128)
+    q, z, sc_h = _group_params(w, search)
     return q.reshape(m, n_in), np.ascontiguousarray(z.T), np.ascontiguousarray(sc_h.T.view(np.uint16))
+
+
+def gptq_factor(H, damp=0.01):
+    """The inputs' second moments H [n_in][n_in] (the sum of x x^T over calibration tokens) as what gptq_rows_w4 needs: the
+    upper Cholesky factor U of the damped H's inverse (H^-1 = U^T U) and the inputs that were never active."""
+    H = np.array(H, dtype=np.float64)
+    n = H.shape[0]
+    d = np.diag(H).copy()
+    dead = d <= 0.0
+    idx = np.where(dead)[0]
+    H[idx, idx] = 1.0
+    live_mean = float(d[~dead].mean()) if (~dead).any() else 1.0
+    H[np.diag_indices(n)] += damp * live_mean
+    U = np.linalg.cholesky(np.linalg.inv(H)).T
+    return np.ascontiguousarray(U), dead
+
+
+def gptq_rows_w4(w_f32, U, dead=None, search=0):
+    """quantize_rows_w4 with calibration (GPTQ): the inputs are quantized in order, and the error each one leaves is moved
+    onto the inputs not yet quantized, weighted by how the calibration inputs vary together (U from gptq_factor), so the
+    products with real inputs change least instead of the weights.  A group's scale and zero are taken from its weights as
+    they stand when the group is reached.  Rows are independent: any subset of a matrix's rows gives those rows' result."""
+    m, n_in = w_f32.shape
+    assert n_in % 128 == 0 and U.shape == (n_in, n_in)
+    ng = n_in // 128
+    W = np.array(w_f32, dtype=np.float64)
+    if dead is not None and dead.any():
+        W[:, dead] = 0.0
+    Q = np.zeros((m, n_in), dtype=np.int32)
+    Z = np.zeros((m, ng), dtype=np.int32)
+    SC = np.zeros((m, ng), dtype=np.float16)
+    for g in range(ng):
+        i1, i2 = 128 * g, 128 * g + 128
+        W1 = W[:, i1:i2].copy()
+        _, z, sc_h = _group_params(W1.astype(np.float32).reshape(m, 1, 128), search)
+        z = z[:, 0].astype(np.float64)
+        scf = sc_h[:, 0].astype(np.float64)
+        inv = np.where(scf > 0.0, 1.0 / np.where(scf > 0.0, scf, 1.0), 0.0)
+        U1 = U[i1:i2, i1:i2]
+        Err = np.zeros_like(W1)
+        for i in range(128):
+            w = W1[:, i]
+            qi = np.clip(np.rint(w * inv + z), 0, 15)
+            e = (w - scf * (qi - z)) / U1[i, i]
+            Q[:, i1 + i] = qi
+            Err[:, i] = e
+            if i < 127:
+                W1[:, i + 1:] -= np.outer(e, U1[i, i + 1:])
+        if i2 < n_in:
+            W[:, i2:] -= Err @ U[i1:i2, i2:]
+        Z[:, g] = z
+        SC[:, g] = sc_h[:, 0]
+    return Q, np.ascontiguousarray(Z.T), np.ascontiguousarray(SC.T.view(np.uint16))
 
 
 def read_header(f):
@@ -170,10 +236,14 @@ def write_pack(out, blobs_path, index, source="", extra=None):
     return len(head)
 
 
-def pack_float_matrix(rows_of, n_in, n_out, fb, off, search=4, check=48, rng=None, chunk_rows=1024):
+def pack_float_matrix(rows_of, n_in, n_out, fb, off, search=4, check=48, rng=None, chunk_rows=1024, quantizer=None,
+                      h_eval=None, out_err=None):
     """A float matrix as a pack matrix appended to the blob file fb at offset `off` (padded to 4096 first).
-    rows_of(r0, r1) -> float32 [r1 - r0][n_in].  Returns (the index entry, the next offset, the relative RMS error, the
-    lowest row correlation with the source over `check` sampled rows)."""
+    rows_of(r0, r1) -> float32 [r1 - r0][n_in].  quantizer(rows) -> (q, z, sc) replaces the plain one (quantize_rows_w4 with
+    `search`).  Returns (the index entry, the next offset, the relative RMS error of the weights, the lowest row correlation
+    with the source over `check` sampled rows).  With h_eval (the second moments of inputs the quantizer has not seen) and a
+    dict out_err, out_err gets "plain" and "used": the relative RMS error of the matrix's products with those inputs, for the
+    plain quantizer and for the one used."""
     if not shape_ok(n_in, n_out):
         raise SystemExit(f"a matrix of {n_in} x {n_out}: rows must be a multiple of 16, inputs of 256")
     rng = rng or np.random.default_rng(7)
@@ -185,12 +255,22 @@ def pack_float_matrix(rows_of, n_in, n_out, fb, off, search=4, check=48, rng=Non
     chunk_rows = max(16, chunk_rows // 16 * 16)
     se = ss = 0.0
     worst = 1.0
+    oe = {"plain": 0.0, "used": 0.0, "ref": 0.0}
     for r0 in range(0, n_out, chunk_rows):
         r1 = min(n_out, r0 + chunk_rows)
         ref = np.asarray(rows_of(r0, r1), dtype=np.float32).reshape(r1 - r0, n_in)
-        q, z, sc = quantize_rows_w4(ref, search)
+        q, z, sc = quantizer(ref) if quantizer else quantize_rows_w4(ref, search)
         qb = q.astype(np.uint8)
         w = deq_rows(qb, z, sc, np.arange(r1 - r0))
+        if h_eval is not None and out_err is not None:
+            r64 = ref.astype(np.float64)
+            oe["ref"] += float(((r64 @ h_eval) * r64).sum())
+            d = w.astype(np.float64) - r64
+            oe["used"] += float(((d @ h_eval) * d).sum())
+            if quantizer:
+                q0, z0, s0 = quantize_rows_w4(ref, search)
+                d = deq_rows(q0.astype(np.uint8), z0, s0, np.arange(r1 - r0)).astype(np.float64) - r64
+            oe["plain"] += float(((d @ h_eval) * d).sum())
         se += float(((w - ref).astype(np.float64) ** 2).sum())
         ss += float((ref.astype(np.float64) ** 2).sum())
         if check > 0:
@@ -203,8 +283,65 @@ def pack_float_matrix(rows_of, n_in, n_out, fb, off, search=4, check=48, rng=Non
         blob = pack(qb, z, sc)
         fb.write(blob.tobytes())
         off += int(blob.nbytes)
+    if out_err is not None and oe["ref"] > 0.0:
+        out_err["plain"] = (max(oe["plain"], 0.0) / oe["ref"]) ** 0.5
+        out_err["used"] = (max(oe["used"], 0.0) / oe["ref"]) ** 0.5
     ent = {"off": start, "bytes": off - start, "n_in": int(n_in), "n_out": int(n_out)}
     return ent, off, (se / ss) ** 0.5 if ss > 0 else 0.0, worst
+
+
+class Calibration:
+    """A folder the engine wrote in a calibration run (STRATA_B70_CALIB_DIR, docs/B70_LIB.md): <tensor name>.x16 (the FP16
+    inputs of that projection, rows of n_in), aliases.txt ("name source": a projection that read another one's input),
+    calls.txt ("name rows n_in" per write, in order).  The last `holdout` writes of each file are kept apart to measure on."""
+
+    def __init__(self, folder, holdout=1):
+        self.folder, self.holdout = folder, holdout
+        self.alias, self.calls = {}, {}
+        ap = os.path.join(folder, "aliases.txt")
+        if os.path.exists(ap):
+            for line in open(ap):
+                f = line.split()
+                if len(f) == 2:
+                    self.alias[f[0]] = f[1]
+        cp = os.path.join(folder, "calls.txt")
+        if os.path.exists(cp):
+            for line in open(cp):
+                f = line.split()
+                if len(f) == 3:
+                    self.calls.setdefault(f[0], []).append(int(f[1]))
+        self._key, self._val = None, None
+
+    def source(self, name):
+        src = self.alias.get(name, name)
+        return src if os.path.exists(os.path.join(self.folder, src + ".x16")) else None
+
+    def moments(self, name, n_in):
+        """(H of the calibration rows, H of the held-out rows or None, their row counts) for a tensor, or None."""
+        src = self.source(name)
+        if src is None:
+            return None
+        if self._key != (src, n_in):
+            x = np.memmap(os.path.join(self.folder, src + ".x16"), dtype="<f2", mode="r")
+            if x.size % n_in:
+                raise SystemExit(f"{src}.x16: {x.size} values are not rows of {n_in}")
+            x = x.reshape(-1, n_in)
+            calls = self.calls.get(src, [])
+            n_val = sum(calls[-self.holdout:]) if self.holdout > 0 and len(calls) > self.holdout else 0
+            n_cal = x.shape[0] - n_val
+
+            def second_moments(r0, r1):
+                h = np.zeros((n_in, n_in), dtype=np.float64)
+                for a in range(r0, r1, 4096):
+                    c = np.asarray(x[a:min(r1, a + 4096)], dtype=np.float32).astype(np.float64)
+                    h += c.T @ c
+                return h
+
+            h_cal = second_moments(0, n_cal)
+            h_val = second_moments(n_cal, x.shape[0]) if n_val > 0 else None
+            u, dead = gptq_factor(h_cal)
+            self._key, self._val = (src, n_in), (u, dead, h_val, n_cal, n_val)
+        return self._val
 
 
 def _dequantizer(type_id, type_name):
@@ -240,7 +377,11 @@ def main():
     ap.add_argument("--search", type=int, default=4, help="narrower ranges tried per group of 128 inputs (0: minimum and maximum)")
     ap.add_argument("--check", type=int, default=48, help="rows of each matrix whose correlation with the source is reported (0: none)")
     ap.add_argument("--list", action="store_true", help="print what would be packed and what is left out, write nothing")
+    ap.add_argument("--calib", default=None, help="a calibration folder the engine wrote (STRATA_B70_CALIB_DIR): quantize with GPTQ")
+    ap.add_argument("--holdout", type=int, default=1, help="with --calib: the last N writes of each input are held out and measured on")
     a = ap.parse_args()
+    calib = Calibration(a.calib, a.holdout) if a.calib else None
+    worst_plain, worst_used, n_calibrated = 0.0, 0.0, 0
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from gguf_reader import GGUFFile          # this repository's reader: the directory of any GGUF, whatever its tensor types
     pat = re.compile(a.match)
@@ -280,12 +421,28 @@ def main():
                 def rows_of(r0, r1, raw=raw, deq=deq, n_in=n_in):
                     return deq(raw[r0:r1], n_in)
 
-                ent, off, rel, corr = pack_float_matrix(rows_of, n_in, n_out, fb, off, a.search, a.check, rng)
+                cal = calib.moments(name, n_in) if calib else None
+                note = ""
+                if cal is not None:
+                    u, dead, h_val, n_cal, n_val = cal
+                    oe = {}
+                    ent, off, rel, corr = pack_float_matrix(
+                        rows_of, n_in, n_out, fb, off, a.search, a.check, rng,
+                        quantizer=lambda ref, u=u, dead=dead: gptq_rows_w4(ref, u, dead, a.search), h_eval=h_val, out_err=oe)
+                    n_calibrated += 1
+                    note = ", calibrated on %d tokens" % n_cal
+                    if oe:
+                        worst_plain, worst_used = max(worst_plain, oe["plain"]), max(worst_used, oe["used"])
+                        note += "; error of its products on %d held-out tokens %.4f (uncalibrated %.4f)" % (n_val, oe["used"], oe["plain"])
+                else:
+                    if calib:
+                        note = ", NOT calibrated (no inputs for it in the calibration folder)"
+                    ent, off, rel, corr = pack_float_matrix(rows_of, n_in, n_out, fb, off, a.search, a.check, rng)
                 index[name] = ent
                 src_bytes += nbytes
                 worst_err, worst_corr = max(worst_err, rel), min(worst_corr, corr)
-                print("%s: %d x %d (%s) -> %.2f MiB, relative error %.4f, lowest row correlation %.4f"
-                      % (name, n_in, n_out, t.type_name, ent["bytes"] / 2 ** 20, rel, corr), flush=True)
+                print("%s: %d x %d (%s) -> %.2f MiB, relative error %.4f, lowest row correlation %.4f%s"
+                      % (name, n_in, n_out, t.type_name, ent["bytes"] / 2 ** 20, rel, corr, note), flush=True)
     finally:
         if fb:
             fb.close()
@@ -296,9 +453,14 @@ def main():
         os.remove(tmp)
         raise SystemExit("no tensor matched: nothing written (--list shows what the GGUF holds for a --match)")
     head = write_pack(a.out, tmp, index, source=os.path.basename(a.gguf[0]),
-                      extra={"made_by": "tools/b70_pack.py", "quantizer": f"rtn-asym-g128-search{a.search}"})
+                      extra={"made_by": "tools/b70_pack.py",
+                             "quantizer": (f"gptq-asym-g128-search{a.search}" if n_calibrated else f"rtn-asym-g128-search{a.search}"),
+                             "calibrated": n_calibrated})
     print("%s: %d matrices, %.2f GiB (their GGUF blocks: %.2f GiB), blobs from byte %d, highest relative error %.4f, lowest row "
           "correlation %.4f" % (a.out, len(index), (head + off) / 2 ** 30, src_bytes / 2 ** 30, head, worst_err, worst_corr))
+    if calib:
+        print("calibrated %d of %d matrices; highest error of the products on held-out inputs %.4f (uncalibrated %.4f)"
+              % (n_calibrated, len(index), worst_used, worst_plain))
     return 0
 
 

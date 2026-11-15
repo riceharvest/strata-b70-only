@@ -132,8 +132,8 @@ PCIe 4.0 x16 slot. Treat them as a floor; on a newer platform expect more, but n
    the binary, the entry, the serve protocol, the kernel libraries and the build are shared.
    The kernels written from the card's limits (matrix-engine products on 4-bit weights, attention over an 8-bit cache) and the
    card's own weight format are a library both families can call, [docs/B70_LIB.md](docs/B70_LIB.md): `tools/b70_pack.py` packs
-   any model's matrices for it. Flash-Next ran on it with a pack made from its GGUF: 5 to 12% faster answers, 3.5% worse perplexity, so it is
-   off by default.
+   any model's matrices for it, calibrated on inputs the engine captures. Flash-Next with all its projections packed: a draft window
+   10.5% shorter for 1.4% worse perplexity; with two kinds packed, 1 to 4% for 0.24%. Off by default: a choice.
    The image pins the device compiler (IGC 2.41.5, ocloc 26.35.39758.10): a newer one made answers 3-5% slower (docs/B70.md, "Build and run").
 
 3. Set up the model and serve it:

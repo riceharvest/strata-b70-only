@@ -71,6 +71,9 @@ void qsa_prompt_attn_percell(const float* q, const QsaAttnPools& pools, const in
 
 #include <algorithm>
 #include <set>
+#if defined(STRATA_B70_LIB)
+#include <regex>     // STRATA_B70_CALIB_DIR's name filter
+#endif
 #include <map>
 #include <cmath>
 #include <chrono>
@@ -3816,9 +3819,67 @@ struct ColdTrace {
     }
 };
 ColdTrace g_cold;
+#if defined(STRATA_B70_LIB)
+// STRATA_B70_CALIB_DIR=<dir> (a calibration run for tools/b70_pack.py --calib; docs/B70_LIB.md): the FP16 inputs of the
+// projections a pack can hold, as the prompt path feeds them, appended to <dir>/<tensor name>.x16 (rows of n_in halves, in
+// prompt order).  A projection that reads the same input as one already written in this call sequence (the recurrence's qkv
+// and gate, an attention layer's k, v and q) writes nothing: <dir>/aliases.txt names the file that holds its input.
+// <dir>/calls.txt has a line "name rows n_in" per write, so a reader can cut the rows by request.  STRATA_B70_CALIB_MATCH is
+// the name filter (a regular expression; default: the projections tools/b70_pack.py packs).  Each write waits for the
+// queue and copies the input to the host: a calibration run is slow on purpose.  Unset: nothing of this runs.
+void b70_calib_dump(Gemm& gm, const uint16_t* X, int64_t T, int64_t K, int64_t ldx, const std::string& name) {
+    static const char* dir = [] { const char* d = std::getenv("STRATA_B70_CALIB_DIR"); return d && d[0] ? d : nullptr; }();
+    if (dir == nullptr || X == nullptr || T <= 0 || K <= 0) return;
+    static const std::regex match([] {
+        const char* m = std::getenv("STRATA_B70_CALIB_MATCH");
+        return std::string(m && m[0] ? m : "\\.(attn_qkv|attn_gate|ssm_out|attn_q|attn_k|attn_v|attn_output|ffn_gate|ffn_up|ffn_down)\\.weight$");
+    }());
+    if (!std::regex_search(name, match)) return;
+    const int64_t ld = ldx > 0 ? ldx : K;
+    std::vector<uint16_t> host((size_t) (T * ld));
+    sycl::queue& q = *strata::q_of(gm.stream());
+    q.wait();
+    q.memcpy(host.data(), X, host.size() * sizeof(uint16_t)).wait();
+    if (ld != K) {   // a padded row stride: the rows packed
+        for (int64_t t = 1; t < T; ++t) std::memmove(host.data() + t * K, host.data() + t * ld, (size_t) K * sizeof(uint16_t));
+        host.resize((size_t) (T * K));
+    }
+    uint64_t h = 1469598103934665603ull;
+    for (const uint16_t v : host) h = (h ^ v) * 1099511628211ull;
+    struct Last { uint64_t hash; int64_t T, K; std::string name; };
+    static std::vector<Last> last;            // the inputs written since the last new one of each width
+    static std::set<std::string> aliased;
+    const std::string d = dir;
+    for (const Last& l : last)
+        if (l.hash == h && l.T == T && l.K == K && l.name != name) {
+            if (aliased.insert(name).second) {
+                if (std::FILE* f = std::fopen((d + "/aliases.txt").c_str(), "ab")) {
+                    std::fprintf(f, "%s %s\n", name.c_str(), l.name.c_str());
+                    std::fclose(f);
+                }
+            }
+            return;
+        }
+    last.erase(std::remove_if(last.begin(), last.end(), [&](const Last& l) { return l.K == K; }), last.end());
+    last.push_back(Last{h, T, K, name});
+    std::FILE* f = std::fopen((d + "/" + name + ".x16").c_str(), "ab");
+    if (f == nullptr || std::fwrite(host.data(), sizeof(uint16_t), host.size(), f) != host.size()) {
+        std::fprintf(stderr, "strata: STRATA_B70_CALIB_DIR: cannot write %s/%s.x16\n", dir, name.c_str());
+        std::exit(1);
+    }
+    std::fclose(f);
+    if (std::FILE* c = std::fopen((d + "/calls.txt").c_str(), "ab")) {
+        std::fprintf(c, "%s %lld %lld\n", name.c_str(), (long long) T, (long long) K);
+        std::fclose(c);
+    }
+}
+#endif
 bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
                  std::string& err, int64_t ldy = 0, int64_t ldx = 0) {
     if (!w->native_data) { err = "prefill: " + name + " has no native GGUF blocks (run with --native)"; return false; }
+#if defined(STRATA_B70_LIB)
+    b70_calib_dump(gm, X, T, w->ne0, ldx, name);
+#endif
     const bool ct = g_cold.begin();
     gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy, 0.0f, ldx);
     if (ct) g_cold.end("native", name, T, w->ne1, w->ne0);

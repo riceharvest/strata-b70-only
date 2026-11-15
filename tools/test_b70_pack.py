@@ -228,6 +228,81 @@ int main(int argc, char** argv) {
                 self.assertEqual(out.strip(), "0 0", name)
 
 
+class Calibrated(unittest.TestCase):
+    """GPTQ: the same format, the error moved to where the calibration inputs do not look."""
+
+    @classmethod
+    def setUpClass(cls):
+        rng = np.random.default_rng(11)
+        cls.n_in, cls.n_out, r = 512, 96, 48
+        basis = rng.standard_normal((r, cls.n_in))
+
+        def inputs(n):
+            return (rng.standard_normal((n, r)) * np.linspace(3, 0.2, r)) @ basis + 0.15 * rng.standard_normal((n, cls.n_in))
+
+        cls.xc, cls.xv = inputs(4000), inputs(1500)
+        cls.w = (rng.standard_normal((cls.n_out, cls.n_in)) * rng.uniform(0.02, 1, (cls.n_out, 1))).astype(np.float32)
+        cls.u, cls.dead = bp.gptq_factor(cls.xc.T @ cls.xc)
+
+    def products_error(self, q, z, sc, x):
+        d = bp.deq_rows(q.astype(np.uint8), z, sc, np.arange(self.n_out)).astype(np.float64) - self.w
+        return float(np.sqrt(((d @ x.T) ** 2).sum() / ((self.w.astype(np.float64) @ x.T) ** 2).sum()))
+
+    def test_products_on_held_out_inputs(self):
+        for search in (0, 4):
+            g = bp.gptq_rows_w4(self.w, self.u, self.dead, search)
+            self.assertTrue(((g[0] >= 0) & (g[0] <= 15)).all())
+            self.assertTrue(((g[1] >= 1) & (g[1] <= 16)).all())
+            plain = self.products_error(*bp.quantize_rows_w4(self.w, search), self.xv)
+            used = self.products_error(*g, self.xv)
+            self.assertLess(used, 0.5 * plain, f"search {search}: {used:.4f} against {plain:.4f} uncalibrated")
+
+    def test_rows_are_independent(self):
+        a = bp.gptq_rows_w4(self.w[:32], self.u, self.dead, 4)
+        b = bp.gptq_rows_w4(self.w, self.u, self.dead, 4)
+        np.testing.assert_array_equal(a[0], b[0][:32])
+        np.testing.assert_array_equal(a[1], b[1][:, :32])
+        np.testing.assert_array_equal(a[2], b[2][:, :32])
+
+    def test_uncorrelated_inputs_give_the_plain_quantizer(self):
+        u, dead = bp.gptq_factor(np.eye(self.n_in) * 1000.0, damp=0.0)
+        for x, y in zip(bp.gptq_rows_w4(self.w, u, dead, 0), bp.quantize_rows_w4(self.w, 0)):
+            np.testing.assert_array_equal(x, y)
+
+    def test_an_input_never_active_gets_zero_weights(self):
+        h = self.xc.T @ self.xc
+        h[:, 7] = 0.0
+        h[7, :] = 0.0
+        u, dead = bp.gptq_factor(h)
+        self.assertTrue(dead[7])
+        q, z, sc = bp.gptq_rows_w4(self.w, u, dead, 0)
+        d = bp.deq_rows(q.astype(np.uint8), z, sc, np.arange(self.n_out))
+        self.assertLess(float(np.abs(d[:, 7]).max()), 0.5 * float(np.abs(self.w[:, 7]).max()))
+
+    def test_the_calibration_folder_through_the_tool(self):
+        """The engine's folder layout (x16 files, aliases, calls) read back: the second matrix takes the first one's inputs."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            x = np.concatenate([self.xc, self.xv]).astype(np.float16)
+            x.tofile(d / "blk.0.attn_qkv.weight.x16")
+            (d / "aliases.txt").write_text("blk.0.attn_gate.weight blk.0.attn_qkv.weight\n")
+            (d / "calls.txt").write_text("blk.0.attn_qkv.weight %d %d\nblk.0.attn_qkv.weight %d %d\n"
+                                         % (len(self.xc), self.n_in, len(self.xv), self.n_in))
+            cal = bp.Calibration(str(d), holdout=1)
+            self.assertEqual(cal.source("blk.0.attn_gate.weight"), "blk.0.attn_qkv.weight")
+            self.assertIsNone(cal.source("blk.0.ssm_out.weight"))
+            u, dead, h_val, n_cal, n_val = cal.moments("blk.0.attn_gate.weight", self.n_in)
+            self.assertEqual((n_cal, n_val), (len(self.xc), len(self.xv)))
+            oe = {}
+            with open(d / "blobs", "wb") as fb:
+                ent, off, rel, corr = bp.pack_float_matrix(
+                    lambda r0, r1: self.w[r0:r1], self.n_in, self.n_out, fb, 0, 4, 8, np.random.default_rng(1),
+                    quantizer=lambda ref: bp.gptq_rows_w4(ref, u, dead, 4), h_eval=h_val, out_err=oe)
+            self.assertEqual(ent["bytes"], bp.pack_bytes(self.n_in, self.n_out))
+            self.assertLess(oe["used"], 0.5 * oe["plain"])
+
+
 class Readers(unittest.TestCase):
     def test_float_types_need_no_gguf_package(self):
         w = np.array([[1.5, -2.25, 0.0, 3.0]], dtype=np.float32)
