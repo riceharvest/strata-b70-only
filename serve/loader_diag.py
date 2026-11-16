@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import struct
+from collections.abc import Sequence
 from pathlib import Path
 
 LOADER_FAILURE_CODES = (0xC0000135,)          # STATUS_DLL_NOT_FOUND
@@ -64,7 +65,7 @@ def pe_imports(path: Path) -> list[str]:
     return names
 
 
-def missing_files(exe, system_dirs=None) -> list[str]:
+def missing_files(exe: str | os.PathLike[str], system_dirs: Sequence[Path] | None = None) -> list[str]:
     """DLL names the engine (and the DLLs beside it) import that cannot be found: not in the engine's folder, not a Windows or
     driver library, and not in a Windows folder on this PC. Sorted, without duplicates; [] when nothing is missing or the file
     cannot be read (this is advice for an error message, it never raises)."""
@@ -94,7 +95,7 @@ def missing_files(exe, system_dirs=None) -> list[str]:
         return []
 
 
-def missing_note(rc, exe) -> str:
+def missing_note(rc: int | None, exe: str | os.PathLike[str] | None) -> str:
     """The sentence for the start error, or "" when the exit status is not a missing-library one or nothing can be named."""
     if rc is None or (rc & 0xFFFFFFFF) not in LOADER_FAILURE_CODES or not exe:
         return ""

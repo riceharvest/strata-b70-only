@@ -9,6 +9,8 @@ JSON object, and the server says so once.
 """
 import json
 import threading
+from collections.abc import Iterable, Iterator
+from typing import NoReturn
 
 
 class StructuredOutputError(RuntimeError):
@@ -18,7 +20,7 @@ class StructuredOutputError(RuntimeError):
 class _ObjectOnly:
     """The validator for json_object, and for json_schema without jsonschema: one JSON object."""
 
-    def iter_errors(self, value):
+    def iter_errors(self, value: object) -> "Iterator[_ObjectError]":
         if not isinstance(value, dict):
             yield _ObjectError()
 
@@ -33,7 +35,7 @@ class _Repairing:
     are not valid JSON escapes doubled (response_format "repair_latex_escapes": true, #2893)."""
     repair_escapes = True
 
-    def __init__(self, inner):
+    def __init__(self, inner) -> None:
         self.inner = inner
 
     def iter_errors(self, value):
@@ -91,7 +93,7 @@ def jsonschema_modules():
         return _jsonschema or None
 
 
-def _only_objects(node, root, refs=()):
+def _only_objects(node: object, root: object, refs: tuple[str, ...] = ()) -> bool:
     """True when every value `node` accepts is a JSON object, so "return one JSON object" stays true.
 
     `type: object`, an anyOf/oneOf whose branches all qualify (e.g. a root union of object shapes, which llama.cpp's
@@ -147,7 +149,7 @@ def prepare_format(response_format, messages, with_tools=False):
     else:
         raise ValueError("response_format.type must be text, json_object or json_schema")
 
-    def check_refs(node):
+    def check_refs(node: object) -> None:
         if isinstance(node, dict):
             for key, value in node.items():
                 if key in ("$ref", "$dynamicRef") and isinstance(value, str) and not value.startswith("#"):
@@ -234,8 +236,8 @@ def extract_json(text: str) -> str:
     return s[start:]
 
 
-def validated_json(text, validator, finish):
-    def pairs(items):
+def validated_json(text: str, validator, finish: str | None) -> str:
+    def pairs(items: Iterable[tuple[str, object]]) -> dict[str, object]:
         obj = {}
         for key, value in items:
             if key in obj:
@@ -243,7 +245,7 @@ def validated_json(text, validator, finish):
             obj[key] = value
         return obj
 
-    def constant(value):
+    def constant(value: object) -> NoReturn:
         raise ValueError(f"invalid JSON constant: {value}")
 
     if finish != "stop":

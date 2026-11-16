@@ -4,9 +4,10 @@ import math
 import re
 import threading
 from collections import OrderedDict
+from collections.abc import Mapping
 
 
-def _normalize(value, vocab_size=None):
+def _normalize(value: object, vocab_size: int | None = None) -> dict[int, float]:
     if value is None:
         return {}
     if isinstance(value, dict):
@@ -89,11 +90,11 @@ def _entry(value, vocab_size):
     return entry
 
 
-def normalize(value, vocab_size=None):
+def normalize(value: object, vocab_size: int | None = None) -> dict[int, float]:
     return dict(_entry(value, vocab_size)[0])
 
 
-def engine_key(value):
+def engine_key(value: object) -> str:
     entry = _entry(value, None)
     if not entry[0]:
         return ""
@@ -102,7 +103,7 @@ def engine_key(value):
     return entry[1]
 
 
-def validate_request(req, engine, vocab_size):
+def validate_request(req: Mapping[str, object], engine, vocab_size: int | None) -> dict[int, float]:
     """Fail closed for old engines, unsupported backends and continuous batching."""
     normalized = normalize(req.get("logit_bias"), vocab_size)
     if normalized:

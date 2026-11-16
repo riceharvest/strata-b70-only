@@ -33,6 +33,8 @@ import shutil
 import tempfile
 import threading
 import time
+from collections.abc import Callable, Iterator, Sequence
+from typing import Any
 
 MIN_TOKENS = 2048                    # the decode engine's own tail below this is read in place
 KNOWN_KEYS = {"prefill_gpu", "decode_gpu", "min_prompt_tokens", "dir", "shared_arena", "prefill_args", "decode_args"}
@@ -133,7 +135,7 @@ def role_cfg(cfg: dict, spec: dict, role: str) -> dict:
     return c
 
 
-def _arg_value(args: list, flag: str):
+def _arg_value(args: list, flag: str) -> str | None:
     for i, a in enumerate(args):
         if a == flag and i + 1 < len(args):
             return args[i + 1]
@@ -185,7 +187,7 @@ def session_dir(spec: dict) -> str:
     return tempfile.mkdtemp(prefix="strata-split-")
 
 
-def common_prefix(a, b) -> int:
+def common_prefix(a: Sequence[int], b: Sequence[int]) -> int:
     n = min(len(a), len(b))
     i = 0
     while i < n and a[i] == b[i]:
@@ -200,7 +202,7 @@ class SplitEngine:
     PROPAGATE = {"silence_s", "gpu_busy"}
 
     def __init__(self, prefill, decode, *, min_tokens: int = MIN_TOKENS, work_dir: str | None = None,
-                 arena_file: str | None = None, say=print):
+                 arena_file: str | None = None, say: Callable[..., object] = print) -> None:
         d = self.__dict__
         d["prefill"], d["decode"] = prefill, decode
         d["cur"] = decode                      # the engine the request is on now (progress, last)
@@ -217,12 +219,12 @@ class SplitEngine:
                       "save_ms": 0.0, "restore_ms": 0.0, "last": None}
 
     # ---- attribute plumbing
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> Any:
         if name in self.NOT_HERE or name.startswith("__"):
             raise AttributeError(name)
         return getattr(self.decode, name)
 
-    def __setattr__(self, name, value):
+    def __setattr__(self, name: str, value: object) -> None:
         if name in self.PROPAGATE:
             self.prefill.__setattr__(name, value)
             self.decode.__setattr__(name, value)
@@ -234,7 +236,7 @@ class SplitEngine:
         return self.decode.last
 
     @last.setter
-    def last(self, value):
+    def last(self, value) -> None:
         self.decode.last = value
 
     @property
@@ -270,13 +272,13 @@ class SplitEngine:
         return i
 
     @info.setter
-    def info(self, value):
+    def info(self, value) -> None:
         pass
 
     def alive(self) -> bool:
         return bool(self.decode.alive())
 
-    def exit_code(self):
+    def exit_code(self) -> int | None:
         return next((c for c in (e.exit_code() for e in (self.decode, self.prefill) if not e.alive()) if c is not None),
                     None)
 
@@ -291,7 +293,7 @@ class SplitEngine:
         return s
 
     # ---- life cycle
-    def restart(self, tries: int = 3):
+    def restart(self, tries: int = 3) -> None:
         errors = {}
         for name, e in (("decode", self.decode), ("prefill", self.prefill)):      # one at a time: the arena fills once
             if e.alive():
@@ -306,12 +308,12 @@ class SplitEngine:
             self.say(f"[strata] the {name} engine of the split did not start ({x}); the other one serves")
         self.__dict__["held"] = []
 
-    def unload(self):
+    def unload(self) -> None:
         for e in (self.prefill, self.decode):
             e.unload()
         self.__dict__["held"] = []
 
-    def close(self):
+    def close(self) -> None:
         err = None
         for e in (self.prefill, self.decode):
             try:
@@ -336,7 +338,7 @@ class SplitEngine:
         self.__dict__["heal_at"] = now + HEAL_COOLDOWN_S
         self.__dict__["healing"] = True
 
-        def run():
+        def run() -> None:
             try:
                 self.say("[strata] split: the prefill engine had stopped; starting it again")
                 e.restart()
@@ -348,7 +350,7 @@ class SplitEngine:
         threading.Thread(target=run, daemon=True).start()
 
     # ---- the request
-    def wants_handover(self, ids) -> tuple[bool, int]:
+    def wants_handover(self, ids: Sequence[int]) -> tuple[bool, int]:
         """(hand the prompt to the prefill engine?, the tokens the decode engine would read itself)."""
         n = len(ids)
         if n < 2:
@@ -360,7 +362,7 @@ class SplitEngine:
         """Run a blocking engine call on a thread; yields None as a keep-alive while it runs.  -> its result."""
         box = {}
 
-        def run():
+        def run() -> None:
             try:
                 box["r"] = fn()
             except BaseException as e:           # noqa: BLE001
@@ -375,7 +377,7 @@ class SplitEngine:
             raise box["e"]
         return box.get("r")
 
-    def _hand_over(self, ids, cancel, rec: dict):
+    def _hand_over(self, ids: Sequence[int], cancel: threading.Event, rec: dict) -> Iterator[None]:
         """Prefill engine reads the prompt, saves the session; the decode engine restores it.  Yields keep-alives.
         rec['ok'] is True when the decode engine now holds the prompt's first n-1 tokens."""
         from serve.server import EngineDied, SessionRefused
@@ -467,7 +469,7 @@ class SplitEngine:
             if rec.get("ok") and ok:
                 self._account(ids, rec)
 
-    def _account(self, ids, rec: dict) -> None:
+    def _account(self, ids: Sequence[int], rec: dict) -> None:
         """The figures of the engine's last DONE, as the whole request: the prefill engine's read, the file steps and the
         decode engine's own start are the prompt time; what the prefill engine reused is the cached part."""
         D = self.decode

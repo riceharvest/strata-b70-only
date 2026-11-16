@@ -19,6 +19,7 @@ import signal
 import stat
 import threading
 import time
+from collections.abc import Callable
 
 
 def _stop_gracefully() -> None:
@@ -26,7 +27,7 @@ def _stop_gracefully() -> None:
     _thread.interrupt_main()
 
 
-def start(fd: int, on_loss=None, grace: float = 60.0) -> None:
+def start(fd: int, on_loss: Callable[[], object] | None = None, grace: float = 60.0) -> None:
     if os.name == "nt":
         if fd < 0 or not stat.S_ISFIFO(os.fstat(fd).st_mode):
             raise ValueError("--owner-fd must be an inherited pipe")

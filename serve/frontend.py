@@ -23,8 +23,10 @@ import re
 import threading
 import uuid
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, NoReturn
 
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
@@ -41,8 +43,8 @@ class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
 class ChatTemplate:
     """The model's chat template, rendered with the same Jinja settings as transformers' apply_chat_template."""
 
-    def __init__(self, path: str | Path, bos_token: str = ""):
-        def raise_exception(message):
+    def __init__(self, path: str | Path, bos_token: str = "") -> None:
+        def raise_exception(message: str) -> NoReturn:
             raise TemplateRequestError(message)
 
         def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
@@ -59,7 +61,7 @@ class ChatTemplate:
         self.caps = self._detect_caps()
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
-               **kwargs) -> str:
+               **kwargs: Any) -> str:
         # Do not use completed empty assistant turns as examples for the next reply. Keep the final message.
         # (#843.  STRATA_KEEP_EMPTY_TURNS=1 renders them as before.)
         messages = [m for i, m in enumerate(messages)
@@ -124,7 +126,7 @@ class ChatTemplate:
 TEXT_PARTS = ("text", "input_text", None)
 
 
-def _text_of(content) -> str:
+def _text_of(content: str | list | None) -> str:
     if content is None:
         return ""
     if isinstance(content, str):
@@ -141,7 +143,7 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
           "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "maximum": "xhigh"}
 
 
-def effort_number(value):
+def effort_number(value: object) -> int | None:
     """A reasoning effort given as a number - 40, 40.0 or "40" (clients send it as a string too) - as an int, else None."""
     if isinstance(value, bool):
         return None
@@ -152,7 +154,7 @@ def effort_number(value):
     return None
 
 
-def effort_kwargs(value) -> dict:
+def effort_kwargs(value: object) -> dict:
     """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400, not a crash.
     A whole number 1..100 becomes the nearest word."""
     if value is None or value == "":
@@ -180,7 +182,7 @@ def budget_effort(tokens) -> dict:
     return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else EFFORT["high"]}
 
 
-def _has_image(content) -> bool:
+def _has_image(content: object) -> bool:
     return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS for p in content)
 
 
@@ -278,7 +280,7 @@ THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
 CONTROL_MARK0 = 0xF0E10      # the control tokens' marks start here, clear of the two sets above
 
 
-def literal_tags(controls) -> dict[str, str]:
+def literal_tags(controls: Iterable[str]) -> dict[str, str]:
     """LITERAL_TAGS plus a mark for each control token's text (`controls`: the tokenizer's CONTROL literals,
     <|im_start|>, <|im_end|>, <|endoftext|>, ...).  The rendered prompt is encoded with those literals parsed, so one
     written inside a message - a file an agent reads, a pasted chat template - opened or ended a turn there.  Longest
@@ -310,7 +312,7 @@ def _memo_get(memo, key):
         return v
 
 
-def _memo_put(memo, key, v):
+def _memo_put(memo, key, v) -> None:
     with _MEMO_LOCK:
         if key not in memo:
             _MEMO_CHARS[id(memo)] += len(key[0])
@@ -348,7 +350,7 @@ def _mark_deep(v, tags: dict[str, str] = LITERAL_TAGS):
     return v
 
 
-def _has_tag(v, tags: dict[str, str] = LITERAL_TAGS) -> bool:
+def _has_tag(v: object, tags: dict[str, str] = LITERAL_TAGS) -> bool:
     if isinstance(v, str):
         if not FAST_PROMPT or len(v) < _MEMO_MIN_CHARS:
             return any(tag in v for tag in tags)
@@ -596,7 +598,7 @@ def _tool_list(value, wrapper: str | None) -> list[dict]:
     return _stable_tool_order(tools, lambda t: (t.get(wrapper, t) if wrapper and t.get("type") == wrapper else t)["name"])
 
 
-def tool_arguments(raw) -> dict:
+def tool_arguments(raw: object) -> dict:
     """A call's arguments from a client's history -> the mapping the template renders (both APIs).  A JSON object
     (as text or already parsed) is used as it is; empty is {}; anything else (cut-off or malformed JSON, a list, a
     number) is kept as text under "arguments" instead of refusing the whole conversation (#510)."""
@@ -1005,7 +1007,7 @@ def call_end(text: str, final: bool = False, hold: bool = True, declared=None) -
             return text.find(CALL_END, pos)
 
 
-def tool_choice_of(tool_choice) -> tuple[str, str | None]:
+def tool_choice_of(tool_choice: object) -> tuple[str, str | None]:
     """A client's `tool_choice` in either API's shape -> ("auto" | "none" | "required" | "named", name).  OpenAI:
     "auto" / "none" / "required", {"type": "function", "function": {"name": N}} or the flat {"type": "function",
     "name": N}; Anthropic: {"type": "auto" | "any" | "none"} and {"type": "tool", "name": N}.  A value it does not
@@ -1028,7 +1030,7 @@ def tool_choice_of(tool_choice) -> tuple[str, str | None]:
     return "unknown", None
 
 
-def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
+def forced_call(tool_choice: object, tools: list[dict] | None) -> str | None:
     """`tool_choice` -> the text that opens the call the reply must make, or None (the model decides).
     There is no grammar here: the server writes this opening itself, so the model can only go on with a call.
     "required" / Anthropic "any": any of the tools; a named function: that one.  A value it cannot honour (an
@@ -1127,7 +1129,7 @@ class _Lenient:
     _ESC = {'"': '"', "'": "'", "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
     _TOKEN = re.compile(r"[^\s,\]}:]+")
 
-    def __init__(self, text: str):
+    def __init__(self, text: str) -> None:
         self.s, self.i = text, 0
 
     def peek(self) -> str:
@@ -1178,7 +1180,7 @@ class _Lenient:
             return self._WORDS[m.group()]
         return json.loads(m.group())            # a number, or ValueError
 
-    def obj(self, depth: int):
+    def obj(self, depth: int) -> dict:
         self.i += 1
         out: dict = {}
         while True:
@@ -1198,7 +1200,7 @@ class _Lenient:
             elif self.peek() not in (",", "}", ""):     # a bare string where a member belongs is dropped
                 raise ValueError("object member")
 
-    def arr(self, depth: int):
+    def arr(self, depth: int) -> list:
         self.i += 1
         out: list = []
         while True:
@@ -1235,7 +1237,7 @@ _INT_TEXT = re.compile(r"[+-]?\d+")
 _NUM_TEXT = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
 
 
-def _schema_kinds(schema) -> tuple[set, bool]:
+def _schema_kinds(schema: object) -> tuple[set, bool]:
     """A parameter's declared schema -> (the JSON types it allows, whether a string is allowed).  `schema` is the property
     object ({"type": ..., "anyOf": [...], "enum": [...]}) or just its `type` (a word or a list).  A schema with no type, no
     anyOf/oneOf and no enum says nothing: no types, no string."""
@@ -1261,7 +1263,7 @@ def _schema_kinds(schema) -> tuple[set, bool]:
     return kinds, text or "string" in kinds
 
 
-def schema_is_string(schema) -> bool:
+def schema_is_string(schema: object) -> bool:
     """The text of a parameter is the value: the schema allows a string (type string, a type list or anyOf/oneOf with a
     string, or an enum of strings).  Without tool_arg_coercion only the exact type "string" counts, as before."""
     if not TOOL_ARG_COERCION:
@@ -1269,7 +1271,7 @@ def schema_is_string(schema) -> bool:
     return _schema_kinds(schema)[1]
 
 
-def _number_of(text: str, kinds: set):
+def _number_of(text: str, kinds: set) -> int | float | None:
     """A quoted number for an integer or number parameter -> the number, or None when it is not one that is finite and
     reads back as written (nan, inf, 1e999, 1_000, a fraction for an integer)."""
     t = text.strip()
@@ -1371,7 +1373,7 @@ class OutputParser:
     NAME_REPAIR = "off"
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
-                 recover: bool = False, declared_only: bool = False):
+                 recover: bool = False, declared_only: bool = False) -> None:
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False
@@ -1548,7 +1550,7 @@ class OutputParser:
         return self._line_parts[0] if self._line_parts else ""
 
     @line.setter
-    def line(self, text: str):
+    def line(self, text: str) -> None:
         self._line_parts = [text] if text else []
         self._line_blocks = None
 
@@ -1666,7 +1668,7 @@ class OutputParser:
         self.pending = []
         return out
 
-    def _reset_scan(self):
+    def _reset_scan(self) -> None:
         self._call_end_checked = 0   # closing-tag search progress for the current wrapped call
         self.sp = 0                  # how much of self.buf (the call body) the scanner has consumed
         self.ss = "name"             # name -> between -> str|raw -> ... -> function_done -> done
@@ -1696,7 +1698,7 @@ class OutputParser:
         """Advance the streaming view of the call body in self.buf (see stream_tools)."""
         out = []
 
-        def args(s):
+        def args(s: str) -> None:
             if s:
                 out.append(Event("tool_args", s, call=self.scall))
         while True:
@@ -1786,13 +1788,13 @@ class OutputParser:
             else:
                 return out
 
-    def _declared(self, name: str):
+    def _declared(self, name: str) -> set[str]:
         """The declared parameter names of the tool `name` (an alias counts), for param_end's tool_skipped_closer rule."""
         name = self.aliases.get(name, name)
         props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
         return set(props)
 
-    def _siblings(self):
+    def _siblings(self) -> set[str] | None:
         """The declared parameters of the streamed call that are not given yet (param_end's tool_skipped_closer rule)."""
         return set(self.sdeclared) - self.sgiven if TOOL_SKIPPED_CLOSER else None
 
@@ -1840,7 +1842,7 @@ class OutputParser:
         start = max(0, len(self.buf) - fresh - _PREFIX_LOOKBACK)
         buf = self.buf[start:]
         if "<function=" in buf:
-            def spaced(m):
+            def spaced(m: re.Match[str]) -> str:
                 name = m.group(2).strip()
                 return f"<function={name}>" if name in self.schemas else m.group(0)
             buf = _PREFIX_SPACED.sub(spaced, buf)
@@ -1848,7 +1850,7 @@ class OutputParser:
             if m and not held:
                 held, buf = buf[m.start():], buf[:m.start()]
             if self.recover:
-                def bare(m):
+                def bare(m: re.Match[str]) -> str:
                     body = m.group(3)
                     names = re.findall(r"<parameter=\s*([^<>\s]+?)\s*>", body)
                     tool = None if m.group(2) in self.schemas else self._tool_by_params(names)

@@ -20,12 +20,12 @@ def wants_prometheus(accept: str, query: str) -> bool:
 
 
 class Histogram:
-    def __init__(self):
+    def __init__(self) -> None:
         self.counts = [0] * len(BUCKETS)
         self.sum = 0.0
         self.n = 0
 
-    def observe(self, v: float, times: int = 1):
+    def observe(self, v: float, times: int = 1) -> None:
         if v is None or times <= 0:
             return
         for i, b in enumerate(BUCKETS):
@@ -38,11 +38,11 @@ class Histogram:
 class Latencies:
     """Time to first token, the time between tokens and the whole request, per finished request."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.lock = threading.Lock()
         self.ttft, self.itl, self.e2e = Histogram(), Histogram(), Histogram()
 
-    def observe(self, ttft_s, output_tokens, decode_s, total_s):
+    def observe(self, ttft_s, output_tokens, decode_s, total_s) -> None:
         with self.lock:
             self.ttft.observe(ttft_s)
             if output_tokens and output_tokens > 1 and decode_s:
@@ -50,13 +50,13 @@ class Latencies:
                 self.itl.observe(decode_s / (output_tokens - 1), output_tokens - 1)
             self.e2e.observe(total_s)
 
-    def snapshot(self):
+    def snapshot(self) -> dict[str, tuple[list[int], float, int]]:
         with self.lock:
             return {k: (list(h.counts), h.sum, h.n) for k, h in
                     (("ttft", self.ttft), ("itl", self.itl), ("e2e", self.e2e))}
 
 
-def _num(v, default=0):
+def _num(v: object, default: int | float = 0) -> int | float:
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else default
 
 
@@ -67,7 +67,7 @@ def render(m: dict, lat: dict) -> str:
     live, totals = m.get("live") or {}, m.get("totals") or {}
     out = []
 
-    def metric(name, kind, help_, value):
+    def metric(name: str, kind: str, help_: str, value: object) -> None:
         out.append(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name}{{{lab}}} {value}")
 
     busy = live.get("state") in ("reading", "generating")
@@ -106,7 +106,7 @@ def render(m: dict, lat: dict) -> str:
     return "\n".join(out) + "\n"
 
 
-def strata(m: dict, out: list, lab: str):
+def strata(m: dict, out: list[str], lab: str) -> None:
     """The JSON's facts vLLM has no name for, under `strata:` and the JSON's key."""
     live, totals = m.get("live") or {}, m.get("totals") or {}
     hw, eng = m.get("hardware") or {}, m.get("engine") or {}
@@ -114,7 +114,7 @@ def strata(m: dict, out: list, lab: str):
 
     typed = set()
 
-    def metric(name, kind, help_, value, labels=""):
+    def metric(name: str, kind: str, help_: str, value: object, labels: str = "") -> None:
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             return                                       # unknown here (no GPU telemetry, an older engine): no sample
         if name not in typed:                            # one HELP / TYPE per family, before its first sample

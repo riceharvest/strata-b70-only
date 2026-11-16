@@ -33,18 +33,18 @@ PAGE = 2
 cancelled: set = set()
 
 
-def log(event: dict):
+def log(event: dict) -> None:
     path = os.environ.get("FAKE_MCP_LOG")
     if path:
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(event) + "\n")
 
 
-def text(t, error=False):
+def text(t: str, error: bool = False) -> dict:
     return {"content": [{"type": "text", "text": t}], "isError": error}
 
 
-def handle(msg: dict):
+def handle(msg: dict) -> dict | None:
     """-> the response for a request, None for a notification."""
     method, rid, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
     if "id" not in msg:
@@ -86,12 +86,12 @@ def handle(msg: dict):
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"no method {method}"}}
 
 
-def stdio():
+def stdio() -> None:
     for f in (sys.stdin, sys.stdout, sys.stderr):      # MCP's stdio is UTF-8, whatever the Windows code page is
         f.reconfigure(encoding="utf-8")
     out = threading.Lock()
 
-    def answer(msg):
+    def answer(msg: dict) -> None:
         r = handle(msg)
         if r is not None and msg.get("id") not in cancelled:
             with out:
@@ -116,10 +116,10 @@ def http_server(port: int = 0) -> ThreadingHTTPServer:
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
 
-        def log_message(self, *a):
+        def log_message(self, *a: object) -> None:
             pass
 
-        def do_POST(self):
+        def do_POST(self) -> None:
             msg = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
             if msg.get("method") != "initialize" and self.headers.get("Mcp-Session-Id") not in sessions:
                 self.send_response(400)
@@ -149,7 +149,7 @@ def http_server(port: int = 0) -> ThreadingHTTPServer:
             self.end_headers()
             self.wfile.write(body)
 
-        def do_DELETE(self):
+        def do_DELETE(self) -> None:
             sessions.discard(self.headers.get("Mcp-Session-Id"))
             self.send_response(200)
             self.end_headers()

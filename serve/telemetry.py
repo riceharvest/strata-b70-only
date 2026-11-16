@@ -16,6 +16,7 @@ import platform
 import sys
 import threading
 import time
+from collections.abc import Callable, Sequence
 
 HISTORY = 60
 
@@ -26,25 +27,25 @@ class _NoGpu:
     (sycl/serve/xe_telemetry.py) is installed as gpu_reader by sycl/serve/server_intel.py."""
     note = None
 
-    def __init__(self, index=0):
+    def __init__(self, index: int = 0) -> None:
         self.index = index
 
-    def ok(self):
+    def ok(self) -> bool:
         return False
 
-    def name(self):
+    def name(self) -> str | None:
         return None
 
-    def read(self):
+    def read(self) -> dict:
         return {}
 
 
-def gpu_reader(index=0):
+def gpu_reader(index: int = 0):
     """The card's readings; sycl/serve/server_intel.py replaces this with the Intel Arc (xe) reader."""
     return _NoGpu(index)
 
 
-def free_vram_mib(index=0):
+def free_vram_mib(index: int = 0) -> int | None:
     """Free VRAM of a card in MiB, or None when it cannot be read."""
     g = gpu_reader(index)
     if not g.ok():
@@ -56,7 +57,7 @@ def free_vram_mib(index=0):
 
 
 # ------------------------------------------------------------------------------------------------ CPU / RAM
-def _cpu_topology(root: str = "/sys/devices/system"):
+def _cpu_topology(root: str = "/sys/devices/system") -> tuple[int | None, int | None]:
     """(sockets, NUMA nodes) of this computer: how many CPU packages it has and how many memory nodes (None where it cannot be read).
     Linux reads /sys, Windows asks GetLogicalProcessorInformationEx / GetNumaHighestNodeNumber, macOS asks sysctl (Apple silicon and every Mac
     sold so far: one package, no NUMA)."""
@@ -97,7 +98,7 @@ def _cpu_topology(root: str = "/sys/devices/system"):
         return None, None
 
 
-def _cpu_name():
+def _cpu_name() -> str | None:
     if os.name == "nt":
         try:
             import winreg
@@ -115,10 +116,10 @@ def _cpu_name():
 class _CpuRamFallback:
     """CPU load and RAM without psutil."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.prev = self._times()
 
-    def _times(self):
+    def _times(self) -> tuple[int, int] | None:
         if os.name == "nt":
             idle, kern, user = (ctypes.c_ulonglong() for _ in range(3))
             if ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kern), ctypes.byref(user)):
@@ -130,7 +131,7 @@ class _CpuRamFallback:
         except (OSError, ValueError):
             return None
 
-    def cpu(self):
+    def cpu(self) -> float | None:
         cur = self._times()
         prev, self.prev = self.prev, cur
         if not cur or not prev or cur[1] == prev[1]:
@@ -162,7 +163,8 @@ class _CpuRamFallback:
 
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
-    def __init__(self, extra=None, gpu_index=0, gpu_indices=None):
+    def __init__(self, extra: Callable[[], dict] | None = None, gpu_index: int = 0,
+                 gpu_indices: Sequence[int] | None = None) -> None:
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as setup numbers them; `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
@@ -199,7 +201,7 @@ class Telemetry:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
-    def _disk(self):
+    def _disk(self) -> tuple[float | None, float | None]:
         if not self.ps:
             return None, None
         try:
@@ -215,7 +217,7 @@ class Telemetry:
         dt = t - prev[0]
         return (c.read_bytes - prev[1]) / dt / 2**20, (c.write_bytes - prev[2]) / dt / 2**20
 
-    def sample(self):
+    def sample(self) -> dict:
         s = {}
         if self.gpu.ok():
             reads = [(i, g.read()) for i, g in self.gpus]
@@ -252,11 +254,11 @@ class Telemetry:
                 pass
         return s
 
-    def close(self):
+    def close(self) -> None:
         """Ends the sampler thread (a server that stops, a test's service): it used to run for the life of the process."""
         self._stop.set()
 
-    def _loop(self):
+    def _loop(self) -> None:
         """One sample a second, for as long as the server lives.
 
         A failing sample must not end the thread: on a machine where the GPU/psutil source is not readable
@@ -282,7 +284,7 @@ class Telemetry:
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
             self._stop.wait(1.0)
 
-    def snapshot(self):
+    def snapshot(self) -> dict:
         with self.lock:
             return {"now": dict(self.now), "history": {k: list(v) for k, v in self.hist.items()},
                     "static": dict(self.static)}

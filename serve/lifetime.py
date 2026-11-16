@@ -22,7 +22,7 @@ def _zero() -> dict:
 
 
 class Lifetime:
-    def __init__(self, path=None):
+    def __init__(self, path: str | os.PathLike[str] | None = None) -> None:
         self.path = Path(path) if path else None
         self.lock = threading.Lock()
         self.data = {"since": time.time(), "total": _zero(), "days": {}}
@@ -39,7 +39,8 @@ class Lifetime:
             except (OSError, ValueError, AttributeError, TypeError):
                 pass
 
-    def record(self, prompt_tokens=0, reused=0, output_tokens=0, prompt_ms=0.0, decode_ms=0.0, when=None):
+    def record(self, prompt_tokens: int | None = 0, reused: int | None = 0, output_tokens: int | None = 0,
+               prompt_ms: float | None = 0.0, decode_ms: float | None = 0.0, when: float | None = None) -> None:
         day = date.fromtimestamp(when or time.time()).isoformat()
         with self.lock:
             bucket = self.data["days"].setdefault(day, _zero())
@@ -55,7 +56,7 @@ class Lifetime:
             self.dirty = True
         self.save()
 
-    def save(self, force=False):
+    def save(self, force: bool = False) -> None:
         if not self.path or not self.dirty:
             return
         now = time.time()

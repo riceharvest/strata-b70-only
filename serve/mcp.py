@@ -55,13 +55,13 @@ class McpCancelled(McpError):
 class _Slot:
     """One request waiting for its response."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.done = threading.Event()
         self.msg = None
         self.error = None
 
 
-def _wait(slot: _Slot, timeout: float, cancel: threading.Event | None, what: str):
+def _wait(slot: _Slot, timeout: float, cancel: threading.Event | None, what: str) -> dict:
     """Wait for a response, checking the chat's stop button and the deadline a few times a second."""
     deadline = time.monotonic() + timeout
     while not slot.done.wait(0.05):
@@ -83,7 +83,7 @@ class StdioTransport:
     """A server Strata starts: JSON-RPC messages one per line on its stdin and stdout; its stderr is its log."""
     kind = "stdio"
 
-    def __init__(self, name: str, cfg: dict):
+    def __init__(self, name: str, cfg: dict) -> None:
         self.name, self.cfg = name, cfg
         self.proc = None
         self.lock = threading.Lock()                    # the pending requests
@@ -93,7 +93,7 @@ class StdioTransport:
         self.stderr = collections.deque(maxlen=40)       # its last log lines, for the error message when it fails
         self.protocol = PROTOCOL
 
-    def start(self):
+    def start(self) -> None:
         env = dict(os.environ)
         env.update({str(k): str(v) for k, v in (self.cfg.get("env") or {}).items()})
         command = str(self.cfg["command"])
@@ -125,7 +125,7 @@ class StdioTransport:
         except (OSError, ValueError):
             return
 
-    def _read_stderr(self):
+    def _read_stderr(self) -> None:
         for raw in self._lines(self.proc.stderr):
             line = raw.decode("utf-8", "replace").rstrip()
             if line:
@@ -133,7 +133,7 @@ class StdioTransport:
                 if os.environ.get("STRATA_DEBUG"):
                     print(f"[mcp {self.name}] {line}", flush=True)
 
-    def _read(self):
+    def _read(self) -> None:
         for raw in self._lines(self.proc.stdout):
             line = raw.decode("utf-8", "replace").strip()
             if not line:
@@ -161,7 +161,7 @@ class StdioTransport:
     def _tail(self) -> str:
         return f": {self.stderr[-1][:300]}" if self.stderr else ""
 
-    def _dispatch(self, m: dict):
+    def _dispatch(self, m: dict) -> None:
         if "method" in m:
             if "id" in m:                                # a request from the server: we offer no client features
                 try:
@@ -179,7 +179,7 @@ class StdioTransport:
             slot.msg = m
             slot.done.set()
 
-    def _send(self, msg: dict):
+    def _send(self, msg: dict) -> None:
         data = json.dumps(msg, ensure_ascii=False).encode("utf-8") + b"\n"
         try:
             with self.write_lock:
@@ -188,7 +188,7 @@ class StdioTransport:
         except (OSError, ValueError):
             raise McpError(f"the server stopped{self._tail()}") from None
 
-    def request(self, method: str, params: dict, timeout: float, cancel=None):
+    def request(self, method: str, params: dict, timeout: float, cancel: threading.Event | None = None) -> dict:
         if not self.alive():
             raise McpError(f"the server is not running{self._tail()}")
         slot = _Slot()
@@ -208,10 +208,10 @@ class StdioTransport:
                 pass
             raise
 
-    def notify(self, method: str, params: dict | None = None):
+    def notify(self, method: str, params: dict | None = None) -> None:
         self._send({"jsonrpc": "2.0", "method": method, **({"params": params} if params is not None else {})})
 
-    def close(self):
+    def close(self) -> None:
         """As the spec says: close its stdin, give it a moment to exit, then end it (and what it started)."""
         p = self.proc
         if p is None:
@@ -231,7 +231,7 @@ class StdioTransport:
                 pass
 
     @staticmethod
-    def _kill_tree(p):
+    def _kill_tree(p: subprocess.Popen) -> None:
         try:
             if os.name == "nt":                          # npx.cmd -> node: end the whole tree
                 subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
@@ -255,7 +255,7 @@ class HttpTransport:
     carries it.  The session id the server hands out at `initialize` rides on every later request."""
     kind = "http"
 
-    def __init__(self, name: str, cfg: dict):
+    def __init__(self, name: str, cfg: dict) -> None:
         self.name, self.url = name, str(cfg["url"])
         self.headers = {str(k): str(v) for k, v in (cfg.get("headers") or {}).items()}
         self.session = None
@@ -264,7 +264,7 @@ class HttpTransport:
         self.lock = threading.Lock()
         self.broken = None
 
-    def start(self):
+    def start(self) -> None:
         pass
 
     def alive(self) -> bool:
@@ -279,7 +279,7 @@ class HttpTransport:
             h["MCP-Protocol-Version"] = self.protocol
         return h
 
-    def _post(self, msg: dict, rid, timeout: float, slot: _Slot | None):
+    def _post(self, msg: dict, rid, timeout: float, slot: _Slot | None) -> None:
         try:
             req = urllib.request.Request(self.url, data=json.dumps(msg, ensure_ascii=False).encode("utf-8"),
                                          headers=self._headers(), method="POST")
@@ -341,7 +341,7 @@ class HttpTransport:
                         return x
         return None
 
-    def request(self, method: str, params: dict, timeout: float, cancel=None):
+    def request(self, method: str, params: dict, timeout: float, cancel: threading.Event | None = None) -> dict:
         if self.broken:
             raise self.broken
         with self.lock:
@@ -358,17 +358,17 @@ class HttpTransport:
                                                               {"requestId": rid, "reason": str(e)}), daemon=True).start()
             raise
 
-    def _quiet_notify(self, method, params):
+    def _quiet_notify(self, method: str, params: dict | None) -> None:
         try:
             self.notify(method, params)
         except McpError:
             pass
 
-    def notify(self, method: str, params: dict | None = None):
+    def notify(self, method: str, params: dict | None = None) -> None:
         self._post({"jsonrpc": "2.0", "method": method, **({"params": params} if params is not None else {})},
                    None, 10, None)
 
-    def close(self):
+    def close(self) -> None:
         if not self.session:
             return
         try:                                             # end the session on the server (it may not allow that)
@@ -382,7 +382,7 @@ class HttpTransport:
 class McpServer:
     """One configured server: started once (and again after it stopped), with the tools it listed."""
 
-    def __init__(self, name: str, cfg: dict, settings: dict):
+    def __init__(self, name: str, cfg: dict, settings: dict) -> None:
         self.name, self.cfg, self.settings = name, cfg, settings
         self.kind = "http" if cfg.get("url") else "stdio"
         self.status = "idle"             # idle -> starting -> ready | failed; ready -> stopped when it ends
@@ -437,7 +437,7 @@ class McpServer:
                   "without them.", flush=True)
             return False
 
-    def call(self, tool: str, arguments: dict, timeout: float, cancel=None) -> dict:
+    def call(self, tool: str, arguments: dict, timeout: float, cancel: threading.Event | None = None) -> dict:
         with self.lock:
             if self.transport is None or not self.transport.alive():
                 # it stopped since its last call (a crash, an expired session): start it again; one that failed to
@@ -455,7 +455,7 @@ class McpServer:
                 self.status, self.error = "stopped", str(e)
             raise
 
-    def close(self):
+    def close(self) -> None:
         with self.lock:
             if self.transport is not None:
                 self.transport.close()
@@ -532,14 +532,14 @@ def _clean(name: str) -> str:
 class McpHub:
     """Every configured server, and the merged, namespaced tool list the model sees."""
 
-    def __init__(self, servers: dict[str, dict], settings: dict | None = None):
+    def __init__(self, servers: dict[str, dict], settings: dict | None = None) -> None:
         self.media_dir = None
         self.settings = {**DEFAULTS, **(settings or {})}
         self.servers = {name: McpServer(name, cfg, self.settings) for name, cfg in servers.items()}
         self.threads: list[threading.Thread] = []
         self._routes: dict[str, tuple[McpServer, str]] = {}
 
-    def start(self, wait: bool = False):
+    def start(self, wait: bool = False) -> None:
         """Start every server on its own thread (npx may download a package first: that must not delay the chat)."""
         self.threads = [threading.Thread(target=s.start, daemon=True, name=f"mcp-{s.name}")
                         for s in self.servers.values()]
@@ -640,7 +640,7 @@ class McpHub:
         return {"servers": servers, "tools": len(routes),
                 "settings": {k: self.settings[k] for k in ("timeout_s", "max_result_chars", "max_rounds")}}
 
-    def close(self):
+    def close(self) -> None:
         for s in self.servers.values():
             try:
                 s.close()
@@ -668,7 +668,7 @@ def _check_server(name, cfg, where) -> dict:
     return cfg
 
 
-def servers_from(block, where: str) -> dict[str, dict]:
+def servers_from(block: object, where: str) -> dict[str, dict]:
     """{"name": {...}} with the entries checked; `"disabled": true` leaves one out."""
     if block is None:
         return {}
