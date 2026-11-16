@@ -51,10 +51,11 @@ import threading
 import time
 import urllib.request
 import uuid
+from collections.abc import Callable, Collection, Iterable, Sequence
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Iterator, Protocol
+from typing import Any, Iterator, Protocol
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -90,7 +91,7 @@ IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
 
 
-def popen(what: str, args: list, role: str = "engine", **kw):
+def popen(what: str, args: list, role: str = "engine", **kw: Any) -> subprocess.Popen:
     """#735: subprocess.Popen, but Windows' refusal to start a program (WinError 4551, or 1260 when a policy blocks it:
     Smart App Control on a clean Windows 11 blocks an exe that is not signed) is said in words instead of a bare
     OSError."""
@@ -379,7 +380,7 @@ class RawTextParser:
     state, buf, clean = "content", "", True
     rescued = refused = stray_think = unread = 0
 
-    def __init__(self, *_, **__):
+    def __init__(self, *_: object, **__: object) -> None:
         self.pending, self.name_repairs, self.notes, self.unread_names = [], [], [], []
 
     def feed(self, delta: str) -> list[Event]:
@@ -394,7 +395,7 @@ class MockEngine:
     scripts, each request gets the next one and the last one repeats (a tool call, then the answer after it)."""
 
     def __init__(self, tokenizer, script: str | list[str], max_context: int = 32768, delay_s: float = 0.0,
-                 cycle: bool = False):
+                 cycle: bool = False) -> None:
         self.tok, self.max_context, self.delay = tokenizer, max_context, delay_s
         end = tokenizer.encode(IM_END, parse_special=True)
         self.scripts = [tokenizer.encode(x, parse_special=True) + end for x in ([script] if isinstance(script, str)
@@ -470,7 +471,7 @@ class SessionRefused(ValueError):
 
     STATUS = {"invalid": 400, "storage": 507, "memory": 503, "io": 500}
 
-    def __init__(self, kind: str, message: str, published: bool = False):
+    def __init__(self, kind: str, message: str, published: bool = False) -> None:
         super().__init__(message)
         self.kind = kind if kind in self.STATUS else "io"
         self.published = published
@@ -490,7 +491,7 @@ class GpuBusy(RuntimeError):
     model server) is using it, so the engine is not started into the little that is left.  `retry_after`: seconds
     for the Retry-After header of the 503."""
 
-    def __init__(self, message="", retry_after=None):
+    def __init__(self, message="", retry_after=None) -> None:
         super().__init__(message)
         self.retry_after = retry_after
 
@@ -501,7 +502,7 @@ class GpuLocks:
     unloaded, and a load never starts while one of them runs.  Taken without waiting: a held file is a GpuBusy (503
     with Retry-After), never a request that hangs.  The kernel drops them when the process ends, however it ends."""
 
-    def __init__(self, paths):
+    def __init__(self, paths: Iterable[str | os.PathLike[str]]) -> None:
         self.paths = [str(Path(x).expanduser()) for x in paths]
         self.fds: list[int] = []
 
@@ -534,7 +535,7 @@ class GpuLocks:
 PAGE_CSP = "frame-src 'none'"
 
 
-def unload_wait(value, default: float) -> float:
+def unload_wait(value: object, default: float) -> float:
     """#1997: the `wait` of POST /unload?wait=...: absent / 0 / false: 0 (answer "busy" at once, as before); 1 / true /
     yes: `default` seconds; a number of seconds above 1: that long (at most an hour)."""
     if value is None:
@@ -670,7 +671,7 @@ def cpu_isa_words() -> tuple:
     return f"{model or 'this CPU'} ({have})", missing
 
 
-def start_exit_note(rc: int | None, exe=None) -> str:
+def start_exit_note(rc: int | None, exe: str | os.PathLike[str] | None = None) -> str:
     """The sentence the start error carries about how the engine process ended (the engine log is silent when the
     system ends it): "" without a status, else a line, with the CPU's AVX flags after an illegal instruction."""
     words = engine_exit_words(rc)
@@ -787,7 +788,7 @@ def experts_loading_words(args: list, size: str) -> str:
 OPENS_BROWSER = False        # set in main() when the server was started with --open: only then may a message say a browser opens
 
 
-def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0) -> None:
+def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat: float = 20.0) -> None:
     """While the engine starts, say in the server window what it is doing, from its log: the start reads tens of GB
     into RAM and locks part of it for the GPU, and on many PCs everything is slow or frozen for a minute or more -
     people closed the window thinking it had hung.  The warning comes at that step, not after it."""
@@ -802,7 +803,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
     t0 = last = time.time()
     said = set()
 
-    def say(key, text):
+    def say(key, text) -> None:
         nonlocal last
         if key not in said:
             said.add(key)
@@ -857,12 +858,12 @@ class ConvCacheLog:
     SKIP = re.compile(r"conversation cache: skip parking \(([^)]*)")
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.key, self.pos = None, 0
         self.lock = threading.Lock()                    # the metrics page and the stream order both read the log
         self.reset()
 
-    def reset(self):
+    def reset(self) -> None:
         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
                       "last_tokens": None, "last_at": None, "ssd_read_mbps": None, "ssd_write_mbps": None,
                       "ssd_files": None, "ssd_gib": None, "ssd_restores": 0, "ssd_written_mib": 0.0,
@@ -971,7 +972,7 @@ _BTRACE = bool(os.environ.get("STRATA_BATCH_TRACE"))
 FAST_PROMPT = os.environ.get("STRATA_SERVER_FAST_PROMPT", "1") != "0"   # see StrataEngine._ids_text and serve/frontend.py
 
 
-def btrace(*a):
+def btrace(*a: object) -> None:
     if _BTRACE:
         print("[batch-trace]", threading.get_ident() % 10000, *a, file=sys.stderr, flush=True)
 
@@ -1098,14 +1099,14 @@ class StrataEngine:
         return self.__dict__.get("_last", {})
 
     @last.setter
-    def last(self, value):
+    def last(self, value) -> None:
         self.__dict__["_last"] = value
         if self.batch:
             tl = self.__dict__.setdefault("_tl", threading.local())
             tl.last = value
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0):
+                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0) -> None:
         self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
@@ -1307,7 +1308,7 @@ class StrataEngine:
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
 
-    def _pump(self):
+    def _pump(self) -> None:
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         slot_q = self.slot_q
         line = None
@@ -1389,7 +1390,7 @@ class StrataEngine:
         proc = self.proc                                 # read once: restart() / close() may set it to None meanwhile
         return proc is not None and not getattr(self, "ended", False) and proc.poll() is None
 
-    def exit_code(self):
+    def exit_code(self) -> int | None:
         if self.proc is None:
             return None
         try:
@@ -1397,7 +1398,7 @@ class StrataEngine:
         except subprocess.TimeoutExpired:
             return None
 
-    def unload(self):
+    def unload(self) -> None:
         """Release GPU/RAM between requests, retaining the spawn config for automatic reloading."""
         self.close()
         self.unloaded = True
@@ -1420,7 +1421,7 @@ class StrataEngine:
             if not done:
                 out.put(None)
 
-    def restart(self, tries: int = 3):
+    def restart(self, tries: int = 3) -> None:
         """Start the engine again (the same command) after it died; the new process has its own line queue.
         close() ends and waits for the old process first (EngineStuck when it cannot be ended).  A start that still
         exits before READY - a dead engine's VRAM can take a while to come back, notably on ROCm - is retried
@@ -1455,7 +1456,7 @@ class StrataEngine:
                     self.slot_cv.notify_all()    # new engine, or (it did not start) end with a clean EngineDied
         self.info = {**info, **self.info}
 
-    def _parse_done(self, line):
+    def _parse_done(self, line) -> None:
         f = line.split()
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
                      "decode_ms": float(f[4]), "finish": f[5]}
@@ -1618,7 +1619,7 @@ class StrataEngine:
         on = sampling.get("experimental_speed_projection")
         return f" cvec={int(on)}" if isinstance(on, bool) else ""
 
-    def _send(self, text: str):
+    def _send(self, text: str) -> None:
         btrace("send>", text[:60])
         try:
             with self.wlock:
@@ -1767,7 +1768,7 @@ class StrataEngine:
                 return line
         return None
 
-    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None):
+    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None) -> None:
         """A slot whose consumer left (a stop token, a stop string, a disconnect): BSTOP it and free it once the engine
         says BDONE (in the background).  `stream`: the prompt and every token of it so far - with the tokens still to
         come before BDONE, all but the last are what the slot holds then (the next turn of its conversation)."""
@@ -1781,7 +1782,7 @@ class StrataEngine:
         releasing = self.slot_releasing
         releasing.add(slot)
 
-        def wait():
+        def wait() -> None:
             end = time.monotonic() + SLOT_QUIET_S           # no-progress limit: every line of the slot starts it again
             tail = list(stream or [])
             while time.monotonic() < end:
@@ -1820,7 +1821,7 @@ class StrataEngine:
             self.slot_busy[slot] = True
         busy = self.slot_busy
 
-        def free():
+        def free() -> None:
             with self.slot_cv:
                 if slot not in self.slot_claims and slot not in self.slot_releasing:
                     busy[slot] = False
@@ -2013,7 +2014,7 @@ class StrataEngine:
                         with self.slot_cv:
                             return self.waiting > 0
 
-                    def give_way():   # at a PP line, and between two far apart (the engine takes it at its next boundary)
+                    def give_way() -> None:   # at a PP line, and between two far apart (the engine takes it at its next boundary)
                         nonlocal reserved
                         if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
                                 self._shorter_waiting(len(prompt))):
@@ -2143,14 +2144,14 @@ class StrataEngine:
                     self._ctl_erred = False
                     asked = False
 
-                    def ask():        # as give_way above, for the slot this admission reads into
+                    def ask() -> None:        # as give_way above, for the slot this admission reads into
                         nonlocal asked
                         if (not asked and not embeddings and yields < self.YIELDS_MAX and
                                 self._shorter_waiting(len(prompt))):
                             self._send(f"BYIELD {slot}")
                             asked = True
 
-                    def note_progress():
+                    def note_progress() -> None:
                         # the terminal layer's live prompt counter (the batch admission path)
                         if self.progress and live["state"] == "reading":
                             live["prompt_read"] = self.progress[0]
@@ -2715,7 +2716,7 @@ class StrataEngine:
                 continue
             raise out_of_step(line)
 
-    def close(self):
+    def close(self) -> None:
         """End the engine process: STOP + QUIT first (the engine frees its memory itself - unpinning tens of GB can take
         a while; ENGINE_QUIT_WAIT_S), then terminate (ENGINE_TERM_WAIT_S), then kill (ENGINE_KILL_WAIT_S).  Raises
         EngineStuck when it still runs after all three."""
@@ -2861,7 +2862,7 @@ class Vision:
                 pass
         return Path(tempfile.mkdtemp(prefix="strata-vision-"))
 
-    def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
+    def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False) -> None:
         args = self.reader_args(cfg)
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload
@@ -2913,14 +2914,14 @@ class Vision:
             args += ["--min-tokens", str(cfg["min_tokens"])]
         return args
 
-    def _ensure_dir(self):
+    def _ensure_dir(self) -> None:
         """#3370: a temp cleaner (Windows Storage Sense) removes the empty work folder while the encoder is unloaded; the next
         start then failed with WinError 267 for as long as the server lived.  Make it again; pictures cached in it are gone."""
         if not self.dir.is_dir():
             self.dir.mkdir(parents=True, exist_ok=True)
             self.cache.clear()
 
-    def _start(self):
+    def _start(self) -> None:
         """Start the reader.  When a GPU reader that has a CPU reader to fall back on does not start (the GPU runtime does not
         load, the card is not in its build, the card is busy), the CPU reader is started instead, for good, with one log line
         and no question."""
@@ -2935,7 +2936,7 @@ class Vision:
             self.spawn, self.fallback = fallback, None
             self._start_reader()
 
-    def _start_reader(self):
+    def _start_reader(self) -> None:
         args, log, env = self.spawn
         self._ensure_dir()
         # cwd is the encoder's directory: the ENC lines name the files relative to it (#480: no space in the line)
@@ -2969,7 +2970,7 @@ class Vision:
         proc = self.proc
         got: queue.Queue = queue.Queue()
 
-        def read():
+        def read() -> None:
             try:
                 got.put(proc.stdout.readline())
             except (OSError, ValueError):               # killed under the read
@@ -2988,12 +2989,12 @@ class Vision:
     def alive(self) -> bool:
         return self.proc is not None and not self.stopped and self.proc.poll() is None
 
-    def unload(self):
+    def unload(self) -> None:
         """Stop the encoder process (its VRAM or RAM goes back); the encoded images stay cached on disk."""
         self.close()
         self.stopped = True
 
-    def restart(self):
+    def restart(self) -> None:
         """Start the encoder again after an unload (or if it died); the cache of encoded images is kept."""
         if self.proc is not None:
             try:
@@ -3145,7 +3146,7 @@ class Vision:
                   "the picture reader is not applying its limit. Update the engine, and send the line 'strata-vision: warmed up at N image "
                   "tokens' from the reader's log with the report", flush=True)
 
-    def close(self):
+    def close(self) -> None:
         proc, self.proc = self.proc, None
         if proc is None:
             self.stopped = True
@@ -3165,7 +3166,7 @@ class Vision:
                 pass
         self.stopped = True
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         """#914: close() for good: the server ends, so the encoder's directory (one ~10 MB .sve per image, on a tmpfs
         /tmp that is RAM) goes with it instead of piling up with every start.  unload() keeps it for the restart."""
         self.close()
@@ -3182,7 +3183,7 @@ def gpu_list(cfg: dict) -> list[int]:
     return _gpu_numbers(cfg.get("gpu"))
 
 
-def _gpu_numbers(g) -> list[int]:
+def _gpu_numbers(g: object) -> list[int]:
     if g is None or g == "":
         return []
     items = g if isinstance(g, (list, tuple)) else str(g).split(",")
@@ -3584,7 +3585,7 @@ class Detokenizer:
     every generated id cost 2 ms per token after 8K tokens and 4 ms after 16K (perf-review F-1).  A tokenizer
     without `token_bytes` (the tests' byte tokenizer) keeps the re-decode."""
 
-    def __init__(self, tok):
+    def __init__(self, tok) -> None:
         self.tok, self.ids, self.sent = tok, [], 0
         self.inc = codecs.getincrementaldecoder("utf-8")(errors="replace") if hasattr(tok, "token_bytes") else None
 
@@ -3608,7 +3609,7 @@ class Detokenizer:
 OPENAI_MAX_STOP = 4                                  # OpenAI's limit on `stop`
 
 
-def top_logprobs(req: dict):
+def top_logprobs(req: dict) -> int | None:
     """The K for the engine's logprobs=K, or None when the request did not ask.
 
     OpenAI: "logprobs": true with "top_logprobs" 0..20; the legacy completions form,
@@ -3666,7 +3667,7 @@ class StopMatcher:
     """Cuts the answer's text at the first stop string.  Text that could still be the start of a stop string is held
     back (only that tail, never more), so a stop string split across tokens or chunks is still found and never sent."""
 
-    def __init__(self, stops: list[str]):
+    def __init__(self, stops: list[str]) -> None:
         self.stops, self.held, self.hit = stops, "", None
 
     def push(self, text: str) -> str:
@@ -3702,7 +3703,7 @@ _WIN_DEVICES = {"con", "prn", "aux", "nul", "conin$", "conout$", *(f"com{i}" for
                 *(f"lpt{i}" for i in "123456789\u00b9\u00b2\u00b3")}
 
 
-def slot_filename_problem(name) -> str | None:
+def slot_filename_problem(name: object) -> str | None:
     """/slots/0 {"filename": NAME}: why NAME is not one plain file name inside the slot save path, on Linux and on
     Windows alike (None when it is).  No separator or drive (`D:x`), no stream (`a:b`), no device (`NUL.txt`), no
     trailing dot or space (Windows drops them), no control character, no leading dot (temporary files use it)."""
@@ -3727,7 +3728,7 @@ def slot_filename_problem(name) -> str | None:
     return None
 
 
-def slot_save_dir(value, base: str | None = None) -> str:
+def slot_save_dir(value: object, base: str | None = None) -> str:
     """The slot save path as one absolute, normalized directory (relative to `base`, else the server's working
     directory), created private to this user when missing.  ValueError for anything else."""
     if not isinstance(value, str) or not value.strip():
@@ -3743,7 +3744,7 @@ def slot_save_dir(value, base: str | None = None) -> str:
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = True):
+                 fit_max_tokens: bool = True) -> None:
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
@@ -4093,7 +4094,7 @@ class Service:
         started with, a segment or more below the size it had)."""
         return self.vram_reserve if self.vram_reserve_asked else 0
 
-    def _vision_up(self):
+    def _vision_up(self) -> None:
         """The image turn's start for an elastic encoder that is not running (the caller holds self.fifo): the expert
         cache first keeps the encoder's elastic_mib of VRAM free on top of the reserve, then the encoder starts (load and
         warm-up, a few seconds).  If the cache cannot shrink (an engine without --vram-elastic, the resident low-RAM mode)
@@ -4147,14 +4148,14 @@ class Service:
         finally:
             self.fifo.release()
 
-    def start_vision_idle(self):
+    def start_vision_idle(self) -> None:
         v = self.vision
         if not getattr(v, "elastic", False):
             return
         print(f"[strata] images: the image encoder starts with the first picture and stops after {v.elastic_idle_s:g} s "
               f"without one; while it runs the expert cache keeps {v.elastic_mib} MiB free for it", flush=True)
 
-        def loop():
+        def loop() -> None:
             while True:
                 time.sleep(max(1.0, min(30.0, v.elastic_idle_s / 4)))
                 try:
@@ -4178,7 +4179,7 @@ class Service:
         except Exception:
             return None
 
-    def ensure_loaded(self):
+    def ensure_loaded(self) -> None:
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the gpu_locks, the
         before_load hook and the free-VRAM check.  The caller holds self.fifo."""
         if self.loaded() and not self._vision_down():
@@ -4193,7 +4194,7 @@ class Service:
                 locks.release()
             raise
 
-    def _ensure_loaded(self):
+    def _ensure_loaded(self) -> None:
         hook_failed = None
         if self.before_load:
             cmd = self.before_load
@@ -4318,7 +4319,7 @@ class Service:
         print(f"[strata] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
-    def load(self):
+    def load(self) -> None:
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
         self.last_request_at = time.time()
@@ -4392,12 +4393,12 @@ class Service:
         finally:
             self.fifo.release()
 
-    def start_idle_unload(self):
+    def start_idle_unload(self) -> None:
         if not self.idle_unload_s or not hasattr(self.engine, "unload"):
             return
         print(f"[strata] the model unloads after {self.idle_unload_s} s without requests", flush=True)
 
-        def loop():
+        def loop() -> None:
             while True:
                 time.sleep(max(1.0, min(30.0, self.idle_unload_s / 4)))
                 try:
@@ -4446,7 +4447,7 @@ class Service:
                     req["output_config"] = {"effort": effort}
         return req
 
-    def start_telemetry(self):
+    def start_telemetry(self) -> None:
         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
         if getattr(self, "telemetry", None) is None:
             from serve.telemetry import Telemetry
@@ -4766,7 +4767,7 @@ class Service:
         with self.status_lock:
             self.totals[name] = self.totals.get(name, 0) + 1
 
-    def forget_prompt(self, ids):
+    def forget_prompt(self, ids) -> None:
         if self.prompts is not None:
             self.prompts.forget(ids)
 
@@ -4985,7 +4986,7 @@ class Service:
         if path is not None:
             Path(path).unlink(missing_ok=True)
 
-    def _note(self, n, evs, st=None, rate=None):
+    def _note(self, n, evs, st=None, rate=None) -> None:
         with self.status_lock:
             s = self.status if st is None else st
             s["generated"] = n
@@ -5164,7 +5165,7 @@ class Service:
         deadline = time.monotonic() + self.queue_timeout_s if self.queue_timeout_s is not None else None
         if deadline is not None:
             setattr(cancel, "_strata_queue_deadline", deadline)
-        def queue_started():
+        def queue_started() -> None:
             with self.status_lock:
                 row = self.terminal_requests.get(request_id)
                 if row is not None and row["state"] != "reading":
@@ -5196,7 +5197,7 @@ class Service:
                 self.mirror_evictions()
                 order_entry = self.order.enter(ids, getattr(cancel, "_strata_thread", None))
                 setattr(cancel, "_strata_order_entry", order_entry)
-                def turn_over(oe=order_entry):
+                def turn_over(oe=order_entry) -> None:
                     oe.open = oe.open and not cancel.is_set()       # a client that left does not send a next request
                     self.order.finish(oe)
                     self.mirror_evictions()
@@ -5748,7 +5749,7 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
                if last.get("drafts_offered") is not None else {})}
 
 
-def seed_demo_history(svc, n: int) -> None:
+def seed_demo_history(svc: Service, n: int) -> None:
     """--demo-history (mock engine): made-up finished requests, so the dashboard has something to draw."""
     import random
     rnd = random.Random(7)
@@ -5803,7 +5804,7 @@ def request_stats(segments: list[dict]) -> dict:
     return result
 
 
-def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
+def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens) -> None:
     """One compact line per request while diagnosing blank/empty turns. Set STRATA_DEBUG=1 to enable."""
     if not os.environ.get("STRATA_DEBUG"):
         return
@@ -5872,7 +5873,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             # keep-alives, which is how a client that went away (the web app's Stop) is noticed during a slow tool.
             box = {}
 
-            def work(c=c, box=box):
+            def work(c=c, box=box) -> None:
                 try:
                     box["r"] = hub.call(c.name, c.arguments, cancel)
                 except McpCancelled:
@@ -5937,7 +5938,7 @@ class LPLines(collections.deque):
     tail - come after it has left the queue, when the next request may already have replaced the engine's lp_lines
     with its own: LogprobEntries reads only the lines tagged with its own request's Event."""
 
-    def __init__(self, owner=None):
+    def __init__(self, owner=None) -> None:
         super().__init__()
         self.owner = owner
 
@@ -5962,7 +5963,7 @@ class LogprobEntries:
     that writes an LP line); the slot's `BT` lines carry none, so a longer reply is refused (400) before it starts.
     """
 
-    def __init__(self, svc, allowed=(), owner=None):
+    def __init__(self, svc, allowed=(), owner=None) -> None:
         self.tok, self.stop_ids = svc.tok, svc.stop_ids
         self.allowed = [i for i in allowed]
         self.inc = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -6065,7 +6066,7 @@ class LogprobEntries:
             e["logprob"] = own["logprob"]           # (it used to copy the first alternative's, another token's)
         return e
 
-def prompt_progress(svc: Service):
+def prompt_progress(svc: Service) -> dict | None:
     """The last PP line as llama.cpp's `prompt_progress`, so a client written for llama.cpp reads both servers: the
     same four fields, `time_ms` elapsed since prompt reading started, and `processed` counting from token 0 so that a
     client takes the reused prefix out with `cache` (llama.cpp's rule: the timed progress is
@@ -6163,7 +6164,7 @@ def _is_json(text: str) -> bool:
         return False
 
 
-def openai_collect(chunks) -> dict:
+def openai_collect(chunks: Iterable[dict | None]) -> dict:
     content, reasoning, by_index, last, mcp = [], [], {}, None, []
     lps = {}                                       # "content" / "reasoning_content" -> logprob entries
     for c in chunks:
@@ -6271,7 +6272,7 @@ def completions_chunks(svc: Service, req: dict, ids, max_new, cancel, usage_chun
                 yield last
 
 
-def completions_collect(chunks) -> dict:
+def completions_collect(chunks: Iterable[dict | None]) -> dict:
     """The one `text_completion` reply of a request that is not streamed."""
     text, finish, usage, timings, head = [], None, None, None, None
     for c in chunks:
@@ -6521,12 +6522,12 @@ def body_limit() -> int:
 class BadBody(Exception):
     """A request body that cannot be read (a malformed or oversized chunked body): the status and the sentence."""
 
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str) -> None:
         super().__init__(message)
         self.status = status
 
 
-def make_handler(svc: Service):
+def make_handler(svc: Service) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
 
@@ -6536,15 +6537,15 @@ def make_handler(svc: Service):
         body_read = False                                   # whether a handler took this request's body
         DRAIN_SECONDS = 5                                   # the longest an unread body is read and dropped
 
-        def log_message(self, fmt, *args):
+        def log_message(self, fmt, *args) -> None:
             pass
 
-        def handle_one_request(self):
+        def handle_one_request(self) -> None:
             self.answer_started = False
             super().handle_one_request()
             self._drain_body()
 
-        def send_response(self, code, message=None):
+        def send_response(self, code, message=None) -> None:
             self.answer_started = True                 # a malformed-request answer can only replace one not yet begun
             super().send_response(code, message)
 
@@ -6614,7 +6615,7 @@ def make_handler(svc: Service):
                                    "(STRATA_MAX_BODY_MIB raises the limit)")
             return self.rfile.read(length)
 
-        def _drain_body(self):
+        def _drain_body(self) -> None:
             """An answer sent before the body was read (a 401, a 403, /load, a method with no handler) must not close
             the connection on unread bytes: the close then sends a reset, and a client that sends its body after the
             headers (http.client, urllib, requests) gets a connection error instead of the answer.  So the body is
@@ -6687,7 +6688,7 @@ def make_handler(svc: Service):
                 return True
             return False
 
-        def end_headers(self):
+        def end_headers(self) -> None:
             # HTTP/1.0 without keep-alive: the server closes the connection after every response.  Say so, or a
             # client that pools connections (.NET's SocketsHttpHandler) can put its next request on this socket
             # before the close reaches it, and that request fails with "response ended prematurely" without the
@@ -6714,7 +6715,7 @@ def make_handler(svc: Service):
                 svc.active_cancels.add(cancel)
             sock = self.connection
 
-            def watch():
+            def watch() -> None:
                 while not done.wait(0.5) and not cancel.is_set():
                     try:
                         readable, _, _ = select.select([sock], [], [], 0)
@@ -6730,13 +6731,13 @@ def make_handler(svc: Service):
 
             threading.Thread(target=watch, daemon=True, name="strata-client-watch").start()
 
-        def _note(self, **values):
+        def _note(self, **values) -> None:
             """#332: what the monitor shows about this request (nothing when the monitor is off)."""
             if self.record is not None:
                 with svc.status_lock:
                     self.record.update(values)
 
-        def _cors(self):
+        def _cors(self) -> None:
             """#321: CORS headers for an API path (/v1/*) and an origin the config lists in cors_origins - nothing
             otherwise, so a browser keeps every other page away from the API, /settings, /unload and the MCP tools."""
             if not svc.cors_origins or not self.path.split("?")[0].startswith("/v1/"):
@@ -6757,14 +6758,14 @@ def make_handler(svc: Service):
                              asked or "Authorization, Content-Type, x-api-key, anthropic-version, anthropic-beta")
             self.send_header("Access-Control-Max-Age", "600")
 
-        def do_OPTIONS(self):
+        def do_OPTIONS(self) -> None:
             # a CORS preflight: no credentials come with it, so no API key; the headers only for cors_origins
             self.send_response(204)
             self._cors()
             self.send_header("Content-Length", "0")
             self.end_headers()
 
-        def _json(self, code, obj, headers=None, retry_after=None):
+        def _json(self, code, obj, headers=None, retry_after=None) -> None:
             if self.record is not None:
                 with svc.status_lock:
                     self.record["http_status"] = code
@@ -6806,7 +6807,7 @@ def make_handler(svc: Service):
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong telemetry key"}})
             return False
 
-        def do_GET(self):
+        def do_GET(self) -> None:
             path = self.path.split("?")[0].rstrip("/")
             if path.startswith("/tool-media/"):
                 if not self._authorized():
@@ -7188,13 +7189,13 @@ def make_handler(svc: Service):
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
-        def do_POST(self):
+        def do_POST(self) -> None:
             try:
                 self._post()
             except BadBody as e:                              # #893: a malformed or oversized chunked body
                 self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
 
-        def _post(self):
+        def _post(self) -> None:
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
@@ -7425,7 +7426,7 @@ def make_handler(svc: Service):
                         record["state"] = "error" if record.get("error") else record.get("outcome", "completed")
                     svc.request_trace.record = None
 
-        def _images(self, req):
+        def _images(self, req) -> None:
             """POST /v1/images/generations (serve/images.py): one sd-cli job in the GPU's turn."""
             gen = svc.images
             if gen is None:
@@ -7452,7 +7453,7 @@ def make_handler(svc: Service):
             scheme = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
             self._json(200, gen.response(images, job, figures, f"{scheme}://{host}"))
 
-        def _props(self):
+        def _props(self) -> None:
             model = parse_qs(urlsplit(self.path).query).get("model", [svc.model])[0]
             if model not in svc.model_names():
                 self._json(404, {"error": {"message": "model not found"}})
@@ -7542,7 +7543,7 @@ def make_handler(svc: Service):
                     out.append({"file": f.name, "model": default_model_name(c), "current": f.resolve() == here})
             return out
 
-        def _config_get(self):
+        def _config_get(self) -> None:
             if not svc.config_path:
                 self._json(404, {"error": {"message": "this server was started without a run config"}})
                 return
@@ -7553,7 +7554,7 @@ def make_handler(svc: Service):
                 return
             self._json(200, {**runconfig.view(cfg, svc.config_path), "models": self._model_configs()})
 
-        def _config_post(self):
+        def _config_post(self) -> None:
             """#564: change a few documented keys of the run config - JSON from Strata's own page only, as
             /settings (the key is checked before); every other key of the file stays as it is."""
             body = self._body()
@@ -7588,7 +7589,7 @@ def make_handler(svc: Service):
             return bool(origin) and origin.split("://", 1)[-1] != self.headers.get("Host", "") and \
                 origin not in svc.trusted_origins
 
-        def _no_local_images(self, messages):
+        def _no_local_images(self, messages) -> None:
             """A web page of another origin must not have a file on this computer read as an image.  Without an
             api_key, _foreign_page refuses such a page unless cors_origins lets it in - and a page cors_origins lets
             in (["*"]: every page) could name any file and, CORS allowing, read what the model says about it.  data:
@@ -7600,7 +7601,7 @@ def make_handler(svc: Service):
                                  "image: send it as a data: URL (or add the page's origin to the config's "
                                  "trusted_origins)")
 
-        def _settings(self):
+        def _settings(self) -> None:
             # They change what every client gets, so only the app's own page may set them
             body = self._body()
             if not self._own_page("settings can be changed"):
@@ -7620,7 +7621,7 @@ def make_handler(svc: Service):
                   if shared else "[strata] other apps use their own settings again", flush=True)
             self._json(200, {"shared": bool(shared), "defaults": shared})
 
-        def _sse(self):
+        def _sse(self) -> None:
             self._note(http_status=200)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -7739,7 +7740,7 @@ def make_handler(svc: Service):
                 return self._json(200, openai_collect(chunks))
             self._stream_out(chunks, cancel)
 
-        def _stream_out(self, chunks, cancel):
+        def _stream_out(self, chunks, cancel) -> None:
             """Sends `chunks` (None: a keep-alive) as server-sent events, then [DONE]; the ways it can end early are told to
             the client as a stream's last event (the headers are out) - /v1/chat/completions and /v1/completions."""
             self._sse()
@@ -7887,7 +7888,7 @@ def make_handler(svc: Service):
             self._sse()
             last = time.monotonic()
 
-            def send(e):
+            def send(e) -> None:
                 self.wfile.write(f"event: {e['type']}\n".encode() + b"data: " +
                                  json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
 
@@ -7918,7 +7919,7 @@ def make_handler(svc: Service):
             except ValueError as e:                          # the engine's ERR after the stream started
                 self._responses_failed(asm, str(e), "server_error", send)
 
-        def _responses_failed(self, asm, message, code, send):
+        def _responses_failed(self, asm, message, code, send) -> None:
             e = asm.failed(message, code)
             self._note(error=e["response"]["error"])
             try:
@@ -7987,7 +7988,7 @@ def make_handler(svc: Service):
             # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
             return ids, thinking, tools, max_new, asm, validator, req
 
-        def _count_tokens(self, req):
+        def _count_tokens(self, req) -> None:
             """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would
             read for the same request, rendered and tokenized - the model does not run."""
             req = svc.with_shared(req, "anthropic")
@@ -7996,7 +7997,7 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False))})
 
-        def _tokenize(self, req):
+        def _tokenize(self, req) -> None:
             """POST /tokenize: the prompt a /v1/chat/completions request with this body would read, rendered and
             tokenized; the model does not run.  {"count": N}, and {"tokens": [ids]} too when the body has "ids": true (the shape
             llama.cpp and vLLM use for the list)."""
@@ -8073,16 +8074,16 @@ class Server(ThreadingHTTPServer):
     # (STRATA_HTTP_BACKLOG overrides it)
     request_queue_size = max(5, int(os.environ.get("STRATA_HTTP_BACKLOG") or 256))
 
-    def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True):
+    def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True) -> None:
         if ":" in server_address[0]:
             self.address_family = socket.AF_INET6
         super().__init__(server_address, RequestHandlerClass, bind_and_activate)
 
-    def handle_error(self, request, client_address):
+    def handle_error(self, request, client_address) -> None:
         if not isinstance(sys.exc_info()[1], ConnectionError):   # a client that hangs up needs no stack trace
             super().handle_error(request, client_address)
 
-    def server_close(self):
+    def server_close(self) -> None:
         # the hardware sampler serve() started for this server stops with it (test isolation: every Service a test
         # started used to leave its sampler running, 21 of them after test_responses, which slowed test_parallel's timing)
         tel = getattr(getattr(self, "svc", None), "telemetry", None)
@@ -8091,7 +8092,7 @@ class Server(ThreadingHTTPServer):
         super().server_close()
 
 
-def warn_tight_ram(arena_mib) -> None:
+def warn_tight_ram(arena_mib: object) -> None:
     """The model's experts live in RAM (INFO arena_mib, engine 0.1.10+).  With less than ~6 GB left beside them for the
     system, the engine and this server, Linux ends the engine mid-answer when memory runs out (issue #27) and Windows
     pages to disk; say so at start instead of after a lost answer."""
@@ -8111,7 +8112,7 @@ def warn_tight_ram(arena_mib) -> None:
               + "Close other programs, or run START-HERE --setup and pick a smaller size (Q2_0 / IQ2_XS).", flush=True)
 
 
-def warn_budget_over_ram(args) -> str | None:
+def warn_budget_over_ram(args: Sequence[str]) -> str | None:
     """#1080: an explicit `--resident-budget-gib N` bigger than the RAM this PC has free (or than its total beside
     ~6 GB for everything else) pushes experts into swap or the file tier: decode that is "dead slow" until the number is
     removed.  A warning at start, never a refusal (recommend, never force).  -> the sentence printed, or None."""
@@ -8153,7 +8154,7 @@ def lan_addresses() -> list[str]:
     return ([first] if ok(first) else []) + sorted(ip for ip in ips if ok(ip) and ip != first)
 
 
-def host_name(value) -> str:
+def host_name(value: str | None) -> str:
     """The name in a Host header (or an origin's host[:port]): "Example.com:8080" -> "example.com",
     "[::1]:8095" -> "::1"; "" when it is malformed."""
     v = (value or "").strip().lower()
@@ -8179,12 +8180,12 @@ def _is_ip(name: str) -> bool:
         return False
 
 
-def _name_in(name: str, names) -> bool:
+def _name_in(name: str, names: Collection[str]) -> bool:
     """`name` is one of `names`, or below an entry that starts with a dot (".example.com")."""
     return name in names or any(n.startswith(".") and (name.endswith(n) or name == n[1:]) for n in names)
 
 
-def allowed_hosts_of(value, env: str = "") -> list[str]:
+def allowed_hosts_of(value: object, env: str = "") -> list[str]:
     """The config's allowed_hosts (a name or a list) plus $STRATA_ALLOWED_HOSTS (comma-separated): host names, "*" or
     ".example.com" (it and every name below it).  A scheme, port or path is dropped ("https://a.example.com:8443/"
     -> "a.example.com"); a wrong entry stops the start (ValueError)."""
@@ -8206,7 +8207,7 @@ def allowed_hosts_of(value, env: str = "") -> list[str]:
     return list(dict.fromkeys(out))
 
 
-def host_names_for(bind_host: str, allowed_hosts=(), trusted_origins=()) -> set[str]:
+def host_names_for(bind_host: str, allowed_hosts: Iterable[str] = (), trusted_origins: Iterable[str] = ()) -> set[str]:
     """Every name this server answers to besides an IP address: localhost, the address it listens on, the config's
     allowed_hosts and trusted_origins' hosts, and - listening beyond this PC (0.0.0.0 or a LAN address) - this PC's
     name and LAN addresses (the LAN addresses matter for the Origin check, which takes no IP on trust)."""
@@ -8226,7 +8227,7 @@ def host_names_for(bind_host: str, allowed_hosts=(), trusted_origins=()) -> set[
     return names
 
 
-def host_allowed(host, names, any_host=False) -> bool:
+def host_allowed(host: str | None, names: Collection[str], any_host: bool = False) -> bool:
     """DNS rebinding: a web page of another site whose name its DNS points at 127.0.0.1 reaches this server as the
     same origin, so the browser lets it read every answer.  Its requests carry that site's name in Host, so only
     the names this server answers to pass.  An IP address passes (a page served from an IP is that IP's own page;
@@ -8239,7 +8240,7 @@ def host_allowed(host, names, any_host=False) -> bool:
                            or _name_in(name, names))
 
 
-def key_list(value) -> list[str]:
+def key_list(value: object) -> list[str]:
     """#1344: the keys a server accepts.  --api-key / STRATA_API_KEY / "api_key" take llama.cpp's form, several keys
     separated by commas ("k1,k2"; spaces around each are dropped), or a list in the config ("api_key": ["k1", "k2"],
     the way to give a key that contains a comma).  A list is taken as it is."""
@@ -8250,13 +8251,13 @@ def key_list(value) -> list[str]:
     return [k.strip() for k in str(value).split(",") if k.strip()]
 
 
-def explicit_no_key(value) -> bool:
+def explicit_no_key(value: object) -> bool:
     """The owner chose to serve without a key: "api_key": "none" in the config, STRATA_API_KEY=none or --api-key none
     (or --no-api-key, handled by the caller).  Never a key called "none"."""
     return isinstance(value, str) and value.strip().lower() == "none"
 
 
-def open_server_warning(port, public=False, tools=False) -> str:
+def open_server_warning(port: int, public: bool = False, tools: bool = False) -> str:
     """The one plain warning for a server on the network with no API key (recommend, never force)."""
     msg = f"no API key: anyone who can reach port {port} can use the model" + (" and its tools" if tools else "") + "."
     if tools:
@@ -8283,7 +8284,7 @@ def api_key_of(value):
     return key.strip()
 
 
-def key_matches(given: str, key) -> bool:
+def key_matches(given: str, key: object) -> bool:
     """given: a header's value as http.server read it, each byte one character.  A key with characters outside ASCII
     arrives as UTF-8 from most clients and as Latin-1 from some; the right key passes in both forms (#725: the
     bytes were re-encoded before, so a UTF-8 key never matched).  Constant-time (#213).  #1344: `key` may name several
@@ -8299,7 +8300,7 @@ def key_matches(given: str, key) -> bool:
     return ok
 
 
-def origin_allowed(origin: str, host, names, origins=()) -> bool:
+def origin_allowed(origin: str, host: str | None, names: Collection[str], origins: Collection[str] = ()) -> bool:
     """A browser page's Origin that may use the model without an API key: this server's own page (the Origin is the
     request's own Host), a page on one of the names this server answers to (any port), or an origin the config lists
     (trusted_origins, cors_origins).  Unlike the Host check no IP passes on trust: a page served from any other IP is
@@ -8319,7 +8320,7 @@ def origin_allowed(origin: str, host, names, origins=()) -> bool:
     return bool(name) and (name in LOOPBACK_NAMES or name.endswith(".localhost") or _name_in(name, names))
 
 
-def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
+def serve(svc: Service, host: str = "127.0.0.1", port: int = 8095) -> ThreadingHTTPServer:
     svc.host_names = host_names_for(host, svc.allowed_hosts, svc.trusted_origins)
     svc.start_telemetry()
     httpd = Server((host, port), make_handler(svc))
@@ -8328,7 +8329,7 @@ def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     return httpd
 
 
-def origins_of(value, key: str, wildcard: bool) -> list[str]:
+def origins_of(value: object, key: str, wildcard: bool) -> list[str]:
     """#321: a config's origin list ("https://chat.example.com" or a list of them) - scheme://host[:port], no path;
     "*" only where `wildcard` allows it.  A wrong entry stops the start rather than opening less or more than meant."""
     if value is None or value == "" or value == []:
@@ -8354,7 +8355,7 @@ SHARED_KEYS = ("reasoning_effort", "reasoning_budget_tokens", "temperature", "to
                "experimental_speed_projection")
 
 
-def clean_shared_defaults(d) -> dict:
+def clean_shared_defaults(d: object) -> dict:
     """The Chat settings other apps get (POST /settings): only known keys, each checked; ValueError names a bad one."""
     if d is None:
         return {}
@@ -8424,13 +8425,13 @@ def split_joined_args(cfg: dict) -> None:
               'flag and its value (write them as two elements, e.g. "--ple-io", "mmap")', flush=True)
 
 
-def read_config(path) -> dict:
+def read_config(path: str | os.PathLike[str]) -> dict:
     """The run config's JSON.  A mistake in it (a missing comma between two args, a trailing comma) is said with its
     place in the file instead of a traceback (#2267: editing "args" by hand is where it happens)."""
     return parse_config_text(Path(path).read_text(encoding="utf-8-sig"), path)   # Notepad adds a BOM
 
 
-def parse_config_text(text: str, path) -> dict:
+def parse_config_text(text: str, path: str | os.PathLike[str]) -> dict:
     """read_config on text already read (the owner-launched server hashes the bytes it parses, launch attestation)."""
     try:
         return json.loads(text)
@@ -8473,7 +8474,7 @@ def lift_reasoning_effort_arg(cfg: dict) -> None:
 SAMPLING_ALIASES = {"repeat_penalty": "repetition_penalty", "repeat_last_n": "penalty_last_n"}
 
 
-def apply_saved_tuning(cfg: dict, *, say=None) -> dict:
+def apply_saved_tuning(cfg: dict, *, say: Callable[[str], object] | None = None) -> dict:
     """The run config with the active saved tuning for its choices put on top (strata_control/presets.py), with no measurement.
     Every start path runs this (the Terminal, `runtime start`, the app's load, a restart of the app, an unload and a load), so the
     tuning is applied every time and never re-measured. A tune's own worker sets STRATA_NO_PRESET so that it measures the
@@ -8586,7 +8587,7 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
     engines: list = [None] * n
     errors: list = []
 
-    def one(i: int):
+    def one(i: int) -> None:
         rc = rp.replica_cfg(cfg, i, groups[i])
         try:
             engines[i] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
@@ -8849,7 +8850,7 @@ def apply_server_numbers(cfg: dict) -> list[str]:
     return [k for k in SERVER_NUMBERS if cfg.get(k) is not None]
 
 
-def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> int:
+def main(argv: Sequence[str] | None = None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> int:
     try:                                               # files made by a run as administrator still belong to the user
         from strata_control import private_files as _pf
         _pf.adopt_user_defaults()
@@ -8964,7 +8965,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     termination = "sigint"
     finished = threading.Event()                        # set when the clean stop is over (a Windows console handler waits for it)
 
-    def request_stop(reason: str):
+    def request_stop(reason: str) -> None:
         nonlocal termination
         termination = reason
         if threading.current_thread() is threading.main_thread():
