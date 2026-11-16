@@ -2,12 +2,13 @@
 
 ## Reporting a vulnerability
 
-Please report anything that should not be public until it is fixed **privately**, through GitHub's private
-vulnerability reporting: the repository's **Security** tab, **Report a vulnerability**
-([direct link](https://github.com/riceharvest/strata-b70-only/security/advisories/new)), or by mailing
-[dev@darioa.nl](mailto:dev@darioa.nl) if private reporting is not enabled on this fork. Say what you found, how to
-reproduce it (the request, the config keys involved, the Strata version), and what an attacker gains. I answer
-there, fix it in a release, and credit you in the advisory unless you ask me not to.
+Please report anything that should not be public until it is fixed **privately**. Reach the maintainer first on X as
+[@imdariotoo](https://x.com/imdariotoo) (a direct message), or by mail at [dev@darioa.nl](mailto:dev@darioa.nl). GitHub's
+private vulnerability reporting for `riceharvest/strata-b70-only` also works where it is enabled: the repository's
+**Security** tab, **Report a vulnerability**
+([direct link](https://github.com/riceharvest/strata-b70-only/security/advisories/new)). Say what you found, how to
+reproduce it (the request, the config keys involved, the commit or version), and what an attacker gains. I answer
+there, fix it on branch `b70`, and credit you unless you ask me not to.
 
 This fork is maintained by one person on one B70, not by a security team, and upstream's advisory process only
 covers `Niko1221/Strata`. Send anything that only happens on a B70 to this repository; upstream cannot reproduce it.
@@ -16,7 +17,8 @@ Ordinary hardening ideas and findings that are safe to discuss in public are wel
 [issue](https://github.com/riceharvest/strata-b70-only/issues) or as a pull request, which I review like my own
 code. (Upstream keeps its own audit-findings thread, #544, in its tracker.)
 
-Supported: the latest release. Fixes go into the next release, not into older ones.
+Supported: the head of branch `b70`. The fork's one release tag so far is `b70-2026.11.11`; a fix goes into the branch, not into older
+commits or tags, so build from the head of `b70` to have it.
 
 ## What the server exposes
 
@@ -48,34 +50,29 @@ this PC only. The details and every setting are in [docs/DETAILS.md](docs/DETAIL
   last few prompts, whatever `"api_monitor"` says, to encode the next turn faster; no endpoint shows them, and they
   are gone when the server stops.
 
-## The desktop app and the Terminal
+## The Terminal
 
-Strata comes in three parts that share one engine: the **desktop app**, the **Terminal** (`strata`) and the **engine** that runs
-the model. The section above is about the engine's HTTP server. This is what the other two add.
+This fork ships the **Terminal** (`strata`) and the **engine** that runs the model. Upstream's desktop app and its Windows and macOS
+packages are not part of this fork (`apps/` and `packaging/` were removed), so what upstream's policy says about the app does not
+apply here. The section above is about the engine's HTTP server. This is what the Terminal adds.
 
-- **The app's host listens on this PC only.** The app serves its page from a local host process on `127.0.0.1` (port 8791 unless
-  changed). A request to its `/api/` endpoints that carries a browser `Origin` from any other site gets 403. The app shell holds a
-  random secret (32 characters or more, compared in constant time) that is needed to quit the host or tell it which window is open,
-  and the host gives its own helper processes a second random secret. By default the models the app starts are served on this PC only.
-- **Sharing is a separate, key-protected listener.** "Share with other devices" (and the Cloudflare tunnel) will not start until an
-  API key is set. It opens a different listener that answers only `/v1/models`, `/v1/chat/completions` and `/v1/messages`, never the
-  app's page or its host endpoints.
-- **App and Terminal talk through an owner channel.** One owner process per installation starts and ends the engine, and a second
-  client (the Terminal) attaches to it. On macOS and Linux that is a private Unix socket in a folder only you can open. On Windows it
-  is a TCP listener on `127.0.0.1` that answers only requests carrying a 256-bit token kept in an owner-only folder. That is a weaker
-  guarantee than a socket other users cannot open: on Windows the token is what protects it, as with any loopback service that has a
-  token (`strata_control/owner_transport.py`). The bridge between the app shell and the host (used for the app update) is also loopback and protected by a token.
-- **Starting a model and serving never download anything.** Downloads and updates are one explicit step: `strata update`, or "Update
-  engine" and "Update Strata" in the app's Settings. Models and saved tuning are never replaced by an update.
-- **Updates come from a signed feed.** The release publishes `strata-feed.json` and `strata-feed.json.sig` (Ed25519). An installed
-  Strata checks the signature against the public key it carries (`strata_control/update_keys.json`), refuses a feed older than the last
-  one it accepted (a replayed old feed) or expired, and checks every engine package against its SHA-256, its signed manifest and the
-  card in your PC before it test-starts it and switches to it. Any failure keeps the engine you had. The app installer itself is signed
-  with a separate key (Tauri's minisign key) that the app and the Terminal both check. The private keys are kept offline by the owner.
+- **The Terminal and the engine talk through an owner channel.** One owner process per installation starts and ends the engine, and
+  a second client attaches to it. On Linux that is a private Unix socket in a folder only you can open
+  (`strata_control/owner_transport.py`).
+- **Starting a model and serving never download anything.** Downloads and updates are one explicit step: `strata update`. Models and
+  saved tuning are never replaced by an update.
+- **Updates come from a signed feed.** `strata update` reads upstream's release feed (`DEFAULT_FEED` in `strata_cli/update_cmd.py`,
+  `strata-feed.json` and `strata-feed.json.sig`, Ed25519), so for the engine packages upstream publishes, trust rests on
+  `Niko1221/Strata`, not on this fork. An installed Strata checks the signature against the public key it carries
+  (`strata_control/update_keys.json`), refuses a feed older than the last one it accepted (a replayed old feed) or expired, and
+  checks every engine package against its SHA-256, its signed manifest and the card in your PC before it test-starts it and
+  switches to it. Any failure keeps the engine you had. The private keys are kept offline by the upstream owner. This fork's own
+  engine is built from source (README, "Install") and does not come from that feed.
 
 ### How far to trust `curl | sh` and `irm | iex`
 
-The Terminal installs with one line:
+These are upstream's installers, from `Niko1221/Strata` releases; this fork's own install is a source build and does not use them.
+Upstream's Terminal installs with one line:
 
 ```sh
 curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
@@ -93,7 +90,7 @@ damaged or half-finished download and a feed that was not signed by the release 
 by someone who controls it. Later updates are checked against the key already on your PC, which is a stronger position.
 
 If that is not enough: save the script (`curl -fsSLO https://github.com/Niko1221/Strata/releases/latest/download/install.sh`), read it, and
-run it from the file; or install the desktop app or build from source instead and check the code you build.
+run it from the file; or build from source, which is what this fork's README describes, and check the code you build.
 
 Strata has not had an outside security audit yet.
 What Strata downloads, when it uses the internet, what stays on your PC and how downloads are checked is written up in [docs/SAFETY.md](docs/SAFETY.md).

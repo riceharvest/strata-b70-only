@@ -81,3 +81,14 @@ node_modules/
 *.dmg
 /release/artifacts/
 
+
+# Local build and tool leftovers (the tracked bench/results logs stay tracked)
+build-*.log
+build.log
+.venv*/
+venv/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.DS_Store
+!bench/results/**/*.log
