@@ -102,15 +102,39 @@ class Profile(unittest.TestCase):
         self.assertEqual(res["read_again_by_how"], {"ckpt": 40})
         self.assertAlmostEqual(res["read_again_s"], 1.0 * 40 / 60, places=1)
         self.assertEqual(res["div_checkpoints"], 1)
+        self.assertEqual(res["changed_by_harness_tokens"], 0)
         self.assertIn("thinking 57.1% of the characters", text)   # (8 of 14 characters)
         self.assertIn("in the agent's tool", text)
+
+    def test_a_history_the_harness_rewrote_is_not_the_caches_loss(self):
+        # the engine found 140 cells of the thread, the new prompt shares 110 of them and 100 were kept: 10 read again, 30 changed
+        def ev(t, e):
+            return json.dumps({"t": t, "line": json.dumps(e)}) + "\n"
+
+        def end(t, usage):
+            return ev(t, {"type": "message_update", "assistantMessageEvent": {"type": "text_end"}, "usage": usage})
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "agent-0"))
+            with open(os.path.join(d, "agent-0", "events-a.jsonl"), "w") as f:
+                f.write(ev(10.0, {"type": "turn_start"}) + end(14.0, {"input": 100, "cacheRead": 0, "output": 40}))
+                f.write(ev(15.0, {"type": "turn_start"}) + end(18.0, {"input": 60, "cacheRead": 100, "output": 5}) + ev(18.0, {"type": "agent_settled"}))
+            r1 = dict(req(1, "solo", "none", 100, 0, 100, 500.0, 40, 3000.0, {"tree": 4, "chain": 0, "lookup": 0, "drafter": 0}, 10, 8), ts=14.0)
+            r2 = dict(req(2, "solo", "ckpt", 160, 100, 60, 1000.0, 5, 1000.0, {"tree": 1, "chain": 0, "lookup": 0, "drafter": 0}, 4, 4), ts=18.0, src_cells=140, src_shared=110)
+            open(os.path.join(d, "engine.log"), "w").write("".join("PROF " + json.dumps(r) + "\n" for r in (r1, r2)))
+            text, res = agent_profile.threads(d, agent_profile.load(d)[0])
+        self.assertEqual(res["read_again_tokens"], 10)
+        self.assertEqual(res["changed_by_harness_tokens"], 30)
+        self.assertIn("came back changed by the harness itself", text)
 
     def test_the_figures_of_switches_that_alternate_inside_a_run(self):
         with tempfile.TemporaryDirectory() as d:
             w = {"ev": "win", "dr": {"first": [2, 9.0, 40], "chain": [4, 10.0, 32], "chain_g": [4, 6.0, 32]},
                  "ab": {"0": [10, 800.0, 200, 320, 5, 400.0, 110, 160], "1": [10, 700.0, 190, 280, 5, 350.0, 100, 140]}}
             ph = {"ev": "wphase", "slots": 8, "rows": 32, "cells_max": 20000, "ms": {"proj": 30.0, "gdn": 10.0, "attn": 20.0, "norm": 5.0, "ffn": 25.0, "embed": 1.0, "head": 9.0}}
+            ra = dict(req(1, "solo", "live", 100, 99, 1, 0.0, 400, 4000.0, {"tree": 100, "chain": 0, "lookup": 0, "drafter": 0}, 500, 300), arm=0)
+            rb = dict(req(2, "solo", "live", 100, 99, 1, 0.0, 440, 4000.0, {"tree": 80, "chain": 0, "lookup": 0, "drafter": 0}, 700, 360), arm=1)
             open(os.path.join(d, "engine.log"), "w").write(
+                "PROF " + json.dumps(ra) + "\n" + "PROF " + json.dumps(rb) + "\n" +
                 "PROF " + json.dumps(w) + "\n" + "PROF " + json.dumps(ph) + "\n"
                 "strata serve: the cells left the card at 3.00 GiB/s (direct, 100 ms)\n"
                 "strata serve: the cells left the card at 6.00 GiB/s (pinned staging, 50 ms)\n"
@@ -124,6 +148,8 @@ class Profile(unittest.TestCase):
         self.assertEqual(res["ab"]["0"]["tok_s"], 250.0)
         self.assertEqual(res["ab"]["1"]["full_tok_s"], 285.7)
         self.assertEqual(res["window_parts_ms"]["proj"], 30.0)
+        self.assertEqual(res["solo_arms"]["0"], {"requests": 1, "tokens": 400, "tok_s": 100.0, "ms_step": 40.0, "tok_step": 4.0})
+        self.assertEqual(res["solo_arms"]["1"]["tok_s"], 110.0)
         self.assertIn("proj 30.0% (30.0 ms)", text)
 
     def test_a_long_harness_line_stays_a_record(self):

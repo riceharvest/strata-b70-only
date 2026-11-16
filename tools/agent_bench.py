@@ -20,6 +20,9 @@ tools, the tool results, the turns.
                 OPENAI_BASE_URL / OPENAI_API_BASE and OPENAI_MODEL set.
 --sandbox bwrap the harness sees the machine read-only and can write only its working copy and its own config folder
                 (bubblewrap; the network stays, for the server).  none: no sandbox.
+--max-tokens N  what a turn may write, its reasoning included (pi's models.json; default 32768).  Not 8192: a turn that
+                reasons for longer than that is cut - one server ends it there with no answer, another stops the reasoning
+                early to leave room for one - and the run measures the cut, not the model.
 --context N     the context window the harness is told (pi's models.json).  Keep it under what one of the server's
                 sessions holds: a harness that believes in more does not shorten its history in time and its task runs
                 into the server's limit.
@@ -49,7 +52,7 @@ def parse():
     a.add_argument("--harness-cmd", default="")
     a.add_argument("--thinking", default="")
     a.add_argument("--context", type=int, default=131072)
-    a.add_argument("--max-tokens", type=int, default=8192)
+    a.add_argument("--max-tokens", type=int, default=32768)
     a.add_argument("--sandbox", default="bwrap", choices=("bwrap", "none"))
     a.add_argument("--engine-log", default="")
     return a.parse_args()
