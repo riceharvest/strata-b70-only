@@ -28,6 +28,8 @@ This fork builds only the Intel Arc (`sycl/`) engine on Linux for one Arc Pro B7
 
 | Guide | What it covers |
 | --- | --- |
+| [What differs from upstream](FORK.md) | What this fork removed, which model families are live, what exists only here and what stays upstream's |
+| [Command-line reference](CLI.md) | Every `strata` command and the server, setup and engine flags, pasted from the real `--help` output |
 | [The `b70` branch](B70.md) | What the `b70` branch changes over upstream `main`, defaults, compiler pins, and B70 measurements |
 | [`b70-2026.11.11` release notes](release-notes-b70-2026.11.11.md) | What shipped in `b70-2026.11.11` and follow-up PRs `#27`–`#36`, compiler pin (`IGC 2.41.5`), and experimental notes |
 | [B70 model fit arithmetic](B70_MODELS.md) | Exact B70 VRAM and host RAM sums picking `UD-IQ1_S` (Flash-Next) and `UD-Q4_K_M` (27B dense) and why `--ple-io ram` needs 85 GB+ |
@@ -61,6 +63,7 @@ Kept for history and provenance; not part of the active single-B70 Linux setup:
 - [Build or run from a source checkout](SOURCE_INSTALL.md)
 - [Contribution rules](../CONTRIBUTING.md)
 - [Community benchmarks](COMMUNITY_BENCHMARKS.md) and the [standard benchmark protocol](BENCHMARK_PROTOCOL.md)
+- [What is in `bench/results`](../bench/results/README.md) and [the archived working notes](work/README.md)
 - [How the engine works](HOW_IT_WORKS.md), [technical reference](DETAILS.md) and [Terminal reference](TERMINAL.md)
 
 ## AI tools and media
