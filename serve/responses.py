@@ -645,7 +645,7 @@ class Assembler:
             item["namespace"] = namespace
         return item
 
-    def finish(self, done: dict, validate: Callable[[str, str], str] | None = None) -> list[dict]:
+    def finish(self, done: dict, validate: Callable[[str, str | None], str] | None = None) -> list[dict]:
         """The end: close what is open, then response.completed (or .incomplete when max_output_tokens ran out).
         `validate(text, finish)` checks a structured answer and returns its text (or raises)."""
         length = done.get("finish") == "length"
