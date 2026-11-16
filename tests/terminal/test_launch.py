@@ -1051,13 +1051,13 @@ class ConnectCommand(unittest.TestCase):
     def test_list_and_unknown_names(self):
         code, out, _ = run_cli(["connect"])
         self.assertEqual(code, 0)
-        for h in ("opencode", "codex", "claude-code", "omp", "pi", "hermes", "openclaw", "deepseek-harness"):
+        for h in ("opencode", "codex", "claude-code", "omp", "pi", "hermes", "openclaw"):
             self.assertIn(h, out)
         code, out, err = run_cli(["connect", "opncode"])
         self.assertEqual(code, 2)
         self.assertIn("Did you mean 'opencode'", err)
         code, out, _ = run_cli(["connect", "--output", "json"])
-        self.assertEqual(len(json.loads(out)["harnesses"]), 8)
+        self.assertEqual(len(json.loads(out)["harnesses"]), 7)
 
     def test_prints_the_config_with_a_masked_key(self):
         code, out, err = run_cli(["connect", "opencode", "--url", "http://127.0.0.1:8123", "--key", "sk-strata-abcdefghij1234", "--model", "m1"])
@@ -1119,19 +1119,14 @@ class ConnectCommand(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("Nothing was written", out)
 
-    def test_built_in_harness_has_nothing_to_write(self):
-        code, out, _ = run_cli(["connect", "deepseek-harness", "--write", "--yes"])
-        self.assertEqual(code, 0)
-        self.assertIn("Nothing to write", out)
-
     def render(self, name, **kw):
         h = harness.find(name)
         t = harness.target(kw.get("url", "http://127.0.0.1:18900"), kw.get("key"), "qwen3.8-flash-next-q2_0", kw.get("context", 32768))
         return harness.render(h, t)
 
-    def test_all_eight_are_tested_configs(self):
+    def test_all_seven_are_tested_configs(self):
         self.assertEqual([h.id for h in harness.HARNESSES],
-                         ["opencode", "codex", "claude-code", "omp", "pi", "hermes", "openclaw", "deepseek-harness"])
+                         ["opencode", "codex", "claude-code", "omp", "pi", "hermes", "openclaw"])
         for h in harness.HARNESSES:
             self.assertTrue(h.tested, h.id)
             self.assertIn("tested", h.status)
@@ -1184,11 +1179,6 @@ class ConnectCommand(unittest.TestCase):
     def test_limits_are_in_plain_words_for_every_app(self):
         for h in harness.HARNESSES:
             self.assertTrue(self.render(h.id)["limits"], h.id)
-
-    def test_deepseek_harness_is_the_app(self):
-        out = self.render("deepseek-harness")
-        self.assertEqual(out["files"], [])
-        self.assertIn("Strata app", " ".join(out["limits"]))
 
     def test_check_sends_the_apps_own_wire_format_and_reports_pass_or_fail(self):
         from strata_cli.launch import check

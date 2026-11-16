@@ -149,7 +149,7 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Shows the settings file and environment an app needs to talk to the Strata server that `strata launch` started. "
                     "Without a name it lists the apps. With --write it writes the file after asking, keeping a backup of any file it replaces.")
-    c.add_argument("harness", nargs="?", help="opencode, codex, claude-code, omp, pi, hermes, openclaw, deepseek-harness")
+    c.add_argument("harness", nargs="?", help="opencode, codex, claude-code, omp, pi, hermes, openclaw")
     c.add_argument("--url", metavar="URL", help="the server address (default: the running launch, else http://127.0.0.1:8080)")
     c.add_argument("--key", metavar="KEY", help="the API key (default: the running launch's)")
     c.add_argument("--key-env", metavar="NAME", help="read the key from this environment variable")
@@ -900,7 +900,7 @@ def run_connect(a: argparse.Namespace) -> int:
         # --check runs the same two checks as the plain-words output (one prompt, one tool call, the way this app sends them) and the answer
         # says what they found: "ok" is true only when both worked, and the exit code is 1 when one failed or the server cannot be reached.
         from strata_cli.launch import check
-        results = check.run_checks(h.id if not h.built_in else "opencode", tgt.url, key, tgt.model)
+        results = check.run_checks(h.id, tgt.url, key, tgt.model)
         passed = all(r.ok for r in results)
         payload["checks"] = [{"name": r.name, "ok": r.ok, "detail": r.detail, "seconds": round(r.seconds, 1)} for r in results]
         payload["checked_server"] = tgt.url
@@ -942,7 +942,7 @@ def run_connect(a: argparse.Namespace) -> int:
         from strata_cli.launch import check
         _say("")
         _say("Checking: one prompt and one tool call, sent the way this app sends them (this can take a minute).")
-        results = check.run_checks(h.id if not h.built_in else "opencode", tgt.url, key, tgt.model)
+        results = check.run_checks(h.id, tgt.url, key, tgt.model)
         for r in results:
             _say(f"{'PASS' if r.ok else 'FAIL'} {r.name}: {r.detail} ({r.seconds:.0f} s)")
         if not all(r.ok for r in results):

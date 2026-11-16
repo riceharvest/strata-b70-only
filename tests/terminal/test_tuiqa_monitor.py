@@ -200,7 +200,7 @@ class ConnectStatus(unittest.TestCase):
             header = next(ln for ln in shown.splitlines() if "Vendor tested" in ln)
             self.assertIn("This server", header)
             for h in harness.HARNESSES:
-                said = "built into Strata" if h.built_in else h.tested
+                said = h.tested
                 row = next(ln for ln in shown.splitlines() if h.title[:16] in ln and said[:23] in ln)
                 self.assertIn("Not checked", row)                          # nothing has been tried against THIS server yet
                 self.assertNotIn("tested ok", row)
@@ -225,7 +225,7 @@ class ConnectStatus(unittest.TestCase):
                 await pilot.press("down")
                 await pilot.pause(0.1)
             shown = text_of(app)
-            self.assertEqual(shown.count("Not checked"), 6)                # 8 apps, 2 checked
+            self.assertEqual(shown.count("Not checked"), 5)                # 7 apps, 2 checked
         self.run_app(case)
 
     def test_narrow_widths_keep_the_this_server_column(self):

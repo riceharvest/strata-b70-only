@@ -73,13 +73,10 @@ class Harness:
     limits: Callable[[Target], list[str]] | None = None
     run: str = ""                      # one example command
     install: str = ""
-    built_in: bool = False
     aliases: tuple[str, ...] = ()
 
     @property
     def status(self) -> str:
-        if self.built_in:
-            return "built into the Strata app (tested)"
         return f"tested ({self.tested})" if self.tested else "not tested yet"
 
 
@@ -214,11 +211,6 @@ def _limits_openclaw(t: Target) -> list[str]:
             "Harmless on exit: 'SQLite reclamation Worker failed' and 'semantic vector embeddings unavailable'."]
 
 
-def _limits_dsh(t: Target) -> list[str]:
-    return ["DeepSeek Harness is Strata's own coding harness inside the Strata app: nothing to write here.",
-            "Its package default compaction headroom (64K) is larger than a 32K window; the app's bridge sets it for you."]
-
-
 HARNESSES: list[Harness] = [
     Harness("opencode", "OpenCode", "chat + tools", tested="opencode 1.19.3",
             files=[FileSpec("~/.config/opencode/opencode.json", "json", opencode_file, merge=True)], limits=_limits_opencode,
@@ -243,8 +235,6 @@ HARNESSES: list[Harness] = [
     Harness("openclaw", "OpenClaw", "chat + tools", tested="OpenClaw 2026.10.4",
             files=[FileSpec("~/.openclaw/openclaw.json", "json", openclaw_file, merge=True)], limits=_limits_openclaw,
             run='openclaw agent --local --agent main --session-id demo --thinking low -m "your task"', install="npm install -g openclaw (Node 24.16+)"),
-    Harness("deepseek-harness", "DeepSeek Harness", "the Strata app", tested="DSH 0.2.1-alpha.3", built_in=True,
-            limits=_limits_dsh, aliases=("deepseek", "dsh")),
 ]
 
 
