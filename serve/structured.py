@@ -236,7 +236,7 @@ def extract_json(text: str) -> str:
     return s[start:]
 
 
-def validated_json(text: str, validator, finish: str) -> str:
+def validated_json(text: str, validator, finish: str | None) -> str:
     def pairs(items: Iterable[tuple[str, object]]) -> dict[str, object]:
         obj = {}
         for key, value in items:
