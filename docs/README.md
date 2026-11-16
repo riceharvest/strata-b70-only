@@ -54,7 +54,6 @@ Kept for history and provenance; not part of the active single-B70 Linux setup:
 
 | File | Why it is out of scope here |
 | --- | --- |
-| [STRIX_HALO_WINDOWS.md](STRIX_HALO_WINDOWS.md) | Upstream/out-of-scope: AMD Ryzen AI Max / Strix Halo (`gfx1151`) on Windows |
 | [A770_SPEED_SPEC.md](A770_SPEED_SPEC.md) | Upstream/out-of-scope: Intel Arc A770 Coder IQ1_M optimization campaign spec (not the Arc Pro B70 target) |
 
 ## Developers and contributors
@@ -68,7 +67,6 @@ Kept for history and provenance; not part of the active single-B70 Linux setup:
 
 - [Install for a user](AI_SETUP.md)
 - [Verified facts, model availability and API reference](AI_REFERENCE.md)
-- [Articles and videos](MEDIA_KIT.md)
 - [Repository instructions for agents](../AGENTS.md)
 
 ## Which instructions apply?
