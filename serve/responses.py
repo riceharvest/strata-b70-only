@@ -26,6 +26,7 @@ import copy
 import json
 import time
 import uuid
+from collections.abc import Callable, Iterable
 
 from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs
 
@@ -37,15 +38,17 @@ HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use
 class ResponsesError(ValueError):
     """A request error in the Responses format: {"error": {"message", "type", "param", "code"}}."""
 
-    def __init__(self, message, param=None, code=None, status=400, kind="invalid_request_error"):
+    def __init__(self, message: str, param: str | None = None, code: str | None = None, status: int = 400,
+                 kind: str = "invalid_request_error") -> None:
         super().__init__(message)
         self.param, self.code, self.status, self.kind = param, code, status, kind
 
-    def body(self):
+    def body(self) -> dict:
         return error_body(str(self), self.kind, self.param, self.code)
 
 
-def error_body(message, kind="invalid_request_error", param=None, code=None) -> dict:
+def error_body(message: str, kind: str = "invalid_request_error", param: str | None = None,
+               code: str | None = None) -> dict:
     return {"error": {"message": message, "type": kind, "param": param, "code": code}}
 
 
@@ -54,7 +57,7 @@ def new_id(prefix: str) -> str:
 
 
 # ------------------------------------------------------------------------------------------------ request -> chat
-def _content(content, param):
+def _content(content: object, param: str):
     """A message's (or a tool output's) content -> the template's form: a string, or text and image parts."""
     if content is None:
         return ""
@@ -85,7 +88,7 @@ def _content(content, param):
     return _parts_of(parts)
 
 
-def _reasoning_text(item, param) -> str:
+def _reasoning_text(item: dict, param: str) -> str:
     """The thinking a reasoning item carries: its reasoning_text content, else our own encrypted_content.  A summary
     alone, or another server's encrypted_content, carries none that can go back into the prompt."""
     texts = [p.get("text") or "" for p in item.get("content") or [] if isinstance(p, dict)
@@ -102,7 +105,7 @@ def _reasoning_text(item, param) -> str:
     return ""
 
 
-def _arguments(raw, param) -> dict:
+def _arguments(raw: object, param: str) -> dict:
     """A function_call's arguments (a JSON string) -> the mapping the template renders.  Arguments that are not a JSON
     object (a call the output ended inside) are kept as text rather than refusing the whole conversation."""
     if isinstance(raw, dict):
@@ -210,7 +213,7 @@ def input_messages(req: dict) -> list[dict]:
     return _late_system_to_user(messages)
 
 
-def _order_tool_results(messages):
+def _order_tool_results(messages) -> None:
     """The template places tool results by position: each run of tool messages is put in the order of the calls of
     the assistant turn before it (a client may send the results in the order they finished), then the private call
     ids are dropped."""
@@ -246,7 +249,7 @@ def request_tools(req: dict):
              for t in item["tools"]]
     given = list(given) + extra
 
-    def add(tool, param, namespace=None, ns_description=""):
+    def add(tool, param, namespace=None, ns_description="") -> None:
         kind = tool.get("type")
         name = tool.get("name")
         if not isinstance(name, str) or not name:
@@ -289,7 +292,7 @@ def request_tools(req: dict):
     return tools or None, names, skipped
 
 
-def _turn_body(req: dict):
+def _turn_body(req: dict) -> dict | None:
     meta = req.get("client_metadata")
     raw = meta.get("x-codex-turn-metadata") if isinstance(meta, dict) else None
     try:
@@ -393,7 +396,7 @@ def prompt_tools(req: dict, tools):
     return json.loads(kept)                          # a fresh copy: the kept one is nobody's to change
 
 
-def prompt_made(req: dict, tools):
+def prompt_made(req: dict, tools) -> None:
     """The prompt of `req` was rendered with `tools` and goes to the engine: a Codex request that is not a compaction
     leaves its conversation and those tools for that conversation's compaction. A thread-title turn is another
     session Codex sends beside the real one, and it does not replace this entry."""
@@ -469,7 +472,7 @@ class Assembler:
     answer is the `response` of the last event, so both modes are the same items."""
 
     def __init__(self, req: dict, model: str, prompt_tokens: int, names: dict, encrypted: bool,
-                 json_mode: bool = False):
+                 json_mode: bool = False) -> None:
         self.names, self.encrypted, self.json_mode = names, encrypted, json_mode
         self.prompt_tokens = prompt_tokens
         self.seq = 0
@@ -491,7 +494,7 @@ class Assembler:
             "metadata": req.get("metadata") or {}}
 
     # --- events
-    def event(self, kind, **data) -> dict:
+    def event(self, kind: str, **data: object) -> dict:
         e = {"type": kind, "sequence_number": self.seq, **data}
         self.seq += 1
         return e
@@ -507,7 +510,7 @@ class Assembler:
         """A keep-alive a client counts as activity (SSE comments are not events: Codex's idle timer ignores them)."""
         return self.event("response.in_progress", response=self.snapshot())
 
-    def _open(self, item) -> list[dict]:
+    def _open(self, item: dict) -> list[dict]:
         self.response["output"].append(item)
         self.item = item
         out = [self.event("response.output_item.added", output_index=self.index, item=copy.deepcopy(item))]
@@ -522,7 +525,7 @@ class Assembler:
     def index(self) -> int:
         return len(self.response["output"]) - 1
 
-    def close(self, status=None) -> list[dict]:
+    def close(self, status: str | None = None) -> list[dict]:
         item, self.item = self.item, None
         if item is None:
             return []
@@ -642,7 +645,7 @@ class Assembler:
             item["namespace"] = namespace
         return item
 
-    def finish(self, done: dict, validate=None) -> list[dict]:
+    def finish(self, done: dict, validate: Callable[[str, str], str] | None = None) -> list[dict]:
         """The end: close what is open, then response.completed (or .incomplete when max_output_tokens ran out).
         `validate(text, finish)` checks a structured answer and returns its text (or raises)."""
         length = done.get("finish") == "length"
@@ -687,7 +690,7 @@ class Assembler:
         return self.event("response.failed", response=self.snapshot())
 
 
-def collect(events) -> dict:
+def collect(events: Iterable[dict | None]) -> dict:
     """The non-streaming answer: the final response object."""
     last = None
     for e in events:
