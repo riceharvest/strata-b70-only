@@ -365,11 +365,18 @@ def threads(d, prof):
             for k in sorted(ch, key=lambda k: -ch[k])))
     # the cells a thread held when its last turn ended (its prompt and what it wrote) that its next turn read again
     last, hows = {}, {}
+    edited = 0   # tokens of a thread's earlier turns that came back changed (the harness's own edits of its history)
     for t in J:
         key, r0 = (t["agent"], t["task"]), t["reqs"][0]
         if key in last:
             had = last[key]["P"] + last[key]["out"]
-            again = max(0, min(had, r0["prompt"]) - r0["kept"])
+            if r0.get("src_cells", 0) > 0:
+                # the engine says how many of the cells it found the prompt shares: a harness that rewrote its history (to
+                # stay under its context window) shares less than it held, and what it changed has to be read
+                again = max(0, r0["src_shared"] - r0["kept"])
+                edited += max(0, min(had, r0["prompt"]) - max(r0["src_shared"], r0["kept"]))
+            else:
+                again = max(0, min(had, r0["prompt"]) - r0["kept"])   # (no cache of the thread was found, or an older engine's record)
             h = hows.setdefault(r0["how"], [0, 0, 0, 0.0])
             h[0] += 1
             h[1] += again
@@ -383,13 +390,15 @@ def threads(d, prof):
     for k in sorted(hows, key=lambda k: -hows[k][1]):
         h = hows[k]
         P("     %-10s %4d turns: %7d tokens read again (%.0f%% of what they read)" % (k, h[0], h[1], 100.0 * h[1] / max(1, h[2])))
+    if edited:
+        P("   (another %d tokens of earlier turns came back changed by the harness itself and had to be read: not the cache's)" % edited)
     div = [r for r in reqs if r.get("div", 0) > 0]
     if div:
         P("   checkpoints left where a prompt parts from another thread's: %d (at cell %s)" % (len(div), ", ".join(str(r["div"]) for r in div[:6])))
     return "\n".join(out), {"turns": len(T), "joined": len(J), "before_first_pct": round(100.0 * ttft / dur, 1), "waiting_pct": round(100.0 * wait / dur, 1),
                              "read_again_tokens": sum(h[1] for h in hows.values()), "read_again_s": round(again_s, 1),
                              "read_again_pct_of_reads": round(100.0 * again_s / max(1e-9, all_read), 1),
-                             "read_again_by_how": {k: h[1] for k, h in hows.items()}, "div_checkpoints": len(div)}
+                             "read_again_by_how": {k: h[1] for k, h in hows.items()}, "div_checkpoints": len(div), "changed_by_harness_tokens": edited}
 
 
 def in_run(path, prof):
@@ -426,6 +435,25 @@ def in_run(path, prof):
         res["ab"] = {k: {"windows": int(v[0]), "tok_s": round(1000.0 * v[2] / max(1e-9, v[1]), 1), "full_windows": int(v[4]),
                          "full_tok_s": round(1000.0 * v[6] / max(1e-9, v[5]), 1), "full_rows": round(v[7] / max(1, v[4]), 1),
                          "full_tokens": round(v[6] / max(1, v[4]), 2), "full_ms": round(v[5] / max(1, v[4]), 1)} for k, v in ab.items() if v[0] > 0}
+    # requests alone by the tree size they verified (STRATA_Q36_TREE_NODES_AB: every other request)
+    arms = {}
+    for r in prof:
+        if r.get("ev") == "req" and r.get("kind") == "solo" and r.get("out", 0) >= 8 and "arm" in r:
+            a = arms.setdefault(r["arm"], [0, 0, 0.0, 0, 0, 0])
+            a[0] += 1
+            a[1] += r["out"]
+            a[2] += r["dec_ms"]
+            a[3] += sum(r["steps"].values())
+            a[4] += r["offered"]
+            a[5] += r["accepted"]
+    if 1 in arms:
+        for k in sorted(arms):
+            a = arms[k]
+            out.append("   requests alone, %s: %d requests, %d tokens, %.1f tok/s, %.1f ms a step, %.2f tokens a step, drafts %.1f%% of %d" % (
+                "the other tree size" if k else "the tree size as set", a[0], a[1], 1000.0 * a[1] / max(1e-9, a[2]), a[2] / max(1, a[3]), a[1] / max(1, a[3]),
+                100.0 * a[5] / max(1, a[4]), a[4]))
+        res["solo_arms"] = {str(k): {"requests": a[0], "tokens": a[1], "tok_s": round(1000.0 * a[1] / max(1e-9, a[2]), 1), "ms_step": round(a[2] / max(1, a[3]), 1),
+                                     "tok_step": round(a[1] / max(1, a[3]), 2)} for k, a in arms.items()}
     # a sampled window's parts (STRATA_Q36_PROFILE_PHASES=1)
     wp = [w for w in prof if w.get("ev") == "wphase"]
     if wp:
