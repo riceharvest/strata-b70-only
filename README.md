@@ -7,6 +7,8 @@ The NVIDIA (CUDA), AMD (HIP/ROCm) and Apple (Metal) runtimes are removed. What's
 (`sycl/`), tuned for this one card, plus Strata's server, setup and APIs. If you have a different GPU, use
 [upstream Strata](https://github.com/Niko1221/Strata).
 
+What differs from upstream, what was removed and what stays upstream's: [docs/FORK.md](docs/FORK.md).
+
 Not affiliated with Intel or with upstream Strata.
 
 ## Who maintains this and where to ask
