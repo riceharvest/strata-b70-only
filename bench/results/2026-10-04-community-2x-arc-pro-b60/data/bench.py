@@ -7,7 +7,7 @@ def ask(msgs,max_tokens=256):
     d=json.load(r); d["wall"]=time.time()-t
     return d
 def show(tag,d):
-    tm=d["timings"]
+    tm=d["timings"];u=d["usage"]
     print(f"[{tag}] prompt_n={tm['prompt_n']} cache_n={tm['cache_n']} prompt {tm['prompt_per_second']:.1f} tok/s | decode {tm['predicted_n']} tok {tm['predicted_per_second']:.1f} tok/s | drafts {tm.get('draft_n_accepted')}/{tm.get('draft_n')} | wall {d['wall']:.1f}s | finish {d['choices'][0]['finish_reason']}")
 def code(text):
     m=re.search(r"```python\n(.*?)```",text,re.S); return m.group(1) if m else text

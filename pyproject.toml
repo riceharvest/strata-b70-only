@@ -2,7 +2,8 @@
 # Only real defects are checked (pyflakes F, syntax/runtime E9). No formatter, no import sorting, no style rules.
 [tool.ruff]
 target-version = "py310"
-extend-exclude = ["third_party"]
+# bench/results holds frozen benchmark scripts (published numbers) and community contributions: not linted.
+extend-exclude = ["third_party", "bench/results"]
 
 [tool.ruff.lint]
 select = ["F", "E9"]

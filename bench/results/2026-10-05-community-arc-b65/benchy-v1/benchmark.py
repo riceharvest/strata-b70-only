@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Three fresh benchy-fixture runs; content lives only in RAM and process memory."""
-import argparse, hashlib, json, os, re, signal, sys, threading, time
+import argparse, hashlib, importlib.util, json, os, re, signal, sys, threading, time
 from pathlib import Path
 
 R = Path(__file__).resolve().parent
