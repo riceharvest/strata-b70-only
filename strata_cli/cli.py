@@ -492,25 +492,11 @@ def parser() -> argparse.ArgumentParser:
     monitor_commands.add_monitor(sp)
     monitor_commands.add_logs(sp)
     monitor_commands.add_connections(sp)
-    code = sp.add_parser("code", help="coding client for the shared Desktop harness")
-    code.add_argument("--workspace")
-    code.add_argument("--resume")
-    code.add_argument("--quiet", action="store_true", help="suppress human informational output")
-    code_sp = code.add_subparsers(dest="code_command")
-    code_run = code_sp.add_parser("run", help="scripted harness turn (requires the shared harness component)")
-    code_run.add_argument("--prompt-file", required=True)
-    code_run.add_argument("--policy", required=True)
-    code_run.add_argument("--output", choices=("jsonl",), default="jsonl")
-    code_run.add_argument("--quiet", action="store_true", default=argparse.SUPPRESS,
-                          help="suppress human informational output")
-    code_sessions = code_sp.add_parser("sessions", help="shared harness sessions")
-    code_sessions.add_argument("action", choices=("list",))
-    code_sessions.add_argument("--output", choices=("human", "json"), default="human")
     for one_shot in (profile_create, profile_list, profile_show, profile_validate, profile_set,
                      profile_source, profile_edit, profile_history, profile_rollback, doctor,
                      components_verify, models_list, models_inspect, models_import, models_move, calibrate,
                      runtime_start, runtime_status, runtime_verify, runtime_stop, runtime_cleanup, runtime_restart,
-                     *ops_items, bench_run, bench_report, bench_compare, code_sessions, *update_parsers):
+                     *ops_items, bench_run, bench_report, bench_compare, *update_parsers):
         one_shot.add_argument("--json", action="store_true", help="alias for --output json")
         one_shot.add_argument("--quiet", action="store_true", default=argparse.SUPPRESS,
                               help="suppress human informational output")
@@ -2160,9 +2146,6 @@ def _run(a: argparse.Namespace) -> int:
             return _runtime(a)
         if a.command == "ops":
             return _ops(a)
-        if a.command == "code":
-            return _error("the shared Desktop harness component is not installed; coding sessions are unavailable", 5,
-                          getattr(a, "output", None) in ("json", "jsonl"))
         return monitor_commands.run(a)
     except ValueError as e:
         retried = _access_retry(a, e)

@@ -48,20 +48,11 @@ pick_python() {
     if [ -x "$candidate" ]; then printf '%s\n' "$candidate"; return 0; fi
   done
 
-  # Anything on PATH that is new enough, then the usual places an interpreter lives on macOS
-  # without being on a non-interactive PATH (Homebrew, python.org, and the interpreter a DeepSeek
-  # Harness installation already ships, which is a legitimate Python 3.12 to reuse rather than
-  # download a second copy of). Strata needs 3.10 or newer; macOS's own /usr/bin/python3 is 3.9 and
-  # is correctly rejected below.
+  # Anything on PATH that is new enough, then the usual places. Strata needs 3.10 or newer.
   for candidate in \
       "$(command -v python3 2>/dev/null || true)" \
       "$(command -v python 2>/dev/null || true)" \
-      /opt/homebrew/bin/python3 /usr/local/bin/python3 \
-      /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 \
-      /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 \
-      /Library/Frameworks/Python.framework/Versions/3.11/bin/python3 \
-      "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/python/bin/python3" \
-      /usr/bin/python3
+      /usr/local/bin/python3 /usr/bin/python3
   do
     [ -n "$candidate" ] || continue
     [ -x "$candidate" ] || continue

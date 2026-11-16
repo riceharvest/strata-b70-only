@@ -5635,14 +5635,6 @@ def main() -> int:
             cfg["gpu_order"] = "as_given"
         ok(f"layer split across GPUs {multi} ({cfg['layer_split']})")
         recommend_remote_expert_opt(cfg, off=a.no_remote_expert_opt)
-        if hip and a.layer_split in (None, "auto"):    # four Radeon AI PRO R9700 cards and Qwen3.8 IQ3_S: the measured serving profile
-            try:                                       # (strata_control/amd_four_card.py); what the person chose always wins
-                from strata_control import amd_four_card
-                for line in amd_four_card.apply([{"name": c.get("name"), "vram_gb": c.get("vram_gb"), "vendor": "amd"} for c in chosen],
-                                                cfg, parallel_given=a.parallel is not None):
-                    ok(line)
-            except Exception as e:                     # noqa: BLE001 - a profile is never a reason to stop setup
-                say(f"  (the four-card profile was not applied: {e})")
     if getattr(a, "_roles", None):                     # the roles themselves (strata_control/gpu_roles.py); "gpu" above is their mirror
         final = cfg["gpu"] if isinstance(cfg.get("gpu"), list) else [cfg["gpu"]]      # what the checks above left (a model that cannot share keeps one card)
         main = final[-1]

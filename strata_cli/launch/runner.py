@@ -1239,7 +1239,6 @@ class Runner:
         base = read_config(base_path)
         cfg = derive_config(base, self.s, bool_flags=tune_knobs.BOOL_FLAGS,
                             log=str(launch_dir() / f"{self.name}.engine.log"), gpus=cards_for_launch(self.s, self.catalog, base=base))
-        self.apply_four_card(cfg)
         wait = self.start_wait()
         if wait > 600 and not cfg.get("engine_ready_s"):     # the server's own wait for the engine (900 s) must not end before the start's
             cfg["engine_ready_s"] = wait + 60
@@ -1248,29 +1247,10 @@ class Runner:
         self.config_path = out
         return out
 
-    def apply_four_card(self, cfg: dict) -> None:
-        """Four Radeon AI PRO R9700 cards and Qwen3.8-Flash-Next IQ3_S: the measured serving profile (strata_control/amd_four_card.py), filled
-        in where the person chose nothing. Never stops a launch."""
-        self.four_card_parallel = None
-        try:
-            from strata_control import amd_four_card
-            picked = cfg.get("gpu")
-            if not (isinstance(picked, list) and len(picked) == amd_four_card.CARDS):
-                return
-            want = {int(i) for i in picked}
-            cards = [c for c in self.catalog.computer().usable_gpus if int(c.get("index", -1)) in want]
-            before = cfg.get("parallel")
-            notes = amd_four_card.apply(cards, cfg, parallel_given=bool(self.s.parallel))
-            if notes:
-                self.four_card_parallel = cfg.get("parallel") if before is None and cfg.get("parallel") else None   # (only a number the profile set)
-                self.emit("model", "Four " + str(cards[0].get("name", "AMD")).replace("AMD Radeon ", "") + " cards: " + "; ".join(notes) + ".", None)
-        except Exception:                                    # noqa: BLE001 - a profile is never a reason to stop a launch
-            self.four_card_parallel = None
-
     def ensure_profile(self, config: Path) -> None:
         from strata_control import profiles
         name = self.profile
-        parallel = self.s.parallel if self.s.parallel else (getattr(self, "four_card_parallel", None) or self.catalog_parallel())
+        parallel = self.s.parallel if self.s.parallel else self.catalog_parallel()
         sets = [f"host={acc.host_for(self.s.access)}", f"port={int(self.s.port)}"] + ([f"parallel={parallel}"] if parallel else [])
         try:
             current, _rev = profiles.load(name)
