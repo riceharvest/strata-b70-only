@@ -1,0 +1,32 @@
+# Local hooks only: nothing is fetched from the network. Needs `ruff` and `bash` on PATH.
+# Setup once per clone:  pre-commit install --install-hooks -t pre-commit -t commit-msg -t pre-push
+repos:
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff check (pyflakes and syntax errors only, see pyproject.toml)
+        language: system
+        entry: ruff check --force-exclude
+        types: [python]
+
+      - id: no-report-files
+        name: no REPORT.md, PLAN.md or DESIGN.md
+        language: system
+        entry: bash -c 'for f in "$@"; do echo "$f must not be committed (write reports outside the repo)"; done; exit 1' --
+        files: '(?i)(^|/)(report|plan|design)\.md$'
+
+      - id: no-ai-credit
+        name: no Co-Authored-By or "Generated with" line in the commit message
+        language: system
+        stages: [commit-msg]
+        entry: bash -c 'if grep -iqE "^[[:space:]]*co-authored-by:|^[^[:alnum:]]*generated with" "$1"; then echo "commit message has a Co-Authored-By trailer or a Generated with line"; exit 1; fi' --
+        always_run: true
+        pass_filenames: true
+
+      - id: repo-guard
+        name: repo-guard on the pushed range (same script as CI)
+        language: system
+        stages: [pre-push]
+        entry: bash -c 'bash .github/scripts/repo-guard.sh "${PRE_COMMIT_FROM_REF:-origin/b70}" "${PRE_COMMIT_TO_REF:-HEAD}"'
+        always_run: true
+        pass_filenames: false
