@@ -14,12 +14,14 @@ from typing import Any
 
 from textual.app import App
 from textual.binding import Binding
+from textual.screen import Screen
 
 from strata_cli.launch import access as acc
 from strata_cli.launch import params as P
 from strata_cli.launch import settings as S
 from strata_cli.launch import store
 from strata_cli.launch.catalog import Catalog
+from strata_cli.launch.modelstate import ModelState
 from strata_cli.launch.runner import Cancelled, Event, LaunchError, Result, Runner, read_config
 from strata_cli.launch.screens import (AccessScreen, AdvancedScreen, CardsScreen, ConfirmScreen, ContextScreen, FolderScreen,
                                        ModelScreen, ParallelScreen, PicturesScreen, RunScreen, SaveScreen, StartScreen,
@@ -103,7 +105,7 @@ class Ctx:
             return None
 
     # ---- where the model is and what it still needs
-    def model_state(self, data_dir: str | None = None):
+    def model_state(self, data_dir: str | None = None) -> ModelState:
         """The chosen model's state (installed, what helper files are missing, sizes) for these choices."""
         from strata_cli.launch import modelstate
         s = self.settings
@@ -263,7 +265,7 @@ class LaunchApp(App):
         self.ctx.settings = s
         self.run_launch()
 
-    def show(self, screen) -> None:
+    def show(self, screen: Screen) -> None:
         """Put `screen` in front. The first screen of a run that skips the questions has nothing to replace (the app starts with only its
         empty base screen), so it is pushed; every later one replaces the one on top. (switch_screen on the base screen raised
         IndexError: pop from empty list, tester report T02.)"""

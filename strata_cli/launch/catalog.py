@@ -216,7 +216,7 @@ class Catalog:
     """setup.py's tables through strata_mcp's `Strata` object (the app's own catalog code)."""
 
     def __init__(self, src: str | os.PathLike | None = None, root: str | os.PathLike | None = None,
-                 hardware: dict | None = None):
+                 hardware: dict | None = None) -> None:
         self.src = installer_folder(src)
         self.places = install_places(root, self.src)
         self.root = Path(root) if root else (self.places[0].path if self.places else install_root(None, self.src))

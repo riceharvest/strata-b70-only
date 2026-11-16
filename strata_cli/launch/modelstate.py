@@ -9,9 +9,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from strata_control import discovery
 from strata_control.discovery import MMPROJ_GB, MTP_FETCH_GB
+
+if TYPE_CHECKING:
+    from strata_cli.launch.catalog import Catalog
 
 
 @dataclass
@@ -88,7 +92,7 @@ def mtp_choice(mtp: str | None, drafting: str | None = None) -> str | None:
     return mtp
 
 
-def mmproj_name(catalog, family: str | None) -> str:
+def mmproj_name(catalog: Catalog, family: str | None) -> str:
     try:
         _m, families, _c, _s = catalog.tables()
         name = (families.get(family or "") or {}).get("mmproj")
@@ -102,7 +106,7 @@ def mmproj_name(catalog, family: str | None) -> str:
     return "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 
 
-def assess(catalog, family: str | None, model: str | None, *, vision: str = "off", model_path: str | None = None,
+def assess(catalog: Catalog, family: str | None, model: str | None, *, vision: str = "off", model_path: str | None = None,
            data_dir: str | Path | None = None, config: Path | None = None, desc: dict | None = None, rows: list | None = None,
            mtp: str | None = None, drafting: str | None = None) -> ModelState:
     """The state of `family model` for these choices. `config` / `desc` are the installed run config and its description (looked up when

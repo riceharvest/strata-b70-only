@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import TextIO
 
 DATA_ITEMS = ("models", "packs", "mtp")
 
@@ -48,7 +49,7 @@ def movable_library(old: Path | None, new: Path) -> float:
     return library_gb(Path(old))
 
 
-def ask_move(gb: float, new: Path, *, stdin_tty: bool | None = None, out=None) -> bool:
+def ask_move(gb: float, new: Path, *, stdin_tty: bool | None = None, out: TextIO | None = None) -> bool:
     """Ask: keep the models where they are (and use the new folder for new downloads), or move them.  True = move.
     No keyboard (a pipe, a script) or Enter: keep, the answer that loses nothing."""
     out = out or sys.stdout

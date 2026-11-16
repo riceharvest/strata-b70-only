@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from typing import Callable
 
 from strata_control import loopback
 
@@ -108,7 +109,8 @@ def tool_calls(wire: str, data: dict) -> list[tuple[str, dict]]:
     return out
 
 
-def run_checks(harness_id: str, url: str, key: str, model: str, *, timeout: float = 240.0, poster=None) -> list[Check]:
+def run_checks(harness_id: str, url: str, key: str, model: str, *, timeout: float = 240.0,
+               poster: Callable[..., dict] | None = None) -> list[Check]:
     """The two checks for one harness. `poster` is replaceable for tests."""
     poster = poster or _post
     base = url.rstrip("/")

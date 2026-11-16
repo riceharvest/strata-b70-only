@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from rich.text import Text
+from textual import events
 from textual.widgets import Static
 
 BG, PANEL, FG, MUTE = "#0e1113", "#161a1d", "#eef1f3", "#8e979f"
@@ -58,7 +59,7 @@ def unicode_ok() -> bool:
 
 
 class Glyphs:
-    def __init__(self, unicode: bool | None = None):
+    def __init__(self, unicode: bool | None = None) -> None:
         u = unicode_ok() if unicode is None else unicode
         self.unicode = u
         self.cursor = "›" if u else ">"      # (U+203A is in Consolas too, but one rule for the whole screen is simpler)
@@ -205,7 +206,7 @@ class Menu(Static):
             out.append(f"\n  {self.top + 1}-{min(len(self.items), self.top + win)} of {len(self.items)}", style=self.palette.mute)
         return out
 
-    def on_resize(self, _event) -> None:
+    def on_resize(self, _event: events.Resize) -> None:
         self._refresh()
 
 

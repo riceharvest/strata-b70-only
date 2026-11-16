@@ -79,7 +79,7 @@ class Harness:
         return f"tested ({self.tested})" if self.tested else "not tested yet"
 
 
-def _j(obj) -> str:
+def _j(obj: object) -> str:
     return json.dumps(obj, indent=2)
 
 

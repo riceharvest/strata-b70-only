@@ -15,20 +15,24 @@ from __future__ import annotations
 
 import textwrap
 import threading
+from typing import Any
 
 from rich.text import Text
+from textual import events
+from textual.geometry import Size
 from textual.widgets import Static
 
 from strata_cli import nav
+from strata_cli.client import Endpoint
 from strata_cli.launch import check, harness
 from strata_cli.launch.screens import ConfirmScreen
-from strata_cli.launch.widgets import DARK, LIGHT, Glyphs
+from strata_cli.launch.widgets import DARK, LIGHT, Glyphs, Palette
 from strata_cli.monitor import MonitorApp
 
 CONNECT = 6                                   # the index of the Connect view (the seventh)
 
 
-def connect_palette(theme: str, color: bool):
+def connect_palette(theme: str, color: bool) -> Palette | None:
     """The colours of the Connect view for the monitor's theme: dark, light (readable on white), or the terminal's own (no colours set)."""
     if not color or theme == "terminal":
         return None
@@ -36,7 +40,7 @@ def connect_palette(theme: str, color: bool):
 
 
 class LaunchMonitor(MonitorApp):
-    def __init__(self, endpoint, snapshot, *, info: dict, ask_quit: bool = True, **kw) -> None:
+    def __init__(self, endpoint: Endpoint, snapshot: dict | None, *, info: dict, ask_quit: bool = True, **kw: Any) -> None:
         super().__init__(endpoint, snapshot, **kw)
         self.info = info
         self.ask_quit = ask_quit                  # False: plain `strata monitor` (q detaches, nothing to stop)
@@ -115,7 +119,7 @@ class LaunchMonitor(MonitorApp):
         if not self.connect_open:
             super().action_request_detail()
 
-    def on_key(self, event) -> None:
+    def on_key(self, event: events.Key) -> None:
         if not self.connect_open:
             return
         key = event.key
@@ -197,7 +201,7 @@ class LaunchMonitor(MonitorApp):
         threading.Thread(target=work, daemon=True).start()
 
     # ---- painting
-    def _paint(self, size=None) -> None:
+    def _paint(self, size: Size | None = None) -> None:
         if not self.connect_open:
             super()._paint(size)
             if self.ask_quit and not self.error and not self.selection_notice and self.connection_state == "connected" and not self.frozen:

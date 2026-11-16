@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from rich.text import Text
+from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
@@ -23,6 +25,11 @@ from strata_cli.launch import settings as S
 from strata_cli.launch import store
 from strata_cli.launch.widgets import (ACCENT, BAD, DARK, FG, LIGHT, MUTE, WARN, Cell, Item, Menu, bar)
 
+if TYPE_CHECKING:
+    from strata_cli.launch.app import Ctx
+    from strata_cli.launch.modelstate import ModelState
+    from strata_cli.launch.runner import Event
+
 STEPS = (("model", "Model"), ("cards", "Cards"), ("folder", "Folder"), ("context", "Context"), ("pictures", "Pictures"),
          ("parallel", "Parallel"), ("tuning", "Tuning"), ("advanced", "Advanced"), ("access", "Access"), ("save", "Save"))
 
@@ -30,7 +37,7 @@ STEPS = (("model", "Model"), ("cards", "Cards"), ("folder", "Folder"), ("context
 STEP_LABELS = dict(STEPS)
 
 
-def flow_for(ctx) -> list[str]:
+def flow_for(ctx: Ctx) -> list[str]:
     """The steps of this computer: the Cards step exists only when two or more graphics cards can be used."""
     ids = [sid for sid, _ in STEPS]
     if len(ctx.computer.usable_gpus) < 2:
@@ -72,7 +79,7 @@ class Base(Screen):
 
     # ---- frame
     @property
-    def ctx(self):
+    def ctx(self) -> Ctx:
         return self.app.ctx           # type: ignore[attr-defined]
 
     @property
@@ -96,7 +103,7 @@ class Base(Screen):
     def on_mount(self) -> None:
         self.paint()
 
-    def on_resize(self, _e) -> None:
+    def on_resize(self, _e: events.Resize) -> None:
         self.paint()
 
     def width(self) -> int:
@@ -324,7 +331,7 @@ class ConfirmScreen(ModalScreen):
     #dialog {{ width: 70; max-width: 100%; height: auto; max-height: 100%; background: #161a1d; border: solid {ACCENT}; padding: 1 2; }}
     """
 
-    def __init__(self, question: str, detail: str, options: list[tuple[str, str]]):
+    def __init__(self, question: str, detail: str, options: list[tuple[str, str]]) -> None:
         super().__init__()
         self.question, self.detail, self.options = question, detail, options
 
@@ -415,7 +422,7 @@ class ModelScreen(Base):
         m.window = max(4, (self.size.height or 30) - 12)
         m.set_items(items, sel if (initial or not m.items) else None)
 
-    def on_resize(self, _e) -> None:
+    def on_resize(self, _e: events.Resize) -> None:
         if hasattr(self, "rows"):
             self.build_menu()
         self.paint()
@@ -728,10 +735,10 @@ class FolderScreen(Base):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.action_next()
 
-    def state(self, value: str | None = None):
+    def state(self, value: str | None = None) -> ModelState:
         return self.ctx.model_state(value or None)
 
-    def need_gb(self, st=None) -> float:
+    def need_gb(self, st: ModelState | None = None) -> float:
         """The room to ask for: what is still to download plus working room (a little when the model is already there)."""
         st = st or self.state()
         return st.remaining_gb + (2.0 if (st.installed or st.own_files) else 8.0)
@@ -1120,7 +1127,7 @@ class AdvancedScreen(Base):
         m.window = max(3, body_h - box_h - 4)                # the heading, the column titles, the "n of m" line and the box's rule
         m.set_items(items, min(m.index, len(items) - 1))
 
-    def on_resize(self, _e) -> None:
+    def on_resize(self, _e: events.Resize) -> None:
         if hasattr(self, "rows"):
             self.build()
         self.paint()
@@ -1578,7 +1585,7 @@ class RunScreen(Base):
         out.append(f"   {s.name or ''}", style=MUTE)
         return out
 
-    def handle_event(self, ev) -> None:
+    def handle_event(self, ev: Event) -> None:
         if ev.stage == "done":
             return
         st = self.state.get(ev.stage)

@@ -24,7 +24,7 @@ import time
 from strata_control import atomic as _atomic_mod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from strata_cli.launch import access as acc
 from strata_cli.launch import modelstate
@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[2]
 WINDOWS = os.name == "nt"
 
 
-def install_isolation_words(catalog, data_dir: str | os.PathLike | None = None) -> list[str]:
+def install_isolation_words(catalog: Catalog, data_dir: str | os.PathLike | None = None) -> list[str]:
     """Round 8, N5: a clean test (a scratch data folder) silently ran an OLDER install found elsewhere (its run config and engine 0.1.41).
     When a data folder was chosen (--data-dir, or STRATA_DATA_DIR from the installer) and the install in use is outside it, say which one is used
     and why. Nothing is moved or switched."""
@@ -97,7 +97,7 @@ def capital(text: str) -> str:
 class LaunchError(RuntimeError):
     """A step could not be done. `text` says what it means; `next` says what to do."""
 
-    def __init__(self, text: str, next: str = "", code: int = 6):
+    def __init__(self, text: str, next: str = "", code: int = 6) -> None:
         super().__init__((text + " " + next).strip())
         self.text, self.next, self.code = text, next, code
 
@@ -132,7 +132,7 @@ def setup_failure(lines: list[str], err: str, hint: str, details: str | None, ow
 
 
 class Cancelled(LaunchError):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__("Stopped. Nothing was changed on your computer beyond files already downloaded.", "", 130)
 
 
@@ -355,7 +355,7 @@ def installed_cards(base: dict | None) -> list[int] | None:
     return cards or None
 
 
-def cards_for_launch(s: S.LaunchSettings, catalog, ram_gb: float | None = None, base: dict | None = None) -> "list[int] | dict | None":
+def cards_for_launch(s: S.LaunchSettings, catalog: Catalog, ram_gb: float | None = None, base: dict | None = None) -> "list[int] | dict | None":
     """The cards this launch uses: the ones named (--gpu / --gpus, the Cards step), else the cards the installed config was set to (a person's
     earlier choice, "gpu": 1 or [1, 0] - never replaced by the automatic pick, which would put the first of equal cards back), else the
     recommended ones by the shared fit rule (strata_control/gpu_fit.py) when the computer has more than one card that counts, else None."""
@@ -494,7 +494,7 @@ class Runner:
                  components_dir: str | None = None, hardware: dict | None = None,
                  confirm: Callable[[str, str], bool] | None = None, assume_yes: bool = False, move_data: bool = False,
                  retune: bool = False, restart: bool = False, confirm_restart: Callable[[str, str], bool] | None = None,
-                 after_check: Callable[[], None] | None = None):
+                 after_check: Callable[[], None] | None = None) -> None:
         self.s = s
         self.after_check = after_check        # called once when nothing blocks the launch (no server, the same one, or "Restart" was answered): the screens save the preset then
         self.restart = restart                # --restart: a server that serves other choices (or holds this port) is stopped and replaced without asking
@@ -898,7 +898,7 @@ class Runner:
         except Exception:                                    # noqa: BLE001
             return None
 
-    def model_state(self):
+    def model_state(self) -> modelstate.ModelState:
         """What this launch still needs for the model, in numbers and words (strata_cli/launch/modelstate.py)."""
         from strata_cli.launch import modelstate
         s = self.s
@@ -938,7 +938,7 @@ class Runner:
     #: seconds of silence from setup before a "still working" line (packing a 40 GB model prints nothing for minutes)
     HEARTBEAT_S = 30.0
 
-    def _read_lines(self, p: subprocess.Popen):
+    def _read_lines(self, p: subprocess.Popen) -> Iterator[str | None]:
         """The lines setup prints, and None whenever a second passes with none, so a silent step can say it is still going and a cancel is
         seen at once."""
         import queue

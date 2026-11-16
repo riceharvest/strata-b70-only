@@ -8,8 +8,13 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable
 
 from strata_cli.launch import settings as S
+
+if TYPE_CHECKING:
+    from strata_cli.launch.catalog import Catalog, Computer
+    from strata_cli.launch.runner import Event
 
 EXAMPLES = """\
 examples:
@@ -32,7 +37,7 @@ examples:
 PICTURE_WORDS = {"off": "off", "on": "on", "cpu": "on (the reader runs on the processor)", "gpu": "on (the reader runs on the graphics card)"}
 
 
-def _choice(label: str, options: tuple[str, ...]):
+def _choice(label: str, options: tuple[str, ...]) -> Callable[[str], str]:
     def convert(value: str) -> str:
         v = str(value).strip().lower()
         if v in options:
@@ -191,7 +196,7 @@ def _gpus(text: str | None) -> list[int] | None:
         raise ValueError(f"'{text}' is not a list of graphics card numbers. Use 0 or 0,1.") from None
 
 
-def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSettings, list[str]]:
+def settings_from_args(a: argparse.Namespace, catalog: Catalog | None = None) -> tuple[S.LaunchSettings, list[str]]:
     """The preset (if named) with the flags on top; model names resolved against the catalog. Returns (settings, warnings)."""
     from strata_cli.launch import store
     notices: list[str] = []
@@ -276,7 +281,7 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
     return s, notices
 
 
-def apply_defaults(s: S.LaunchSettings, catalog) -> tuple[S.LaunchSettings, list[S.Notice]]:
+def apply_defaults(s: S.LaunchSettings, catalog: Catalog) -> tuple[S.LaunchSettings, list[S.Notice]]:
     """Fill what was left open with the recommendation for this computer, and collect warnings (never errors for a bad fit)."""
     notices: list[S.Notice] = []
     comp = catalog.computer()
@@ -325,7 +330,7 @@ def apply_defaults(s: S.LaunchSettings, catalog) -> tuple[S.LaunchSettings, list
     return s, notices
 
 
-def roles_line(s: S.LaunchSettings, catalog) -> str | None:
+def roles_line(s: S.LaunchSettings, catalog: Catalog | None) -> str | None:
     """`Main: GPU 2 RTX 4070 Ti. Helper: GPU 1 RTX 3060.` for the cards this launch names (--gpu-roles, or --gpu: the faster card goes last), else None."""
     if not (s.gpu_roles or s.gpus) or catalog is None:
         return None
@@ -343,7 +348,7 @@ def roles_line(s: S.LaunchSettings, catalog) -> str | None:
         return None
 
 
-def gpu_notices(s: S.LaunchSettings, comp) -> list[S.Notice]:
+def gpu_notices(s: S.LaunchSettings, comp: Computer) -> list[S.Notice]:
     """Cards of another make than the engine drives: never offered, never mixed into a split. Said in plain words: a named card of the other
     make is refused with the reason, and a better card of the other make is mentioned once (recommend, never force)."""
     from strata_control import gpu_fit
@@ -383,7 +388,7 @@ def gpu_notices(s: S.LaunchSettings, comp) -> list[S.Notice]:
 
 # ------------------------------------------------------------------------------------------------ plain-text run
 
-def _engine_log_of(config) -> str:
+def _engine_log_of(config: str | Path) -> str:
     """Where this launch writes the engine's log (#3656): the config's own "log", printed so a failure can be read without a search."""
     try:
         from strata_cli.launch.runner import read_config
@@ -408,12 +413,12 @@ def _interrupted_move_notice() -> None:
         _say("A move of your models was interrupted. Finish it with `strata models move --resume`, or keep them where they are with `strata models move --leave`.")
 
 
-def _printer(quiet: bool = False):
+def _printer(quiet: bool = False) -> Callable[[Event], None]:
     """An emit callback that prints readable lines: new text once, progress in steps of 10% when not on a terminal."""
     state = {"last": None, "pct": -10, "stage": None}
     isatty = sys.stdout.isatty()
 
-    def emit(ev) -> None:
+    def emit(ev: Event) -> None:
         if quiet:
             return
         text = ev.text
@@ -480,7 +485,7 @@ def _ask_yes(title: str, text: str) -> bool:
     return answer in ("", "y", "yes")
 
 
-def _move_data_choice(a: argparse.Namespace, s: S.LaunchSettings, catalog, machine: bool) -> bool:
+def _move_data_choice(a: argparse.Namespace, s: S.LaunchSettings, catalog: Catalog, machine: bool) -> bool:
     """Whether the models already on this computer move into --data-dir.  Only --move-data or the answer "move" says yes; --yes, --plan,
     --output json and a run with no keyboard keep the old library where it is (it stays usable; the new folder gets new downloads)."""
     if not a.data_dir:
@@ -521,7 +526,7 @@ def _screens_missing() -> str | None:
     return next((m for m in ("rich", "textual") if importlib.util.find_spec(m) is None), None)
 
 
-def final_hint_lines(s, preset_saved: bool) -> list[str]:
+def final_hint_lines(s: S.LaunchSettings, preset_saved: bool) -> list[str]:
     """The last lines of a flag launch: how to connect an app and how to stop.  `--preset "<name>"` is suggested only when a preset by that name exists
     (--preset NAME, or --save-preset NAME); otherwise the plain command, and how to keep the settings."""
     if preset_saved:
@@ -530,7 +535,7 @@ def final_hint_lines(s, preset_saved: bool) -> list[str]:
             "  To keep these settings for next time, add --save-preset NAME."]
 
 
-def _tui(run, *args, **kw) -> int:
+def _tui(run: Callable[..., int | None], *args: Any, **kw: Any) -> int:
     """Open the screens. An error of the screens themselves ends with a plain sentence and a non-zero exit code, never a traceback and exit 0
     (tester report T02)."""
     try:
