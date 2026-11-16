@@ -89,7 +89,7 @@ changes the order only with `--reorder` (your trace's pairs first, then the base
 ## Which model?
 
 [MODELS.md](MODELS.md) is the page for choosing a model: sizes, memory, providers and what fits. The families are
-Qwen3.8-Flash-Next (with its Coder, Swift, Gyro, Unsloth and NVFP4 variants) and, on the B70, the dense
+Qwen3.8-Flash-Next (with its Coder, Swift, Gyro and Unsloth variants) and, on the B70, the dense
 Qwen3.8-27B ([Q36.md](Q36.md)). The ISTA-DASLab Qwen3.8-Flash-Next packs are:
 
 | Model | Download | RAM it uses | Speed | Quality |
@@ -144,7 +144,7 @@ Some engine settings depend on the PC more than on the model:
 | `--spec-min-p` | How sure the draft layer must be to add another guess to a check. |
 | `--pool-workers` | How many CPU threads compute experts. On CPUs with efficiency cores, fewer can be faster. |
 | `--adapt-every`, `--adapt-swaps`, `--adapt-decay` | How busily the VRAM expert cache follows the conversation. A CPU that reads missed experts slowly (DDR3 or DDR4 in few channels) gains from more swaps. |
-| `--prefill-pipe` | On two or more cards (layer split), the prompt chunks that keep the cards reading at once. This fork serves one card, so it has no effect here. |
+| `--prefill-pipe` | On two or more cards (layer split), the prompt chunks that keep the cards reading at once. This fork is tested on one card only. |
 
 The defaults were measured on a Ryzen 5 7600 with an RTX 5070. From a source checkout, `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`)
 measures output speed with each setting on your PC and keeps one only when it is more than 3% faster. The result is

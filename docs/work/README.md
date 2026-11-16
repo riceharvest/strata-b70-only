@@ -25,17 +25,18 @@ All files were added to this repository on 2026-10-22 (`git log` on the files); 
 | [archive/evidence/timeskip-harness.txt](archive/evidence/timeskip-harness.txt), [timeskip-http.txt](archive/evidence/timeskip-http.txt) | Time-skip runs (mock engine). |
 | [archive/evidence/tuning-sweep.txt](archive/evidence/tuning-sweep.txt), [tuning-apply.txt](archive/evidence/tuning-apply.txt), [tuning-http.txt](archive/evidence/tuning-http.txt) | Tuning sweep, apply and rollback runs against a stub engine. |
 
-The `evidence/` files cited by the matrix files that were deleted (below) are no longer there.
+## Also kept: the evidence of artifacts that no longer exist
 
-## Deleted
+These record the macOS app, the Tauri DMG, the Metal engine build and runs against `DeepSeek Harness.app`. The fork deleted
+those things, so nobody can reproduce or re-read the artifacts, but the files are dated records and the matrix files above
+cite them by name. They are history only.
 
-These evidence files recorded artifacts that this fork deleted, on Apple hardware, and nothing can reproduce or read them
-here. They are still in git history (`git log --diff-filter=D -- docs/work/evidence`).
-
-| File | Why |
+| File | What it records |
 | --- | --- |
-| `evidence/artifact.txt`, `tauri-artifact.txt`, `tauri-selftest.json`, `tauri-selftest-from-dmg.json` | The macOS DMG and `.app` (Tauri), removed with `apps/` and `packaging/` |
-| `evidence/desktop-smoke-packaged.txt`, `desktop-smoke-unpackaged.txt` | Smoke test of that desktop app |
-| `evidence/engine-build.txt`, `tuning-plan.txt` | The Apple Metal engine build and its tuning plan (`metal/` is removed) |
-| `evidence/terminal-dist.txt` | The `darwin-arm64` terminal tarball |
-| `evidence/bridge-e2e.txt`, `tool-flow.txt` | Runs against `DeepSeek Harness.app` on the Mac |
+| [archive/evidence/artifact.txt](archive/evidence/artifact.txt), [tauri-artifact.txt](archive/evidence/tauri-artifact.txt), [tauri-selftest.json](archive/evidence/tauri-selftest.json), [tauri-selftest-from-dmg.json](archive/evidence/tauri-selftest-from-dmg.json) | The macOS DMG and `.app` (Tauri), removed with `apps/` and `packaging/` |
+| [archive/evidence/desktop-smoke-packaged.txt](archive/evidence/desktop-smoke-packaged.txt), [desktop-smoke-unpackaged.txt](archive/evidence/desktop-smoke-unpackaged.txt) | Smoke test of that desktop app |
+| [archive/evidence/engine-build.txt](archive/evidence/engine-build.txt), [tuning-plan.txt](archive/evidence/tuning-plan.txt) | The Apple Metal engine build and its tuning plan (`metal/` is removed) |
+| [archive/evidence/terminal-dist.txt](archive/evidence/terminal-dist.txt) | The `darwin-arm64` terminal tarball |
+| [archive/evidence/bridge-e2e.txt](archive/evidence/bridge-e2e.txt), [tool-flow.txt](archive/evidence/tool-flow.txt) | Runs against `DeepSeek Harness.app` on the Mac |
+
+Nothing from `docs/work` was deleted.

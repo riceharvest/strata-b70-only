@@ -5,6 +5,9 @@ This is a fork of [Strata](https://github.com/Niko1221/Strata) by Niko1221 and i
 Intel Arc Pro B70 (32 GB, Battlemage `bmg-g31`) on Linux with the `xe` driver, using the SYCL engine in `sycl/`. If you
 have another GPU, use upstream.
 
+This page and [CLI.md](CLI.md) describe the tree at `1b121d6db` plus the documentation commits of 2026-11-16. If other work removes more
+code later (for example the two-card paths), the "not removed" list below and CLI.md need checking and regenerating.
+
 Every claim below can be checked with git or in the tree. The commands are given where a number comes from.
 
 ## Where the fork starts
@@ -24,9 +27,10 @@ Every claim below can be checked with git or in the tree. The commands are given
 on 2026-11-16: of 465,653 lines in code files (`.cpp .hpp .h .cu .py .sh .cmake .js .html .css`, `CMakeLists.txt`; not
 `docs/`, `third_party/` or `ref/`; 1,210 files), 73.7% were last changed by a commit that is in `upstream/main`'s history
 and 26.3% by a commit that only this fork has. By language: Python is mostly upstream's (145,435 lines against 13,859);
-C++ is split (131,389 against 94,782 in `.cpp`, 50,700 against 11,379 in `.hpp`). A line a fork author changed and
-upstream later took (the community pull requests listed in [B70.md](B70.md)) counts as upstream's. The script that made
-the number was not kept in the repository.
+C++ is split (131,389 against 94,782 in `.cpp`, 50,700 against 11,379 in `.hpp`). A commit that was cherry-picked from an
+upstream pull request has a new hash here, so its lines count as the fork's; the community pull requests listed in
+[B70.md](B70.md) are such commits (for example `e14ddfa4b` is not an ancestor of `upstream/main`, its upstream twin is
+`8fffe81d4`). The fork's share is therefore an upper bound. The script that made the number was not kept in the repository.
 
 ## What was removed
 
@@ -51,8 +55,8 @@ Things that are not removed, so you do not trust the list too far:
 
 - **Two-card code is still in the tree.** The guides for layer splits (`MULTI_GPU.md`, `SECOND_GPU.md`) are gone, but code such as
   `sycl/src/core/peer_experts.cpp`, the `--layer-split` and `--gpus` options of setup, and split serving ([SPLIT_SERVE.md](SPLIT_SERVE.md))
-  were not deleted. This fork is tested on one card. `tests/sycl/test_intel_two_card_spec.py` and the Arc Pro B60 report in
-  `bench/results/` are the only two-card material here.
+  were not deleted. This fork is tested on one card. also `serve/test_split.py`, `sycl/src/core/pipeline_auto_test.cpp`,
+  `tests/sycl/test_intel_two_card_spec.py` and the Arc Pro B60 report in `bench/results/`.
 - **Other Intel cards are not removed either.** [A770_SPEED_SPEC.md](A770_SPEED_SPEC.md) and the Arc B60 and B65 reports are kept as
   history. The fork is built for and measured on the B70.
 - **Some pages still describe the removed engines.** [DETAILS.md](DETAILS.md) is upstream's reference page and still has CUDA and
@@ -79,20 +83,24 @@ Not live: Qwen3.6-35B-A3B, DeepSeek V4.1-Flash and the NVFP4 packs (see the tabl
 - **The DFlash2 drafter for the 27B.** `STRATA_Q36_DFLASH=<pack>` swaps the MTP draft chain for the DFlash2 block drafter. It is
   opt-in. The pack is made by `tools/qwen35/dflash_pack.py` (`f4e2046e9`, 2026-11-14). The measurements and the arbiter that
   moves a request back to MTP are in [Q36.md](Q36.md).
-- **The DFlash2 option of the terminal comes from upstream.** `strata launch --drafting dflash2` and `strata drafting plan|fetch`
-  were added upstream in 0.2.3 ([release-notes-0.2.3.md](release-notes-0.2.3.md)) for Flash-Next. They are still in the
-  command line ([CLI.md](CLI.md)). No B70 measurement of that path is recorded in [B70.md](B70.md).
 - **B70 defaults.** `strata::apply_b70_defaults` in `sycl/include/strata/sycl_queue.hpp` sets the B70 switches unless you set
-  them. `STRATA_B70_DEFAULTS=0` turns all of them off; a switch set to `0` turns one off.
+  them. `STRATA_B70_DEFAULTS=0` turns all of them off; a switch set to `0` turns one off. `git grep apply_b70_defaults upstream/main` finds nothing.
 - **The served setup.** `./setup.sh --backend sycl --family unsloth --model UD-IQ1_S` downloads at a pinned revision, grafts one
   tensor into shard 2 (`tools/graft_tensor.py`), builds the pack and writes the served flags into the config.
-  `--no-served-recipe` leaves them out. See [B70.md](B70.md#the-served-setup).
+  `--no-served-recipe` leaves them out. Neither it nor `tools/graft_tensor.py` exists in `upstream/main`. See [B70.md](B70.md#the-served-setup).
 - **Many `STRATA_*` switches.** Counted with `git grep -h -o -E "STRATA_[A-Z0-9_]+"` over the tree outside `docs/`: 334 names
   appear in the tree now that did not appear at the merge base. That count includes names in comments and tests, so it is
   an upper bound on switches. The ones that matter are in [B70.md](B70.md), [Q36.md](Q36.md), [B70_LIB.md](B70_LIB.md) and
   [INTEL.md](INTEL.md). A switch is `STRATA_*`, read once; a hot path change has an off switch ([AGENTS.md](../AGENTS.md)).
-- **Container build.** The engine is built in the `strata-sycl-dev` image (`sycl/tools`) with a pinned device compiler.
-  [release-notes-b70-2026.11.11.md](release-notes-b70-2026.11.11.md) says which one and why.
+- **A pinned device compiler.** The `strata-sycl-dev` image and `sycl/tools/build.sh` are upstream's; the pin of the compiler
+  (IGC 2.41.5) was added here (`c1b16af25`, 2026-11-11, `git log -S"2.41.5" -- sycl/tools`).
+  [release-notes-b70-2026.11.11.md](release-notes-b70-2026.11.11.md) says why.
+
+## Upstream features the fork still carries
+
+- **DFlash2 in the terminal.** `strata launch --drafting dflash2` and `strata drafting plan|fetch`
+  were added upstream in 0.2.3 ([release-notes-0.2.3.md](release-notes-0.2.3.md)) for Flash-Next. They are still in the
+  command line ([CLI.md](CLI.md)). No B70 measurement of that path is recorded in [B70.md](B70.md).
 
 ## What stays upstream on purpose
 
