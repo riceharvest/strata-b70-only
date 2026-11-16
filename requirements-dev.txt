@@ -1,0 +1,8 @@
+# Test-only install of the two packages the host tests need, for a venv that has nothing else.
+# serve/frontend.py imports jinja2 and the tokenizer code imports regex, so the tests that import serve/server.py
+# error at import in a bare venv (the Strata venv holds only pip). requirements.txt pins both as well; this file repeats
+# the same two pins so a test-only install works without numpy, pillow and the rest.
+# Install with: pip install -r requirements-dev.txt   (or add -r requirements.txt for the full runtime)
+# No pytest: conftest.py imports only os and tempfile, no test imports pytest, and the tests run under unittest.
+jinja2==3.1.6
+regex==2026.9.10
