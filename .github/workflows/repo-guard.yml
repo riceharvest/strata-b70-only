@@ -1,0 +1,35 @@
+name: Repo guard
+
+# Fails a change that adds REPORT.md, PLAN.md or DESIGN.md, or whose commits carry
+# a Co-Authored-By trailer or a "Generated with" line. Plain git and bash.
+
+on:
+  pull_request:
+  push:
+    branches: [b70]
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check the commit range
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            bash .github/scripts/repo-guard.sh "$PR_BASE" "$PR_HEAD"
+          else
+            bash .github/scripts/repo-guard.sh "$PUSH_BEFORE" "$PUSH_AFTER"
+          fi
