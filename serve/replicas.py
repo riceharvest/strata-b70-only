@@ -28,6 +28,8 @@ import copy
 import os
 import threading
 import time
+from collections.abc import Sequence
+from typing import Any
 
 BLOCK = 64                          # tokens per hashed block of a prompt
 LOAD_TOKENS = 3000                  # the cost of one request already running on a replica, in prompt tokens
@@ -71,7 +73,7 @@ def gpu_groups(cfg: dict) -> list[list[int]]:
     return groups
 
 
-def _cards(g) -> list[int]:
+def _cards(g: object) -> list[int]:
     if g is None or g == "":
         return []
     items = g if isinstance(g, (list, tuple)) else str(g).split(",")
@@ -106,7 +108,7 @@ def replica_cfg(cfg: dict, i: int, gpus: list[int]) -> dict:
     return c
 
 
-def cpu_sets(n: int, enabled: bool = True):
+def cpu_sets(n: int, enabled: bool = True) -> list[list[int]] | None:
     """n disjoint sets of CPUs (whole physical cores, SMT siblings together), or None (off, not Linux, or the topology
     cannot be read: the engines then share the cores as they would without replicas)."""
     if not enabled or n < 2 or not hasattr(os, "sched_getaffinity"):
@@ -123,20 +125,20 @@ class Router:
     """Which replica holds the start of a prompt: chained hashes of its 64-token blocks, each with the set of replicas
     that served it (a bit mask)."""
 
-    def __init__(self, n: int, cap: int = INDEX_MAX):
+    def __init__(self, n: int, cap: int = INDEX_MAX) -> None:
         self.n, self.cap = n, cap
         self.blocks: collections.OrderedDict[int, int] = collections.OrderedDict()
         self.lock = threading.Lock()
 
     @staticmethod
-    def chain(ids) -> list[int]:
+    def chain(ids: Sequence[int]) -> list[int]:
         out, h = [], 0
         for k in range(len(ids) // BLOCK):
             h = hash((h, tuple(ids[k * BLOCK:(k + 1) * BLOCK])))
             out.append(h)
         return out
 
-    def matched(self, ids) -> list[int]:
+    def matched(self, ids: Sequence[int]) -> list[int]:
         """Per replica: how many leading tokens of `ids` it holds (a multiple of BLOCK)."""
         got = [0] * self.n
         alive = (1 << self.n) - 1
@@ -151,7 +153,7 @@ class Router:
                         got[r] = (k + 1) * BLOCK
         return got
 
-    def note(self, r: int, ids) -> None:
+    def note(self, r: int, ids: Sequence[int]) -> None:
         with self.lock:
             for h in self.chain(ids):
                 self.blocks[h] = self.blocks.pop(h, 0) | (1 << r)
@@ -176,7 +178,7 @@ class ReplicaEngine:
     NOT_HERE = {"session_file", "vram", "ctl", "slot_cv"}       # not offered: one conversation file / VRAM resize / control line
     PROPAGATE = {"silence_s", "gpu_busy"}
 
-    def __init__(self, engines: list, load_tokens: int = LOAD_TOKENS):
+    def __init__(self, engines: list, load_tokens: int = LOAD_TOKENS) -> None:
         if len(engines) < 2:
             raise ValueError("ReplicaEngine needs two or more engines")
         d = self.__dict__
@@ -197,12 +199,12 @@ class ReplicaEngine:
     def current(self):
         return getattr(self.tl, "cur", None) or self.engines[0]
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> Any:
         if name in self.NOT_HERE or name.startswith("__"):
             raise AttributeError(name)
         return getattr(self.current, name)
 
-    def __setattr__(self, name, value):
+    def __setattr__(self, name: str, value: object) -> None:
         if name in self.PROPAGATE:
             for e in self.engines:
                 setattr(e, name, value)
@@ -214,7 +216,7 @@ class ReplicaEngine:
         return self.current.last
 
     @last.setter
-    def last(self, value):
+    def last(self, value) -> None:
         self.current.last = value
 
     @property
@@ -253,7 +255,7 @@ class ReplicaEngine:
         return i
 
     @info.setter
-    def info(self, value):
+    def info(self, value) -> None:
         pass
 
     @property
@@ -281,7 +283,7 @@ class ReplicaEngine:
     def alive(self) -> bool:
         return any(e.alive() for e in self.engines)
 
-    def exit_code(self):
+    def exit_code(self) -> int | None:
         return next((c for c in (e.exit_code() for e in self.engines if not e.alive()) if c is not None), None)
 
     def death_note(self) -> str:
@@ -304,11 +306,11 @@ class ReplicaEngine:
                  "batch": int(getattr(e, "batch", 0) or 0)} for k, e in enumerate(self.engines)]
 
     # ---- life cycle
-    def restart(self, tries: int = 3):
+    def restart(self, tries: int = 3) -> None:
         dead = [k for k, e in enumerate(self.engines) if not e.alive()]
         errors: dict[int, BaseException] = {}
 
-        def one(k):
+        def one(k: int) -> None:
             try:
                 self.engines[k].restart(tries)
                 self.router.forget(k)
@@ -324,13 +326,13 @@ class ReplicaEngine:
         for k, e in errors.items():
             print(f"[strata] replica {k} did not start ({e}); the others serve", flush=True)
 
-    def unload(self):
+    def unload(self) -> None:
         for e in self.engines:
             e.unload()
         for k in range(len(self.engines)):
             self.router.forget(k)
 
-    def close(self):
+    def close(self) -> None:
         err = None
         for e in self.engines:
             try:
@@ -341,7 +343,7 @@ class ReplicaEngine:
             raise err
 
     # ---- routing
-    def route(self, ids) -> int:
+    def route(self, ids: Sequence[int]) -> int:
         """The replica for this prompt (and its running count raised): lowest cost among the living ones."""
         got = self.router.matched(ids)
         with self.lock:
@@ -368,7 +370,7 @@ class ReplicaEngine:
             self.heal_at[k] = now + HEAL_COOLDOWN_S
             self.healing[k] = True
 
-            def run(k=k):
+            def run(k: int = k) -> None:
                 try:
                     print(f"[strata] replica {k} had stopped; starting it again", flush=True)
                     self.engines[k].restart()

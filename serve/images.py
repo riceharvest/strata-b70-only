@@ -36,6 +36,10 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING, TextIO
+
+if TYPE_CHECKING:
+    from serve.server import Service
 
 # Qwen-Image-2.1-Turbo's own schedule (model_index.json "sample_sigmas") plus the terminal 0, as Unsloth's card passes
 # it to sd-cli; it is an 8-step schedule, so another step count leaves the schedule to sd.cpp
@@ -57,7 +61,7 @@ class ImageJobFailed(RuntimeError):
     """sd-cli ended without the images (500); the message carries the end of its log."""
 
 
-def parse_size(value, max_side: int) -> tuple[int, int]:
+def parse_size(value: object, max_side: int) -> tuple[int, int]:
     """OpenAI's size, "1024x1024" (or "auto": 1024x1024) -> (width, height); each side a multiple of 32 from 256 to
     max_side."""
     if value is None or value == "auto":
@@ -166,7 +170,7 @@ def need_mib(cfg: dict, width: int, height: int) -> int:
 class ImageGen:
     """One sd-cli process per request, one request at a time (the service's turn, gpu_turn)."""
 
-    def __init__(self, cfg: dict, log=None):
+    def __init__(self, cfg: dict, log: TextIO | None = None) -> None:
         self.cfg = dict(cfg)
         policy = self.cfg.get("gpu_policy") or "auto"
         if policy not in POLICIES:
@@ -236,7 +240,7 @@ class ImageGen:
                     raise ImageJobFailed(f"sd-cli did not start ({cmd[0]}): {e}") from e
                 why = None
 
-                def pump():
+                def pump() -> None:
                     for line in proc.stdout:
                         lf.write(line)
                         m = STEP_LINE.search(line)
@@ -320,7 +324,7 @@ class ImageGen:
 
 
 # ------------------------------------------------------------------------------------------- the GPU turn
-def resolve_policy(svc, gen: ImageGen, need: int) -> str:
+def resolve_policy(svc: Service, gen: ImageGen, need: int) -> str:
     """auto -> keep / shrink / unload for this job (see the module's docstring); a fixed policy is kept, except that
     an engine that is not running has nothing to give back (keep)."""
     eng = svc.engine
@@ -350,14 +354,14 @@ def engine_elastic(eng) -> bool:
     return "--vram-elastic" in (args or [])
 
 
-def _client_gone(svc) -> Exception:
+def _client_gone(svc: Service) -> Exception:
     """The server module's ClientGone (it may run as __main__, so not imported by name)."""
     import sys
     return getattr(sys.modules.get(type(svc).__module__), "ClientGone", RuntimeError)()
 
 
 @contextlib.contextmanager
-def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = None):
+def gpu_turn(svc: Service, gen: ImageGen, job: dict, cancel: threading.Event | None = None):
     """The image job's turn on the GPU: the service's FIFO (and, with parallel requests, the engine's control lines
     once no slot is generating), and the text engine made room for it per the policy.  Yields the policy used."""
     with svc.status_lock:
@@ -401,7 +405,7 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
                 svc.status["queued"] -= 1
 
 
-def _make_room(svc, gen: ImageGen, policy: str, need: int):
+def _make_room(svc: Service, gen: ImageGen, policy: str, need: int) -> str | None:
     """Do what `policy` says before the job; -> what _give_back needs."""
     eng = svc.engine
     if policy == "shrink":
@@ -431,7 +435,7 @@ def _make_room(svc, gen: ImageGen, policy: str, need: int):
     return None
 
 
-def _give_back(svc, gen: ImageGen, policy: str, restore) -> None:
+def _give_back(svc: Service, gen: ImageGen, policy: str, restore: str | None) -> None:
     eng = svc.engine
     if restore == "shrunk":
         try:
@@ -448,7 +452,7 @@ def _give_back(svc, gen: ImageGen, policy: str, restore) -> None:
                 gen._say(f"image job: the model did not load again yet ({e}); the next request loads it")
 
 
-def restore_session(svc) -> None:
+def restore_session(svc: Service) -> None:
     """After an engine start: restore the conversation an image job saved before it unloaded the engine."""
     path = getattr(svc, "restore_after_load", None)
     if not path:

@@ -24,11 +24,16 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
+from types import FrameType
+from typing import Any, TypeVar
 
 from pathlib import Path
 
 from serve import winjob
 from strata_control import procs
+
+T = TypeVar("T")
 
 _REAL_POPEN = subprocess.Popen                  # tests replace subprocess.Popen; isinstance needs the class
 LINUX = sys.platform.startswith("linux")
@@ -62,7 +67,7 @@ class _Anchor:
             except BaseException as exc:  # noqa: BLE001 - handed to the caller
                 future.set_exception(exc)
 
-    def call(self, fn):
+    def call(self, fn: Callable[[], T]) -> T:
         if threading.current_thread() is self._thread:
             return fn()
         future: concurrent.futures.Future = concurrent.futures.Future()
@@ -82,7 +87,7 @@ def _the_anchor() -> _Anchor:
         return _anchor
 
 
-def _die_with_parent(parent: int, then=None):
+def _die_with_parent(parent: int, then: Callable[[], object] | None = None) -> Callable[[], None]:
     """The preexec function of a child: SIGKILL when the starting thread ends; and if it ended already, now."""
     def run() -> None:
         _libc.prctl(PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0)
@@ -262,7 +267,7 @@ def _after_exit(child: subprocess.Popen, token: str | None) -> None:
 ISOLATED_ROLES = ("engine", "vision")      # speak a stdin protocol with us: the server alone decides when they stop
 
 
-def _own_group(then=None):
+def _own_group(then: Callable[[], object] | None = None) -> Callable[[], None]:
     def run() -> None:
         os.setpgid(0, 0)
         if then is not None:
@@ -270,7 +275,7 @@ def _own_group(then=None):
     return run
 
 
-def popen(args, role: str = "engine", **kw) -> subprocess.Popen:
+def popen(args, role: str = "engine", **kw: Any) -> subprocess.Popen:
     """``subprocess.Popen(args, **kw)`` for a process that must not outlive us.
 
     An engine or image encoder is also taken out of the terminal's reach (its own process group on POSIX, a new
@@ -312,7 +317,7 @@ def popen(args, role: str = "engine", **kw) -> subprocess.Popen:
 _console_handler = None            # the ctypes callback must stay referenced for the life of the process
 
 
-def install_stop_handlers(request_stop, finished: threading.Event | None = None) -> None:
+def install_stop_handlers(request_stop: Callable[[str], object], finished: threading.Event | None = None) -> None:
     """Make every ordinary way a server is asked to end take the clean path (`request_stop(reason)`).
 
     * POSIX: SIGTERM (docker stop, systemd, `kill`), SIGHUP (the terminal closed, the ssh connection dropped; not when it
@@ -322,8 +327,8 @@ def install_stop_handlers(request_stop, finished: threading.Event | None = None)
       the system ends the process a few seconds after the handler returns, so the handler waits for `finished` (up to
       4.5 s) and then returns; whatever is still running is ended by the job object.
     Must be called from the main thread."""
-    def in_main(reason: str):
-        def handler(signum, frame):
+    def in_main(reason: str) -> Callable[[int, FrameType | None], None]:
+        def handler(signum: int, frame: FrameType | None) -> None:
             request_stop(reason)
         return handler
     for name, reason in (("SIGTERM", "sigterm"), ("SIGHUP", "sighup"), ("SIGBREAK", "sigbreak")):
