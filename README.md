@@ -8,6 +8,7 @@ The NVIDIA (CUDA), AMD (HIP/ROCm) and Apple (Metal) runtimes are removed. What's
 [upstream Strata](https://github.com/Niko1221/Strata).
 
 What differs from upstream, what was removed and what stays upstream's: [docs/FORK.md](docs/FORK.md).
+Every command and flag, from the real `--help` output: [docs/CLI.md](docs/CLI.md).
 
 Not affiliated with Intel or with upstream Strata.
 
