@@ -9,6 +9,14 @@ The NVIDIA (CUDA), AMD (HIP/ROCm) and Apple (Metal) runtimes are removed. What's
 
 Not affiliated with Intel or with upstream Strata.
 
+## Read next
+
+- [docs/FORK.md](docs/FORK.md): what differs from upstream, what was removed, what stays upstream's.
+- [docs/B70.md](docs/B70.md): the numbers that were measured, the switches, the build and run commands. Read it first.
+- [docs/CLI.md](docs/CLI.md): every command and flag, from the real `--help` output.
+- [docs/README.md](docs/README.md): the index of all pages.
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) when something fails.
+
 ## Who maintains this and where to ask
 
 One person, on one B70: [riceharvest](https://github.com/riceharvest), on X as

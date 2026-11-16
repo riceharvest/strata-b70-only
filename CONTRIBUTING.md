@@ -53,9 +53,10 @@ Reproduction status: <reproduced locally OR unconfirmed static analysis>
 
 ## Titles
 
-Every issue and pull request title starts with its area in square brackets, then a short description: `[Engine]`, `[GUI]`, `[TUI]`,
-`[Benchmark]`, `[Docs]` or `[Other]`. For example `[Engine] fix decode stop on long prompts` or `[GUI] keep the model list after a tab
-switch`. The issue forms ask for the area and a check on the title fails when the prefix is missing.
+Every issue and pull request title starts with its area in square brackets, then a short description: `[Engine]`, `[TUI]`,
+`[Benchmark]`, `[Docs]` or `[Other]`. For example `[Engine] fix decode stop on long prompts` or `[TUI] keep the connect screen after a
+resize`. The issue forms ask for the area and a check on the title fails when the prefix is missing. This fork has no desktop app,
+so it has no `[GUI]` area.
 
 ## Prepare a focused pull request
 

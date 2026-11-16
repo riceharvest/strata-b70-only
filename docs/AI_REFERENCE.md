@@ -3,7 +3,7 @@
 Last reviewed: 25 October 2026 against the 0.2.5 release tree (app and Terminal 0.2.5; Control and engines 0.1.50).
 App, Control and engine versions differ; use the release notes and the installed component information. This page
 holds the technical context behind the short [README](../README.md). Use [AI_SETUP.md](AI_SETUP.md) to install Strata for a user,
-[AGENTS.md](../AGENTS.md) for repository work, and [MEDIA_KIT.md](MEDIA_KIT.md) for articles or videos.
+[AGENTS.md](../AGENTS.md) for repository work.
 
 ## Product facts and sources
 
@@ -80,7 +80,7 @@ does not imply that every model or feature works on it.
 | AMD Radeon / HIP | Upstream `AMD_HIP.md` (removed in this fork); RX 6000 validation differed from newer cards |
 | Intel Arc / SYCL | [B70.md](B70.md), [INTEL.md](INTEL.md), [INTEL_ARC.md](INTEL_ARC.md); Linux SYCL engine targeting one Arc Pro B70 |
 | Apple Silicon / Metal | Upstream `MAC.md` (removed in this fork) |
-| AMD Ryzen AI Max / Strix Halo | Upstream `STRIX_HALO.md` (removed in this fork; historical Windows notes in [STRIX_HALO_WINDOWS.md](STRIX_HALO_WINDOWS.md)) |
+| AMD Ryzen AI Max / Strix Halo | Upstream `STRIX_HALO.md` and `STRIX_HALO_WINDOWS.md` (removed in this fork) |
 | Multiple GPUs and older hardware | Upstream `MULTI_GPU.md` and `OLDER_GPUS.md` (removed in this fork) |
 
 Use the model's actual memory and disk requirements. RAM, VRAM, unified memory, download size and temporary
@@ -126,5 +126,4 @@ See [connection instructions and limits](TERMINAL_LAUNCH.md#connect-your-apps-st
   The [standard benchmark protocol](BENCHMARK_PROTOCOL.md) remains subject to its documented activation status;
   do not label legacy commands or results as implementing it.
 - Mark missing or unverified information explicitly. Never invent measurements, test results or download links.
-- For contribution evidence, follow [CONTRIBUTING.md](../CONTRIBUTING.md). For video assets and narration,
-  follow [MEDIA_KIT.md](MEDIA_KIT.md).
+- For contribution evidence, follow [CONTRIBUTING.md](../CONTRIBUTING.md).

@@ -22,7 +22,7 @@ install does not need a source checkout or a startup `.bat` file.
 | Windows or Linux x86-64 with a supported AMD Radeon | Upstream AMD/HIP guide (removed in this fork). |
 | Linux x86-64 with Intel Arc | [Intel Arc guide](INTEL_ARC.md), [SYCL build notes](INTEL.md), and [B70 branch notes](B70.md); this fork targets one Arc Pro B70 on Linux |
 | Apple Silicon Mac, macOS 15 or newer | Upstream Mac/Metal guide (removed in this fork). Intel Macs were not supported. |
-| AMD Ryzen AI Max / Strix Halo | Upstream Strix Halo Linux guide (removed in this fork; see [Windows notes](STRIX_HALO_WINDOWS.md) for upstream history) |
+| AMD Ryzen AI Max / Strix Halo | Upstream Strix Halo Linux guide (removed in this fork) |
 
 Memory and disk needs depend on the **model, quantization, context and enabled features**. Check
 [which model fits](MODELS.md#pick-by-memory); download size is not the same as RAM use. Unified memory counts once.
