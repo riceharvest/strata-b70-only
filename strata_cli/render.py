@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import time
 import unicodedata
-from typing import Any
+from typing import Any, Iterator
 
 from strata_cli import nav
 from strata_cli.client import complete_slots
@@ -59,7 +59,7 @@ def _regional_indicator(char: str) -> bool:
     return 0x1F1E6 <= ord(char) <= 0x1F1FF
 
 
-def _clusters(value: Any):
+def _clusters(value: Any) -> Iterator[str]:
     """Yield printable clusters without terminal controls or bidi formatters."""
     current = ""
     join_emoji = False

@@ -10,9 +10,11 @@ import sys
 import time
 
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
+from textual.geometry import Size
 from textual.widgets import Input, Static
 
 from strata_cli import nav
@@ -106,7 +108,7 @@ class MonitorApp(App):
     ]
 
     def __init__(self, endpoint: Endpoint, snapshot: dict | None, *, interval: float = 1.0,
-                 requests: int = 12, theme: str = "auto", color: str = "auto", glyphs: str = "auto"):
+                 requests: int = 12, theme: str = "auto", color: str = "auto", glyphs: str = "auto") -> None:
         super().__init__()
         self.endpoint = endpoint
         self.latest = snapshot if snapshot is not None else {"source": "pending"}
@@ -187,7 +189,7 @@ class MonitorApp(App):
         """Six views, and a seventh (Connect) when `strata launch` opened the monitor: arrows, number keys and the tab line all use this."""
         return nav.count(self.connect_enabled)
 
-    def _paint(self, size=None) -> None:
+    def _paint(self, size: Size | None = None) -> None:
         size = self.screen.size if size is None else size
         if self.view >= len(VIEWS):          # the Connect view belongs to the launch-aware monitor (strata_cli/launch/monitor_ext.py)
             return
@@ -329,7 +331,7 @@ class MonitorApp(App):
         self.error = f"Opened {url} in your browser" if opened else f"Open {url} in a browser (none could be started here)"
         self._paint()
 
-    def on_resize(self, event) -> None:
+    def on_resize(self, event: events.Resize) -> None:
         self._paint(event.size)
 
     def action_quit(self) -> None:

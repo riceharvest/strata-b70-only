@@ -36,7 +36,7 @@ def complete_slots(work: dict) -> list[dict] | None:
 
 
 class ClientError(Exception):
-    def __init__(self, message: str, exit_code: int = 3, *, http_status: int | None = None):
+    def __init__(self, message: str, exit_code: int = 3, *, http_status: int | None = None) -> None:
         super().__init__(message)
         self.exit_code = exit_code
         self.http_status = http_status
@@ -88,7 +88,7 @@ class Endpoint:
     timeout: float = 3.0
     prefix: str = ""
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         object.__setattr__(self, "root", server_url(self.root))
         object.__setattr__(self, "prefix", url_prefix(self.prefix))
         if not 0 < self.timeout <= 30:

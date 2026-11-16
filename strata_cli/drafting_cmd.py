@@ -7,6 +7,7 @@ only in that case, so the app can call it before every load without asking twice
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -14,7 +15,7 @@ from pathlib import Path
 from strata_control import acquisition, drafting
 
 
-def add_parser(sp) -> None:
+def add_parser(sp: argparse._SubParsersAction) -> None:
     drafting_p = sp.add_parser("drafting", help="the DFlash2 drafter file: what it would download, and fetch it")
     d_sp = drafting_p.add_subparsers(dest="drafting_command", required=True)
     for name, text in (("plan", "say what fetching would download; nothing is changed"),
@@ -33,7 +34,7 @@ def _card_class() -> str:
     return drafting.card_class([])                          # the table has no Intel Arc row: "other"
 
 
-def _inputs(a) -> dict:
+def _inputs(a: argparse.Namespace) -> dict:
     cfg: dict = {}
     if a.config:
         try:
@@ -50,7 +51,7 @@ def _inputs(a) -> dict:
     return {"mode": a.mode if a.mode else cfg.get("drafting"), "klass": _card_class(), "model_name": cfg.get("model_name"), "family": a.family, "data_dir": data}
 
 
-def run(a) -> int:
+def run(a: argparse.Namespace) -> int:
     from strata_control import drafting_fetch      # here, not at the top: it pulls in the network code, which a started engine's command line must not load
     machine = a.output in ("json", "jsonl")
     want = _inputs(a)

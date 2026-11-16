@@ -30,7 +30,7 @@ WORK_SAMPLE_MAX_AGE_S = 5.0
 _ASCII_BOXES = False
 
 
-def _rounded():
+def _rounded() -> box.Box:
     """Panel corners: rounded where the font has them, square (Consolas has these) in the classic Windows console."""
     return box.SQUARE if _ASCII_BOXES else box.ROUNDED
 
@@ -54,7 +54,7 @@ def _current_batch_value(row: dict, key: str) -> Any:
 class MonitorHistory:
     """Small display-only device history, reset when the server changes."""
 
-    def __init__(self, limit: int = 32):
+    def __init__(self, limit: int = 32) -> None:
         self.limit = limit
         self.instance: tuple[str, str] | None = None
         self.device_util: dict[int, deque[float | None]] = {}

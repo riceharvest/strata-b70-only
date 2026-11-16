@@ -46,7 +46,7 @@ def _common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--output", choices=("human", "json", "jsonl"), default="human")
 
 
-def add_parsers(sp, components_sp) -> list:
+def add_parsers(sp: argparse._SubParsersAction, components_sp: argparse._SubParsersAction) -> list:
     update = sp.add_parser("update", help="download and install the engine for this PC (and Control) from the signed feed; switches only after a test start")
     _common(update)
     update.add_argument("--check", action="store_true", help="only read the feed and say what would change")
@@ -69,7 +69,7 @@ def add_parsers(sp, components_sp) -> list:
     return [update, comp_update, rollback, install_file]
 
 
-def _emit_factory(a, lines: list):
+def _emit_factory(a: argparse.Namespace, lines: list):
     machine = a.output in ("json", "jsonl")
     state = {"pct": -10}
 
@@ -94,7 +94,7 @@ def _emit_factory(a, lines: list):
     return emit
 
 
-def _feed_source(a, root: Path) -> str:
+def _feed_source(a: argparse.Namespace, root: Path) -> str:
     from strata_control import updater
     if a.feed:
         return a.feed
@@ -180,7 +180,7 @@ def _print_check(report: dict) -> None:
         print("  An engine is serving; an update waits until it stops.")
 
 
-def run(a) -> int:
+def run(a: argparse.Namespace) -> int:
     from strata_control import acquisition, engine_component as ec, feed as feedmod, signing, updater
     machine = a.output in ("json", "jsonl")
 
@@ -266,7 +266,7 @@ def run(a) -> int:
         return fail("stopped; a partial download is kept and the next update resumes it", 130)
 
 
-def _maybe_wait(a, ctx, machine: bool) -> None:
+def _maybe_wait(a: argparse.Namespace, ctx, machine: bool) -> None:
     """If an engine is serving and no --wait was given, a terminal user is asked whether to wait; a script is told no."""
     if ctx.wait:
         return

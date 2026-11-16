@@ -34,6 +34,7 @@ import stat
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 from strata_cli.client import server_url, url_prefix
 
@@ -45,7 +46,7 @@ DEFAULT_URL = "http://127.0.0.1:8095"
 
 
 class ConnectionError(ValueError):
-    def __init__(self, message: str, exit_code: int = 2):
+    def __init__(self, message: str, exit_code: int = 2) -> None:
         super().__init__(message)
         self.exit_code = exit_code
 
@@ -188,7 +189,7 @@ def _replace(path: Path, data: bytes) -> None:
 
 
 @contextmanager
-def _lock(name: str):
+def _lock(name: str) -> Iterator[None]:
     path = connection_dir(create=True) / f".{_name(name)}.lock"
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(descriptor, "r+b") as stream:

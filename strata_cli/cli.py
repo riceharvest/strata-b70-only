@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 from strata_control import profiles
 
@@ -31,7 +32,8 @@ class _VersionAction(argparse.Action):
     """--version on one line: argparse's own version action wraps the text at the terminal width, and a path to the
     interpreter is the thing a user (and the packaging smoke test) wants to read back whole."""
 
-    def __call__(self, parser, namespace, values, option_string=None):
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace, values: object,
+                 option_string: str | None = None) -> None:
         import strata_cli
         sys.stdout.write(f"strata {strata_cli.PRODUCT_VERSION} (build {strata_cli.version()}; python {sys.version.split()[0]} at {sys.executable})\n")
         parser.exit()
@@ -821,7 +823,7 @@ def _serve_error(a: argparse.Namespace, message: str, code: int = 2) -> int:
     return _error(message, code, a.output == "json")
 
 
-def _serve_jsonl(server_main, args: list[str], plan: dict, *, quiet: bool = False) -> int:
+def _serve_jsonl(server_main: Callable[..., int], args: list[str], plan: dict, *, quiet: bool = False) -> int:
     output = sys.stdout
     output_open = True
     ready = False
@@ -883,7 +885,7 @@ def _serve_jsonl(server_main, args: list[str], plan: dict, *, quiet: bool = Fals
     return result
 
 
-def _serve_foreground(server_main, args: list[str], plan: dict, *, output: str, quiet: bool) -> int:
+def _serve_foreground(server_main: Callable[..., int], args: list[str], plan: dict, *, output: str, quiet: bool) -> int:
     if output == "jsonl":
         return _serve_jsonl(server_main, args, plan, quiet=quiet)
     if quiet:
@@ -1031,7 +1033,7 @@ def _doctor(a: argparse.Namespace) -> int:
     return 0 if report["ok"] else 5
 
 
-def _direct_calibration(ref: str, kind: str, report_path: Path, action) -> tuple[str | None, dict]:
+def _direct_calibration(ref: str, kind: str, report_path: Path, action: Callable[[], dict]) -> tuple[str | None, dict]:
     """Saved profiles share the local journal; explicit run-config paths keep legacy behavior."""
     _, saved, revision = profiles.resolve(ref)
     if saved is None:
@@ -1555,7 +1557,7 @@ def _timeskip(a: argparse.Namespace) -> int:
 
     run = time_skip.TimeSkipRun(state_root(), workspace, a.prompt, checks, max_attempts=a.attempts)
 
-    def revise(candidate: Path, prompt: str, attempt: int):
+    def revise(candidate: Path, prompt: str, attempt: int) -> str | None:
         if not a.revise_command:
             return None
         env = {**os.environ, "STRATA_TIMESKIP_PROMPT": prompt,
@@ -2179,7 +2181,7 @@ def _run(a: argparse.Namespace) -> int:
 class _QuietCapture:
     """Keep the last human output to show only when an operation fails."""
 
-    def __init__(self, limit: int = 64 * 1024):
+    def __init__(self, limit: int = 64 * 1024) -> None:
         self.limit = limit
         self.text = ""
         self.truncated = False

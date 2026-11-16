@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 ENV_GUARD = "STRATA_HANDOVER"
@@ -31,7 +32,7 @@ _FOLDER = re.compile(r"^[\w.+-]+$")
 _VERSION = re.compile(r"^[0-9]+(\.[0-9]+){1,3}(-[0-9A-Za-z][0-9A-Za-z.]*)?$")     # 0.2.2, or a pre-release such as 0.2.2-rc1
 
 
-def components_dir(environ=None) -> Path:
+def components_dir(environ: Mapping[str, str] | None = None) -> Path:
     """The per-user component folder (same rule as strata_control/engine_component.py components_dir)."""
     environ = os.environ if environ is None else environ
     if environ.get("STRATA_COMPONENTS_DIR"):
@@ -42,7 +43,7 @@ def components_dir(environ=None) -> Path:
     return Path(environ.get("XDG_DATA_HOME") or str(home / ".local" / "share")) / "strata" / "components"
 
 
-def version_key(text) -> tuple[int, ...] | None:
+def version_key(text: object) -> tuple[int, ...] | None:
     if not isinstance(text, str) or not _VERSION.fullmatch(text.strip()):
         return None
     base, dash, _pre = text.strip().partition("-")
@@ -67,7 +68,7 @@ def bundled_python(folder: Path) -> Path:
     return folder / "python" / "python.exe" if os.name == "nt" else folder / "python" / "bin" / "python3"
 
 
-def find_target(running: str, environ=None, root: Path | None = None):
+def find_target(running: str, environ: Mapping[str, str] | None = None, root: Path | None = None):
     """(folder, version, problem). folder is a newer, whole Control; or None with problem None (nothing to do) or a reason
     (a newer Control is named but cannot be used)."""
     root = components_dir(environ) if root is None else Path(root)
@@ -114,7 +115,7 @@ def find_target(running: str, environ=None, root: Path | None = None):
     return folder, version, None
 
 
-def _child_env(environ) -> dict:
+def _child_env(environ: Mapping[str, str]) -> dict:
     env = dict(environ)
     env[ENV_GUARD] = "1"
     env["PYTHONNOUSERSITE"] = "1"
@@ -123,7 +124,7 @@ def _child_env(environ) -> dict:
     return env
 
 
-def maybe_hand_over(argv, environ=None, root=None, running=None, execv=None, run=None, warn=None) -> int | None:
+def maybe_hand_over(argv: Sequence[str], environ: Mapping[str, str] | None = None, root=None, running=None, execv=None, run=None, warn=None) -> int | None:
     """Returns None to carry on with the current Control, or an exit code when a newer Control already ran this command
     (Windows; on POSIX the process is replaced and this does not return)."""
     environ = os.environ if environ is None else environ
@@ -171,7 +172,7 @@ OLD_LAUNCHER_EXIT = 7
 _STAGE_FOLDER = ".s"                                 # strata_control.updater.STAGE_DIR: the folder a Control is test-started from
 
 
-def refuse_old_updater(argv, environ=None, tree=None) -> int | None:
+def refuse_old_updater(argv: Sequence[str], environ: Mapping[str, str] | None = None, tree=None) -> int | None:
     """0.2.0-beta's Terminal (Control 0.1.45.3) and the other releases before 0.1.46.2 install a newer Control and report success, but their
     launcher never switches to it (no hand-over code), so the update would change nothing. They test-start the staged Control with
     `--version`, with STRATA_NO_ACQUIRE=1 and without STRATA_HANDOVER (every updater that can hand over sets it). This Control, started that
