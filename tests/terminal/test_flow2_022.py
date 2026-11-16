@@ -150,7 +150,7 @@ class LinkedShards(Base):
                          "a.gguf and b.gguf: the file is cut short (a download or copy that did not finish)")
         self.assertEqual(models.problem_words(["multiple_model_groups", "unrecognized_or_unsupported_model_variant"]),
                          "the folder holds more than one model")
-        many = [f"unsupported_or_missing_architecture", "incomplete_or_invalid_shard_set", "multiple_model_groups",
+        many = ["unsupported_or_missing_architecture", "incomplete_or_invalid_shard_set", "multiple_model_groups",
                 "unsupported_or_incomplete_tokenizer_metadata", "missing_or_unexpected_expert_quantization"]
         self.assertTrue(models.problem_words(many).endswith("and 2 more problems"))
 

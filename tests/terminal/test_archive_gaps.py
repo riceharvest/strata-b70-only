@@ -14,7 +14,6 @@ sys.path.insert(0, str(ROOT))
 
 from strata_control import calibration, tune_apply, tuning  # noqa: E402
 from strata_control.profiles import ProfileError  # noqa: E402
-from strata_control.targets import host_platform  # noqa: E402
 
 
 class BooleanFlags(unittest.TestCase):

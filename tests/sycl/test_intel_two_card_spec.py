@@ -4,7 +4,6 @@ The rule changes only the generated default (--spec 4).  Single cards, Alchemist
 layer and anything the person set stay as they are.  Also checks the two places that apply it: sycl/setup_intel.py's
 config rewrite (through apply_to_config) and the Intel server's engine_args wrapper."""
 import importlib.util
-import json
 import sys
 from pathlib import Path
 

@@ -3,16 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
-import threading
 import time
 import unittest
-from pathlib import Path
 from unittest import mock
 
 from strata_cli.launch import access, settings as S, store
-from strata_cli.launch.app import Ctx, LaunchApp, run_monitor
+from strata_cli.launch.app import Ctx, LaunchApp
 from strata_cli.launch.runner import Cancelled, Event, LaunchError, Result
 from strata_cli.launch.widgets import Glyphs
 from tests.terminal.launch_support import HW_12, HW_24, HW_2X16, Home, catalog, text_of

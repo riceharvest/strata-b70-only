@@ -13,7 +13,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 import setup  # noqa: E402
-from test_setup_hybrid import fake_sys  # noqa: E402
 
 BASE = ["--expert-cache", "auto", "--prefill", "auto", "--max-context", "65536"]
 

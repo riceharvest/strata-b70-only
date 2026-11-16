@@ -8,7 +8,7 @@
 Parks three conversations, runs a fourth (D), SAVEs it, runs an unrelated one, RESTOREs, and checks that D's next turn
 gives the same token ids after the restore as it does when continued live.  Prints SAVE: ok|refused (...) and PASS/FAIL.
 """
-import json, os, sys, threading, time
+import json, os, sys, threading
 from pathlib import Path
 
 REPO = Path(os.environ.get("STRATA_REPO", Path(__file__).resolve().parent.parent))

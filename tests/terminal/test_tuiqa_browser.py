@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from strata_cli.launch import cmd, settings as S
+from strata_cli.launch import settings as S
 from strata_cli.launch.runner import Result, Runner, derive_config
 from strata_control import tune_knobs
 from tests.terminal.launch_support import Home, run_cli

@@ -4,8 +4,6 @@ other make is mentioned in one plain line, and two models at once (one per make)
 
 from __future__ import annotations
 
-import os
-import sys
 import unittest
 from pathlib import Path
 from unittest import mock

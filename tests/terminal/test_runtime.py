@@ -1336,7 +1336,7 @@ class StartWaitLimit(unittest.TestCase):
         # ceiling was raised (#3949), a long start died at each of the first two with
         # "start wait must be finite seconds in 0..600" / "direct runtime intent has an invalid timeout". So this walks the
         # whole way with only the engine itself faked: any layer that still carries the old 600 s shows up here.
-        from strata_control import journal as jn, management as mg, profiles as pr, runtime as rt
+        from strata_control import management as mg, runtime as rt
         revision = "0123456789abcdef"
         for wait in (300, 600, 601, rt.MAX_START_WAIT):
             reached = {}

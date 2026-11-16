@@ -13,7 +13,6 @@ hands the engine and what it reads back.
 from __future__ import annotations
 
 import json
-import re
 import unittest
 from pathlib import Path
 from types import SimpleNamespace

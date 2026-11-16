@@ -14,8 +14,7 @@ from textual.app import App
 
 from strata_cli.launch import app as launch_app
 from strata_cli.launch import settings as S
-from strata_cli.launch.app import Ctx, LaunchApp
-from strata_cli.launch.widgets import Glyphs
+from strata_cli.launch.app import LaunchApp
 from tests.terminal.launch_support import HW_12, Home, catalog, text_of
 from tests.terminal.test_launch_tui import FakeRunner, SIZE, make_ctx
 

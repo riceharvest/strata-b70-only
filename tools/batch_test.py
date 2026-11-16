@@ -5,7 +5,7 @@ windows (BGEN), greedy.  Every slot's tokens must equal its solo tokens; prints 
   python3 tools/batch_test.py --exe engine/strata --config strata-<model>.json --batch 4 --n 4 \
       --extra "--layer-split 12,24,36 --trim-stage-weights --pcie-frac 0 --adapt-every 1000000"
 """
-import argparse, json, os, subprocess, sys, tempfile, threading, time
+import argparse, json, os, subprocess, sys, tempfile, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))

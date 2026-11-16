@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import platform
 import re
 import shutil
 import sys

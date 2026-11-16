@@ -10,7 +10,6 @@ import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from strata_control import tune_session
 from strata_control.tune_session import RequestSet, WorkerEngine, WorkerSession, parse_facts, failure_kind, make_prompt
 
 

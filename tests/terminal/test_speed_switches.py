@@ -7,8 +7,6 @@ the run config's "env" (`--set STRATA_KVA=1` turns Faster long prompts on); a de
 from __future__ import annotations
 
 import json
-import shutil
-import subprocess
 import unittest
 from pathlib import Path
 

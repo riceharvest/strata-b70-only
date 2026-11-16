@@ -15,7 +15,6 @@ from __future__ import annotations
 import http.server
 import json
 import sys
-import tempfile
 import threading
 import time
 import unittest

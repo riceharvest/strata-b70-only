@@ -25,7 +25,7 @@ Exact comparisons need the same settings as batch_test.py (this script sets STRA
 Without --no-prefill-borrow the slots decoding during C's read see the expert cache without the slots C's prompt
 borrowed (those experts run on the CPU, which rounds differently): A's and B's text may then drift from solo.
 """
-import argparse, json, os, re, sys, time
+import argparse, json, re, sys, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))

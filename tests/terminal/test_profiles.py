@@ -3,7 +3,6 @@
 import io
 import json
 import os
-import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout

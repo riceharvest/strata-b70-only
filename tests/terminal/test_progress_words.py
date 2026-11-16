@@ -138,7 +138,6 @@ class CombinedFigure(unittest.TestCase):
             files = [{"path": str(folder / "m-00001-of-00002.gguf"), "bytes": 1_000_000_000, "role": "model"}]
             prog_ = {"step": "5/7: downloading X", "download": {"file": "m-00001-of-00002.gguf", "done_gb": 0.5, "total_gb": 1.0, "percent": 50}}
             # the .part says 1000 bytes here; make it say 1 GB without writing it
-            import os
             with open(part, "r+b") as f:
                 f.truncate(1_000_000_000)
             out = strata_mcp.files_progress(prog_, {"total_gb": 1.0}, files)

@@ -6,14 +6,12 @@ launch-aware extras: a Connect view (key 7) and a quit question (keep serving in
 
 from __future__ import annotations
 
-import json
 import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from rich.text import Text
 from textual.app import App
 from textual.binding import Binding
 
@@ -418,7 +416,6 @@ def run_monitor(info: dict, *, keep_default: bool = True, color: str = "auto") -
     app = LaunchMonitor(endpoint, None, info=info, color=color)
     app.run()
     if app.stop_requested:
-        from strata_cli.launch.runner import Runner as R
         from strata_control import runtime
         try:
             runtime.stop(info["profile"], timeout=180)

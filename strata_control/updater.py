@@ -779,8 +779,8 @@ def _test_start_failure(component: ec.EngineComponent, started: dict, ctx: Conte
             return TestStartFailed(component.version, f"it loaded the model but did not answer one token within {minutes} minutes",
                                    busy=False, hint="Nothing was changed. Run `strata update` again; if it happens again, report it with the log." + kept)
         if phase == "ready_file_not_matched":
-            return TestStartFailed(component.version, f"it reported that it was ready, but Strata could not match it to the engine process it "
-                                   f"started", busy=False,
+            return TestStartFailed(component.version, "it reported that it was ready, but Strata could not match it to the engine process it "
+                                   "started", busy=False,
                                    hint="This looks like a problem in Strata, not in your engine or card. Nothing was changed; report it with the log." + kept)
         return TestStartFailed(component.version, f"it was still loading the model after {minutes} minutes", busy=True,
                                hint="Nothing was changed. A slow disk or a card that other programs are using can do this: close them and run "

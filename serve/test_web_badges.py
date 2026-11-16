@@ -4,7 +4,6 @@ A request that waits past the queue limit ends with finish "timeout"; the Status
 """
 from __future__ import annotations
 
-import re
 import unittest
 from pathlib import Path
 

@@ -31,7 +31,7 @@ tools, the tool results, the turns.
 The run folder gets: run.json (settings, per agent and task: time, exit code, tool calls seen), agent-<i>/ (working copy,
 events-<task>.jsonl: the harness's output, a time stamp a line), metrics.json (the server's GET /metrics), engine.log.
 """
-import argparse, json, os, shlex, shutil, subprocess, sys, threading, time, urllib.request
+import argparse, json, os, shlex, shutil, subprocess, threading, time, urllib.request
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_FILES = "tools/b70_pack.py,tools/test_b70_pack.py,tools/gguf_reader.py,docs/B70_LIB.md"

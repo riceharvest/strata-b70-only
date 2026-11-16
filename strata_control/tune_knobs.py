@@ -16,9 +16,8 @@ bit-exact run to run). Only ``exact`` is picked on its own; the others need the 
 
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass, field
-from typing import Any, Callable, Sequence
+from typing import Any, Sequence
 
 from strata_control import user_args
 

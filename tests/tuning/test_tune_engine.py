@@ -12,8 +12,6 @@ as a slow one will happily recommend a configuration that does not work.
 
 from __future__ import annotations
 
-import os
-import stat
 import sys
 import tempfile
 import unittest

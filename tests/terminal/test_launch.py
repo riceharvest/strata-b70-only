@@ -372,7 +372,6 @@ class SetupArgs(unittest.TestCase):
     def test_an_arc_b_series_card_is_allowed_with_pictures_on_the_cpu_reader_and_one_plain_line(self):
         """Owner decision 2026-10-22: Arc B-series (Battlemage) runs like any Arc. An Arc Pro B70 (32 GB) gets pictures on, with the CPU reader (the GPU
         reader has not run on a 24 GB+ Arc), and a warn-level note that it is new and how to report a problem. An A-series card gets no such note."""
-        from strata_cli.launch import cmd
         for name, vram, note in (("Intel Arc Pro B70", 32.0, True), ("Intel Arc B580", 12.0, True), ("Intel Arc A750", 8.0, False)):
             hw = {"ram_gb": 64.0, "os": "Linux", "cpu": {"avx2": True, "name": "x"},
                   "gpus": [{"index": 0, "name": name, "vendor": "intel", "vram_gb": vram, "usable": True}]}
@@ -576,7 +575,7 @@ class AdoptRules(unittest.TestCase):
 
     def test_the_cards_of_this_launch_go_into_its_config_without_reinstalling(self):
         from tests.terminal.launch_support import HW_2X16
-        from strata_cli.launch.runner import apply_cards, cards_for_launch
+        from strata_cli.launch.runner import cards_for_launch
         from strata_control import tune_knobs
         base = {"exe": "component:strata-engine", "args": ["--max-context", "32768"], "gpu": 0, "port": 8080}
         with Home() as h:

@@ -1,7 +1,6 @@
 """The pair-trellis ggml types (147-149: TQP5 / TQP6 / TQP7, Gyro-L): the Python reader and the C++ reader agree on
 their names and block sizes, and the sizes follow the layout (fp16 scale + 8 * K bytes per 128 values)."""
 
-import re
 import sys
 import unittest
 from pathlib import Path

@@ -8,8 +8,6 @@ They are what the screens draw at 110 x 34 (the monitor views at 120 x 36), as t
 from __future__ import annotations
 
 import asyncio
-import io
-import os
 import sys
 import time
 from pathlib import Path
@@ -18,7 +16,6 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from rich.console import Console  # noqa: E402
 
 from strata_cli.launch import access, settings as S, store  # noqa: E402
 from strata_cli.launch.app import Ctx, LaunchApp  # noqa: E402

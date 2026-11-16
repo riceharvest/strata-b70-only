@@ -1188,11 +1188,11 @@ def report_markdown(doc: dict, redact=lambda text: text) -> str:
         "## Model and configuration", "",
         f"- Model: {model['id'] or nm}; quantization {model['quantization'] or nm}; revision {model['revision'] or nm}; "
         f"source revision {model['source_revision'] or nm}",
-        f"- Files: " + ("; ".join(f"`{f['path']}` `{f['sha256'][:16]}...`" for f in model['files']) if model['files'] else nm),
+        "- Files: " + ("; ".join(f"`{f['path']}` `{f['sha256'][:16]}...`" for f in model['files']) if model['files'] else nm),
         f"- Track: **{cfg['track']}** ({cfg['track_notes']})",
         f"- Context {cfg['context_tokens'] or nm} tokens; server capacity {cfg['server_capacity'] or nm} slot(s)",
-        f"- Sampling: " + ", ".join(f"{k} {v}" for k, v in cfg["sampling"].items()) + "; thinking on, preserved",
-        f"- Engine options: `config.json`; chat template: `provenance/chat_template.jinja`", "",
+        "- Sampling: " + ", ".join(f"{k} {v}" for k, v in cfg["sampling"].items()) + "; thinking on, preserved",
+        "- Engine options: `config.json`; chat template: `provenance/chat_template.jinja`", "",
         "## Method", "",
         f"The frozen requests of `bench/prompts/standard-v1` (corpus `{doc['protocol']['corpus_sha256'][:16]}...`) were sent over "
         "loopback HTTP, streaming, one at a time, in this order: 1 warm-up (excluded), 3 repetitions of the short, 4K and 16K prompts, "

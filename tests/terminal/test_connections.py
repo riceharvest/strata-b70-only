@@ -4,20 +4,15 @@ import io
 import json
 import os
 import stat
-import subprocess
-import sys
 import tempfile
-import threading
 import unittest
 from contextlib import redirect_stdout
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
 from strata_cli.cli import main
 from strata_cli import connections
-from strata_cli.client import ClientError, Endpoint, server_url
-from strata_cli.render import render_view
+from strata_cli.client import server_url
 
 
 ROOT = Path(__file__).resolve().parents[2]

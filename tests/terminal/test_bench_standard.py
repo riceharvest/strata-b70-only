@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import copy
-import http.client
 import io
 import json
 import os
@@ -18,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
-from strata_cli import bench, bench_facts, bench_standard as bs
+from strata_cli import bench_facts, bench_standard as bs
 from strata_cli.cli import main
 from strata_control.profiles import ProfileError
 

@@ -2,7 +2,6 @@
 """Validate three repetitions and summarize native timings without mixing tasks."""
 import argparse
 import csv
-import hashlib
 import json
 from pathlib import Path
 import re

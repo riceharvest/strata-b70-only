@@ -5,15 +5,14 @@ screen; the app must still be alive after every key. The same file runs on Windo
 from __future__ import annotations
 
 import asyncio
-import os
 import random
 import unittest
 from unittest import mock
 
-from strata_cli.launch import access, store
+from strata_cli.launch import access
 from strata_cli.launch import settings as S
 from strata_cli.launch.app import LaunchApp
-from tests.terminal.launch_support import HW_12, HW_24, HW_2X16, Home, text_of
+from tests.terminal.launch_support import HW_12, HW_2X16, Home, text_of
 from tests.terminal.test_launch_tui import FakeRunner, make_ctx
 
 HW_H100 = {"ram_gb": 1024.0, "os": "Test OS", "cpu": {"avx2": True, "name": "test cpu"},

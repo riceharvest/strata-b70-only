@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path, PureWindowsPath
 from unittest import mock
 
-from strata_control import engine_component as ec, longpath, updater
+from strata_control import longpath, updater
 
 DATA = json.loads((Path(__file__).parent / "data" / "windows_package_paths.json").read_text(encoding="utf-8"))
 LIMIT = longpath.PLAIN_LIMIT

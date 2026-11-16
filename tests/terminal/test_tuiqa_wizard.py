@@ -13,8 +13,8 @@ from unittest import mock
 from strata_cli.launch import settings as S
 from strata_cli.launch.app import Ctx, LaunchApp
 from strata_cli.launch import params as P
-from tests.terminal.launch_support import HW_12, Home, text_of
-from tests.terminal.test_launch_tui import FakeRunner, make_ctx, press, flat, typed
+from tests.terminal.launch_support import Home, text_of
+from tests.terminal.test_launch_tui import FakeRunner, make_ctx, press, flat
 
 SIZES = ((120, 40), (80, 24), (60, 20), (40, 15))
 

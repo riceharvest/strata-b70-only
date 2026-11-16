@@ -1,7 +1,7 @@
 # ruff: noqa: F821
 # The names walk, A8, A4, PROD, names and conf_T come from the exec() on the next lines (the scripts of this
 # experiment ran from a Windows work folder), so ruff cannot see them. Only that rule is switched off here.
-import json
+import json  # noqa: F401  (used by the exec()d analyze2.py code below, which shares this namespace)
 import numpy as np
 import sys
 sys.path.insert(0, r"C:\dflash2-work")

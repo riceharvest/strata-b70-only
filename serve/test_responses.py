@@ -276,7 +276,6 @@ class NoLeakedSampler(unittest.TestCase):
     running (21 after this file), polling NVML and psutil every second, which skewed serve/test_parallel's timings."""
 
     def test_server_close_ends_the_sampler(self):
-        import time
         tok = ByteTokenizer()
         httpd = serve(Service(MockEngine(tok, ANSWER, max_context=16384), tok, TEMPLATE), port=0)
         sampler = getattr(getattr(httpd, "svc", None), "telemetry", None)

@@ -8,10 +8,7 @@ of key hints. Esc goes back, Enter goes on, q leaves (and says what is kept). Ch
 from __future__ import annotations
 
 import os
-import shutil
-import threading
 from pathlib import Path
-from typing import Any
 
 from rich.text import Text
 from textual.app import ComposeResult

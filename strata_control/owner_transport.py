@@ -62,7 +62,7 @@ def address_for(runtime_dir: Path, name: str) -> str:
     if WINDOWS:
         # The port is chosen by the listener and written into the state file; the address here is
         # only a placeholder that the caller always overwrites with the real one.
-        return f"tcp:127.0.0.1:0"
+        return "tcp:127.0.0.1:0"
     import hashlib
     digest = hashlib.sha256(f"{runtime_dir}\0{name}".encode()).hexdigest()[:16]
     candidate = runtime_dir / f"{digest}.sock"

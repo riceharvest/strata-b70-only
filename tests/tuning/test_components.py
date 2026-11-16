@@ -17,7 +17,6 @@ would be too late.
 from __future__ import annotations
 
 import io
-import json
 import os
 import stat
 import sys

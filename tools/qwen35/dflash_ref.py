@@ -37,7 +37,6 @@ Dump format (written by the engine, one folder):
 import argparse
 import json
 import os
-import struct
 import sys
 import time
 

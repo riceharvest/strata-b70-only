@@ -82,8 +82,8 @@ class EngineMissing(acquisition.AcquisitionRefused):
         RuntimeError.__init__(
             self,
             (f"{notice} (" if notice else "") + f"No engine for this PC was found{where}: {reason}" + (")" if notice else "") + ". The app never downloads an engine while it "
-            f"starts or serves. Download the engine for your GPU with Update engine in the app's Settings, or with "
-            f"`strata update` (or `strata install`) in the Terminal, or copy an engine package into the component folder.")
+            "starts or serves. Download the engine for your GPU with Update engine in the app's Settings, or with "
+            "`strata update` (or `strata install`) in the Terminal, or copy an engine package into the component folder.")
         self.what = "the engine component"
         self.command = "strata install"
 

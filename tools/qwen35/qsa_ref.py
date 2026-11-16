@@ -111,7 +111,6 @@ def main():
 
     # 6. (--pool) the pooled keys from the whole sequence's input rows
     if a.pool:
-        import os
         lines = [ln.split() for ln in open(d + "hall.txt")]
         hb = np.fromfile(d + "hall.f32", dtype="<f4")
         nemb = hb.size // sum(int(t) for _, t in lines)
