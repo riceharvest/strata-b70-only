@@ -2074,12 +2074,22 @@ inline bool q36_tree_on() {
     static const bool v = [] { const char* e = std::getenv("STRATA_Q36_TREE"); return !(e && e[0] == '0'); }();
     return v;
 }
+// STRATA_Q36_TREE_NODES_AB=<n> (an in-run comparison): every other request alone verifies a tree of n rows instead of
+// STRATA_Q36_TREE_NODES; its `req` record says which (`arm` 1).  g_q36_tree_nodes_ab: set by such a request for its steps.
+inline int g_q36_tree_nodes_ab = 0;
+inline int q36_tree_nodes_ab() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_Q36_TREE_NODES_AB");
+        return e && *e ? std::max(2, std::min(16, std::atoi(e))) : 0;
+    }();
+    return v;
+}
 inline int q36_tree_nodes() {
     static const int v = [] {
         const char* e = std::getenv("STRATA_Q36_TREE_NODES");
         return e && *e ? std::max(2, std::min(16, std::atoi(e))) : 8;
     }();
-    return v;
+    return g_q36_tree_nodes_ab > 0 ? g_q36_tree_nodes_ab : v;
 }
 inline float q36_tree_thr0() {
     static const float v = [] {
@@ -12271,6 +12281,10 @@ struct Serve {
         const char* const pr_how = E.unpark_n > pr_unpark_n0 ? "unpark" : pr_copy && pr_ckpt ? "copy+ckpt" : pr_copy ? "copy" : pr_ckpt ? "ckpt"
                                    : reuse > 0 ? "live" : "none";
         const long long pr_id = ++prof_req_n;
+        // STRATA_Q36_TREE_NODES_AB: every other request alone takes the other tree size for its steps
+        struct TreeArm { ~TreeArm() { g_q36_tree_nodes_ab = 0; } } tree_arm_guard;
+        const int pr_arm = (!adm && q36_tree_nodes_ab() > 0 && (pr_id & 1) != 0) ? 1 : 0;
+        if (pr_arm) g_q36_tree_nodes_ab = q36_tree_nodes_ab();
         // one record at the request's end: `out` tokens written here in `dec_ms` over `steps` steps (0: an admission's one token)
         const auto prof_req = [&](long long out, double read_ms, double dec_ms, const char* fin, long long tokens_read, long long offered_, long long accepted_,
                                   long long look_off, long long look_acc, long long n_tree, long long n_chain, long long n_look, long long n_df) {
@@ -12279,10 +12293,10 @@ struct Serve {
                                  "\"read\":%lld,\"read_ms\":%.1f,\"sess_ms\":%.1f,\"park_ms\":%.1f,\"unpark_ms\":%.1f,\"to_drive\":%lld,\"from_drive\":%lld,"
                                  "\"out\":%lld,\"dec_ms\":%.1f,\"steps\":{\"tree\":%lld,\"chain\":%lld,\"lookup\":%lld,\"drafter\":%lld},"
                                  "\"offered\":%lld,\"accepted\":%lld,\"look_offered\":%lld,\"look_accepted\":%lld,\"finish\":\"%s\",\"cells\":%lld,"
-                                 "\"slots_busy\":%d,\"total_ms\":%.1f,\"div\":%lld,\"src_cells\":%lld,\"src_shared\":%lld,\"tail\":%d}\n",
+                                 "\"slots_busy\":%d,\"total_ms\":%.1f,\"div\":%lld,\"src_cells\":%lld,\"src_shared\":%lld,\"tail\":%d,\"arm\":%d}\n",
                          pr_id, prof_t(), prof_ts(), adm ? "adm" : "solo", s, ids.size(), reuse, pr_how, tokens_read, read_ms, pr_sess_ms,
                          E.park_ms - pr_park0, E.unpark_ms - pr_unpark0, E.spill_n - pr_spill0, E.unspill_n - pr_unspill0, out, dec_ms, n_tree, n_chain, n_look, n_df,
-                         offered_, accepted_, look_off, look_acc, fin, (long long) E.pos, n_active, ms_since(pr_t0), pr_div, pr_tcells, pr_tlcp, (int) ss.tail_kept);
+                         offered_, accepted_, look_off, look_acc, fin, (long long) E.pos, n_active, ms_since(pr_t0), pr_div, pr_tcells, pr_tlcp, (int) ss.tail_kept, pr_arm);
         };
         {   // the thread this session holds from here on: the one the reused cells belong to when the request shares more than its
             // first prompt, else a new one that begins with this prompt
