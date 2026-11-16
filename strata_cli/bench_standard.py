@@ -30,6 +30,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable, Iterable, Iterator, NoReturn
 
 from strata_cli import bench_facts as facts
 from strata_cli.bench import _private_mkdir, _write_new
@@ -69,7 +70,7 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _number(value) -> float | None:
+def _number(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value) if math.isfinite(value) and value >= 0 else None
@@ -85,7 +86,7 @@ def _count(value) -> int | None:
 
 # ------------------------------------------------------------------------------------------------------------ the fixtures
 class Corpus:
-    def __init__(self, sha256: str, specs: list[dict], build: dict, manifest: bytes, directory: Path):
+    def __init__(self, sha256: str, specs: list[dict], build: dict, manifest: bytes, directory: Path) -> None:
         self.sha256, self.specs, self.build, self.manifest, self.directory = sha256, specs, build, manifest, directory
 
 
@@ -130,7 +131,7 @@ def load_corpus(directory: Path | None = None) -> Corpus:
 
 # ------------------------------------------------------------------------------------------------------------ HTTP
 class Target:
-    def __init__(self, root: str, key: str | None):
+    def __init__(self, root: str, key: str | None) -> None:
         parts = urllib.parse.urlsplit(root)
         self.scheme, self.host = parts.scheme, parts.hostname or ""
         self.port = parts.port or (443 if parts.scheme == "https" else 80)
@@ -190,7 +191,7 @@ def stream_chat(target: Target, spec: dict, model: str | None, *, timeout_s: flo
     raw["t0"] = start = time.monotonic_ns()
     conn = target.connection(timeout_s)
 
-    def expire():
+    def expire() -> None:
         raw["timed_out"] = True
         sock = getattr(conn, "sock", None)
         if sock is not None:
@@ -306,7 +307,7 @@ def stream_chat(target: Target, spec: dict, model: str | None, *, timeout_s: flo
 # ------------------------------------------------------------------------------------------------------------ scoring
 def strict_json(text: str):
     """One complete JSON value: no duplicate keys, no NaN or Infinity, no prose or fence around it."""
-    def pairs(items):
+    def pairs(items: Iterable[tuple[str, object]]) -> dict:
         out = {}
         for key, value in items:
             if key in out:
@@ -314,12 +315,12 @@ def strict_json(text: str):
             out[key] = value
         return out
 
-    def constant(name):
+    def constant(name: str) -> NoReturn:
         raise ValueError(f"{name} is not JSON")
     return json.loads(text.strip(" \t\r\n\x0b\x0c"), object_pairs_hook=pairs, parse_constant=constant)
 
 
-def same_json(a, b) -> bool:
+def same_json(a: object, b: object) -> bool:
     """Equal values of equal JSON types (true is not 1, 3 is not 3.0); object key order does not matter."""
     if isinstance(a, bool) or isinstance(b, bool):
         return isinstance(a, bool) and isinstance(b, bool) and a == b
@@ -490,7 +491,7 @@ def skipped_record(spec: dict, reason: str) -> tuple[dict, dict, dict]:
 class Collector:
     """Runs the scheduled requests in order and keeps their records."""
 
-    def __init__(self, target: Target, corpus: Corpus, model: str | None, log, timeout_s: float):
+    def __init__(self, target: Target, corpus: Corpus, model: str | None, log: Callable[[str], None], timeout_s: float) -> None:
         self.target, self.corpus, self.model, self.log, self.timeout_s = target, corpus, model, log, timeout_s
         self.meta = {row["id"]: row for row in corpus.build["requests"]}
         self.results: dict[str, tuple[dict, dict, dict]] = {}
@@ -532,7 +533,7 @@ class Collector:
         gate = threading.Event()
         raws: dict[str, dict] = {}
 
-        def work(spec):
+        def work(spec: dict) -> None:
             raws[spec["id"]] = stream_chat(self.target, spec, self.model, timeout_s=self.timeout_s, gate=gate)
         with ThreadPoolExecutor(max_workers=len(specs)) as pool:
             futures = [pool.submit(work, spec) for spec in specs]
@@ -601,7 +602,7 @@ def quality_of(records: list[dict]) -> dict:
     return {"passed": sum(c["passed"] for c in cats.values()), "total": 12, "categories": cats}
 
 
-def scan_nulls(value, path: str = ""):
+def scan_nulls(value: object, path: str = "") -> Iterator[str]:
     if value is None:
         yield path
     elif isinstance(value, dict):
@@ -655,7 +656,7 @@ def default_reason(doc: dict, pointer: str) -> str:
     return "not available"
 
 
-def _start_wait(target: Target, proc, timeout_s: float, log, log_path: Path | None) -> bool:
+def _start_wait(target: Target, proc: subprocess.Popen | None, timeout_s: float, log: Callable[[str], None], log_path: Path | None) -> bool:
     began, announced = time.monotonic(), 0.0
     while time.monotonic() - began < timeout_s:
         if proc is not None and proc.poll() is not None:
@@ -670,7 +671,7 @@ def _start_wait(target: Target, proc, timeout_s: float, log, log_path: Path | No
     return False
 
 
-def start_engine(ref: str, target: Target, log_path: Path, log, timeout_s: float):
+def start_engine(ref: str, target: Target, log_path: Path, log: Callable[[str], None], timeout_s: float) -> subprocess.Popen:
     """Start `strata serve --profile REF` as a child of this run. -> the process."""
     root = Path(__file__).resolve().parents[1]
     command = [sys.executable, str(root / "strata.py"), "serve", "--profile", ref, "--quiet"]
@@ -713,7 +714,7 @@ def engine_log_since(console_log: Path, run_log: Path | None, offset: int) -> Pa
     return console_log
 
 
-def stop_engine(proc) -> str | None:
+def stop_engine(proc: subprocess.Popen | None) -> str | None:
     """Stop only the process this run started. -> None when it is gone, else a plain sentence on why it may still be running
     (a failed taskkill / signal, or a process that outlives the wait): the caller must not report a normal finish then, because
     a process that is still alive can hold the server's port and the GPU (#3438)."""
@@ -766,7 +767,7 @@ def slug(text: str, limit: int = 40) -> str:
 def run(target: Target, out: Path | None, *, out_root: Path | None = None, optional_concurrency: bool = False,
         corpus: Corpus | None = None, declared: dict | None = None, plan: dict | None = None,
         engine_log: Path | None = None, engine_run_log: tuple[Path | None, int] | None = None, command: str = "strata bench run --suite standard-v1",
-        log=lambda message: None, timeout_s: float = REQUEST_TIMEOUT_S, started_engine: bool = False,
+        log: Callable[[str], None] = lambda message: None, timeout_s: float = REQUEST_TIMEOUT_S, started_engine: bool = False,
         hash_model: bool = True) -> tuple[dict, Path]:
     """Run the protocol against `target` and write the report into the new directory `out` (or a new folder named
     <date>-standard-<gpu>-<run id> under `out_root`). -> (the result, the folder)."""
@@ -1157,7 +1158,7 @@ def format_plain(doc: dict) -> str:
     return "\n".join(lines)
 
 
-def report_markdown(doc: dict, redact=lambda text: text) -> str:
+def report_markdown(doc: dict, redact: Callable[[str], str] = lambda text: text) -> str:
     hw, sw, run_block, model, cfg = doc["hardware"], doc["software"], doc["run"], doc["model"], doc["configuration"]
     counts = doc["request_counts"]
     quality = doc["quality"]

@@ -30,6 +30,7 @@ from contextlib import contextmanager, nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable, Iterator
 
 from strata_cli.client import ClientError, Endpoint, _NoRedirect
 from strata_control.profiles import ProfileError
@@ -57,7 +58,7 @@ SUITES = {"serving-smoke": ("warmup", "serial", "mixed"),
 class OperatorCancellation:
     """Stop benchmark-owned streams after an owner-local cancel request appears."""
 
-    def __init__(self, directory: Path):
+    def __init__(self, directory: Path) -> None:
         self.path = directory / "cancel.request"
         self.event = threading.Event()
         self._stop = threading.Event()
@@ -82,7 +83,7 @@ class OperatorCancellation:
                 pass
 
     @contextmanager
-    def track(self, response):
+    def track(self, response: object) -> Iterator[None]:
         # urllib's HTTPResponse owns the socket while reading its buffered stream.
         stream = getattr(response, "fp", None)
         raw = getattr(stream, "raw", None)
@@ -105,11 +106,11 @@ class OperatorCancellation:
                 with self._lock:
                     self._sockets.discard(owned)
 
-    def __enter__(self):
+    def __enter__(self) -> OperatorCancellation:
         self._watcher.start()
         return self
 
-    def __exit__(self, *_):
+    def __exit__(self, *_: object) -> None:
         self._stop.set()
         self._watcher.join(timeout=1)
 
@@ -404,7 +405,7 @@ def _cancel_phase(endpoint: Endpoint, telemetry: Endpoint, *, kind: str,
             samples_omitted += 1
         return snapshot
 
-    def until(check, seconds: float) -> dict | None:
+    def until(check: Callable[[dict], bool], seconds: float) -> dict | None:
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             if operator is not None and operator.event.is_set():
@@ -558,7 +559,7 @@ def _phase(endpoint: Endpoint, telemetry: Endpoint, *, kind: str, count: int,
     last_sample = None
     stop = threading.Event()
 
-    def record(snapshot):
+    def record(snapshot: dict) -> None:
         nonlocal samples_omitted, first_sample, last_sample
         sample = _sample(snapshot)
         if first_sample is None:
@@ -573,7 +574,7 @@ def _phase(endpoint: Endpoint, telemetry: Endpoint, *, kind: str, count: int,
         else:
             samples_omitted += 1
 
-    def poll():
+    def poll() -> None:
         nonlocal sample_errors
         while not stop.is_set() and (operator is None or not operator.event.is_set()):
             try:
@@ -634,7 +635,7 @@ def _phase(endpoint: Endpoint, telemetry: Endpoint, *, kind: str, count: int,
                               ("admission_full", "queue_wait_timeout") for r in requests)
     passed = (sum(bool(r["ok"]) for r in requests) > 0 and expected_overload > 0 and
               unexpected_failures == 0) if kind == "overload" else all(r["ok"] for r in requests)
-    def counter_delta(key):
+    def counter_delta(key: str) -> int | None:
         if (first_sample is None or last_sample is None or
                 first_sample.get("instance_id") != last_sample.get("instance_id") or
                 type(first_sample.get(key)) is not int or type(last_sample.get(key)) is not int):

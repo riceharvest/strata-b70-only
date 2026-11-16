@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Callable, Iterator
 
 ROOT = Path(__file__).resolve().parents[1]
 LOOPBACK = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -32,7 +33,7 @@ class Why(dict):
         self[pointer] = reason
 
 
-def pointer(*parts) -> str:
+def pointer(*parts: object) -> str:
     return "".join("/" + str(p).replace("~", "~0").replace("/", "~1") for p in parts)
 
 
@@ -148,7 +149,7 @@ def cpu_name() -> str | None:
 def lsblk_disk(data: dict) -> list[dict] | None:
     """The first physical disk in `lsblk -J -s` output. `-s` lists the parents of a device as nested children: an LVM volume
     is lvm -> partition -> disk, two levels down, so the walk goes all the way down."""
-    def disks(item):
+    def disks(item: dict) -> Iterator[dict]:
         if item.get("type") == "disk":
             yield item
         for child in item.get("children") or []:
@@ -342,7 +343,7 @@ def detect_quantization(names: list[str]) -> str | None:
     return None
 
 
-def model(why: Why, *, props: dict, status: dict, files: list[Path], declared: dict, log) -> dict:
+def model(why: Why, *, props: dict, status: dict, files: list[Path], declared: dict, log: Callable[[str], None]) -> dict:
     served = props.get("model_alias") or status.get("model")
     rows = []
     for index, path in enumerate(files):
