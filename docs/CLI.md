@@ -2,7 +2,7 @@
 
 Regenerate with `COLUMNS=100 python strata.py --help`, then `COLUMNS=100 python strata.py <command> [<subcommand>] --help` for each command named in it; paste the output unchanged. The engine section is the text of `usage()` in `sycl/src/program/generate.cpp` and of the `strata-q36` usage line in `sycl/src/qwen35/q36_engine.dp.cpp`.
 
-Generated on 2026-11-16 from commit `f7450910a`. The blocks below are the real output; nothing is paraphrased. I did not edit them.
+Generated on 2026-11-16 from commit `d6b112b1a`. The blocks below are the real output; nothing is paraphrased. I did not edit them.
 
 Contents: [`strata`](#strata) · [`serve/server.py`](#serveserverpy) · [`setup.py` / `./setup.sh`](#setuppy--setupsh) · [Engine flags](#engine-flags)
 
@@ -12,12 +12,12 @@ Contents: [`strata`](#strata) · [`serve/server.py`](#serveserverpy) · [`setup.
 
 ```text
 usage: strata [-h] [--version]
-              {serve,profile,repair-access,doctor,components,update,models,drafting,engine,install,runtime,ops,bench,timeskip,tune,presets,launch,connect,status,monitor,logs,connection,config,code} ...
+              {serve,profile,repair-access,doctor,components,update,models,drafting,engine,install,runtime,ops,bench,timeskip,tune,presets,launch,connect,status,monitor,logs,connection,config} ...
 
 Strata serving and terminal clients
 
 positional arguments:
-  {serve,profile,repair-access,doctor,components,update,models,drafting,engine,install,runtime,ops,bench,timeskip,tune,presets,launch,connect,status,monitor,logs,connection,config,code}
+  {serve,profile,repair-access,doctor,components,update,models,drafting,engine,install,runtime,ops,bench,timeskip,tune,presets,launch,connect,status,monitor,logs,connection,config}
     serve               start the existing Strata inference server in the foreground
     profile             edit saved serving overrides outside setup's run config
     doctor              read-only check of installed engine components
@@ -43,7 +43,6 @@ positional arguments:
     logs                bounded redacted request activity (read only)
     connection          save monitor endpoints without storing credential values
     config              inspect effective client connection settings
-    code                coding client for the shared Desktop harness
 
 options:
   -h, --help            show this help message and exit
@@ -1822,7 +1821,7 @@ usage: strata connect [-h] [--url URL] [--key KEY] [--key-env NAME] [--model NAM
 Shows the settings file and environment an app needs to talk to the Strata server that `strata launch` started. Without a name it lists the apps. With --write it writes the file after asking, keeping a backup of any file it replaces.
 
 positional arguments:
-  harness               opencode, codex, claude-code, omp, pi, hermes, openclaw, deepseek-harness
+  harness               opencode, codex, claude-code, omp, pi, hermes, openclaw
 
 options:
   -h, --help            show this help message and exit
@@ -2035,51 +2034,6 @@ options:
   --credential-env NAME
                         environment variable containing the server credential
   --timeout TIMEOUT     bounded request timeout in seconds (default 3)
-  --output {human,json}
-  --json                alias for --output json
-  --quiet               suppress human informational output
-```
-
-### `strata code`
-
-```text
-usage: strata code [-h] [--workspace WORKSPACE] [--resume RESUME] [--quiet] {run,sessions} ...
-
-positional arguments:
-  {run,sessions}
-    run                 scripted harness turn (requires the shared harness component)
-    sessions            shared harness sessions
-
-options:
-  -h, --help            show this help message and exit
-  --workspace WORKSPACE
-  --resume RESUME
-  --quiet               suppress human informational output
-```
-
-#### `strata code run`
-
-```text
-usage: strata code run [-h] --prompt-file PROMPT_FILE --policy POLICY [--output {jsonl}] [--quiet]
-
-options:
-  -h, --help            show this help message and exit
-  --prompt-file PROMPT_FILE
-  --policy POLICY
-  --output {jsonl}
-  --quiet               suppress human informational output
-```
-
-#### `strata code sessions`
-
-```text
-usage: strata code sessions [-h] [--output {human,json}] [--json] [--quiet] {list}
-
-positional arguments:
-  {list}
-
-options:
-  -h, --help            show this help message and exit
   --output {human,json}
   --json                alias for --output json
   --quiet               suppress human informational output
