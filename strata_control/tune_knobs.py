@@ -360,7 +360,6 @@ def plan_arms(ctx: Context, *, mode: str = "quick", history_bad: set[str] | None
     Order: the machine's classes in order (6.2), each class's arms in the table order. Quick keeps the first ones the
     time budget allows; thorough keeps all of them, flat knobs last."""
     classes = machine_classes(ctx)
-    base_flags = _flags_of(ctx.base_args)
     chosen: list[PlannedArm] = []
     skipped: list[dict[str, str]] = []
     seen: set[str] = set()

@@ -68,7 +68,7 @@ def main():
     meta = dict(line.strip().split("=") for line in open(d + "meta.txt") if "=" in line)
     pos, ctx, vt, H, HKV = int(meta["pos"]), int(meta["ctx"]), int(meta["vt"]), int(meta["H"]), int(meta["HKV"])
     layer, nb = int(meta["layer"]), int(meta["blocks"])
-    base, n_rot, eps = float(meta["rope_base"]), int(meta["n_rot"]), float(meta["eps"])
+    base, n_rot = float(meta["rope_base"]), int(meta["n_rot"])
     G = H // HKV
     w = load_idx(a.idx, layer)
     h = np.fromfile(d + "h.f32", dtype="<f4").astype(np.float64)

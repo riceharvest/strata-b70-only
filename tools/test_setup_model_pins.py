@@ -126,7 +126,7 @@ class DownloadChecksThePin(unittest.TestCase):
                 _, out = quiet(setup.download, pinned_url(name), dst)
                 code = None
             except SystemExit as e:
-                code, out = e.code, ""
+                code = e.code
             result = (code, dst.exists(), dst.with_name(dst.name + ".done").exists(),
                       dst.with_name(dst.name + ".part").exists(),
                       dst.with_name(dst.name + ".done").read_text() if dst.with_name(dst.name + ".done").exists() else "")

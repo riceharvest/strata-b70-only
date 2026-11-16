@@ -204,7 +204,6 @@ def active_managed_instances() -> list[dict]:
 
 def _paths(name: str) -> tuple[Path, Path, Path]:
     directory = runtime_dir()
-    digest = hashlib.sha256((str(directory) + "\0" + name).encode("utf-8")).hexdigest()[:16]
     # The address form is the transport's business: POSIX gets a private socket path (with the
     # short-path fallback for a long home directory), Windows gets its loopback placeholder, which
     # the listener replaces with the real port when it binds.

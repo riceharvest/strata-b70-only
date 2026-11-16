@@ -862,7 +862,7 @@ class CommandLineTests(StandardBase):
         with mock.patch("strata_cli.cli._source", return_value=(Path("p.json"), None, None, cfg)), \
                 mock.patch("strata_cli.cli._launch_plan", return_value=(plan, [])), \
                 mock.patch.object(bs.Target, "get", get), \
-                mock.patch.object(bs, "start_engine", side_effect=lambda ref, target, log, say, wait: started.append(ref) or "proc") as start, \
+                mock.patch.object(bs, "start_engine", side_effect=lambda ref, target, log, say, wait: started.append(ref) or "proc"), \
                 mock.patch.object(bs, "stop_engine") as stop:
             code, text, errors = self.invoke("--profile", "p.json", "--out", str(out))
         self.assertEqual(code, 0, errors)

@@ -4647,7 +4647,7 @@ class Service:
         def scaled(v, unit, digits=0):
             return round(v / unit, digits) if isinstance(v, (int, float)) else None
 
-        busy, ctx = bool(s.get("busy")), self.reported_ctx()
+        ctx = self.reported_ctx()
         images = self.vision is not None
         return {
             "service": "strata", "model": self.model,

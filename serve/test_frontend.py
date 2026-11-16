@@ -89,7 +89,6 @@ class UnreadContentParts(unittest.TestCase):
     def test_chat_file_and_audio_parts_are_left_out(self):
         parts = ({"type": "file", "file": {"filename": "a.pdf", "file_data": "data:application/pdf;base64,AA"}},
                  {"type": "input_audio", "input_audio": {"data": "AA", "format": "wav"}})
-        plain = [{"role": "user", "content": "summarize"}, {"role": "user", "content": "this one"}]
         for part in parts:
             with self.subTest(kind=part["type"]):
                 got = openai_to_messages({"messages": [

@@ -68,7 +68,6 @@ def rope_neox(x, cos, sin):
 
 def conv_block(x, dyn, base):
     """x [8][H]; dyn [8][2 taps][H/16 groups]; base [2][H] -> y[r] = (b0 + d0[r]) x[r] + (r >= 1) (b1 + d1[r]) x[r-1]."""
-    g = H // GROUP
     coef = base[None, :, :] + np.repeat(dyn, GROUP, axis=2)        # [8][2][H]
     y = coef[:, 0, :] * x
     y[1:] += coef[1:, 1, :] * x[:-1]

@@ -523,7 +523,7 @@ class AdoptRules(unittest.TestCase):
             self.assertNotIn("..", problems[0] + ".")                           # round 8, N11: the caller adds the full stop
 
     def test_pictures_on_is_setups_yes_and_setup_picks_the_encoder(self):
-        with Home() as h:
+        with Home():
             cat = catalog(HW_12)
             for vision, want in (("on", "yes"), ("off", "no"), ("gpu", "gpu"), ("cpu", "cpu")):
                 r = Runner(S.LaunchSettings(family="qwen", model="IQ3_XXS", vision=vision), catalog=cat)

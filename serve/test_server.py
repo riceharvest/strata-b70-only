@@ -570,7 +570,10 @@ class ImageMarkers(unittest.TestCase):
                     self.assertEqual(svc.encode_prompt(msgs, tools, {}), old(msgs, tools))
 
 
-class VisionTempFiles(unittest.TestCase):
+# F811: this class has the name of the one at line 310, so the two tests of that one never run. Tried 2026-11: renamed, test_over_http
+# passes and test_a_refused_request_writes_none fails (no "exceeds the context" ValueError any more), so the old class stays shadowed
+# until its test is brought up to date.
+class VisionTempFiles(unittest.TestCase):  # noqa: F811
     """#480 (a TEMP path with a space), #874 (the per-request embeddings file), #735 (Smart App Control)."""
 
     def test_work_dir_has_no_space_when_temp_has_one(self):

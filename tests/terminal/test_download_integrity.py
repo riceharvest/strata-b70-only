@@ -195,7 +195,7 @@ class Misbehaving(DownloadCase):
         self.assertGood()
 
     def test_another_version_for_good_stops_and_leaves_no_file(self):
-        out = self.run_download(self.serve(Behavior(lambda n, s, e: {"etag": '"v2"'} if n > 3 else {})), expect_exit=True)
+        self.run_download(self.serve(Behavior(lambda n, s, e: {"etag": '"v2"'} if n > 3 else {})), expect_exit=True)
         self.assertFalse(self.dst.exists())
 
     def test_the_file_changing_between_resolves_is_noticed(self):

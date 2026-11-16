@@ -73,7 +73,6 @@ def main() -> int:
                               np.corrcoef(np.abs(Wr).ravel()[::7], np.abs(E).ravel()[::7])[0, 1]))
                 # their scale vs the least-squares scale for their own path
                 dv = raw.reshape(-1, bb)[:, :2].copy().view(np.float16).astype(np.float64).ravel()
-                cw = tqenc.decode(np.concatenate([np.zeros((raw.size // bb, 2), np.uint8), raw.reshape(-1, bb)[:, 2:]], axis=1), t)  # d = 0 -> zeros
                 # unit-scale path values: decode with d = 1.0 (fp16 0x3c00)
                 one = raw.reshape(-1, bb).copy()
                 one[:, 0] = 0x00

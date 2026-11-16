@@ -274,7 +274,7 @@ class ModelStep(Base):
         async def case(app, pilot, ctx):
             await press(pilot, "enter", "o")
             self.assertIn("Type or paste the folder", text_of(app))
-            with mock.patch("strata_control.models.plan_import", return_value=plan) as pi, mock.patch("strata_control.models.own_path_problem", return_value=None):
+            with mock.patch("strata_control.models.plan_import", return_value=plan), mock.patch("strata_control.models.own_path_problem", return_value=None):
                 await typed(pilot, "/data/models/IQ3_XXS")
                 await press(pilot, "enter")
             self.assertEqual(ctx.settings.model_path, os.path.abspath("/data/models/IQ3_XXS"))

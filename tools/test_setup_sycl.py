@@ -518,7 +518,7 @@ class GraftStep(unittest.TestCase):
     def test_a_linked_shard_with_no_room_for_a_copy_stops_with_the_command(self):
         (self.dir / "other.gguf").hardlink_to(self.shard)
         with mock.patch.object(setup.shutil, "disk_usage", return_value=mock.Mock(free=10)), \
-                self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertRaises(SystemExit), contextlib.redirect_stdout(io.StringIO()):
             self.step()
         self.assertEqual(self.shard.read_bytes(), self.pristine)
 

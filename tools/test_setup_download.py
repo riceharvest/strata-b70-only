@@ -415,7 +415,6 @@ class Failures(unittest.TestCase):
 
     def test_a_full_disk_stops_with_a_message(self):
         with small_pieces(), Server() as srv, tempfile.TemporaryDirectory() as d:
-            real = setup._piece_worker
 
             def worker(src, st, todo, part):
                 st.fatal = setup._DiskError("No space left on device")

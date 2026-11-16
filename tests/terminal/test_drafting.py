@@ -432,7 +432,7 @@ class TheDownloadPlanListsIt(unittest.TestCase):
     def test_the_plan_line_and_the_part(self):
         from tests.terminal.launch_support import HW_12, Home, catalog
         from strata_cli.launch.runner import Runner
-        with Home() as home:
+        with Home():
             runner = Runner(S.LaunchSettings(family="qwen", model="Q2_0", context=32768, vision="off", drafting="dflash2"), catalog=catalog(HW_12))
             line = runner.drafting_plan_line()
             self.assertEqual(line, "Drafting: MTP (DFlash2 isn't available in this mode)")

@@ -90,7 +90,6 @@ def report(prof, metrics, run):
     span = max(1e-9, (t_hi - t_lo) / 1000.0)
     wall = run["wall"] if run else span
     tok_solo = sum(r["out"] for r in reqs if r["kind"] == "solo")
-    tok_adm = sum(r["out"] for r in reqs if r["kind"] == "adm")
     tok_slot = sum(s["out"] for s in slots)
     out_tokens = tok_solo + tok_slot   # (a slot's count has its admission's first token in it)
     P("1. The run")

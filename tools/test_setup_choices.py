@@ -402,7 +402,7 @@ class CalibrateWithModel(unittest.TestCase):
             try:
                 code, out = quiet(setup.main)
             except SystemExit as e:
-                code, out = e.code, ""
+                code = e.code
         return code, tuned
 
     def test_model_is_the_target(self):

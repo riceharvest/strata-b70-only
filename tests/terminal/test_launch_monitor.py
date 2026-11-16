@@ -106,7 +106,7 @@ class Connect(unittest.TestCase):
             self.run_app(case)
 
     def test_write_asks_then_writes_with_a_backup(self):
-        with Home() as home:
+        with Home():
             target = Path(os.environ["HOME"]) / ".config" / "opencode" / "opencode.json"
             target.parent.mkdir(parents=True)
             target.write_text(json.dumps({"theme": "dark"}))

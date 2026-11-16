@@ -64,7 +64,7 @@ def main() -> int:
             if t is None:
                 print(name, "type", ti.type_name, "is not a trellis type: skipped")
                 continue
-            n_in, n_out, n_exp = ti.shape[0], ti.shape[1], ti.shape[2]
+            n_in, n_out = ti.shape[0], ti.shape[1]
             bb = tqenc.block_bytes(t)
             row_bytes = n_in // 128 * bb
             for e in [int(x) for x in a.experts.split(",")]:
@@ -85,7 +85,6 @@ def main() -> int:
                     dec = tqenc.decode(packed, t)
                     chk = float(np.sum((wd.ravel().astype(np.float64) - dec) ** 2))
                     nexact = int((err == 0).sum())
-                    same_bytes = int((packed.reshape(-1) == raw).sum()) / raw.size
                     print("    %-8s rel MSE %.3e  SQNR %7.2f dB  exact blocks %5d/%d (%.1f%%)  scale==theirs %.1f%%  "
                           "%.0f weights/s  (recheck %.3e)" % (
                               c, tot / en, tqenc.sqnr_db(wd, dec), nexact, err.size, 100.0 * nexact / err.size,

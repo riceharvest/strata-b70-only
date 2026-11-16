@@ -130,7 +130,6 @@ def _server_intel():
 def test_server_wrapper_applies_the_rule_at_start(monkeypatch):
     mod = _server_intel()
     S = mod.S
-    seen = []
     monkeypatch.setattr(S, "engine_args", lambda cfg: list(cfg["args"]))
     monkeypatch.setattr(intel_spec, "sysfs_cards", lambda *a, **k: [dict(B65, index=0), dict(B65, index=1)])
     mod.install_two_card_spec()

@@ -13,7 +13,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('mode', choices=['matched'])
     a = ap.parse_args()
-    runid = os.environ.get('STRATA_TEST_ID','public-fixtures')
     ram = Path(os.environ['STRATA_TEST_RAM'])
     out = Path(os.environ['BENCH_OUTPUT'])
     out.mkdir(exist_ok=False)
@@ -38,10 +37,6 @@ def main():
         return ids
     public = [int(x) for x in (R / 'benchy-long.ids').read_text().strip().split(',')]
     assert len(public) == 2185
-    bench7000 = (public[:2000] * 4)[:7000]
-    our7000 = shaped(frozen.TASKS[0], 7000)
-    our512 = shaped(frozen.TASKS[0], 512)
-    warm = shaped(frozen.WARMUP, 512)
     canary = tok.encode(tpl.render([{'role':'user','content':'Reply only with CANARY_MAPLE_73.'}], enable_thinking=False), parse_special=True)
     env = dict(os.environ); env['STRATA_TRACE']='1'; assert 'STRATA_DBG_NAN' not in env
     short=[int(x) for x in (R/'benchy-short.ids').read_text().strip().split(',')]; assert len(short)==20

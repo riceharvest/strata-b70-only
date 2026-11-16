@@ -191,7 +191,6 @@ class TunerTest(unittest.TestCase):
 
     def test_machine_drift_is_not_mistaken_for_a_gain(self):
         clock = FakeClock()
-        counter = {"n": 0}
 
         def model(args, env, tune=None):                    # the machine slows 1.2% per engine start
             return 60.0 * (1.0 - 0.012 * len(session.runs)) * (1.03 if flag(args, "--kv-resident") == "65536" else 1.0)
@@ -205,7 +204,6 @@ class TunerTest(unittest.TestCase):
         model = speed_with({("--kv-resident", "65536"): 1.10})
         clock = FakeClock()
         session = StubSession(model=model, clock=clock, avail=9000, rss=lambda a, e: 12000.0)
-        calls = {"n": 0}
         real = session.system
 
         def system():
@@ -280,7 +278,6 @@ class TunerTest(unittest.TestCase):
     def test_cancel_changes_nothing(self):
         cancel = threading.Event()
         model = speed_with({("--kv-resident", "65536"): 1.1})
-        n = {"i": 0}
 
         def progress(p):
             if p["stage"] == "rounds":
@@ -315,7 +312,6 @@ class TunerTest(unittest.TestCase):
         self.assertGreater(len(last), 1, "the candidates' speeds follow the base")
 
     def test_per_request_value_needs_every_round(self):
-        wins = {"n": 0}
 
         def model(args, env, tune=None):
             if tune and tune.get("spec_min_p") == 0.7:

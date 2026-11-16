@@ -345,7 +345,7 @@ class StoredTuning(Base):
     def run_tune(self, r):
         seen = []
         r.emit_cb = lambda ev: seen.append(ev.text)
-        with mock.patch.object(Runner, "_spawn", side_effect=RuntimeError("the tuner started")) as spawn:
+        with mock.patch.object(Runner, "_spawn", side_effect=RuntimeError("the tuner started")):
             try:
                 r.tune()
                 started = False

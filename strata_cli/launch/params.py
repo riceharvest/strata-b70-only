@@ -191,7 +191,6 @@ def build_rows(engine_help: str | None, base_args: list[Any], tuned_args: list[A
             t = t if t is not None else d
         else:
             t = t if t is not None else ""
-        shown = lambda v: "on" if v == "" and not is_env and name in (base if v is d else tuned) else v     # noqa: E731
         y = extra.get(name, "")
         rows.append(Row(name=name, default=str(d) if d else "", tuned=str(t) if t else "", yours=str(y),
                         description=((p.full or p.short) if p else "(not in this engine's list: newer flag or a typing mistake)"),

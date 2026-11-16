@@ -497,7 +497,6 @@ def history_path() -> Path:
 def record_trials(trials: list[dict[str, Any]], *, hw_hash: str, model_digest: str | None, engine_sha: str | None) -> None:
     rows = []
     for t in trials:
-        args = {}
         a = t.get("args") or []
         rows.append({"at": t.get("at"), "hw": hw_hash, "model": model_digest, "engine": engine_sha, "label": t.get("label"),
                      "sig": " ".join(str(x) for x in a) + "|" + json.dumps(t.get("env") or {}, sort_keys=True),

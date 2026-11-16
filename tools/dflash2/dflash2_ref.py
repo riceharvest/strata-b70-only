@@ -113,7 +113,7 @@ class Drafter:
     # ---- one block: anchor token at position s (s >= 1), block size b; returns the drafted path (b-1 tokens), the candidate lists
     def draft(self, s, anchor, b, greedy=True):
         w = self.w
-        H, NH, NKV, HD = self.H, self.NH, self.NKV, self.HD
+        NH, NKV, HD = self.NH, self.NKV, self.HD
         ids = torch.tensor([anchor] + [self.mask_id] * (b - 1))
         h = self.embed[ids]                                  # [b, H]
         pos = torch.arange(s, s + b)
@@ -135,7 +135,6 @@ class Drafter:
             Vc = self.Vc[l][:, lo:s, :]
             K = torch.cat([Kc, kn.permute(1, 0, 2)], dim=1)  # [NKV, c+b, HD]
             V = torch.cat([Vc, vn.permute(1, 0, 2)], dim=1)
-            c = Kc.shape[1]
             kpos = torch.cat([torch.arange(lo, s), pos])
             vis = (pos[:, None] - kpos[None, :]).abs() < self.win          # [b, c+b]
             rep = NH // NKV

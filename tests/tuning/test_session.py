@@ -88,7 +88,6 @@ class SessionTest(unittest.TestCase):
 
     def test_prompt_length_calibrates_once(self):
         s = self.eng.s
-        before = s.chars_per_token
         self.eng.prompt_once(4096)
         self.assertTrue(s.calibrated)
         self.assertNotEqual(s.chars_per_token, 0)
