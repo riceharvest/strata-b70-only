@@ -1,0 +1,21 @@
+version: 2
+updates:
+  # Python: requirements.txt, requirements-build.txt, requirements-monitor.txt, requirements-dev.txt (repo root).
+# The default branch of the repository is b70, so no target-branch is needed. GitHub reads this file from the default branch only.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      python-dependencies:
+        patterns: ["*"]
+  # Workflow actions under .github/workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns: ["*"]
