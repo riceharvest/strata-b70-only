@@ -10,12 +10,13 @@ from __future__ import annotations
 import atexit
 import sys
 import threading
+from collections.abc import Callable
 
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
 
 
-def _windows_call():
+def _windows_call() -> Callable[[int], int]:
     import ctypes
     fn = ctypes.windll.kernel32.SetThreadExecutionState
     fn.argtypes = [ctypes.c_uint32]
@@ -24,7 +25,7 @@ def _windows_call():
 
 
 class KeepAwake:
-    def __init__(self, call=None):
+    def __init__(self, call: Callable[[int], object] | None = None) -> None:
         self._call = call
         self._count = 0
         self._cond = threading.Condition()
@@ -32,7 +33,7 @@ class KeepAwake:
         self._thread = None
 
     @classmethod
-    def create(cls, enabled: bool, say=print):
+    def create(cls, enabled: bool, say: Callable[..., object] = print) -> KeepAwake | None:
         """None when off.  On a system without SetThreadExecutionState: one line, and None."""
         if not enabled:
             return None
@@ -48,7 +49,7 @@ class KeepAwake:
         say('[strata] prevent_sleep: Windows stays awake while a request is running or queued', flush=True)
         return ka
 
-    def _loop(self):
+    def _loop(self) -> None:
         held = False
         while True:
             with self._cond:
@@ -67,12 +68,12 @@ class KeepAwake:
         except Exception:             # noqa: BLE001
             pass
 
-    def _start(self):
+    def _start(self) -> None:
         if self._thread is None:
             self._thread = threading.Thread(target=self._loop, daemon=True, name="keep-awake")
             self._thread.start()
 
-    def acquire(self):
+    def acquire(self) -> None:
         with self._cond:
             if self._closed:
                 return
@@ -80,12 +81,12 @@ class KeepAwake:
             self._start()
             self._cond.notify_all()
 
-    def release(self):
+    def release(self) -> None:
         with self._cond:
             self._count = max(0, self._count - 1)
             self._cond.notify_all()
 
-    def close(self):
+    def close(self) -> None:
         with self._cond:
             self._closed = True
             self._cond.notify_all()

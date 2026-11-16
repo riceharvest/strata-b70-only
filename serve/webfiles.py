@@ -18,7 +18,7 @@ VENDOR_TYPES = {".js": "text/javascript; charset=utf-8", ".css": "text/css; char
 VENDOR_PREFIX = "/web/vendor/katex/"
 
 
-def subtree_file(path: str, web: Path = WEB):
+def subtree_file(path: str, web: Path = WEB) -> tuple[Path, str] | None:
     """(file, content type) for a /web/locales or /web/vendor path, or None when it is not served."""
     if any(c in path for c in ("\\", ":", "%", "\0")) or ".." in path:
         return None

@@ -14,7 +14,7 @@ MAX_RETRIES = 3
 POLL_SECONDS = 0.5
 
 
-def required_mib(error) -> int | None:
+def required_mib(error: object) -> int | None:
     match = re.search(r'^not enough RAM to save the session '
                       r'\((\d+) MiB plus a floor of (\d+) MiB needed,', str(error))
     # Each diagnostic term rounds bytes down; two MiB preserve admission headroom.
@@ -32,7 +32,7 @@ def available_mib() -> int | None:
         return None
 
 
-def retryable(action, error) -> bool:
+def retryable(action: str, error) -> bool:
     return (action == 'save' and error.kind == 'memory' and not error.published
             and required_mib(error) is not None)
 

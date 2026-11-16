@@ -395,7 +395,7 @@ def _args(cfg: dict) -> list:
     return user_args.merge(a, cfg["user_args"]) if cfg.get("user_args") else a
 
 
-def _arg(cfg: dict, flag: str):
+def _arg(cfg: dict, flag: str) -> int | str | None:
     a = _args(cfg)
     if flag in a[:-1]:
         v = str(a[a.index(flag) + 1])
@@ -403,7 +403,7 @@ def _arg(cfg: dict, flag: str):
     return None
 
 
-def _num_text(v) -> str:
+def _num_text(v: float) -> str:
     """A number as the engine reads it: 1 for 1.0, 0.5 for 0.5."""
     return str(int(v)) if float(v) == int(v) else repr(float(v))
 
@@ -476,7 +476,7 @@ def view(cfg: dict, path: str | Path) -> dict:
             "note": "Saved to the run config; used from the next start of the model."}
 
 
-def _number(key, v, whole=False, lo=0.0, hi=None, lo_open=False):
+def _number(key: str, v: object, whole: bool = False, lo=0.0, hi=None, lo_open: bool = False) -> int | float:
     # (json reads NaN and Infinity as numbers: neither is below or above anything, and int(inf) raises OverflowError)
     if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or (whole and v != int(v)) or \
             (v <= lo if lo_open else v < lo) or (hi is not None and v > hi):
@@ -485,7 +485,7 @@ def _number(key, v, whole=False, lo=0.0, hi=None, lo_open=False):
     return int(v) if whole else v
 
 
-def check(key: str, v, cfg: dict):
+def check(key: str, v: object, cfg: dict):
     """The value to store for `key`, or a ValueError naming what is expected.  None removes the key (its default)."""
     if key not in SPEC:
         raise ValueError(f"{key!r} cannot be changed here (only the keys the Settings view lists)")

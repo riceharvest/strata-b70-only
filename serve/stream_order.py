@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from collections.abc import Iterable, Sequence
 
 
 def _env_float(name: str, default: float) -> float:
@@ -49,7 +50,7 @@ KEY_MAX = 128               # a thread key is cut to this
 THREAD_HEADER = "X-Strata-Thread"      # the request header that names a conversation (Hermes: session_affinity_header)
 
 
-def common_prefix(a, b) -> int:
+def common_prefix(a: Sequence[int], b: Sequence[int]) -> int:
     """Length of the longest common prefix of two token lists (bisection on slice equality: C speed)."""
     n = min(len(a), len(b))
     if n == 0 or a[0] != b[0]:
@@ -66,7 +67,7 @@ def common_prefix(a, b) -> int:
     return lo
 
 
-def continues(ids, last) -> bool:
+def continues(ids: Sequence[int], last: Sequence[int] | None) -> bool:
     """Is `ids` the next request of the thread whose prompt was `last`?  It shares all of it but the last TAIL tokens
     (at most 1/16 of a short one), and not just a system prompt."""
     if not last:
@@ -74,7 +75,7 @@ def continues(ids, last) -> bool:
     return common_prefix(ids, last) >= max(len(last) - min(TAIL, len(last) // 16 + 1), min(len(last), MIN_SHARED))
 
 
-def clean_key(key) -> str | None:
+def clean_key(key: object) -> str | None:
     """A thread key from a request header: text up to KEY_MAX characters, or None (empty, not text)."""
     if not isinstance(key, str):
         return None
@@ -86,7 +87,7 @@ class Thread:
     """A conversation the engine's cache may still hold: its last prompt, its key (if the client names threads)."""
     __slots__ = ("key", "ids", "ver", "turns", "last")
 
-    def __init__(self, key, ids):
+    def __init__(self, key: str | None, ids: list[int]) -> None:
         self.key, self.ids, self.ver = key, ids, 0
         self.turns, self.last = 0, time.monotonic()   # turns served; when the last one ended
 
@@ -94,7 +95,7 @@ class Thread:
 class Entry:
     __slots__ = ("ids", "key", "t0", "cache", "why", "served", "open", "finish")
 
-    def __init__(self, ids, key=None):
+    def __init__(self, ids: list[int], key: object = None) -> None:
         self.ids = ids
         self.key = clean_key(key)
         self.t0 = time.monotonic()
@@ -106,7 +107,7 @@ class Entry:
 
 
 class StreamOrder:
-    def __init__(self, enabled: bool | None = None, capacity: int = 3):
+    def __init__(self, enabled: bool | None = None, capacity: int = 3) -> None:
         self.enabled = ENABLED if enabled is None else enabled
         self.capacity = max(1, capacity)      # conversations the cache holds, the live one included
         self.cv = threading.Condition()
@@ -122,7 +123,7 @@ class StreamOrder:
         self._held_for: Thread | None = None
 
     # -- the caller's side -------------------------------------------------------------------------------------------
-    def enter(self, ids, key=None) -> Entry:
+    def enter(self, ids: Iterable[int], key: object = None) -> Entry:
         e = Entry(ids if isinstance(ids, list) else list(ids), key)
         with self.cv:
             self.waiters.append(e)
@@ -164,7 +165,7 @@ class StreamOrder:
         with self.cv:
             del self.recent[:max(0, n)]
 
-    def pin(self, key) -> bool:
+    def pin(self, key: object) -> bool:
         """Only the thread named `key` takes the engine from now on, until it ends or unpin() (a request that has waited
         STRATA_STREAM_MAX_WAIT_S, when that is set, still goes).  False: no usable key."""
         key = clean_key(key)
@@ -187,7 +188,7 @@ class StreamOrder:
         with self.cv:
             rows: dict = {}
 
-            def put(key, state, ids, waited=None, turns=None):
+            def put(key, state, ids, waited=None, turns=None) -> None:
                 k = key if key is not None else f"\0{len(rows)}"        # a thread without a name stays its own row
                 if k in rows and rows[k]["state"] != "between turns":
                     return

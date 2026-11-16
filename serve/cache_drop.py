@@ -8,15 +8,16 @@ model files are advised, and only after the engine process has ended (its mappin
 from __future__ import annotations
 
 import os
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 
 
-def enabled(env=None) -> bool:
+def enabled(env: Mapping[str, str] | None = None) -> bool:
     env = os.environ if env is None else env
     return os.name != "nt" and env.get("STRATA_DROP_CACHE_ON_EXIT", "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def model_files(paths) -> list[str]:
+def model_files(paths: Iterable[str | os.PathLike[str] | None]) -> list[str]:
     """The regular files named by `paths` (a file, or a directory walked recursively); missing ones are skipped."""
     out: list[str] = []
     for p in paths:
@@ -33,7 +34,7 @@ def model_files(paths) -> list[str]:
     return out
 
 
-def drop(paths, advise=None) -> int:
+def drop(paths: Iterable[str | os.PathLike[str] | None], advise: Callable[[int, int, int, int], None] | None = None) -> int:
     """posix_fadvise(DONTNEED) on every file of `paths`; returns how many files were advised.  Never raises."""
     advise = advise or getattr(os, "posix_fadvise", None)
     if advise is None:
@@ -54,7 +55,8 @@ def drop(paths, advise=None) -> int:
     return n
 
 
-def drop_after_exit(engine, env=None, advise=None) -> int:
+def drop_after_exit(engine, env: Mapping[str, str] | None = None,
+                    advise: Callable[[int, int, int, int], None] | None = None) -> int:
     """Called once the engine has been closed.  0 when not opted in or the engine still runs."""
     if not enabled(env):
         return 0

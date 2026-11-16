@@ -10,6 +10,7 @@ power throttling, see `no_throttle` (#691). Elsewhere, and if the job cannot be 
 from __future__ import annotations
 
 import os
+import subprocess
 import threading
 
 _job = None
@@ -65,7 +66,7 @@ if os.name == "nt":
     _k32.SetProcessInformation.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
     _k32.GetCurrentProcess.restype = wintypes.HANDLE
 
-    def no_throttle(handle) -> bool:
+    def no_throttle(handle: int) -> bool:
         """Opt a process out of Windows power throttling (EcoQoS).  Without it Windows 11 treats a process whose console
         window is minimized as background work and, on a hybrid CPU, moves its threads to the E-cores: generation
         slowed by about 20% while the server window was minimized (#691, i9-13980HX: 36.6 -> 43.2 tok/s)."""
@@ -77,7 +78,7 @@ if os.name == "nt":
 
     no_throttle(_k32.GetCurrentProcess())           # the server itself (tokenizing, streaming) too
 else:
-    def no_throttle(handle) -> bool:
+    def no_throttle(handle: int) -> bool:
         return False
 
 
@@ -89,7 +90,7 @@ def terminate() -> bool:
     return bool(_k32.TerminateJobObject(_job, 1))
 
 
-def contain(proc) -> bool:
+def contain(proc: subprocess.Popen | None) -> bool:
     """Put a started subprocess.Popen in the kill-on-close job. True if it is in; False (harmlessly) otherwise."""
     global _job
     if os.name != "nt" or proc is None:
