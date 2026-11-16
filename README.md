@@ -227,10 +227,26 @@ under [Speed](#speed); sessions past 118K tokens are not measured yet.
   `STRATA_B70_DEFAULTS=0` turns all of them off. The B70 prompt kernels (attention, selection, GDN, hyper-connections,
   experts) are on by default on this card, each with its own switch to turn it off, also in [docs/B70.md](docs/B70.md).
 
+## Developing
+
+No GPU is needed for any of this.
+
+- `make help` lists the targets: `make test` runs the terminal tests with the standard library `unittest` (there is no
+  pytest), `make test-serve` runs the server tests after `make deps-dev` (jinja2 and regex), `make smoke` checks that the
+  command line starts. The build, setup and serve targets are the commands from [Install](#install).
+- Lint is `ruff check .`, set up in `pyproject.toml`: pyflakes and syntax errors only. There is no formatter on purpose.
+  Hooks for it: `pre-commit install -t pre-commit -t commit-msg -t pre-push`.
+- CI refuses a change that adds `REPORT.md`, `PLAN.md` or `DESIGN.md`, or has a commit with a `Co-Authored-By` or
+  `Generated with` line (`.github/scripts/repo-guard.sh`).
+- Requirements are pinned and Dependabot updates them weekly. What changed between releases: [CHANGELOG.md](CHANGELOG.md).
+  Rules for a pull request: [CONTRIBUTING.md](CONTRIBUTING.md).
+
 <a id="guides"></a>
 <a id="how-fast-is-it"></a>
 <a id="how-does-it-work"></a>
 <a id="something-went-wrong"></a>
+
+## Credits
 
 - The engine and server are [Strata](https://github.com/Niko1221/Strata) by Niko1221 and its contributors. Several B70
   changes here are community pull requests to upstream, credited in [docs/B70.md](docs/B70.md). The B70 port, the SYCL
