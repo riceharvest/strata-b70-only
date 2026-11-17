@@ -8,7 +8,7 @@ use ratatui::{
     widgets::{Padding, Bar, BarChart, BarGroup, Block, BorderType, Borders, Cell, Clear, Gauge, List, ListItem, ListState, Paragraph, Row, Sparkline, Table, TableState, Wrap},
 };
 
-use super::{App, Tab, ToastKind, theme as t};
+use super::{ACCESS, App, DRAFTING, KV, TUNE, Tab, ToastKind, VISION, theme as t};
 use crate::fmt::{self, Snap};
 
 pub fn popup_rect(screen: Rect, w: u16, h: u16) -> Rect {
@@ -96,6 +96,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
         Tab::Requests => requests(f, app, body),
         Tab::Models => models(f, app, body),
+        Tab::Setup => setup(f, app, body),
+        Tab::Tools => tools(f, app, body),
         Tab::Logs => logs(f, app, body),
         Tab::Chat => chat(f, app, body),
     }
@@ -118,7 +120,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         app.areas.toast = toast_rect(screen, "                              ");
     }
     if let Some(c) = &app.confirm {
-        let r = popup_rect(screen, 60, 8);
+        let inner_w = 60u16.min(screen.width.saturating_sub(4)).saturating_sub(4).max(10) as usize;
+        let body_rows: usize = c.body.lines().map(|l| l.chars().count().div_ceil(inner_w).max(1)).sum();
+        let r = popup_rect(screen, 64, body_rows as u16 + 5);
         app.areas.popup = r;
         f.render_widget(Clear, r);
         let mut lines: Vec<Line> = c.body.lines().map(|l| Line::from(Span::styled(l.to_string(), Style::new().fg(t::TEXT)))).collect();
@@ -198,6 +202,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Tab::Chat => &[("enter", "send"), ("esc", "clear/back"), ("↑↓", "scroll"), ("^L", "new chat"), ("tab", "next view")],
         Tab::Models => &[("↑↓", "pick"), ("enter", "start / switch"), ("R", "re-read folder"), ("s", "stop"), ("?", "keys"), ("q", "quit")],
         Tab::Logs => &[("↑↓ pgup pgdn", "scroll"), ("G", "follow"), ("?", "keys"), ("q", "quit")],
+        Tab::Setup if app.editing_port.is_some() => &[("digits", "port"), ("enter", "keep"), ("esc", "cancel")],
+        Tab::Setup => &[("↑↓", "model"), ("c m v d t a o", "options"), ("p", "plan"), ("enter", "set up + start"), ("x", "stop job"), ("pgup/dn", "output")],
+        Tab::Tools => &[("↑↓", "pick"), ("enter", "run"), ("x", "stop job"), ("pgup/dn", "output"), ("?", "keys"), ("q", "quit")],
         _ if !app.online => &[("↑↓", "pick"), ("enter", "start"), ("tab", "views"), ("?", "keys"), ("q", "quit")],
         _ => &[("l", "load"), ("u", "unload"), ("r", "restart"), ("s", "stop"), ("tab", "views"), ("?", "keys"), ("q", "quit")],
     };
@@ -637,10 +644,12 @@ fn chat(f: &mut Frame, app: &mut App, area: Rect) {
 // ---- help ----
 
 fn help(f: &mut Frame, screen: Rect) {
-    let r = popup_rect(screen, 58, 18);
+    let r = popup_rect(screen, 84, 20);
     f.render_widget(Clear, r);
     let rows = [
-        ("1-5, tab", "switch view"),
+        ("1-7, tab", "switch view"),
+        ("setup: c m v d t a o", "context, memory, pictures, drafting, tuning, access, port"),
+        ("setup / tools: p", "plan (nothing changes) · enter runs · x stops"),
         ("enter", "start / switch to the picked run config"),
         ("l / u", "load the model / unload it (frees the GPU)"),
         ("r", "restart the server (the run config is read again)"),
@@ -659,4 +668,168 @@ fn help(f: &mut Frame, screen: Rect) {
         ),
         r,
     );
+}
+
+// ---- Setup ----
+
+fn verdict_color(v: &str) -> Color {
+    match v {
+        "fits" => t::GREEN,
+        "tight" | "spills" | "slow" => t::AMBER,
+        "no" | "too_big" | "does_not_fit" => t::RED,
+        _ => t::DIM,
+    }
+}
+
+fn setup(f: &mut Frame, app: &mut App, area: Rect) {
+    let [left, right] = Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)]).areas(area);
+    let rows = app.catalog_rows();
+    match &app.catalog {
+        Some(Ok(v)) => {
+            let pc = v["computer"].as_str().unwrap_or("").to_string();
+            let items: Vec<ListItem> = rows
+                .iter()
+                .map(|r| {
+                    let verdict = r["verdict"].as_str().unwrap_or("");
+                    let mark = if r["installed"].as_bool() == Some(true) {
+                        Span::styled("● ", Style::new().fg(t::GREEN))
+                    } else if r["recommended"].as_bool() == Some(true) {
+                        Span::styled("★ ", Style::new().fg(t::AMBER))
+                    } else {
+                        Span::raw("  ")
+                    };
+                    ListItem::new(vec![
+                        Line::from(vec![
+                            mark,
+                            Span::styled(r["title"].as_str().unwrap_or("?").to_string(), t::bold(t::TEXT)),
+                            Span::styled(format!("  {:.0} GB", r["download_gb"].as_f64().unwrap_or(0.0)), t::dim()),
+                            Span::styled(format!("  {}", r["words"].as_str().unwrap_or(verdict)), Style::new().fg(verdict_color(verdict))),
+                        ]),
+                        Line::from(Span::styled(format!("    {}", r["about"].as_str().unwrap_or("")), t::faint())),
+                    ])
+                })
+                .collect();
+            let mut st = ListState::default().with_selected(Some(app.sel_model.min(rows.len().saturating_sub(1))));
+            f.render_stateful_widget(
+                List::new(items).highlight_style(Style::new().bg(t::LINE)).highlight_symbol("› ").block(panel(&format!("models · {pc}"))),
+                left,
+                &mut st,
+            );
+        }
+        Some(Err(e)) => f.render_widget(Paragraph::new(Span::styled(e.clone(), t::dim())).wrap(Wrap { trim: true }).block(panel("models")), left),
+        None => f.render_widget(Paragraph::new("").block(panel("models")), left),
+    }
+    let [opts, job] = Layout::vertical([Constraint::Length(12), Constraint::Min(4)]).areas(right);
+    let fm = &app.setup;
+    let opt = |key: &'static str, name: &'static str, val: String, note: &'static str| {
+        Line::from(vec![
+            Span::styled(format!(" {key} "), Style::new().fg(t::BG).bg(t::CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {name:<11}"), t::dim()),
+            Span::styled(format!("{val:<12}"), t::bold(t::TEXT)),
+            Span::styled(note, t::faint()),
+        ])
+    };
+    let ctx = fm.contexts.get(fm.context).map(|c| fmt::tokens(*c as f64)).unwrap_or("—".into());
+    let port = match &app.editing_port {
+        Some(p) => format!("{p}▏"),
+        None => fm.port.to_string(),
+    };
+    let mut lines = vec![];
+    if let Some(r) = rows.get(app.sel_model) {
+        lines.push(Line::from(vec![
+            Span::styled(r["title"].as_str().unwrap_or("").to_string(), t::bold(t::CYAN)),
+            Span::styled(
+                format!("  needs {:.0} GB VRAM + {:.0} GB RAM{}", r["need_vram_gb"].as_f64().unwrap_or(0.0), r["need_ram_gb"].as_f64().unwrap_or(0.0), if r["images"].as_bool() == Some(true) { " · reads pictures" } else { "" }),
+                t::dim(),
+            ),
+        ]));
+    } else {
+        lines.push(Line::default());
+    }
+    lines.push(Line::default());
+    lines.push(opt("c", "context", ctx, "tokens it remembers (C goes back)"));
+    lines.push(opt("m", "memory", KV[fm.kv].into(), "conversation memory format"));
+    lines.push(opt("v", "pictures", VISION[fm.vision].into(), "off saves memory"));
+    lines.push(opt("d", "drafting", DRAFTING[fm.drafting].into(), "guessing tokens ahead"));
+    lines.push(opt("t", "tuning", TUNE[fm.tune].into(), "find the fastest settings first"));
+    lines.push(opt("a", "access", ACCESS[fm.access].into(), "who can use it"));
+    lines.push(opt("o", "port", port, ""));
+    f.render_widget(Paragraph::new(lines).block(panel("choices")), opts);
+    job_panel(f, app, job, "p shows the plan (nothing changes); enter downloads what is missing, writes the run config and starts it.");
+}
+
+// ---- Tools ----
+
+fn tools(f: &mut Frame, app: &mut App, area: Rect) {
+    let [left, right] = Layout::horizontal([Constraint::Length(54), Constraint::Min(30)]).areas(area);
+    let tools = app.tools();
+    app.sel_tool = app.sel_tool.min(tools.len().saturating_sub(1));
+    let items: Vec<ListItem> = tools
+        .iter()
+        .map(|(label, what, _, ask)| {
+            ListItem::new(vec![
+                Line::from(vec![Span::styled(label.clone(), t::bold(t::TEXT)), Span::styled(if *ask { "  ⚑" } else { "" }, Style::new().fg(t::AMBER))]),
+                Line::from(Span::styled(format!("  {what}"), t::faint())),
+            ])
+        })
+        .collect();
+    let mut st = ListState::default().with_selected(Some(app.sel_tool));
+    f.render_stateful_widget(List::new(items).highlight_style(Style::new().bg(t::LINE)).highlight_symbol("› ").block(panel("tools  ⚑ asks first")), left, &mut st);
+    let hint = tools.get(app.sel_tool).map(|(_, _, s, _)| s.command_line()).unwrap_or_default();
+    job_panel(f, app, right, &format!("enter runs it. In a terminal: {hint}"));
+}
+
+fn job_panel(f: &mut Frame, app: &mut App, area: Rect, idle: &str) {
+    app.areas.job = area;
+    let Some(job) = &app.job else {
+        f.render_widget(Paragraph::new(Span::styled(idle.to_string(), t::dim())).wrap(Wrap { trim: true }).block(panel("output")), area);
+        return;
+    };
+    let (state, c) = match job.code {
+        None => ("running".to_string(), t::CYAN),
+        Some(0) => ("done".to_string(), t::GREEN),
+        Some(n) => (format!("exit {n}"), t::RED),
+    };
+    let took = job.ended.unwrap_or_else(std::time::Instant::now) - job.started;
+    let title = format!("{} · {} · {}", job.spec.title, state, fmt::secs(took.as_secs_f64()));
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(c))
+        .title(Span::styled(format!(" {title} "), t::bold(c)))
+        .style(Style::new().bg(t::PANEL))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let (gauge_area, text_area) = if job.progress.is_some() {
+        let [g, x] = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).areas(inner);
+        (Some(g), x)
+    } else {
+        (None, inner)
+    };
+    if let (Some(g), Some((frac, label))) = (gauge_area, &job.progress) {
+        gauge(f, g, &format!("{label}  {:.0}%", frac * 100.0), *frac, t::CYAN);
+    }
+    let mut lines: Vec<Line> = job.lines.iter().map(|l| Line::from(Span::styled(l.clone(), log_style(l)))).collect();
+    if let Some(res) = &job.result {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        for l in res {
+            let st = if l.starts_with('✓') {
+                t::bold(t::GREEN)
+            } else if l.starts_with('✗') {
+                t::bold(t::RED)
+            } else {
+                Style::new().fg(t::TEXT)
+            };
+            lines.push(Line::from(Span::styled(l.clone(), st)));
+        }
+    }
+    let width = text_area.width.max(1) as usize;
+    let total: usize = lines.iter().map(|l| l.width().max(1).div_ceil(width)).sum();
+    let over = total.saturating_sub(text_area.height as usize);
+    app.job_scroll = app.job_scroll.min(over);
+    let scroll = (over - app.job_scroll) as u16;
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll, 0)), text_area);
 }

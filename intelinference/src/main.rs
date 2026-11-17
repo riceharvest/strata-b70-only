@@ -3,15 +3,17 @@
 //! `intelinference` alone opens the live screen; the subcommands do one thing each and exit.
 
 mod api;
+mod bridge;
 mod cmd;
 mod fmt;
+mod render;
 mod server;
 mod settings;
 mod ui;
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "intelinference", version, about = "Run and watch the Strata engine on an Intel Arc B70", long_about = None)]
@@ -44,7 +46,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// the live screen (the default)
+    #[command(alias = "monitor")]
     Ui,
+    /// pick a model, set it up and start it (the Setup screen)
+    Setup,
+    /// updates, drafter, benchmarks, tuning, presets, app connections (the Tools screen)
+    Tools,
     /// start the server with a run config, in the background
     Up {
         /// run config: file name, name without .json, model name or a path (default: the last one started)
@@ -71,9 +78,12 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// the run configs you can start or switch to
+    /// the run configs you can start or switch to; `models list|inspect|import|move` for installed models
     #[command(alias = "ls")]
-    Models,
+    Models {
+        #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
+    },
     /// switch the running server to another run config (or start it with that one)
     Use {
         config: String,
@@ -112,37 +122,63 @@ enum Cmd {
     Where,
 }
 
+fn overrides(m: &clap::ArgMatches) -> settings::Overrides {
+    let st = |id: &str| m.get_one::<String>(id).cloned();
+    let pb = |id: &str| m.get_one::<PathBuf>(id).cloned();
+    settings::Overrides {
+        host: st("host"),
+        port: m.get_one::<u16>("port").copied(),
+        api_key: st("api_key"),
+        config_dir: pb("config_dir"),
+        root: pb("root"),
+        python: st("python"),
+        log: pb("log"),
+    }
+}
+
 fn main() {
-    let cli = Cli::parse();
-    let o = settings::Overrides {
-        host: cli.host,
-        port: cli.port,
-        api_key: cli.api_key,
-        config_dir: cli.config_dir,
-        root: cli.root,
-        python: cli.python,
-        log: cli.log,
-    };
-    let s = match settings::Settings::resolve(&o) {
+    let matches = bridge::add_to(Cli::command()).get_matches();
+    let s = match settings::Settings::resolve(&overrides(&matches)) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("intelinference: {e:#}");
             std::process::exit(2);
         }
     };
-    let r = match cli.command.unwrap_or(Cmd::Ui) {
-        Cmd::Ui => ui::run(s),
-        Cmd::Up { config, fg, no_wait } => cmd::up(&s, config.as_deref(), fg, !no_wait),
-        Cmd::Down { force, wait } => cmd::down(&s, force, wait),
-        Cmd::Status { json } => cmd::status(&s, json),
-        Cmd::Models => cmd::models(&s),
-        Cmd::Use { config, force } => cmd::use_config(&s, &config, force),
-        Cmd::Restart { force } => cmd::restart(&s, force),
-        Cmd::Load => cmd::load(&s),
-        Cmd::Unload => cmd::unload(&s),
-        Cmd::Logs { follow, lines } => cmd::logs(&s, follow, lines),
-        Cmd::Ask { prompt, max_tokens, think } => cmd::ask(&s, &prompt.join(" "), max_tokens, think),
-        Cmd::Where => cmd::where_(&s),
+    let r = match matches.subcommand() {
+        Some((top, sub)) if bridge::is_bridged(top) => {
+            let (path, args) = bridge::from_matches(top, sub);
+            bridge::run(&s, &path, &args)
+        }
+        _ => {
+            let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+            match cli.command.unwrap_or(Cmd::Ui) {
+                Cmd::Ui => ui::run(s, ui::Tab::Live),
+                Cmd::Setup => ui::run(s, ui::Tab::Setup),
+                Cmd::Tools => ui::run(s, ui::Tab::Tools),
+                Cmd::Up { config, fg, no_wait } => cmd::up(&s, config.as_deref(), fg, !no_wait),
+                Cmd::Down { force, wait } => cmd::down(&s, force, wait),
+                Cmd::Status { json } => cmd::status(&s, json),
+                Cmd::Models { rest } if !rest.is_empty() => {
+                    let mut path = vec!["models".to_string(), rest[0].clone()];
+                    if !bridge::TREE.iter().any(|(p, _, _)| *p == path.join(" ")) {
+                        eprintln!("intelinference: models has no {:?} (list, inspect, import, move)", rest[0]);
+                        std::process::exit(2);
+                    }
+                    let args = rest[1..].to_vec();
+                    path.truncate(2);
+                    bridge::run(&s, &path, &args)
+                }
+                Cmd::Models { .. } => cmd::models(&s),
+                Cmd::Use { config, force } => cmd::use_config(&s, &config, force),
+                Cmd::Restart { force } => cmd::restart(&s, force),
+                Cmd::Load => cmd::load(&s),
+                Cmd::Unload => cmd::unload(&s),
+                Cmd::Logs { follow, lines } => cmd::logs(&s, follow, lines),
+                Cmd::Ask { prompt, max_tokens, think } => cmd::ask(&s, &prompt.join(" "), max_tokens, think),
+                Cmd::Where => cmd::where_(&s),
+            }
+        }
     };
     match r {
         Ok(code) => std::process::exit(code),

@@ -223,13 +223,19 @@ load/unload/restart posts), so it runs beside any server, also one started anoth
     ln -s "$PWD/intelinference/target/release/intelinference" ~/.local/bin/intelinference
 
 - `intelinference` opens the live screen: decode speed, what is running, the last requests, RAM and VRAM, the run
-  configs to start or switch to, the server log and a chat. Keys are listed under `?`.
+  configs to start or switch to, the server log and a chat. **Setup** picks a model from what fits this PC and sets
+  it up (download, run config, tuning, start; `p` shows the plan first). **Tools** checks the install, updates or
+  rolls back the engine, fetches the DFlash2 drafter, runs benchmarks and tuning, lists presets and profiles, and
+  prints the settings for claude-code, opencode, codex, pi or hermes. Keys are listed under `?`.
 - One-shot commands: `up <config>`, `down`, `status`, `models`, `use <config>`, `restart`, `load`, `unload`,
-  `logs -f`, `ask "..."`, `where`. `intelinference --help` has the rest.
+  `logs -f`, `ask "..."`, `where`, and `setup` / `tools` to open those screens.
+- Every command of the Python command line is here under the same name (`update`, `doctor`, `bench run`,
+  `tune auto`, `presets list`, `profile set`, `runtime start`, `connect pi`, ...; its `logs` is `activity`). They
+  run the same Python code and their results are drawn here; `--json` prints the raw result.
+  `intelinference --help` lists them all.
 - Settings come from flags, `INTELINFERENCE_*` variables or `~/.config/intelinference/settings.json` (`port`, `host`,
   `api_key`, `config_dir`, `root`, `python`, `log`, `server_args`, `server_env`). Run configs are read from
   `~/.config/strata/` by default; servers it starts log to `~/.local/state/intelinference/`.
-- `strata` (the Python command line) still does setup, benchmarks, tuning and updates.
 
 ## Things that matter on this card
 
