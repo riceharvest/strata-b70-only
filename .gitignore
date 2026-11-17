@@ -10,6 +10,8 @@ bench/micro/*.dll
 bench/micro/*.txt
 *.log
 build*/
+# the terminal front end's cargo output
+intelinference/target/
 pack/
 logs/
 __pycache__/

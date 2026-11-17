@@ -213,6 +213,24 @@ For [pi](https://github.com/earendil-works/pi), add the server to `~/.pi/agent/m
 and start it with `pi --provider strata --model qwen38-flash-next --thinking xhigh`. What one session measured is
 under [Speed](#speed); sessions past 118K tokens are not measured yet.
 
+### intelinference: the terminal front end
+
+`intelinference` starts, watches and switches the server from a terminal. It is a small Rust program in
+[intelinference/](intelinference/) that talks to the server over HTTP (`/metrics`, `/health`, `/config` and the
+load/unload/restart posts), so it runs beside any server, also one started another way.
+
+    make intelinference                      # or: cargo build --release --manifest-path intelinference/Cargo.toml
+    ln -s "$PWD/intelinference/target/release/intelinference" ~/.local/bin/intelinference
+
+- `intelinference` opens the live screen: decode speed, what is running, the last requests, RAM and VRAM, the run
+  configs to start or switch to, the server log and a chat. Keys are listed under `?`.
+- One-shot commands: `up <config>`, `down`, `status`, `models`, `use <config>`, `restart`, `load`, `unload`,
+  `logs -f`, `ask "..."`, `where`. `intelinference --help` has the rest.
+- Settings come from flags, `INTELINFERENCE_*` variables or `~/.config/intelinference/settings.json` (`port`, `host`,
+  `api_key`, `config_dir`, `root`, `python`, `log`, `server_args`, `server_env`). Run configs are read from
+  `~/.config/strata/` by default; servers it starts log to `~/.local/state/intelinference/`.
+- `strata` (the Python command line) still does setup, benchmarks, tuning and updates.
+
 ## Things that matter on this card
 
 - **Keep VRAM headroom.** Near 32 GB the `xe` driver can wedge the card, and only a reboot or driver rebind brings it

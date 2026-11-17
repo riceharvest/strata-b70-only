@@ -8,7 +8,7 @@ CONFIG ?= strata-unsloth-ud-iq1_s.json
 H      := $(notdir $(CURDIR))
 
 .DEFAULT_GOAL := help
-.PHONY: help image build setup serve test test-serve smoke deps-dev
+.PHONY: help image build setup serve test test-serve smoke deps-dev intelinference
 
 help: ## Show this list
 	@awk 'BEGIN {FS = ":.*## "} /^[a-z-]+:.*## / {printf "  %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -38,3 +38,6 @@ smoke: ## Check that the command line starts
 
 deps-dev: ## Install the runtime and dev requirements into the Python that PY names
 	$(PY) -m pip install -r requirements.txt -r requirements-dev.txt
+
+intelinference: ## Build the terminal front end (Rust, needs cargo) to intelinference/target/release/intelinference
+	cargo build --release --manifest-path intelinference/Cargo.toml

@@ -1,0 +1,27 @@
+[package]
+name = "intelinference"
+version = "0.1.0"
+edition = "2024"
+description = "Terminal front end for the Strata B70 engine: start, watch and switch models"
+license = "MIT"
+
+[[bin]]
+name = "intelinference"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+libc = "0.2"
+ratatui = "0.30"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tachyonfx = "0.25"
+ureq = { version = "3", features = ["json"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+
+# a standalone crate, not part of any Cargo workspace above it
+[workspace]
